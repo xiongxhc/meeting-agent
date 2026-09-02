@@ -13,5 +13,15 @@
     "outDir": "dist",
     "declaration": true,
     "skipLibCheck": true
-  }
+  },
+  "include": [
+    "spikes/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "bridges/linux-browser/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ]
 }

@@ -7,10 +7,10 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test",
-    "typecheck": "out=$(tsc --noEmit 2>&1); code=$?; printf '%s\\n' \"$out\"; if [ $code -eq 0 ]; then exit 0; fi; printf '%s\\n' \"$out\" | grep -q 'error TS18003' && exit 0; exit $code",
+    "test": "node --test \"**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "out=$(tsc 2>&1); code=$?; printf '%s\\n' \"$out\"; if [ $code -eq 0 ]; then exit 0; fi; printf '%s\\n' \"$out\" | grep -q 'error TS18003' && exit 0; exit $code"
+    "build": "tsc"
   },
   "devDependencies": {
     "@eslint/js": "^9.37.0",

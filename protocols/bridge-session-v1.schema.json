@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiongxhc/meeting-agent/protocols/bridge-session-v1.schema.json",
+  "title": "bridge-session/v1",
+  "description": "Frozen wire contract between the Meeting Agent coordinator and a replaceable Feishu media bridge. Two halves: coordinator-to-bridge commands and bridge-to-coordinator events. This schema, together with fixtures/contracts/bridge-session-v1.json, is the normative definition; the TypeScript unions and the Swift structs are derived views. Unknown schema versions and unknown fields are rejected, never ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "sessionId", "commands", "events"],
+  "properties": {
+    "schema": { "$ref": "#/$defs/schemaVersion" },
+    "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+    "commands": {
+      "type": "array",
+      "description": "Coordinator-to-bridge commands, in issue order.",
+      "items": { "$ref": "#/$defs/command" }
+    },
+    "events": {
+      "type": "array",
+      "description": "Bridge-to-coordinator events, in observation order. sequence is strictly increasing per session; gaps are allowed, repeats and regressions are rejected.",
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "schemaVersion": {
+      "const": "bridge-session/v1"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "description": "UTC instant, second or millisecond precision, always Z-suffixed.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3})?Z$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "command": {
+      "description": "One coordinator-to-bridge command.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "commandId",
+            "type",
+            "meetingOccurrenceId",
+            "meetingNo",
+            "leaseId"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "type": { "const": "join" },
+            "meetingOccurrenceId": { "$ref": "#/$defs/nonEmptyString" },
+            "meetingNo": { "$ref": "#/$defs/nonEmptyString" },
+            "leaseId": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "commandId",
+            "type",
+            "endpoint",
+            "sessionToken",
+            "format",
+            "expiresAt"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "type": { "const": "connect_media" },
+            "endpoint": { "$ref": "#/$defs/nonEmptyString" },
+            "sessionToken": { "$ref": "#/$defs/nonEmptyString" },
+            "format": { "$ref": "#/$defs/nonEmptyString" },
+            "expiresAt": { "$ref": "#/$defs/utcTimestamp" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema", "sessionId", "commandId", "type", "text"],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "type": { "const": "post_disclosure" },
+            "text": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema", "sessionId", "commandId", "type", "reason"],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "type": { "const": "leave" },
+            "reason": { "enum": ["meeting_ended", "coordinator_stop"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema", "sessionId", "commandId", "type", "leaseId"],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "type": { "const": "release_lease" },
+            "leaseId": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        }
+      ]
+    },
+    "event": {
+      "description": "One bridge-to-coordinator observation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "meetingOccurrenceId"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "joined" },
+            "meetingOccurrenceId": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "reason"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "left" },
+            "reason": { "enum": ["ended", "removed", "bridge_failure"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "feishuUserId",
+            "displayName"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "participant_joined" },
+            "feishuUserId": { "$ref": "#/$defs/nonEmptyString" },
+            "displayName": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "feishuUserId"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "participant_left" },
+            "feishuUserId": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "Speaker identity is never guessed. confidence ui_exact requires a user id; confidence ambiguous requires feishuUserId to stay null.",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "feishuUserId",
+            "confidence"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "active_speaker" },
+            "feishuUserId": {
+              "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }]
+            },
+            "confidence": { "enum": ["ui_exact", "ambiguous"] }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["confidence"],
+                "properties": { "confidence": { "const": "ui_exact" } }
+              },
+              "then": {
+                "properties": {
+                  "feishuUserId": { "$ref": "#/$defs/nonEmptyString" }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["confidence"],
+                "properties": { "confidence": { "const": "ambiguous" } }
+              },
+              "then": {
+                "properties": { "feishuUserId": { "type": "null" } }
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "direction",
+            "startedAt",
+            "endedAt"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "audio_gap" },
+            "direction": { "enum": ["capture", "playback"] },
+            "startedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "endedAt": {
+              "oneOf": [{ "$ref": "#/$defs/utcTimestamp" }, { "type": "null" }]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "outcome"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "chat_disclosure" },
+            "outcome": { "enum": ["sent", "unavailable", "failed"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "endpoint"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "media_connected" },
+            "endpoint": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "reason"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "media_disconnected" },
+            "reason": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        {
+          "type": "object",
+          "description": "commandId must name a command the coordinator actually issued in this session.",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "commandId",
+            "outcome",
+            "detail"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "command_result" },
+            "commandId": { "$ref": "#/$defs/nonEmptyString" },
+            "outcome": { "enum": ["ok", "rejected", "failed"] },
+            "detail": {
+              "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "attempt"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "reconnecting" },
+            "attempt": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "sequence",
+            "observedAt",
+            "type",
+            "attempt"
+          ],
+          "properties": {
+            "schema": { "$ref": "#/$defs/schemaVersion" },
+            "sessionId": { "$ref": "#/$defs/nonEmptyString" },
+            "sequence": { "$ref": "#/$defs/sequence" },
+            "observedAt": { "$ref": "#/$defs/utcTimestamp" },
+            "type": { "const": "reconnected" },
+            "attempt": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

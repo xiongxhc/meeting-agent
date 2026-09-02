@@ -1,0 +1,150 @@
+{
+  "schema": "bridge-session/v1",
+  "sessionId": "sess_0000000000000001",
+  "commands": [
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "commandId": "cmd_0001",
+      "type": "join",
+      "meetingOccurrenceId": "900000001@2026-09-02T14:00:00Z",
+      "meetingNo": "900000001",
+      "leaseId": "lease_00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "commandId": "cmd_0002",
+      "type": "connect_media",
+      "endpoint": "udp://127.0.0.1:40001",
+      "sessionToken": "synthetic-media-token-not-a-secret",
+      "format": "opus/48000/2",
+      "expiresAt": "2026-09-02T15:00:00Z"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "commandId": "cmd_0003",
+      "type": "post_disclosure",
+      "text": "A meeting agent is present in this test meeting and will produce a transcript."
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "commandId": "cmd_0004",
+      "type": "leave",
+      "reason": "meeting_ended"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "commandId": "cmd_0005",
+      "type": "release_lease",
+      "leaseId": "lease_00000000-0000-4000-8000-000000000001"
+    }
+  ],
+  "events": [
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 1,
+      "observedAt": "2026-09-02T14:00:03.000Z",
+      "type": "joined",
+      "meetingOccurrenceId": "900000001@2026-09-02T14:00:00Z"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 2,
+      "observedAt": "2026-09-02T14:00:04.000Z",
+      "type": "participant_joined",
+      "feishuUserId": "ou_000000000000000000000000000001",
+      "displayName": "Test Participant One"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 3,
+      "observedAt": "2026-09-02T14:00:05.000Z",
+      "type": "media_connected",
+      "endpoint": "udp://127.0.0.1:40001"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 4,
+      "observedAt": "2026-09-02T14:00:05.500Z",
+      "type": "command_result",
+      "commandId": "cmd_0001",
+      "outcome": "ok",
+      "detail": null
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 5,
+      "observedAt": "2026-09-02T14:00:07.000Z",
+      "type": "chat_disclosure",
+      "outcome": "sent"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 6,
+      "observedAt": "2026-09-02T14:01:12.000Z",
+      "type": "active_speaker",
+      "feishuUserId": "ou_000000000000000000000000000001",
+      "confidence": "ui_exact"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 7,
+      "observedAt": "2026-09-02T14:03:40.000Z",
+      "type": "audio_gap",
+      "direction": "capture",
+      "startedAt": "2026-09-02T14:03:38.000Z",
+      "endedAt": "2026-09-02T14:03:39.500Z"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 8,
+      "observedAt": "2026-09-02T14:03:41.000Z",
+      "type": "reconnecting",
+      "attempt": 1
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 9,
+      "observedAt": "2026-09-02T14:03:46.000Z",
+      "type": "reconnected",
+      "attempt": 1
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 10,
+      "observedAt": "2026-09-02T14:29:58.000Z",
+      "type": "media_disconnected",
+      "reason": "endpoint_closed"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 11,
+      "observedAt": "2026-09-02T14:29:59.000Z",
+      "type": "participant_left",
+      "feishuUserId": "ou_000000000000000000000000000001"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 12,
+      "observedAt": "2026-09-02T14:30:00.000Z",
+      "type": "left",
+      "reason": "ended"
+    }
+  ]
+}
