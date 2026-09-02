@@ -1,0 +1,22 @@
+{
+  "name": "meeting-agent",
+  "version": "0.1.0",
+  "description": "Reusable meeting engine: joins, transcribes, and reports on meetings.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "out=$(tsc --noEmit 2>&1); code=$?; printf '%s\\n' \"$out\"; if [ $code -eq 0 ]; then exit 0; fi; printf '%s\\n' \"$out\" | grep -q 'error TS18003' && exit 0; exit $code",
+    "lint": "eslint .",
+    "build": "out=$(tsc 2>&1); code=$?; printf '%s\\n' \"$out\"; if [ $code -eq 0 ]; then exit 0; fi; printf '%s\\n' \"$out\" | grep -q 'error TS18003' && exit 0; exit $code"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.37.0",
+    "@types/node": "^24.9.1",
+    "eslint": "^9.37.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.0"
+  }
+}
