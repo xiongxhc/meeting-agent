@@ -67,12 +67,69 @@ final class AccessibilityObserverTests: XCTestCase {
             tiles: [("tile-1", true)],
             localizedOnly: true
         )
-        XCTAssertEqual(observer().observations(from: tree, at: at1).count, 2)
+        XCTAssertEqual(
+            observer().observations(from: tree, at: at1),
+            [
+                .rosterSnapshot(
+                    observedAt: at1,
+                    participants: [
+                        RosterEntry(
+                            feishuUserId: "ou_00000000000000000000000000000a",
+                            displayName: "Test Participant One")
+                    ]),
+                .speakerHighlight(observedAt: at1, highlightedTileIds: ["tile-1"]),
+            ],
+            "the title fallback must resolve the same nodes the identifiers would")
     }
 
-    func testAMissingMeetingWindowIsObservedAsTheMeetingHavingEnded() {
-        let tree = FakeTree.idleWithJoinSurface()
-        XCTAssertEqual(observer().observations(from: tree, at: at2), [.meetingEnded(observedAt: at2)])
+    func testABackgroundedClientIsNotReportedAsAnEndedMeeting() {
+        // Absence of evidence is not evidence of an end. A backgrounded client,
+        // a partial tree read, or a meeting window that exposes no identifier
+        // must not make the bridge claim the meeting is over.
+        let reducer = reducer()
+        let events = observer().observations(from: FakeTree.backgroundedClient(), at: at1)
+            .flatMap { reducer.reduce($0) }
+        XCTAssertEqual(events, [], "one unreadable frame says nothing about the meeting")
+        XCTAssertEqual(
+            observer().observations(from: FakeTree.backgroundedClient(), at: at1),
+            [.unobservable(observedAt: at1)])
+    }
+
+    func testAPositiveEndNoticeIsReportedAsTheMeetingEndingStraightAway() {
+        XCTAssertEqual(
+            observer().observations(from: FakeTree.meetingEndedNotice(), at: at2),
+            [.meetingEnded(observedAt: at2)],
+            "positive evidence needs no waiting")
+    }
+
+    func testEnoughConsecutiveUnreadableFramesEventuallyReportTheMeetingEnded() {
+        let observer = observer()
+        let absent = FakeTree.backgroundedClient()
+        XCTAssertEqual(observer.observations(from: absent, at: at1), [.unobservable(observedAt: at1)])
+        XCTAssertEqual(observer.observations(from: absent, at: at1), [.unobservable(observedAt: at1)])
+        XCTAssertEqual(
+            observer.observations(from: absent, at: at2), [.meetingEnded(observedAt: at2)],
+            "three consecutive absent frames is a departure, one is a hiccup")
+    }
+
+    func testAMeetingWindowComingBackResetsTheAbsenceCount() {
+        let observer = observer()
+        let absent = FakeTree.backgroundedClient()
+        _ = observer.observations(from: absent, at: at1)
+        _ = observer.observations(from: absent, at: at1)
+        _ = observer.observations(from: FakeTree.inMeeting(), at: at1)
+        XCTAssertEqual(
+            observer.observations(from: absent, at: at2), [.unobservable(observedAt: at2)],
+            "a client that came back is not two thirds of the way to having left")
+    }
+
+    func testARepeatedEndObservationClaimsLeftOnlyOnce() {
+        let reducer = reducer()
+        XCTAssertEqual(reducer.reduce(.meetingEnded(observedAt: at1)).map(\.event),
+            [.left(reason: .ended)])
+        XCTAssertEqual(
+            reducer.reduce(.meetingEnded(observedAt: at2)), [],
+            "a meeting ends once; a repeated observation is not a second departure")
     }
 
     func testAnAbsentRosterPanelReportsNoMembershipRatherThanAnEmptyOne() {

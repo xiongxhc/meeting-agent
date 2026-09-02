@@ -49,6 +49,17 @@ Tests/FeishuBridgeSpikeTests/
   unknown membership, not an empty meeting, so no `participant_left` is invented
   for a panel that merely closed. A roster row whose identity cannot be resolved
   is left out rather than given a guessed id.
+- **Absence of evidence is not an ended meeting.** A tree with no locatable
+  meeting window is `unobservable` — a backgrounded client and a partial read
+  both look like that. An end is claimed on the client's positive "meeting
+  ended" notice, or failing that only after three consecutive absent frames, and
+  `left` is emitted at most once per session.
+- **The UI is re-read after every action.** `snapshot(waitingUpTo:)` carries a
+  timing contract: keep re-reading until the tree changes or the deadline
+  elapses. The adapter waits 60s after pressing join (a waiting-room join takes
+  as long as the host takes to admit) and 5s after a within-meeting press.
+  Searching a pre-press tree for a control the press was meant to reveal is how
+  a collapsed chat panel becomes a false `unavailable`.
 - **Time is injected.** Nothing calls `Date()` inline; `BridgeClock` is the only
   source of "now", which is what makes recorded evidence reproducible.
 
@@ -61,6 +72,17 @@ title as fallback — not the values. Capturing the real ones is the first
 human-gated step in `docs/HUMAN-CHECKLIST.md`, section Plan 1 Task 3, and must
 happen before `docs/feasibility/feishu-client-matrix.md` can hold a single
 measurement.
+
+## What is missing before this can drive a real client
+
+The package declares a library and a test target, no executable, and ships
+`AccessibilityDriver` and `UiIdentityResolver` as protocols with only fakes
+behind them. A real run needs an `AXUIElement`-backed driver honouring the
+timing contract above, a real identity resolver — *if* the client exposes
+anything resolvable to a Feishu user id, which is itself an open feasibility
+question — and an entry point wiring adapter, observer, reducer, and recorder
+together. No task in the current plan owns any of the three; see
+`docs/HUMAN-CHECKLIST.md` section 3.0.
 
 ## Permissions
 

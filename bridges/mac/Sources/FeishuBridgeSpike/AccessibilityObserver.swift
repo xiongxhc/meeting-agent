@@ -66,6 +66,11 @@ public struct RosterEntry: Equatable, Sendable {
 /// in a position to observe entry into a meeting, so only it can report it.
 public enum UiObservation: Equatable, Sendable {
     case joined(observedAt: String, meetingOccurrenceId: String)
+    /// The tree could not be read as a meeting: the client is backgrounded, the
+    /// read came back partial, or the meeting window exposes nothing the label
+    /// table knows. This says nothing about whether the meeting is still on, and
+    /// the reducer emits nothing for it.
+    case unobservable(observedAt: String)
     case rosterSnapshot(observedAt: String, participants: [RosterEntry])
     case speakerHighlight(observedAt: String, highlightedTileIds: [String])
     case meetingEnded(observedAt: String)
@@ -87,21 +92,49 @@ public protocol ChatControlPort {
 }
 
 /// Reads raw observations off an accessibility tree. It reports what the UI
-/// showed and nothing more: no speaker is chosen here, and an unresolvable
-/// identity is left out rather than filled in.
-public struct AccessibilityObserver {
+/// showed and nothing more: no speaker is chosen here, an unresolvable identity
+/// is left out rather than filled in, and a tree it cannot read is reported as
+/// unreadable rather than as an ended meeting.
+///
+/// The end of a meeting is claimed on positive evidence — the client's
+/// meeting-ended notice — or, failing that, only after `absentFramesBeforeEnded`
+/// consecutive frames in which no meeting window could be located at all. One
+/// unreadable frame is `unobservable`. This is the same asymmetry the roster
+/// rule uses: a panel that is not on screen is unknown membership, not an empty
+/// meeting.
+///
+/// Stateful, hence a class: the consecutive-absence count is what separates a
+/// backgrounded client from a meeting that is over.
+public final class AccessibilityObserver {
     private let labels: FeishuUiLabels
     private let identity: any UiIdentityResolver
+    private let absentFramesBeforeEnded: Int
+    private var consecutiveAbsentFrames = 0
 
-    public init(labels: FeishuUiLabels = .bundled, identity: any UiIdentityResolver) {
+    public init(
+        labels: FeishuUiLabels = .bundled,
+        identity: any UiIdentityResolver,
+        absentFramesBeforeEnded: Int = 3
+    ) {
+        precondition(absentFramesBeforeEnded >= 1, "at least one absent frame is needed")
         self.labels = labels
         self.identity = identity
+        self.absentFramesBeforeEnded = absentFramesBeforeEnded
     }
 
     public func observations(from tree: AccessibilityNode, at observedAt: String) -> [UiObservation] {
-        guard let window = tree.locate(labels.identifiers.meetingWindow, labels) else {
+        if tree.locate(labels.identifiers.meetingEndedNotice, labels) != nil {
+            consecutiveAbsentFrames = 0
             return [.meetingEnded(observedAt: observedAt)]
         }
+
+        guard let window = tree.locate(labels.identifiers.meetingWindow, labels) else {
+            consecutiveAbsentFrames += 1
+            return consecutiveAbsentFrames >= absentFramesBeforeEnded
+                ? [.meetingEnded(observedAt: observedAt)]
+                : [.unobservable(observedAt: observedAt)]
+        }
+        consecutiveAbsentFrames = 0
 
         var observations: [UiObservation] = []
 
@@ -170,6 +203,7 @@ public final class SessionObservationReducer {
     private let chatControl: any ChatControlPort
     private var sequence = 0
     private var activeSpeaker: ActiveSpeaker?
+    private var hasLeft = false
     private var roster: [String: String] = [:]
 
     public init(
@@ -185,7 +219,14 @@ public final class SessionObservationReducer {
         case .joined(let observedAt, let meetingOccurrenceId):
             return [emit(observedAt, .joined(meetingOccurrenceId: meetingOccurrenceId))]
 
+        case .unobservable:
+            return []
+
         case .meetingEnded(let observedAt):
+            // A meeting ends once. A repeated end observation is not a second
+            // departure, and the contract has no way to say "still gone".
+            guard !hasLeft else { return [] }
+            hasLeft = true
             return [emit(observedAt, .left(reason: .ended))]
 
         case .disclosureAttempt(let observedAt, let text):

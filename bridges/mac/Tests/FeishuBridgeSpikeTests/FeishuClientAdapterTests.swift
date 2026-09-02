@@ -68,6 +68,17 @@ final class FeishuClientAdapterTests: XCTestCase {
             .joined(meetingOccurrenceId: occurrence))
     }
 
+    func testWaitsForTheClientToSettleBeforeJudgingTheJoin() {
+        let (adapter, driver) = self.adapter([
+            FakeTree.idleWithJoinSurface(),
+            FakeTree.inMeeting(meetingNo: "900000001"),
+        ])
+        _ = adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001")
+        XCTAssertEqual(
+            driver.waits, [0, 60],
+            "read now before pressing; then give the client the join deadline to show the window")
+    }
+
     // MARK: - leave
 
     func testLeavesAndConfirmsTheMeetingWindowIsGone() {
@@ -107,6 +118,32 @@ final class FeishuClientAdapterTests: XCTestCase {
         XCTAssertEqual(driver.typed.map(\.text), ["A meeting agent is present."])
         XCTAssertEqual(
             driver.pressed.last, FeishuUiLabels.bundled.identifiers.chatSendButton)
+    }
+
+    func testRereadsTheTreeAfterOpeningACollapsedChatPanel() {
+        // The toggle reveals the input: it is absent from the pre-press tree and
+        // present in the next one. Searching the stale snapshot would report a
+        // false `unavailable` and, since the attempt is already spent, skip the
+        // disclosure for the whole occurrence.
+        let (adapter, driver) = self.adapter([
+            FakeTree.inMeeting(chat: .revealedByToggle),
+            FakeTree.inMeeting(chat: .reachable),
+        ])
+        XCTAssertEqual(adapter.postDisclosureOnce(text: "A meeting agent is present."), .sent)
+        XCTAssertEqual(
+            driver.pressed,
+            [
+                FeishuUiLabels.bundled.identifiers.chatToggle,
+                FeishuUiLabels.bundled.identifiers.chatSendButton,
+            ])
+    }
+
+    func testLeavesAnAlreadyOpenChatPanelAloneRatherThanTogglingItShut() {
+        let (adapter, driver) = self.adapter([FakeTree.inMeeting(chat: .reachable)])
+        XCTAssertEqual(adapter.postDisclosureOnce(text: "A meeting agent is present."), .sent)
+        XCTAssertFalse(
+            driver.pressed.contains(FeishuUiLabels.bundled.identifiers.chatToggle),
+            "the input was already reachable; pressing the toggle would have hidden it")
     }
 
     func testReportsUnavailableWhenTheChatControlIsNotThere() {

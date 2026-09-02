@@ -38,12 +38,37 @@ measurement. They are below.
 > without a wrong meeting, wrong participant, duplicate disclosure, or guessed
 > speaker.
 
-### 3.0 Prerequisite: capture the real accessibility identifiers
+### 3.0 Prerequisites — bullets 4-6 cannot start until all three are done
 
-Not a brief bullet, but bullets 4-6 cannot start without it. Every identifier
-and localized title in
-`bridges/mac/Sources/FeishuBridgeSpike/LocalizedLabels.swift` is a placeholder;
-none was captured from a real client. Capture the real ones first.
+The Mac package as committed cannot drive a real client. Three things are
+missing, and **no task in this plan creates them**: Task 4 adds audio, Task 5
+scores the language choice, Task 6 is the Linux probe, Task 7 publishes the
+verdict. They are unowned work that has to be scheduled before 3.1 can be
+attempted.
+
+1. **Real labels.** Every identifier and localized title in
+   `bridges/mac/Sources/FeishuBridgeSpike/LocalizedLabels.swift` is a
+   placeholder; none was captured from a real client. See 3.0a below.
+2. **An `AXUIElement`-backed `AccessibilityDriver`.** The package ships the
+   protocol only, and it carries a timing contract that a real implementation
+   must honour: `snapshot(waitingUpTo:)` must keep re-reading until the tree
+   changes or the deadline elapses, and must not return a stale tree
+   immediately. `FeishuClientAdapter` waits 60s after pressing join (the
+   waiting-room path takes as long as the host takes to admit) and 5s after a
+   within-meeting press; both are constructor parameters. A driver that ignores
+   the deadline will report `meeting_window_not_observed` on nearly every real
+   join.
+3. **A real `UiIdentityResolver`, and the finding of whether one is even
+   possible.** The package ships the protocol only; the sole implementation is
+   a fake in the test target. See 3.0b — this is a feasibility question, not
+   just an implementation gap.
+4. **A runnable entry point.** `bridges/mac/Package.swift` declares a library
+   and a test target, no executable, so there is nothing to launch. Whoever
+   builds items 2 and 3 must also add the executable target that wires an
+   adapter, an observer, a reducer, and a `BridgeRecorder` together and writes
+   the JSONL evidence file that 3.1 and 3.2 ask for.
+
+#### 3.0a Capture the real accessibility identifiers
 
 Grant the Accessibility permission to whatever process will drive the client
 (System Settings > Privacy & Security > Accessibility), open Feishu, join a
@@ -69,8 +94,32 @@ cd bridges/mac && swift test
 **Evidence to record:** the client build string, the macOS version, and which
 controls exposed a stable `AXIdentifier` versus which are reachable only by
 localized title. A control reachable only by title is a standing fragility;
-note it. Do not paste a full tree dump into the repository — it will contain
+note it. Also note whether the client shows a positive "meeting has ended"
+notice: the observer claims an end from that notice if it exists, and otherwise
+only after three consecutive frames in which no meeting window could be located
+at all. Do not paste a full tree dump into the repository — it will contain
 real participant names.
+
+#### 3.0b Establish whether a participant identity is resolvable at all
+
+Open the same throwaway meeting and inspect one roster row and one speaker tile.
+The question: **does either expose anything that can be resolved to a Feishu
+user id without OCR and without a directory lookup?** An `AXIdentifier` carrying
+an opaque per-participant handle, an `AXValue`, a help tag — anything stable and
+per-person.
+
+This is a feasibility result, not an implementation detail, and it gates both
+halves of this task. If the answer is no, `active_speaker` can never reach
+`ui_exact` and every speaker observation stays `ambiguous`, and
+`participant_joined` cannot be emitted at all because the contract requires a
+non-empty `feishuUserId`. Two participants with the same display name would also
+be indistinguishable.
+
+**Evidence to record:** what the roster row and the speaker tile expose, whether
+it is stable across a rejoin, and the resulting one-word verdict in the
+**Participant and speaker identity** row of
+`docs/feasibility/feishu-client-matrix.md`. Record the attribute names only —
+never a real handle, since a per-participant handle identifies a real person.
 
 ### 3.1 Brief bullet 4 — five real joins in a test tenant
 
@@ -88,9 +137,12 @@ sw_vers -productVersion && sw_vers -buildVersion
 cd bridges/mac && swift test          # confirm the bridge is green before the run
 ```
 
-Then drive the join for that path and record the bridge's JSONL evidence to a
-file **outside this repository** (it will contain real meeting and participant
-ids):
+Then drive the join for that path, using the entry point built in 3.0, and
+record the bridge's JSONL evidence to a file **outside this repository** (it
+will contain real meeting and participant ids). Note the deadlines the adapter
+was constructed with — the default 60s join deadline is what makes the
+waiting-room path viable, and a run that failed because the deadline was too
+short is a configuration result, not a `not tested`:
 
 ```
 mkdir -p ~/meeting-agent-evidence

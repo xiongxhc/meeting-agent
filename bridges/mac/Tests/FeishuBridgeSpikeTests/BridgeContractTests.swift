@@ -100,11 +100,13 @@ final class BridgeContractTests: XCTestCase {
         let transcript = try decodedTranscript()
         let reencoded = try JSONEncoder().encode(transcript)
 
-        let original = try JSONSerialization.jsonObject(with: frozenBytes())
-        let actual = try JSONSerialization.jsonObject(with: reencoded)
+        // Unwrapped rather than cast inline: two failed casts would both be nil
+        // and the comparison would pass having compared nothing.
+        let original = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: frozenBytes()) as? NSDictionary)
+        let actual = try XCTUnwrap(JSONSerialization.jsonObject(with: reencoded) as? NSDictionary)
         XCTAssertEqual(
-            original as? NSDictionary,
-            actual as? NSDictionary,
+            original, actual,
             "re-encoding the frozen bytes must not add, drop, or alter a single member"
         )
 
@@ -119,14 +121,13 @@ final class BridgeContractTests: XCTestCase {
             observedAt: "2026-09-02T14:00:00.000Z",
             event: .activeSpeaker(.ambiguous)
         )
-        let object =
-            try JSONSerialization.jsonObject(with: JSONEncoder().encode(message))
-            as? [String: Any]
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: Any])
         XCTAssertTrue(
-            object?["feishuUserId"] is NSNull,
+            object["feishuUserId"] is NSNull,
             "feishuUserId must be present and null; an omitted key is a different wire shape"
         )
-        XCTAssertEqual(object?["confidence"] as? String, "ambiguous")
+        XCTAssertEqual(object["confidence"] as? String, "ambiguous")
     }
 
     // MARK: - fail-closed decoding

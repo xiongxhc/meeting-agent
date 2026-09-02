@@ -41,6 +41,19 @@ evidence to capture are in `docs/HUMAN-CHECKLIST.md`, section
 |---|---|---|---|---|---|---|---|
 | Media reconnect after a network drop (bridge stays up) | | | | | | | |
 
+## Participant and speaker identity
+
+Whether a roster row or a speaker tile exposes anything resolvable to a Feishu
+user id without OCR or a directory lookup. If it does not, `active_speaker`
+never reaches `ui_exact` and `participant_joined` cannot be emitted at all — so
+this row gates both halves of the task. Procedure: `docs/HUMAN-CHECKLIST.md`
+section 3.0b. Record attribute names only, never a real handle.
+
+| What was inspected | Attribute that carries an identity | Stable across a rejoin | Feishu client version | macOS version | Result | Measured on |
+|---|---|---|---|---|---|---|
+| Roster row | | | | | | |
+| Speaker tile | | | | | | |
+
 ## Column rules
 
 - **Feishu client version** — the exact build string from the client's About

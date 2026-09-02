@@ -28,6 +28,8 @@ public struct FeishuUiLabels: Sendable, Equatable {
         public let joinMeetingNumberField: String
         public let joinButton: String
         public let meetingWindow: String
+        /// The client's positive "this meeting has ended" notice.
+        public let meetingEndedNotice: String
         public let meetingNumberLabel: String
         public let leaveButton: String
         public let leaveConfirmButton: String
@@ -46,6 +48,7 @@ public struct FeishuUiLabels: Sendable, Equatable {
             joinMeetingNumberField: String,
             joinButton: String,
             meetingWindow: String,
+            meetingEndedNotice: String,
             meetingNumberLabel: String,
             leaveButton: String,
             leaveConfirmButton: String,
@@ -61,6 +64,7 @@ public struct FeishuUiLabels: Sendable, Equatable {
             self.joinMeetingNumberField = joinMeetingNumberField
             self.joinButton = joinButton
             self.meetingWindow = meetingWindow
+            self.meetingEndedNotice = meetingEndedNotice
             self.meetingNumberLabel = meetingNumberLabel
             self.leaveButton = leaveButton
             self.leaveConfirmButton = leaveConfirmButton
@@ -94,6 +98,7 @@ public struct FeishuUiLabels: Sendable, Equatable {
             joinMeetingNumberField: "feishu.join.meetingNumberField",
             joinButton: "feishu.join.confirmButton",
             meetingWindow: "feishu.meeting.window",
+            meetingEndedNotice: "feishu.meeting.endedNotice",
             meetingNumberLabel: "feishu.meeting.numberLabel",
             leaveButton: "feishu.meeting.leaveButton",
             leaveConfirmButton: "feishu.meeting.leaveConfirmButton",
@@ -109,6 +114,7 @@ public struct FeishuUiLabels: Sendable, Equatable {
             "feishu.join.meetingNumberField": ["输入会议号", "Enter meeting number"],
             "feishu.join.confirmButton": ["加入会议", "Join"],
             "feishu.meeting.numberLabel": ["会议号", "Meeting number"],
+            "feishu.meeting.endedNotice": ["会议已结束", "The meeting has ended"],
             "feishu.meeting.leaveButton": ["离开会议", "Leave"],
             "feishu.meeting.leaveConfirmButton": ["确认离开", "Leave meeting"],
             "feishu.meeting.chatToggle": ["聊天", "Chat"],

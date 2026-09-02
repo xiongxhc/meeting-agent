@@ -39,7 +39,11 @@ public final class SequentialClock: BridgeClock {
             return Int((date.timeIntervalSince1970 * 1000).rounded())
         }
         formatter.formatOptions = [.withInternetDateTime]
-        guard let date = formatter.date(from: iso) else { return 0 }
+        guard let date = formatter.date(from: iso) else {
+            // Falling back to the epoch would turn a typo into plausible-looking
+            // 1970 evidence rather than a failure.
+            preconditionFailure("SequentialClock start is not a UTC timestamp: \(iso)")
+        }
         return Int((date.timeIntervalSince1970 * 1000).rounded())
     }
 

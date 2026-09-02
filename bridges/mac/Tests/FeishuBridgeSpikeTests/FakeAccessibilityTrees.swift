@@ -83,9 +83,25 @@ enum FakeTree {
         return AccessibilityNode(
             role: "AXWindow",
             identifier: labels.identifiers.meetingWindow,
-            title: "Meeting",
             children: children
         )
+    }
+
+    /// The client showing its positive "this meeting has ended" notice.
+    static func meetingEndedNotice() -> AccessibilityNode {
+        AccessibilityNode(
+            role: "AXWindow",
+            identifier: labels.identifiers.appWindow,
+            children: [
+                AccessibilityNode(
+                    role: "AXStaticText", identifier: labels.identifiers.meetingEndedNotice)
+            ])
+    }
+
+    /// The client running but backgrounded, or a tree read that came back
+    /// partial: the app window is there, the meeting window is not readable.
+    static func backgroundedClient() -> AccessibilityNode {
+        AccessibilityNode(role: "AXWindow", identifier: labels.identifiers.appWindow)
     }
 
     /// The client running, but not in a meeting: only the join surface is present.
@@ -116,11 +132,22 @@ enum FakeTree {
         case absent
         /// Chat panel present but the input is disabled (client still loading it).
         case disabledInput
+        /// The chat panel is collapsed: the toggle is on screen, the input and
+        /// send control only appear in a tree read *after* the toggle is pressed.
+        case revealedByToggle
 
         func nodes(labels: FeishuUiLabels, localizedOnly: Bool) -> [AccessibilityNode] {
             switch self {
             case .absent:
                 return []
+            case .revealedByToggle:
+                return [
+                    AccessibilityNode(
+                        role: "AXButton",
+                        identifier: localizedOnly ? nil : labels.identifiers.chatToggle,
+                        title: localizedOnly
+                            ? labels.titles(for: labels.identifiers.chatToggle).first : nil)
+                ]
             case .reachable, .disabledInput:
                 let enabled = self == .reachable
                 return [
@@ -172,13 +199,16 @@ final class FakeChatControl: ChatControlPort {
 final class FakeAccessibilityDriver: AccessibilityDriver {
     private var snapshots: [AccessibilityNode?]
     private(set) var pressed: [String] = []
+    /// Every deadline the adapter asked to wait for, in call order.
+    private(set) var waits: [TimeInterval] = []
     private(set) var typed: [(identifier: String, text: String)] = []
     var refusePress: Set<String> = []
     var refuseSetValue: Set<String> = []
 
     init(snapshots: [AccessibilityNode?]) { self.snapshots = snapshots }
 
-    func snapshot() -> AccessibilityNode? {
+    func snapshot(waitingUpTo seconds: TimeInterval) -> AccessibilityNode? {
+        waits.append(seconds)
         guard !snapshots.isEmpty else { return snapshots.last ?? nil }
         return snapshots.count == 1 ? snapshots[0] : snapshots.removeFirst()
     }
