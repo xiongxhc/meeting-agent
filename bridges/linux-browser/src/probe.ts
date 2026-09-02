@@ -214,6 +214,14 @@ const CONTROL_FOR_CAPABILITY: Readonly<Record<CapabilityId, ControlName>> = {
   microphone_input: "microphone_meter",
   speaker_output: "speaker_output_meter",
   chat: "chat_panel",
+  // Weaker than the other mappings: a visible, ok-state reconnect_banner
+  // proves the banner control is reachable and shows current connection
+  // status ("Connected"), not that the client actually recovered from a
+  // real network drop -- which is what "reconnect" means everywhere else
+  // in this plan (see the join-path row of the same name in
+  // docs/feasibility/feishu-client-matrix.md). Do not over-read a `proven`
+  // result for this capability as evidence of real drop-and-recover
+  // behaviour; that needs an actual provoked disconnect on agent-box.
   reconnect: "reconnect_banner",
 };
 

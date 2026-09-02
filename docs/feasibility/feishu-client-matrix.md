@@ -126,6 +126,16 @@ the human genuinely could not reach (never merely never looked at),
 `unreliable` for one that worked at least once but not consistently, and
 `proven` for one that worked every time it was attempted.
 
+**`proven` carries no run-count floor in this section, unlike the join-path
+rows above.** The Result vocabulary table's `proven` (and `unreliable`) are
+defined against a four-consecutive-clean-runs bar. The agent-box rows below
+use the same four words but not that bar: here `proven` means only "every
+attempt actually made succeeded," which a single lucky attempt satisfies.
+If consistency with the rest of this file is wanted, apply the same
+four-consecutive-clean-run bar before writing `proven` into a row below —
+but nothing enforces that, and a `proven` cell here is not a claim that a
+four-run bar was met unless the evidence says so.
+
 | Capability | What a human would check | Feishu web client version | Browser + version | Evidence hash | Result | Measured on |
 |---|---|---|---|---|---|---|
 | Authentication persistence | Whether a logged-in session survives a page reload / process restart without re-prompting | | | | not tested | |

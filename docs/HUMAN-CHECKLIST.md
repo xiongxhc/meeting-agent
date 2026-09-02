@@ -584,6 +584,15 @@ Verbatim from the brief:
 > Record each capability as `proven`, `unreliable`, `unavailable`, or
 > `not tested`, with the exact client/browser version and evidence hash.
 
+**Note: `proven` here has no run-count floor.** The join-path rows
+elsewhere in `docs/feasibility/feishu-client-matrix.md` require four
+consecutive clean runs before writing `proven`; this section's `proven` is
+satisfied by a single successful attempt, since the Task 6 brief states no
+run count. If you want this section's results to carry the same weight as
+the join-path rows, attempt each capability four consecutive times and
+apply that same bar yourself before writing `proven` — the classifier will
+not stop you from writing it after one.
+
 For each of the eight capabilities, attempt it at least once (more than once
 if the first attempt succeeds and a `proven` result is wanted, since
 `unreliable` covers anything that did not succeed every time it was tried):
