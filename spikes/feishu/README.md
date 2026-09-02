@@ -7,8 +7,8 @@ evidence recorder (`src/recorder.ts`, Task 1), and — added in Task 2 — the
 harness** (`src/replay.ts`) that turn raw Feishu-client UI observations into
 that same `BridgeEvent` stream.
 
-Two later tasks build a Swift Mac bridge (`bridges/mac/`, not present yet)
-that observes the real Feishu client. `src/reducer.ts` is the **reference
+A Swift Mac bridge (`bridges/mac/`) that observes the real Feishu client
+landed in Task 3. `src/reducer.ts` is the **reference
 implementation of the ambiguity policy**: the Swift side will produce raw
 observations in the `UiObservation` shape declared there and defer every
 "is this speaker known or ambiguous" decision to the same rules verified
@@ -49,11 +49,10 @@ is the point of the reducer/replay split — permission-gated observation
 (reading the real Feishu client) is entirely the Swift bridge's job in a
 later task; everything here operates on recorded JSON frames.
 
-The Swift bridge, when it exists, will need the macOS Accessibility
-permission (to read UI element state) and possibly Screen Recording (if any
-observation is OCR-based rather than accessibility-based). That request is
-out of scope for this spike and will be documented alongside the Swift code
-when it lands, not here.
+The Swift bridge needs the macOS Accessibility permission (to read UI
+element state) and possibly Screen Recording (if any observation turns out to
+be OCR-based rather than accessibility-based). That is documented alongside
+the Swift code, in `bridges/mac/README.md`, not here.
 
 ## Observation fixtures and redaction rules
 
