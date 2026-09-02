@@ -1,0 +1,13 @@
+{
+  "capturedAt": "2026-09-02T14:00:00.000Z",
+  "controls": {
+    "meeting_container": { "visible": true, "state": "ok", "text": "Test Meeting Room" },
+    "auth_session_badge": { "visible": true, "state": "ok", "text": "Signed in as Test Participant One" },
+    "participants_list": { "visible": true, "state": "ok", "text": "2 participants" },
+    "active_speaker_tile": { "visible": true, "state": "ok", "text": "tile-1" },
+    "microphone_meter": { "visible": true, "state": "ok", "text": null },
+    "speaker_output_meter": { "visible": true, "state": "ok", "text": null },
+    "chat_panel": { "visible": true, "state": "ok", "text": null },
+    "reconnect_banner": { "visible": true, "state": "ok", "text": "Connected" }
+  }
+}

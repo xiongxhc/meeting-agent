@@ -539,3 +539,95 @@ that failed, run against the same `spikes/feishu/` fixture/replay suite
 `spikes/feishu/fixtures/observations/`) that already defines the
 platform-neutral contract. Do not open the re-spike task, and do not switch
 language, on preference alone.
+
+## Plan 1 Task 6: Probe agent-box standalone without overstating support
+
+The task's four bullets split in two. Bullet 1 (unit-test browser meeting
+discovery and failure classification using recorded DOM fixtures, no
+credentials, no tenant HTML) is done in code — see
+`bridges/linux-browser/src/probe.ts`, `bridges/linux-browser/test/probe.test.ts`,
+and the Task 6 report. Bullets 2-4 need an isolated agent-box test session
+and a real Feishu web client login. They were not attempted and not
+simulated, and every result cell added to
+`docs/feasibility/feishu-client-matrix.md`'s **agent-box standalone**
+section is `not tested`. They are below.
+
+**Rule for this section, verbatim from the brief:**
+
+> If raw media or UI observation is unavailable, mark agent-box standalone
+> `deferred`; do not block the recommended coordinator-plus-Mac profile.
+
+### 6.0 Prerequisites
+
+- An isolated agent-box test session (LANE-CONSTRAINTS forbids touching
+  agent-box from this repo's own work; this is a separate human action on
+  the box itself, not something run from a checkout of this repository).
+- A real Feishu web client login in a test tenant, in a throwaway browser
+  profile — never the operator's own Feishu account.
+- `bridges/linux-browser/src/probe.ts`'s `PagePort` interface, if a real
+  driver is written against it, gives a place to wire real DOM reads into
+  the same `classifyCapability` / `classifyAllCapabilities` logic already
+  unit-tested here. Writing that real driver (a real `PagePort`
+  implementation backed by actual browser automation) is itself part of this
+  human-gated work, not something this repository's automated tests do —
+  see the YAGNI note in the Task 6 report for why no browser-automation
+  dependency was added to the package.
+
+### 6.1 Brief bullets 2-3 — probe each capability, record evidence
+
+Verbatim from the brief:
+
+> On an isolated agent-box test session, probe authentication persistence,
+> meeting join, actual participants, active speaker, microphone input,
+> speaker output, chat, and reconnect under the available Feishu web client.
+>
+> Record each capability as `proven`, `unreliable`, `unavailable`, or
+> `not tested`, with the exact client/browser version and evidence hash.
+
+For each of the eight capabilities, attempt it at least once (more than once
+if the first attempt succeeds and a `proven` result is wanted, since
+`unreliable` covers anything that did not succeed every time it was tried):
+
+```
+# on the agent-box session, record the browser and OS versions
+uname -a
+<browser> --version        # exact command depends on which browser agent-box runs
+```
+
+Capture whatever evidence proves the attempt (a redacted DOM dump, a
+screenshot with any identifying content cropped out, or a log line) to a
+file **outside this repository**, then:
+
+```
+shasum -a 256 <path-to-evidence-file>
+```
+
+**Evidence to record**, per capability, in the **agent-box standalone**
+section of `docs/feasibility/feishu-client-matrix.md`: the Feishu web client
+version, the browser and its version, the `shasum -a 256` of the redacted
+evidence, the one-word result, and the UTC date. Apply the same classification
+rule `bridges/linux-browser/src/probe.ts` codes: `not tested` only if the
+capability was never attempted, `unavailable` only if it was attempted and the
+control or capability genuinely could not be reached (never used for "did not
+get to it"), `unreliable` if it worked at least once but not every time, and
+`proven` only if every attempt succeeded. Do not paste real meeting numbers,
+participant ids, display names, tenant names, screenshots, audio, or
+transcripts into the matrix file — it is committed to a public repository.
+
+### 6.2 Brief bullet 4 — the deferred rule
+
+Verbatim from the brief:
+
+> If raw media or UI observation is unavailable, mark agent-box standalone
+> `deferred`; do not block the recommended coordinator-plus-Mac profile.
+
+After 6.1's eight rows are filled: if microphone input or speaker output
+(raw media) came back `unavailable`, or any of the other six rows (UI
+observation) came back `unavailable`, set the **Standalone verdict** line in
+`docs/feasibility/feishu-client-matrix.md`'s agent-box section to `deferred`.
+`deferred` is a profile-level word, not one of the four per-capability
+results, and it is never written into a capability's own Result cell.
+Recording `deferred` here must not be read as, or used to justify, blocking
+or delaying the coordinator-plus-Mac profile that the rest of this matrix and
+`docs/feasibility/mac-bridge-decision.md` are about — the two are independent
+findings.

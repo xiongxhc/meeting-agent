@@ -101,6 +101,53 @@ section 3.0b. Record attribute names only, never a real handle.
 | Roster row | | | | | | |
 | Speaker tile | | | | | | |
 
+## agent-box standalone (Task 6)
+
+Whether the Feishu web client, driven standalone on agent-box with no Mac
+bridge involved, can support the eight capabilities below. **Every result
+cell in this section is `not tested`, and that is the truthful current
+state, not a placeholder awaiting a better answer.** Task 6's own unit tests
+(`bridges/linux-browser/src/probe.ts`, `bridges/linux-browser/test/probe.test.ts`)
+exercise the meeting-discovery and failure-classification *logic* against
+recorded, synthetic DOM fixtures only — no real browser, no real Feishu web
+client, no network, and no agent-box access. That logic has never been run
+against a real page, so nothing here claims a measurement of the real thing.
+
+Running it for real needs an isolated agent-box test session and a real
+Feishu web client login; the exact procedure is
+`docs/HUMAN-CHECKLIST.md`, section **Plan 1 Task 6**. Fill a row only from a
+run actually performed.
+
+Each result is one of the same four words used throughout this file
+(`proven`, `unreliable`, `unavailable`, `not tested` — see Result vocabulary
+above), reached the same way `bridges/linux-browser/src/probe.ts` reaches
+it: `not tested` for a capability never attempted, `unavailable` only for one
+the human genuinely could not reach (never merely never looked at),
+`unreliable` for one that worked at least once but not consistently, and
+`proven` for one that worked every time it was attempted.
+
+| Capability | What a human would check | Feishu web client version | Browser + version | Evidence hash | Result | Measured on |
+|---|---|---|---|---|---|---|
+| Authentication persistence | Whether a logged-in session survives a page reload / process restart without re-prompting | | | | not tested | |
+| Meeting join | Whether the web client can join a real meeting and the join is observable in the DOM | | | | not tested | |
+| Actual participants | Whether the roster reflects who is actually in the meeting | | | | not tested | |
+| Active speaker | Whether an active-speaker indicator is present and resolvable to a participant | | | | not tested | |
+| Microphone input | Whether the browser can capture real microphone audio into the meeting | | | | not tested | |
+| Speaker output | Whether the browser can play received meeting audio out | | | | not tested | |
+| Chat | Whether the meeting-chat control can be found and used for the disclosure text | | | | not tested | |
+| Reconnect | Whether the web client recovers after a network drop without a full manual rejoin | | | | not tested | |
+
+**Standalone verdict:** _(unset — see the rule below)_
+
+If a human run finds that raw media (microphone input or speaker output) or
+UI observation (any of the other six rows) is unavailable on agent-box, the
+verdict for **agent-box standalone** is `deferred` — a fifth, profile-level
+word that is not part of the per-capability vocabulary above and is never
+written into a capability's own Result cell. `deferred` must not block the
+recommended coordinator-plus-Mac profile: agent-box standalone is one
+candidate profile among others, and this matrix's Mac bridge sections above
+are what that recommended profile depends on, not this section.
+
 ## Column rules
 
 - **Feishu client version** — the exact build string from the client's About
