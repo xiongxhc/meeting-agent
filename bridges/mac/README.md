@@ -70,12 +70,14 @@ Tests/FeishuBridgeSpikeTests/
   names; TypeScript/Node is the control plane only and never relays a frame.
   `BridgeControlPlane` is the single door to it and carries a `BridgeEvent`, an
   enum no case of which can hold audio bytes — so a frame is not expressible on
-  that surface at all. The tests hold the line three further ways: a tripwire
-  control plane counts every call and records none across a 960-frame duplex
-  exchange; the frames the endpoint received are compared value-for-value and
-  in order against what was captured; and the exchange runs between two
-  snapshots of the process's own descendants, which must be unchanged and must
-  never contain a `node` executable.
+  that surface at all — that type-level argument is the load-bearing one. The
+  tests add two more: a tripwire control plane counts every call and records
+  none across a 960-frame duplex exchange, and the frames the endpoint received
+  are compared value-for-value and in order against what the bridge produced, so
+  nothing relayed, re-encoded, batched or reordered the stream. A fourth test
+  checks only that the frame path spawns no subprocess; it is deliberately not
+  described as a no-Node assertion, because a real Node relay would be a sibling
+  service rather than a child of a test process and this could not detect one.
 - **A silence the bridge caused is not an `audio_gap`.** A mute and a barge-in
   are explained silences and emit nothing. An `audio_gap` is claimed only from
   an observed discontinuity: capture reports one between the last capture the

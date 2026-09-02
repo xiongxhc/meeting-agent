@@ -39,10 +39,6 @@ public struct AudioFormat: Equatable, Sendable {
         self.frameMilliseconds = frameMilliseconds
     }
 
-    public var wireValue: String {
-        "\(encoding)/\(sampleRate)/\(channels)/\(frameMilliseconds)ms"
-    }
-
     /// nil when the string is not a format this bridge understands. The caller
     /// refuses the session; it never falls back to a default, because a bridge
     /// capturing at a shape the runtime did not ask for is silent corruption.
@@ -153,9 +149,19 @@ public final class AudioBridge {
     private let mediaClient: any MediaEndpointClient
     private let controlPlane: any BridgeControlPlane
     private let jitterBufferMilliseconds: Int
+    private let configuredCaptureGapTolerance: Int?
 
     public private(set) var negotiatedFormat: AudioFormat?
+    /// Whether the bridge is forwarding captured audio. Deliberate state, set by
+    /// the coordinator — see `setMuted`.
     public private(set) var isMuted = false
+
+    /// How long capture may go quiet before the silence is reported as an
+    /// `audio_gap`. Readable because a gap count is meaningless without it: the
+    /// Gate's hour-long run fails on an unexplained gap, and a tolerance tight
+    /// enough to fire on ordinary scheduling jitter manufactures them. Zero
+    /// until a format is negotiated, since the default is two frames.
+    public private(set) var captureGapToleranceMilliseconds = 0
 
     /// How many frames the playback buffer holds before it starts dropping. Zero
     /// until a format is negotiated, because the bound is a duration and only
@@ -185,19 +191,29 @@ public final class AudioBridge {
     ///     buffer deeper than that budget buys nothing and costs latency on
     ///     every turn. 200 ms absorbs ordinary network jitter and still leaves
     ///     headroom under the 300 ms figure.
+    ///   - captureGapToleranceMilliseconds: how long capture may go quiet before
+    ///     the silence is reported. nil means two frame durations, which is
+    ///     tight — 40 ms at a 20 ms format — and a real machine's scheduling
+    ///     will trip it. It is a parameter precisely so a long run can be given
+    ///     a tolerance that does not manufacture gaps nobody can explain.
     public init(
         clock: any MediaClock,
         device: any AudioDevicePort,
         mediaClient: any MediaEndpointClient,
         controlPlane: any BridgeControlPlane,
-        jitterBufferMilliseconds: Int = 200
+        jitterBufferMilliseconds: Int = 200,
+        captureGapToleranceMilliseconds: Int? = nil
     ) {
         precondition(jitterBufferMilliseconds > 0, "the jitter buffer bound must be positive")
+        precondition(
+            captureGapToleranceMilliseconds.map { $0 > 0 } ?? true,
+            "the capture gap tolerance must be positive")
         self.clock = clock
         self.device = device
         self.mediaClient = mediaClient
         self.controlPlane = controlPlane
         self.jitterBufferMilliseconds = jitterBufferMilliseconds
+        self.configuredCaptureGapTolerance = captureGapToleranceMilliseconds
     }
 
     // MARK: connect / disconnect
@@ -233,9 +249,18 @@ public final class AudioBridge {
         negotiatedFormat = requested
         jitterBufferCapacityFrames = max(
             1, jitterBufferMilliseconds / requested.frameMilliseconds)
+        captureGapToleranceMilliseconds =
+            configuredCaptureGapTolerance ?? (requested.frameMilliseconds * 2)
         // Every counter, sequence and gap is per media session. Carrying any of
         // it across a reconnect would let the new session close a gap the old
         // one opened, which is a fabricated observation.
+        //
+        // `isMuted` is deliberately NOT reset. It is not session bookkeeping —
+        // it is a state the coordinator asked for, and a transport reconnect is
+        // not a reason to undo it. Silently unmuting would start forwarding
+        // meeting audio that was deliberately suppressed, which is the worse of
+        // the two failures; staying muted forwards nothing, and `isMuted` says
+        // so to anyone who asks.
         captureSequence = 0
         capturedFramesSent = 0
         playbackFramesDroppedByOverflow = 0
@@ -255,6 +280,7 @@ public final class AudioBridge {
         guard negotiatedFormat != nil else { return }
         negotiatedFormat = nil
         jitterBufferCapacityFrames = 0
+        captureGapToleranceMilliseconds = 0
         jitterBuffer.removeAll()
         lastCaptureMonotonic = nil
         lastCaptureObservedAt = nil
@@ -273,7 +299,7 @@ public final class AudioBridge {
     ///   no session, muted, or a clock fault.
     @discardableResult
     public func captureFrame(payload: [UInt8]) -> AudioFrame? {
-        guard let format = negotiatedFormat, !isMuted else { return nil }
+        guard negotiatedFormat != nil, !isMuted else { return nil }
 
         let monotonic = clock.monotonicMilliseconds()
         if let last = lastCaptureMonotonic, monotonic < last {
@@ -289,7 +315,7 @@ public final class AudioBridge {
         // capture this bridge saw, and this one. `startedAt` is therefore the
         // instant of the last observed capture, not a computed end-of-audio.
         if let last = lastCaptureMonotonic, let lastObservedAt = lastCaptureObservedAt,
-            monotonic - last > format.frameMilliseconds * 2
+            monotonic - last > captureGapToleranceMilliseconds
         {
             controlPlane.emit(
                 .audioGap(direction: .capture, startedAt: lastObservedAt, endedAt: observedAt),
@@ -370,10 +396,17 @@ public final class AudioBridge {
     /// utterance for as long as the cancellation takes to reach it. Without that
     /// gate the buffer refills and the agent talks over the interruption.
     ///
-    /// This is not an `audio_gap`: the silence was asked for.
+    /// This is not an `audio_gap`: the silence was asked for. An `audio_gap`
+    /// that is still open is dropped here for the same reason `disconnect` drops
+    /// one — the overflow was never observed to resolve, it was superseded. The
+    /// alternative, closing it at the cancellation instant, would report an
+    /// outage that ran up to the barge-in and put an `audio_gap` at exactly the
+    /// moment the operator is told to treat one as a defect. The open event
+    /// already emitted stands as the whole of the record.
     public func cancelPlayback() {
         playbackCancelled = true
         jitterBuffer.removeAll()
+        openPlaybackGapStartedAt = nil
     }
 
     /// Reopens the playback path for the next utterance.

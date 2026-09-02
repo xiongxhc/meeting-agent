@@ -261,6 +261,16 @@ and **no task in this plan creates them**:
    the Conversation Runtime's job, from its own media path, and the Meeting
    Agent never holds the recording key.
 
+5. **A capture gap tolerance chosen for the run.**
+   `AudioBridge(captureGapToleranceMilliseconds:)` decides how long capture may
+   go quiet before the bridge calls it an `audio_gap`. It defaults to two frame
+   durations — 40 ms at a 20 ms format — which is tight enough that ordinary
+   scheduling on a real machine will trip it, and 4.2 fails the run on a gap
+   nobody can explain. Pick a value deliberately before the hour-long run,
+   record it, and read the resulting gap count against it. Changing it
+   mid-programme invalidates comparison between runs; if you change it, say so
+   and re-run.
+
 Confirm the bridge is green before any run below:
 
 ```
@@ -358,13 +368,46 @@ mkdir -p ~/meeting-agent-evidence
 #   ~/meeting-agent-evidence/task4-duplex-1h.jsonl
 ```
 
-Then reconcile the file against the notes. Every `audio_gap` must correspond to
-something you observed, and every interruption you provoked must appear:
+**One gap is not one event.** Before counting anything, know how the bridge
+writes a gap down, because counting raw `audio_gap` lines will make a correct
+run look broken:
+
+- A **playback** gap is written as **two** events: an opening one carrying
+  `"endedAt":null` at the moment dropping began, and — only if the end was
+  actually observed — a closing one carrying the **same `startedAt`** and a real
+  `endedAt`. A playback gap that resolved therefore appears twice.
+- A **capture** gap is written as **one** event, already closed. Both of its
+  ends were observed by the time it could be reported at all.
+- So the ratio of events to gaps is not constant, and three provoked playback
+  interruptions that all resolve produce six events. Count **distinct gaps**,
+  keyed by `direction` plus `startedAt` — never lines.
+- For the same reason, `grep -c '"endedAt":null'` is **not** the count of gaps
+  whose end was never observed: every playback gap contributes one such line,
+  including the ones that later closed. A gap's end was never observed only if
+  **no** event anywhere in the file carries its `startedAt` with a real
+  `endedAt`.
+
+Reconcile the file against your notes with this, which does the keying for you:
 
 ```
-grep -c '"type":"audio_gap"' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
-grep '"type":"audio_gap"' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
-grep -c '"endedAt":null' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+python3 - ~/meeting-agent-evidence/task4-duplex-1h.jsonl <<'GAPS'
+import json, sys
+gaps = {}
+for line in open(sys.argv[1]):
+    m = json.loads(line).get("message", {})
+    if m.get("type") != "audio_gap":
+        continue
+    gaps.setdefault((m["direction"], m["startedAt"]), []).append(m["endedAt"])
+never_closed = [k for k, e in gaps.items() if all(x is None for x in e)]
+print("distinct gaps:", len(gaps))
+print("gaps whose end was never observed:", len(never_closed))
+for (d, start), ends in sorted(gaps.items()):
+    end = next((x for x in ends if x is not None), None)
+    print(f"  {d:9} {start} -> {end or 'never observed'}")
+GAPS
+```
+
+```
 head -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
 tail -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
 shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
@@ -372,25 +415,28 @@ shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
 
 Read the results this way, and do not soften any of them:
 
-- An `audio_gap` you cannot tie to something you observed is an **unexplained
-  gap** and fails the run. It is not "probably the network".
-- An interruption you provoked that produced **no** `audio_gap` also fails the
-  run: the bridge missed it, which is the worse of the two failures because the
-  evidence file then looks clean.
-- An `audio_gap` with `"endedAt":null` is a gap the bridge never observed the
-  end of. That is a legitimate, deliberate state, not a bug and not a
-  formatting slip. Count them and say what each one was.
-- A mute and a barge-in produce **no** `audio_gap` by design — those silences
-  are explained. Confirm the file agrees; an `audio_gap` around either one means
-  the bridge is reporting a silence it caused itself.
+- A **distinct gap** you cannot tie to something you observed is an
+  **unexplained gap** and fails the run. It is not "probably the network".
+- An interruption you provoked that produced **no** gap also fails the run: the
+  bridge missed it, which is the worse of the two failures because the evidence
+  file then looks clean.
+- A gap printed as `never observed` is one the bridge never saw the end of. That
+  is a legitimate, deliberate state, not a bug and not a formatting slip. Say
+  what each one was.
+- A mute and a barge-in produce **no** gap by design — those silences are
+  explained, and the bridge drops an open gap at a barge-in rather than closing
+  it across the silence. Confirm the file agrees; a gap opening or closing at
+  either moment means the bridge is reporting a silence it caused itself.
 - "Complete" in the Gate means the first and last record bracket the full hour
   with no missing stretch. Check the first and last `recordedAt` and confirm the
   `sequence` values only ever increase.
 
 **Evidence to record:** the run's duration from the file's own first and last
-`recordedAt`, the total `audio_gap` count, the count with a null `endedAt`, the
-three provoked interruptions matched to their events, any unexplained gap, the
-`shasum -a 256` of the redacted file, and the UTC date. Put the one-word result
+`recordedAt`, the **distinct gap** count, the count whose end was never
+observed, the capture gap tolerance the bridge ran with (see 4.0 item 5 — a gap
+count means nothing without it), the three provoked interruptions matched to
+their gaps, any unexplained gap, the `shasum -a 256` of the redacted file, and
+the UTC date. Put the one-word result
 in the media rows of `docs/feasibility/feishu-client-matrix.md`. Do not commit
 the evidence file, and never commit audio: plaintext audio never touches disk,
 and this repository is public.

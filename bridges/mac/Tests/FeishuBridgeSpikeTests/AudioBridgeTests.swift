@@ -11,16 +11,21 @@ import XCTest
 /// tell one frame from another; no sample, no recording, and no device
 /// identifier appears in this package.
 ///
-/// Two properties are asserted structurally rather than described in prose:
+/// That Node.js is not on the frame path is asserted structurally, and the
+/// weight sits on the first two of these:
 ///
-/// 1. **No control-plane hop on the frame path.** `BridgeControlPlane` is the
-///    single door to the TypeScript coordinator, and it accepts a `BridgeEvent`
-///    — an enum none of whose twelve cases can carry audio bytes, so a frame is
-///    not even expressible on that surface. `TripwireControlPlane` records every
-///    call, and a full duplex exchange records none.
-/// 2. **No process hop either.** The exchange runs between two snapshots of this
-///    process's descendants; the set must be unchanged and must never contain a
-///    `node` executable.
+/// 1. **A frame is not expressible on the control plane.** `BridgeControlPlane`
+///    is the single door to the TypeScript coordinator, and it accepts a
+///    `BridgeEvent` — an enum none of whose twelve cases can carry audio bytes.
+///    There is no way to write the code that would hand a frame to Node.
+/// 2. **The tripwire.** `TripwireControlPlane` records every call it receives,
+///    and a 960-frame duplex exchange records none.
+/// 3. **The endpoint got exactly what was captured.** `endpoint.received` is
+///    compared whole-value and in order against the frames the bridge produced,
+///    so nothing relayed, re-encoded, batched or reordered the stream.
+/// 4. **The frame path runs in-process** — it spawns nothing. That is the whole
+///    of what the process check establishes, and it is the weakest of the four:
+///    a real Node relay would be a sibling service, not a child process.
 final class AudioBridgeTests: XCTestCase {
 
     // MARK: - fixtures
@@ -42,7 +47,8 @@ final class AudioBridgeTests: XCTestCase {
     private func makeHarness(
         supporting formats: [AudioFormat] = [AudioBridgeTests.format],
         echo: Bool = false,
-        jitterBufferMilliseconds: Int = 200
+        jitterBufferMilliseconds: Int = 200,
+        captureGapToleranceMilliseconds: Int? = nil
     ) -> Harness {
         let clock = ManualMediaClock(start: "2026-09-02T14:00:00.000Z")
         let device = FakeAudioDevice(supportedFormats: formats)
@@ -53,7 +59,8 @@ final class AudioBridgeTests: XCTestCase {
             device: device,
             mediaClient: endpoint,
             controlPlane: controlPlane,
-            jitterBufferMilliseconds: jitterBufferMilliseconds)
+            jitterBufferMilliseconds: jitterBufferMilliseconds,
+            captureGapToleranceMilliseconds: captureGapToleranceMilliseconds)
         return Harness(
             clock: clock, device: device, endpoint: endpoint, controlPlane: controlPlane,
             bridge: bridge)
@@ -369,6 +376,39 @@ final class AudioBridgeTests: XCTestCase {
         XCTAssertEqual(harness.bridge.capturedFramesSent, 50)
     }
 
+    func testTheCaptureGapToleranceIsAParameterNotAConstant() {
+        let harness = makeHarness(captureGapToleranceMilliseconds: 500)
+        connect(harness)
+        harness.controlPlane.reset()
+
+        harness.bridge.captureFrame(payload: payload(1))
+        harness.clock.advance(400)
+        harness.bridge.captureFrame(payload: payload(2))
+
+        XCTAssertEqual(
+            harness.bridge.captureGapToleranceMilliseconds, 500,
+            "the value in force is readable, because a gap count means nothing without it")
+        XCTAssertTrue(
+            harness.controlPlane.events.isEmpty,
+            "a 400 ms stall is inside a 500 ms tolerance; the default 40 ms would have fired")
+
+        harness.clock.advance(600)
+        harness.bridge.captureFrame(payload: payload(3))
+        XCTAssertEqual(harness.controlPlane.events.count, 1)
+    }
+
+    func testTheCaptureGapToleranceDefaultsToTwoFrames() {
+        let harness = makeHarness()
+        connect(harness)
+
+        XCTAssertEqual(harness.bridge.captureGapToleranceMilliseconds, 40)
+
+        harness.bridge.disconnect(reason: "endpoint_closed")
+        XCTAssertEqual(
+            harness.bridge.captureGapToleranceMilliseconds, 0,
+            "with no negotiated format there is no tolerance in force to report")
+    }
+
     // MARK: - mute
 
     func testMuteStopsFramesReachingTheEndpointAndIsNotReportedAsAGap() {
@@ -412,6 +452,24 @@ final class AudioBridgeTests: XCTestCase {
         XCTAssertNotNil(harness.bridge.captureFrame(payload: payload(1)))
     }
 
+    func testMuteIsDeliberateStateAndSurvivesAMediaReconnect() {
+        let harness = makeHarness()
+        connect(harness)
+        harness.bridge.setMuted(true)
+        harness.bridge.disconnect(reason: "endpoint_closed")
+
+        connect(harness)
+
+        XCTAssertTrue(
+            harness.bridge.isMuted,
+            "a transport reconnect does not undo a mute the coordinator asked for")
+        XCTAssertNil(harness.bridge.captureFrame(payload: payload(1)))
+        XCTAssertTrue(harness.endpoint.received.isEmpty)
+
+        harness.bridge.setMuted(false)
+        XCTAssertNotNil(harness.bridge.captureFrame(payload: payload(1)))
+    }
+
     // MARK: - barge-in
 
     func testCancellationDropsTheBufferedFramesWithoutWaitingForThemToDrain() {
@@ -435,6 +493,33 @@ final class AudioBridgeTests: XCTestCase {
         XCTAssertTrue(
             harness.controlPlane.events.isEmpty,
             "a cancelled utterance is an explained stop, not an audio_gap")
+    }
+
+    func testABargeInNeverClosesAnOpenGapWithAnEndItDidNotObserve() {
+        let harness = makeHarness()
+        connect(harness)
+        harness.controlPlane.reset()
+
+        for marker in 1...11 {
+            harness.endpoint.deliverPlayback(
+                payload: payload(UInt8(marker)), timestampMilliseconds: 2_000_000 + marker * 20)
+        }
+        XCTAssertEqual(harness.bridge.playbackFramesDroppedByOverflow, 1)
+
+        harness.clock.advance(40)
+        harness.bridge.cancelPlayback()
+        harness.clock.advance(40)
+        harness.bridge.resumePlayback()
+        harness.endpoint.deliverPlayback(payload: payload(20), timestampMilliseconds: 2_000_300)
+
+        XCTAssertEqual(
+            harness.controlPlane.events,
+            [
+                .audioGap(
+                    direction: .playback, startedAt: "2026-09-02T14:00:00.000Z", endedAt: nil)
+            ],
+            "the barge-in ended the tracking, not the outage: no close is emitted, and the "
+                + "reported gap never spans the silence the bridge asked for")
     }
 
     func testCancellationKeepsDiscardingUntilPlaybackIsResumed() {
@@ -493,32 +578,33 @@ final class AudioBridgeTests: XCTestCase {
                 + "coordinator — was not touched once")
     }
 
-    func testNoNodeProcessExistsInTheFramePath() throws {
+    /// The narrow property this can actually establish: the frame path runs
+    /// entirely in-process. It is deliberately not called a no-Node assertion —
+    /// a Node relay would be a sibling service or a daemon, not a child of a
+    /// Swift test process, so this could not detect one even in principle. The
+    /// claim that Node is not on the frame path rests on the type-level
+    /// argument (`BridgeControlPlane` carries a `BridgeEvent`, which cannot hold
+    /// audio bytes) and on the tripwire in the test above.
+    func testTheFramePathSpawnsNoSubprocess() throws {
         let harness = makeHarness(echo: true)
         connect(harness)
 
-        let before = try Self.descendantProcesses()
         for index in 0..<480 {
             harness.bridge.captureFrame(payload: payload(UInt8(index % 251)))
             harness.bridge.renderTick()
             harness.clock.advance(20)
         }
-        let after = try Self.descendantProcesses()
+        let descendants = try Self.descendantProcesses()
 
         XCTAssertEqual(harness.device.played.count, 480, "the duplex exchange really happened")
         XCTAssertTrue(
-            Set(after.keys).subtracting(before.keys).isEmpty,
-            "the frame path spawned no process at all: \(after)")
-        for (_, command) in before.merging(after, uniquingKeysWith: { first, _ in first }) {
-            XCTAssertFalse(
-                command.lowercased().contains("node"),
-                "a Node.js process is in this bridge's process tree: \(command)")
-        }
+            descendants.isEmpty,
+            "moving 960 frames spawned a process: \(descendants)")
     }
 
     /// Every process descended from this test process, as `pid: command`.
-    /// Snapshotted outside the measured window so the snapshot cannot pollute
-    /// it — and `ps` lists itself, so its own pid is taken back out again.
+    /// `ps` lists itself, so its own pid is taken back out again; what is left
+    /// is anything the code under test started.
     private static func descendantProcesses() throws -> [Int32: String] {
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")

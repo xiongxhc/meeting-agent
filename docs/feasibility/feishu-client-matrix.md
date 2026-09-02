@@ -43,6 +43,15 @@ every figure below is a property of that direct path. If a run ever routes a
 frame through the TypeScript coordinator it is void, not slow: the architecture
 under test is the one where Node.js is never in the frame path.
 
+**Count gaps, not events.** A playback gap is written as two `audio_gap`
+records — an opening one with a null `endedAt`, and a closing one carrying the
+same `startedAt` once the end was observed — while a capture gap is written as
+one, already closed. Grepping for `audio_gap` lines therefore overcounts, and
+grepping for `"endedAt":null` overcounts the gaps that were never closed. Every
+gap figure below is a count of **distinct gaps keyed by `direction` plus
+`startedAt`**; section 4.2 of the checklist carries a command that does the
+keying.
+
 Procedure and commands: `docs/HUMAN-CHECKLIST.md` section **Plan 1 Task 4**.
 The pass condition for this whole block is that task's Gate — reliable full
 duplex, no feedback loop, interruption stop at or below 300 ms, and a complete
@@ -63,9 +72,9 @@ measurement exists.
 | Echo and feedback, second participant on open speakers | Whether the returned tone re-entered capture, and whether a loop built | | | | | | | | |
 | Interruption (barge-in) stop time | Interrupt to last rendered frame, ten runs: min / median / max, against the 300 ms Gate | | | | | | | | |
 | One-hour two-participant run | Duration from the evidence file's own first and last record | | | | | | | | |
-| Unexplained audio gaps in that run | Count of `audio_gap` events that could not be tied to something observed; the Gate needs zero | | | | | | | | |
-| Provoked OS/client interruptions | Interruptions provoked versus `audio_gap` events emitted; the two counts must match | | | | | | | | |
-| Gaps whose end was never observed | Count of `audio_gap` events carrying `"endedAt":null`, and what each one was | | | | | | | | |
+| Unexplained audio gaps in that run | Count of distinct gaps (keyed by `direction` + `startedAt`) that could not be tied to something observed; the Gate needs zero | | | | | | | | |
+| Provoked OS/client interruptions | Interruptions provoked versus distinct gaps observed; the two counts must match | | | | | | | | |
+| Gaps whose end was never observed | Count of distinct gaps for which no closing event exists, and what each one was | | | | | | | | |
 
 ## Reconnect
 
@@ -104,7 +113,9 @@ section 3.0b. Record attribute names only, never a real handle.
   with its unit, from a run actually performed. A latency row also needs the
   jitter buffer bound in force during the run (the bridge's default is 200 ms
   and it is a constructor parameter), because the figure is not comparable
-  without it. Leave the cell empty rather than estimating, and never carry a
+  without it. A gap row likewise needs the capture gap tolerance in force
+  (default two frame durations, also a constructor parameter): a tighter
+  tolerance manufactures gaps, so a gap count without it says nothing. Leave the cell empty rather than estimating, and never carry a
   number over from a different configuration.
 - **Consecutive clean runs** — how many consecutive runs of this path completed
   with no wrong meeting, no wrong participant, no duplicate disclosure, and no
