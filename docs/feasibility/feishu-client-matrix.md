@@ -8,7 +8,8 @@ will measure, and claims nothing until they do.
 
 Filling it in is a human-gated step. The exact procedure, the commands, and the
 evidence to capture are in `docs/HUMAN-CHECKLIST.md`, section
-**Plan 1 Task 3**. Fill a row only from a run you actually performed.
+**Plan 1 Task 3** for the control rows and section **Plan 1 Task 4** for the
+duplex media rows. Fill a row only from a run you actually performed.
 
 ## Result vocabulary
 
@@ -34,6 +35,37 @@ evidence to capture are in `docs/HUMAN-CHECKLIST.md`, section
 | Path | Feishu client version | macOS version | Permissions granted | Attempts (must be 1 per occurrence) | Result | Redacted evidence hash | Measured on |
 |---|---|---|---|---|---|---|---|
 | Typed disclosure into meeting chat | | | | | | | |
+
+## Duplex media and timing
+
+The media bridge connects to the Conversation Runtime's data plane itself, so
+every figure below is a property of that direct path. If a run ever routes a
+frame through the TypeScript coordinator it is void, not slow: the architecture
+under test is the one where Node.js is never in the frame path.
+
+Procedure and commands: `docs/HUMAN-CHECKLIST.md` section **Plan 1 Task 4**.
+The pass condition for this whole block is that task's Gate — reliable full
+duplex, no feedback loop, interruption stop at or below 300 ms, and a complete
+timestamped hour-long capture evidence file. The result vocabulary above reads
+the same way here, against that Gate rather than against the four-join one:
+`proven` means the row met the Gate on a run actually performed, `unreliable`
+means it worked but missed the Gate or needed a retry, `unavailable` means the
+capability could not be reached on this client build at all, and `not tested` is
+where every row starts. Every measurement cell below is empty because no
+measurement exists.
+
+| Capability | What is measured | Feishu client version | macOS version | Permissions granted | Negotiated format | Measured value | Result | Redacted evidence hash | Measured on |
+|---|---|---|---|---|---|---|---|---|---|
+| Capture — meeting audio reaches the media endpoint | Capture latency, ten runs: min / median / max | | | | | | | | |
+| Playback — synthesized audio is injected as the agent microphone | Playback latency, ten runs: min / median / max | | | | | | | | |
+| Full duplex — capture and playback at once | Whether both held together for the hour-long run | | | | | | | | |
+| Echo and feedback, second participant on headphones | Whether the returned tone re-entered capture, and whether a loop built | | | | | | | | |
+| Echo and feedback, second participant on open speakers | Whether the returned tone re-entered capture, and whether a loop built | | | | | | | | |
+| Interruption (barge-in) stop time | Interrupt to last rendered frame, ten runs: min / median / max, against the 300 ms Gate | | | | | | | | |
+| One-hour two-participant run | Duration from the evidence file's own first and last record | | | | | | | | |
+| Unexplained audio gaps in that run | Count of `audio_gap` events that could not be tied to something observed; the Gate needs zero | | | | | | | | |
+| Provoked OS/client interruptions | Interruptions provoked versus `audio_gap` events emitted; the two counts must match | | | | | | | | |
+| Gaps whose end was never observed | Count of `audio_gap` events carrying `"endedAt":null`, and what each one was | | | | | | | | |
 
 ## Reconnect
 
@@ -61,7 +93,19 @@ section 3.0b. Record attribute names only, never a real handle.
 - **macOS version** — `sw_vers -productVersion` plus the build, e.g. `26.0 (25A000)`.
 - **Permissions granted** — which of Accessibility / Screen Recording /
   Microphone were on for the bridge process during the run. Note any that were
-  granted but unused.
+  granted but unused. The media rows need Microphone; nothing in this package
+  has ever requested it.
+- **What is measured** — fixed per row; it is there so a filled cell cannot be
+  read as the wrong quantity. Do not reword it to fit a number you have.
+- **Negotiated format** — the exact string the bridge and the endpoint agreed
+  on, in the `connect_media` wire form, e.g. `pcm_s16le/48000/1/20ms`. A run at
+  a format the coordinator did not offer is a defect, not a measurement.
+- **Measured value** — the figure the row's "What is measured" column names,
+  with its unit, from a run actually performed. A latency row also needs the
+  jitter buffer bound in force during the run (the bridge's default is 200 ms
+  and it is a constructor parameter), because the figure is not comparable
+  without it. Leave the cell empty rather than estimating, and never carry a
+  number over from a different configuration.
 - **Consecutive clean runs** — how many consecutive runs of this path completed
   with no wrong meeting, no wrong participant, no duplicate disclosure, and no
   guessed speaker. The gate is four; a run that fails resets the count to zero.

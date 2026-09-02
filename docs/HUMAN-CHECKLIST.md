@@ -209,3 +209,188 @@ consecutive clean runs, a one-word result from the legend (`proven`,
 UTC date. No real meeting numbers, occurrence ids, user ids, display names,
 tenant names, screenshots, audio, or transcripts go in that file — it is
 committed to a public repository.
+
+## Plan 1 Task 4: Prove direct duplex media and timing
+
+The task's five bullets split in two. Bullets 1-3 (unit-test format
+negotiation, monotonic frame timestamps, a bounded jitter buffer, capture and
+playback gap events, mute state and immediate playback cancellation; prove with
+a fake media endpoint that frames travel directly between the bridge and the
+Rust endpoint with no Node.js process in the frame path; run `swift test`) are
+done in code — see `bridges/mac/Sources/FeishuBridgeSpike/AudioBridge.swift`,
+`LoopbackMediaClient.swift`, and the Task 4 report. Bullets 4-5 need a real
+Feishu test meeting, a real calibration phrase, a returned tone, real latency
+and interruption measurements, and a one-hour two-participant run. They were
+not attempted and not simulated. **No latency, echo, or stop-time number exists
+anywhere in this repository**, and no row of
+`docs/feasibility/feishu-client-matrix.md` claims one. They are below.
+
+**Pass condition for every item in this section** (the task's Gate, verbatim):
+
+> Reliable full duplex, no feedback loop, interruption stop at or below 300 ms,
+> and a complete timestamped hour-long capture evidence file.
+
+### 4.0 Prerequisites — bullets 4-5 cannot start until all four are done
+
+Everything in section 3.0 still applies (real labels, a real
+`AccessibilityDriver`, a real `UiIdentityResolver`, a runnable entry point):
+without a real join there is no meeting to carry audio. Media adds four more,
+and **no task in this plan creates them**:
+
+1. **A real `MediaEndpointClient`.** The package ships the protocol and
+   `LoopbackMediaClient`, an in-process stand-in that echoes frames back. A real
+   run needs the client that dials the endpoint `connect_media` carries and
+   speaks the Rust Conversation Runtime's data-plane transport. The whole point
+   of the task is that this connection is made by the bridge itself: if a run
+   ever routes a frame through the TypeScript coordinator, the run is void and
+   the architecture claim has been broken, not measured.
+2. **A real `AudioDevicePort`.** The package ships the protocol and a fake. A
+   real one wraps the macOS capture and render units, publishes the formats the
+   machine can actually carry in `supportedFormats`, drives `captureFrame` from
+   the capture callback and `renderTick` from the render callback. It needs the
+   **Microphone** permission, which nothing in this package has ever requested.
+3. **A real `MediaClock`.** `monotonicMilliseconds()` must come from a source
+   that cannot go backwards (`mach_absolute_time`, not `Date`). The bridge fails
+   the session with `media_clock_regressed` if it ever does, so a clock wired to
+   the wall clock will drop the media session on the first NTP correction.
+4. **A capture evidence writer.** The Gate asks for "a complete timestamped
+   hour-long capture evidence file". `BridgeRecorder` already writes the
+   `bridge-session/v1` event stream as timestamped JSONL and is what should
+   produce it. **It must record events only.** Plaintext audio never touches
+   disk and the bridge never writes audio at all — the encrypted recording is
+   the Conversation Runtime's job, from its own media path, and the Meeting
+   Agent never holds the recording key.
+
+Confirm the bridge is green before any run below:
+
+```
+cd bridges/mac && swift test
+```
+
+### 4.1 Brief bullet 4 — calibration phrase, returned tone, and the four measurements
+
+Verbatim from the brief:
+
+> In the real test meeting, inject a timestamped calibration phrase and return a
+> timestamped tone. Measure capture latency, playback latency, echo/feedback
+> behavior, and interruption stop time.
+
+Run this in the test tenant, with two machines, and with the second participant
+wearing headphones for the first pass and using open speakers for the echo pass.
+Use a synthetic calibration phrase and a synthetic tone — no real meeting
+content, and nothing that identifies a person.
+
+**Step 1 — one shared time base.** Every timestamp compared below must come from
+one monotonic source or from two sources whose offset was measured. Record the
+offset before the meeting and again after it:
+
+```
+sntp time.apple.com   # queries only: note the reported offset, never step the clock mid-run
+python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())'
+```
+
+Run the second command on both machines back to back. (`date` on macOS is BSD
+`date` and has no sub-second format, which is why this reads the clock through
+`python3` instead.)
+
+**Step 2 — capture latency.** Play a calibration phrase into the meeting from
+the second participant's machine at a recorded instant `t_spoken`. Record the
+instant `t_captured` at which the frame carrying its onset reached the media
+endpoint (the endpoint side, not the bridge side — the measurement is of the
+whole path the frame actually travels). Capture latency is
+`t_captured - t_spoken`. Repeat ten times and record min, median, and max.
+
+**Evidence to record:** the ten deltas, the frame's
+`timestampMilliseconds` on the bridge side, the negotiated format string, and
+the clock offset from step 1.
+
+**Step 3 — playback latency.** Have the endpoint return a timestamped tone at a
+recorded instant `t_sent`. Record the instant `t_heard` at which the tone was
+observed in the meeting on the second participant's machine. Playback latency is
+`t_heard - t_sent`. Repeat ten times; record min, median, max.
+
+**Evidence to record:** the ten deltas, plus the buffer depth in force — the
+bridge's jitter buffer bound defaults to 200 ms, which is a constructor
+parameter (`AudioBridge(jitterBufferMilliseconds:)`) and is part of the
+measurement, not a constant of nature. If a run needed a different bound, that
+is a result; record the value used.
+
+**Step 4 — echo and feedback.** Repeat steps 2 and 3 twice: once with the
+second participant on headphones, once on open speakers with the agent machine's
+own output audible to its own input. Record whether the agent's returned tone
+re-entered capture, and whether any feedback loop built up. A feedback loop on
+open speakers is a real finding, not a test error — the Gate says "no feedback
+loop", so record which configurations satisfy it and which do not.
+
+**Evidence to record:** for each configuration, whether the tone re-entered
+capture, whether a loop built, and what stopped it if one did.
+
+**Step 5 — interruption stop time.** With the agent speaking, interrupt it, and
+record `t_interrupt` (the instant the interruption was raised) and `t_silent`
+(the instant the last frame was rendered to the device). Interruption stop time
+is `t_silent - t_interrupt`. `AudioBridge.cancelPlayback()` discards the whole
+buffer at once and goes on discarding inbound frames until `resumePlayback()`,
+so what this measures is the path from the interruption signal to that call plus
+one render tick — not buffer drain. Repeat ten times.
+
+**Evidence to record:** the ten stop times, min, median and max, and the count
+of frames the bridge reported in `playbackFramesDroppedByCancellation`. The Gate
+is **interruption stop at or below 300 ms**; a median under it with a maximum
+over it does not pass — record every one of the ten.
+
+### 4.2 Brief bullet 5 — the one-hour two-participant run
+
+Verbatim from the brief:
+
+> Run a one-hour two-participant test. A normal run has no unexplained audio
+> gap; every OS/client interruption produces an explicit `audio_gap` event.
+
+One meeting, two participants, sixty unbroken minutes, with the bridge recording
+its `bridge-session/v1` event stream to a JSONL file **outside this repository**
+(it carries real meeting and participant ids). During the hour, deliberately
+provoke at least three OS/client interruptions and note the wall time of each:
+switch the input device, put the machine's display to sleep and wake it, and
+change the network the media endpoint is reached over.
+
+```
+mkdir -p ~/meeting-agent-evidence
+# write the run's recorder output to:
+#   ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+```
+
+Then reconcile the file against the notes. Every `audio_gap` must correspond to
+something you observed, and every interruption you provoked must appear:
+
+```
+grep -c '"type":"audio_gap"' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+grep '"type":"audio_gap"' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+grep -c '"endedAt":null' ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+head -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+tail -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+```
+
+Read the results this way, and do not soften any of them:
+
+- An `audio_gap` you cannot tie to something you observed is an **unexplained
+  gap** and fails the run. It is not "probably the network".
+- An interruption you provoked that produced **no** `audio_gap` also fails the
+  run: the bridge missed it, which is the worse of the two failures because the
+  evidence file then looks clean.
+- An `audio_gap` with `"endedAt":null` is a gap the bridge never observed the
+  end of. That is a legitimate, deliberate state, not a bug and not a
+  formatting slip. Count them and say what each one was.
+- A mute and a barge-in produce **no** `audio_gap` by design — those silences
+  are explained. Confirm the file agrees; an `audio_gap` around either one means
+  the bridge is reporting a silence it caused itself.
+- "Complete" in the Gate means the first and last record bracket the full hour
+  with no missing stretch. Check the first and last `recordedAt` and confirm the
+  `sequence` values only ever increase.
+
+**Evidence to record:** the run's duration from the file's own first and last
+`recordedAt`, the total `audio_gap` count, the count with a null `endedAt`, the
+three provoked interruptions matched to their events, any unexplained gap, the
+`shasum -a 256` of the redacted file, and the UTC date. Put the one-word result
+in the media rows of `docs/feasibility/feishu-client-matrix.md`. Do not commit
+the evidence file, and never commit audio: plaintext audio never touches disk,
+and this repository is public.
