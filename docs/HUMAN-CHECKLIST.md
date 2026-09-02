@@ -640,3 +640,65 @@ Recording `deferred` here must not be read as, or used to justify, blocking
 or delaying the coordinator-plus-Mac profile that the rest of this matrix and
 `docs/feasibility/mac-bridge-decision.md` are about — the two are independent
 findings.
+
+## Plan 1 Task 7: Publish the feasibility verdict
+
+The task's five bullets split in two. Bullets 1, 3, 4, and 5 (run `npm test`,
+`npm run typecheck`, `npm run lint`, `npm run build`, and `swift test` in
+`bridges/mac`; structure the verdict section in
+`docs/feasibility/feishu-client-matrix.md`; run a secret scan; review the
+scoped branch diff) are done — see `docs/feasibility/feishu-client-matrix.md`'s
+**Feasibility verdict (Task 7)** section and the Task 7 report. Bullet 2 needs
+a real Feishu client freshly launched from a cold start. It was not attempted
+and not simulated. It is below.
+
+### 7.1 Brief bullet 2 — one clean end-to-end run from a fresh Feishu client launch
+
+Verbatim from the brief:
+
+> Re-run one clean end-to-end test from a fresh Feishu client launch.
+
+This is not a new capability — it is a final confirmation run, performed only
+after every prerequisite in Task 3's section 3.0 (real labels, a real
+`AccessibilityDriver`, a real `UiIdentityResolver`, a runnable entry point)
+and Task 4's section 4.0 (a real `MediaEndpointClient`, a real
+`AudioDevicePort`, a real `MediaClock`, a capture evidence writer, a chosen
+capture gap tolerance) exist, and only after the join paths, disclosure, and
+media rows in `docs/feasibility/feishu-client-matrix.md` already carry
+results from the runs in sections 3.1, 3.2, and 4.1-4.2 of this checklist.
+The point of this run is a **cold start**: it must not reuse a Feishu client
+process, a cached login, or an already-open meeting window left over from an
+earlier run.
+
+Sequence:
+
+```
+# 1. Fully quit the Feishu client (not just close the window) and confirm no
+#    process remains:
+pgrep -fl Feishu   # expect no output before starting
+
+# 2. Confirm the bridge is green before the run:
+cd bridges/mac && swift test
+
+# 3. Launch the Feishu client fresh and let it settle, then drive one full
+#    end-to-end pass through the built entry point (3.0 item 4): join a
+#    throwaway meeting in the test tenant by direct invite, confirm the
+#    single typed disclosure appears in meeting chat, hold duplex media
+#    (calibration phrase in, tone back) for at least a minute, then leave
+#    cleanly. Record the bridge's JSONL evidence to a file outside this
+#    repository:
+mkdir -p ~/meeting-agent-evidence
+# write the run's recorder output to, e.g.:
+#   ~/meeting-agent-evidence/task7-coldstart-<date>.jsonl
+shasum -a 256 ~/meeting-agent-evidence/task7-coldstart-<date>.jsonl
+```
+
+**Evidence to record:** the Feishu client build string, the macOS version and
+build, which permissions were granted, confirmation that the client was a
+genuinely fresh process (the `pgrep` output before launch, showing nothing),
+whether the run was clean by the same bar as 3.1 (no wrong meeting, no wrong
+participant, no duplicate disclosure, no guessed speaker), the `shasum -a 256`
+of the redacted evidence file, and the UTC date. Record the outcome as a note
+under this section rather than in the matrix's per-path rows — those rows are
+for the four-consecutive-run series in 3.1, and this run is a single
+confirmation pass, not a fifth attempt to fold into that count.

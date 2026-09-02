@@ -159,3 +159,26 @@ npm run typecheck   # tsc --noEmit
 npm run lint         # eslint .
 npm run build         # tsc
 ```
+
+## What is proven here, and what is not
+
+Everything in this directory — the frozen wire contract, the reducer's
+ambiguity policy, and the replay harness — is proven only against the fixture
+files under `fixtures/observations/` and synthetic ports. Nothing here has
+ever been driven by a real Feishu client, a real accessibility tree, or a
+real meeting.
+
+A reader landing on this page who wants to know what the whole Feishu Mac
+bridge effort has actually shown, rather than what this one directory shows
+in isolation, should go to three places:
+
+- `docs/feasibility/feishu-client-matrix.md` — the feasibility verdict: which
+  join paths, permissions, and degraded behaviours are proven in unit tests
+  versus never measured against a real client, and why Linux standalone is
+  `not tested` rather than `failed`.
+- `docs/HUMAN-CHECKLIST.md` — every step that needs a real Feishu client, a
+  real tenant, or agent-box access, with the exact procedure and evidence to
+  capture, none of it attempted yet.
+- `docs/feasibility/mac-bridge-decision.md` — the open Swift-versus-Rust
+  decision for `bridges/mac/`; every one of its seven criteria is still
+  unmeasured, so no language has been selected.

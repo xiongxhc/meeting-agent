@@ -205,3 +205,103 @@ for. None of those values was captured from a real client — they are
 placeholders, and the unit tests exercise the *locating strategy*, not the
 values. Capturing the real ones is the first human-gated step of Plan 1 Task 3
 and must happen before any row below can be filled.
+
+## Feasibility verdict (Task 7)
+
+This section is the plan's final statement, written after every row above was
+confirmed still empty. It is not "Swift passed" or "Linux failed" — it is a
+statement of what exists proven in software (unit tests, run locally, see
+`docs/HUMAN-CHECKLIST.md`'s companion report) versus what has never been
+measured against a real client. Every claim below is checkable against a
+named test file or an explicit "not measured"; nothing here claims a
+real-client observation that did not happen.
+
+**Meeting entry paths.** `bridges/mac/Sources/FeishuBridgeSpike/FeishuClientAdapter.swift`
+has code paths for all five join rows this matrix names — direct invite,
+calendar invite, waiting-room admission, host transfer, and reconnect after
+force-closing the bridge — and `FeishuClientAdapterTests.swift` exercises the
+adapter's join/leave/disclosure logic against fake accessibility trees (18
+tests, all passing; see the Task 7 report for the run). None of the five has
+ever been exercised against a real Feishu client, a real tenant, or a real
+meeting. They are **built, not supported** — "supported" is reserved for a
+path that has met the four-consecutive-clean-run Gate in the Join paths table
+above, and every cell in that table is still `not tested`.
+
+**Required permissions.** The design requires the macOS **Accessibility**
+permission (`bridges/mac/README.md`, `FeishuClientAdapter.swift`'s
+`AccessibilityDriver` protocol) to read and drive the Feishu client's UI tree
+— this is the one permission every join and disclosure path depends on. A
+real `AudioDevicePort` (not yet built — see `docs/HUMAN-CHECKLIST.md` section
+4.0 item 2) will additionally require the **Microphone** permission; nothing
+in this package has ever requested it. **Screen Recording** is needed only if
+an observation turns out to require OCR rather than accessibility reads —
+the current design is accessibility-based throughout and does not need it,
+per `bridges/mac/README.md` and `spikes/feishu/README.md`. The permission
+grant flow itself (prompts, System Settings navigation, whether a grant
+survives an OS update or app rename) is entirely unverified: it is criterion
+5 of `docs/feasibility/mac-bridge-decision.md` and every cell in that file is
+empty.
+
+**Degraded behaviours — proven in unit tests, not on a real client.** Four
+degraded-path guarantees exist in the code and each has a passing unit test
+(see the Task 7 report's `npm test` / `swift test` output):
+- An accessibility read that cannot locate the meeting window does not claim
+  the meeting ended; it takes three consecutive unreadable frames before
+  `left(reason: .ended)` is emitted, and a window reappearing resets that
+  count (`AccessibilityObserverTests.testEnoughConsecutiveUnreadableFramesEventuallyReportTheMeetingEnded`,
+  `testABackgroundedClientIsNotReportedAsAnEndedMeeting`,
+  `testAMeetingWindowComingBackResetsTheAbsenceCount`).
+- An open `audio_gap` (`endedAt: null`) is never given an invented end: it
+  stays open across a mute, a barge-in, or a media disconnect until an actual
+  resumption is observed (`AudioBridgeTests.testAnOpenPlaybackGapStaysOpenWhenTheMediaSessionDisconnects`,
+  `testABargeInNeverClosesAnOpenGapWithAnEndItDidNotObserve`,
+  `testAReconnectNeverClosesAGapTheClosedSessionOpened`).
+- An ambiguous speaker highlight — no resolvable identity, or more than one
+  tile highlighted at once even when both individually resolve — always
+  carries `feishuUserId: null, confidence: "ambiguous"`, never a guessed
+  participant (`spikes/feishu/test/reducer.test.ts`: "reducer: single
+  highlighted tile with no resolvable identity is ambiguous, never guessed",
+  "reducer: two highlighted tiles are ambiguous even when both identities
+  resolve").
+- A disclosure attempt that cannot reach the chat control reports
+  `unavailable` and never blocks the adapter from leaving or continuing
+  (`FeishuClientAdapterTests.testReportsUnavailableWhenTheChatControlIsNotThere`,
+  `testAnUnavailableDisclosureDoesNotStopTheAdapterFromLeaving`).
+
+These are proofs that the logic is correct against synthetic fixtures. None
+of the four has been observed against a real Feishu client — a real
+unreadable-window sequence, a real dropped connection, a real ambiguous
+highlight, or a real unreachable chat control have never occurred.
+
+**Selected Mac language.** No selection is recorded. Swift is the built
+candidate (`bridges/mac/`), but the decision itself is open: all seven
+criteria in `docs/feasibility/mac-bridge-decision.md` are unmeasured, and
+that file's own decision rule blocks a `confirmed` verdict until every row
+carries a result from a real run. This document does not anticipate that
+decision.
+
+**Linux standalone: not tested, not failed.** The agent-box probe's
+meeting-discovery and failure-classification logic exists and is unit-tested
+(`bridges/linux-browser/src/probe.ts`, `bridges/linux-browser/test/probe.test.ts`,
+15 tests, all passing) against recorded synthetic DOM fixtures only. No real
+browser, no real Feishu web client, no network call, and no agent-box access
+has ever occurred — every row in the **agent-box standalone** table above is
+`not tested`, and that word is deliberate: `not tested` and `failed` are
+different classifications in the probe's own vocabulary
+(`bridges/linux-browser/src/probe.ts`'s `classifyCapability`), and nothing
+here or in that table asserts the harder claim of a failure. Per the plan's
+brief and the `deferred` rule already stated in the agent-box section above,
+an unproven agent-box standalone path must not block the recommended
+coordinator-plus-Mac profile — that profile depends on the Mac bridge
+sections of this matrix and on `mac-bridge-decision.md`, not on this section.
+
+**What this verdict is, plainly stated.** Every task in this plan built
+working, unit-tested software: 69 TypeScript tests and 86 Swift tests pass
+(see the Task 7 report for the full run). Not one of those tests, and no
+other activity in this plan, has driven a real Feishu client, joined a real
+meeting, captured real audio, or probed agent-box. That is by design — every
+such step is listed, with its exact procedure, in `docs/HUMAN-CHECKLIST.md`,
+waiting for a human to run it. This plan's own exit criteria say a Mac
+bridge path is only demonstrated once it is shown on a real client with a
+replay-testable contract; nothing in this repository meets that bar yet, and
+this document makes no claim that it does.
