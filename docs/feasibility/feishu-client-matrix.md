@@ -11,6 +11,12 @@ evidence to capture are in `docs/HUMAN-CHECKLIST.md`, section
 **Plan 1 Task 3** for the control rows and section **Plan 1 Task 4** for the
 duplex media rows. Fill a row only from a run you actually performed.
 
+The rows below feed the Swift-versus-Rust decision for the Mac bridge, whose
+seven criteria, measurement procedure, and unfilled decision block live in
+`docs/feasibility/mac-bridge-decision.md` (Task 5; procedure in
+`docs/HUMAN-CHECKLIST.md` section **Plan 1 Task 5**). That file makes no
+decision either — it is a template, same as this one.
+
 ## Result vocabulary
 
 | Result | Means |

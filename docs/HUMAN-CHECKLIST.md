@@ -440,3 +440,102 @@ the UTC date. Put the one-word result
 in the media rows of `docs/feasibility/feishu-client-matrix.md`. Do not commit
 the evidence file, and never commit audio: plaintext audio never touches disk,
 and this repository is public.
+
+## Plan 1 Task 5: Confirm Swift for the production Mac bridge, or trigger a Rust re-spike
+
+The task's four bullets are entirely human-gated: every criterion needs a real
+Feishu client and a real meeting, and the decision itself is human-gated too.
+Nothing was attempted or simulated. `docs/feasibility/mac-bridge-decision.md`
+is a template — seven criteria, each with what to measure and how, a pass
+threshold where the brief or spec states one, and an empty result cell — plus
+an unfilled decision block naming Chris as the decider. No score, measurement,
+or verdict exists anywhere in this repository for this task.
+
+**Decision rule, verbatim from the brief:**
+
+> Swift is confirmed if every criterion passes. If one fails, record the
+> failing criterion and open a separate, explicitly scoped Rust re-spike task
+> against the same fixture/replay suite; do not switch language from taste.
+
+### 5.0 Prerequisite
+
+Sections 3.0, 3.1, 3.2, 4.0, and 4.1 in this checklist (Tasks 3 and 4) must be
+done first — most of the seven criteria below are scored from those same runs,
+not from separate ones. Criteria 2 (system audio capture), 4 (binary
+distribution), and 6 (CPU use) need work beyond Tasks 3/4 that this checklist
+does not create; see the "How to measure it" column in
+`docs/feasibility/mac-bridge-decision.md` for what each needs.
+
+### 5.1 Score the seven criteria
+
+For each row of the criteria table in `docs/feasibility/mac-bridge-decision.md`,
+follow that row's "How to measure it" column exactly. Record the result in that
+row's Result cell, not as a separate document. In particular:
+
+**Criterion 1 — Feishu UI access.** Reuses the evidence from checklist section
+3.0a. No separate run needed if 3.0a is complete; otherwise run it first.
+
+**Criterion 2 — system audio capture without an unsupported workaround.**
+Build the real `AudioDevicePort` (checklist section 4.0 item 2) using only
+public macOS capture/render APIs and the Microphone permission. Confirm frames
+reach `AudioBridge.captureFrame` in a real meeting. Record whether any
+workaround requiring a kernel extension, an unsigned virtual audio driver, or
+an undocumented private framework was needed.
+
+**Criterion 3 — crash recovery.** During a real joined meeting, force-kill the
+bridge process:
+
+```
+pkill -9 -f FeishuBridgeSpike
+```
+
+Do this at least twice: once in steady state (no media connected), once with
+media connected. Then attempt the "reconnect after force-closing the bridge"
+join path (matrix row 5 under Join paths) and record whether it recovers
+cleanly, using the same four-consecutive-clean-runs gate as that row.
+
+**Criterion 4 — binary distribution.** Build a release binary:
+
+```
+cd bridges/mac && swift build -c release
+```
+
+Code-sign and notarize it (requires an Apple Developer ID; if none is
+available, record that as the result rather than skipping the row), copy the
+signed binary to a second, non-development Mac, and confirm it launches and
+that Accessibility, Screen Recording, and Microphone can all be granted to it
+from System Settings.
+
+**Criterion 5 — permission UX.** On a clean user account (a new macOS user, or
+a Mac that has never granted these permissions to this binary), walk through
+granting all three permissions. Note the exact prompt text, how many System
+Settings screens deep each grant requires, and whether any permission silently
+revoked after an OS update or after the binary was rebuilt/re-signed.
+
+**Criterion 6 — CPU use.** During the Task 4 one-hour two-participant run,
+sample the bridge process's CPU use at least ten times:
+
+```
+top -pid $(pgrep -f FeishuBridgeSpike) -l 10 -stats pid,cpu -s 30
+```
+
+Record steady-state (typical sample) and peak (highest sample) CPU percentage.
+
+**Criterion 7 — testability.** No separate run. Review criteria 1-6 after they
+are scored and record, for each, whether the check that was actually run could
+be re-run unattended (e.g. `swift test`, a scripted permission check) or
+required a human watching the screen.
+
+### 5.2 Fill the decision block
+
+Only after every row in the criteria table carries a result: if every
+criterion passed, mark the decision `Swift confirmed` in
+`docs/feasibility/mac-bridge-decision.md`'s decision block, name the evidence
+for each row, and record the UTC date. If any criterion failed, record which
+one(s) in the decision block instead of marking a language choice, and open a
+new, separately scoped task for the Rust re-spike — scoped to the criteria
+that failed, run against the same `spikes/feishu/` fixture/replay suite
+(`spikes/feishu/src/reducer.ts`, `spikes/feishu/src/replay.ts`,
+`spikes/feishu/fixtures/observations/`) that already defines the
+platform-neutral contract. Do not open the re-spike task, and do not switch
+language, on preference alone.
