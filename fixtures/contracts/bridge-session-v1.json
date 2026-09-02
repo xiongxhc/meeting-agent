@@ -100,6 +100,15 @@
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
       "sequence": 7,
+      "observedAt": "2026-09-02T14:01:30.000Z",
+      "type": "active_speaker",
+      "feishuUserId": null,
+      "confidence": "ambiguous"
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 8,
       "observedAt": "2026-09-02T14:03:40.000Z",
       "type": "audio_gap",
       "direction": "capture",
@@ -109,7 +118,17 @@
     {
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
-      "sequence": 8,
+      "sequence": 9,
+      "observedAt": "2026-09-02T14:03:40.500Z",
+      "type": "audio_gap",
+      "direction": "playback",
+      "startedAt": "2026-09-02T14:03:40.000Z",
+      "endedAt": null
+    },
+    {
+      "schema": "bridge-session/v1",
+      "sessionId": "sess_0000000000000001",
+      "sequence": 10,
       "observedAt": "2026-09-02T14:03:41.000Z",
       "type": "reconnecting",
       "attempt": 1
@@ -117,7 +136,7 @@
     {
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
-      "sequence": 9,
+      "sequence": 11,
       "observedAt": "2026-09-02T14:03:46.000Z",
       "type": "reconnected",
       "attempt": 1
@@ -125,7 +144,7 @@
     {
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
-      "sequence": 10,
+      "sequence": 12,
       "observedAt": "2026-09-02T14:29:58.000Z",
       "type": "media_disconnected",
       "reason": "endpoint_closed"
@@ -133,7 +152,7 @@
     {
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
-      "sequence": 11,
+      "sequence": 13,
       "observedAt": "2026-09-02T14:29:59.000Z",
       "type": "participant_left",
       "feishuUserId": "ou_000000000000000000000000000001"
@@ -141,7 +160,7 @@
     {
       "schema": "bridge-session/v1",
       "sessionId": "sess_0000000000000001",
-      "sequence": 12,
+      "sequence": 14,
       "observedAt": "2026-09-02T14:30:00.000Z",
       "type": "left",
       "reason": "ended"

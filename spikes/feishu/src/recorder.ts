@@ -26,6 +26,7 @@ export type BridgeRecord =
 export interface BridgeRecorder {
   recordCommand(input: unknown): BridgeResult<BridgeCommandMessage>;
   recordEvent(input: unknown): BridgeResult<BridgeEventMessage>;
+  /** A snapshot copy; the internal evidence log is not exposed for mutation. */
   records(): readonly BridgeRecord[];
   /** One JSON object per line, trailing newline; "" when nothing was recorded. */
   toJsonl(): string;
@@ -64,7 +65,7 @@ export function createJsonlRecorder(options: {
     },
 
     records() {
-      return records;
+      return [...records];
     },
 
     toJsonl() {

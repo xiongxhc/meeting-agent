@@ -4,11 +4,13 @@
  * The normative definition is `protocols/bridge-session-v1.schema.json` plus the
  * canonical bytes in `fixtures/contracts/bridge-session-v1.json`. This module and
  * the Swift bridge structs are two views of those same bytes; the tests validate
- * this view against the fixture read from disk, which is what keeps them aligned.
+ * this view against the fixture read from disk and against the schema itself,
+ * which is what keeps them aligned.
  *
  * Fail-closed rules encoded here:
  *   - an unrecognised `schema` value is rejected, never upgraded or ignored;
- *   - unknown fields are rejected, never passed through;
+ *   - unknown fields are rejected, never passed through — including fields named
+ *     after `Object.prototype` members;
  *   - `sequence` is strictly increasing per session (gaps allowed, repeats and
  *     regressions rejected);
  *   - speaker identity is never guessed: `ui_exact` requires a user id and
@@ -30,7 +32,10 @@ export type BridgeEvent =
   | { type: "left"; reason: "ended" | "removed" | "bridge_failure" }
   | { type: "participant_joined"; feishuUserId: string; displayName: string }
   | { type: "participant_left"; feishuUserId: string }
-  | { type: "active_speaker"; feishuUserId: string | null; confidence: "ui_exact" | "ambiguous" }
+  // Split into the two legal shapes so the type cannot express the combination
+  // the schema and the validator both reject: speaker identity is never guessed.
+  | { type: "active_speaker"; feishuUserId: string; confidence: "ui_exact" }
+  | { type: "active_speaker"; feishuUserId: null; confidence: "ambiguous" }
   | { type: "audio_gap"; direction: "capture" | "playback"; startedAt: string; endedAt: string | null }
   | { type: "chat_disclosure"; outcome: "sent" | "unavailable" | "failed" }
   | { type: "media_connected"; endpoint: string }
@@ -90,6 +95,19 @@ type FieldSpec =
   | "positive_int"
   | readonly string[];
 
+/**
+ * Ties the runtime field tables to the compile-time unions: one entry per member
+ * type, and exactly the payload fields that member declares. A dropped variant,
+ * an extra variant, or a renamed field is a type error rather than a silent
+ * drift the `as` casts in the parsers would hide.
+ */
+type PayloadFieldSpecs<U extends { type: string }> = {
+  [K in U["type"]]: Record<
+    Exclude<keyof Extract<U, { type: K }>, "type">,
+    FieldSpec
+  >;
+};
+
 // Declaration order here is the contract's canonical order and must match the
 // oneOf order in protocols/bridge-session-v1.schema.json.
 const COMMAND_PAYLOADS = {
@@ -107,7 +125,7 @@ const COMMAND_PAYLOADS = {
   post_disclosure: { text: "string" },
   leave: { reason: ["meeting_ended", "coordinator_stop"] },
   release_lease: { leaseId: "string" },
-} as const satisfies Record<string, Record<string, FieldSpec>>;
+} as const satisfies PayloadFieldSpecs<BridgeCommand>;
 
 const EVENT_PAYLOADS = {
   joined: { meetingOccurrenceId: "string" },
@@ -133,7 +151,7 @@ const EVENT_PAYLOADS = {
   },
   reconnecting: { attempt: "positive_int" },
   reconnected: { attempt: "positive_int" },
-} as const satisfies Record<string, Record<string, FieldSpec>>;
+} as const satisfies PayloadFieldSpecs<BridgeEvent>;
 
 const COMMAND_ENVELOPE = {
   sessionId: "string",
@@ -200,10 +218,14 @@ function checkField(
     }
     return null;
   }
-  if (!Number.isInteger(value) || (value as number) < 1) {
-    return { code: "field_type", path, detail: "expected an integer >= 1" };
+  if (spec === "positive_int") {
+    if (!Number.isInteger(value) || (value as number) < 1) {
+      return { code: "field_type", path, detail: "expected an integer >= 1" };
+    }
+    return null;
   }
-  return null;
+  const unreachable: never = spec;
+  throw new Error(`unhandled field spec: ${String(unreachable)}`);
 }
 
 function checkShape(
@@ -216,7 +238,7 @@ function checkShape(
   }
   const record = input as Record<string, unknown>;
 
-  if (!("schema" in record)) {
+  if (!Object.hasOwn(record, "schema")) {
     return { code: "missing_field", path: "/schema", detail: "schema is required" };
   }
   if (record["schema"] !== BRIDGE_SESSION_SCHEMA) {
@@ -227,7 +249,7 @@ function checkShape(
     };
   }
 
-  if (!("type" in record)) {
+  if (!Object.hasOwn(record, "type")) {
     return { code: "missing_field", path: "/type", detail: "type is required" };
   }
   const type = record["type"];
@@ -240,11 +262,13 @@ function checkShape(
   }
   const payload = payloads[type] as Record<string, FieldSpec>;
 
+  // Object.hasOwn throughout: `in` walks the prototype chain, which would let a
+  // field named toString, constructor or __proto__ pass as a declared one.
   for (const [key, spec] of [
     ...Object.entries(envelope),
     ...Object.entries(payload),
   ]) {
-    if (!(key in record)) {
+    if (!Object.hasOwn(record, key)) {
       return { code: "missing_field", path: `/${key}`, detail: `${key} is required` };
     }
     const failure = checkField(spec, record[key], `/${key}`);
@@ -253,7 +277,7 @@ function checkShape(
 
   for (const key of Object.keys(record)) {
     if (key === "schema" || key === "type") continue;
-    if (key in envelope || key in payload) continue;
+    if (Object.hasOwn(envelope, key) || Object.hasOwn(payload, key)) continue;
     return {
       code: "unknown_field",
       path: `/${key}`,
