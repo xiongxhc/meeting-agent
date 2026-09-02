@@ -1,0 +1,12 @@
+{
+  "sessionId": "sess_replay_0000000000000007",
+  "tileIdentities": {},
+  "chatControl": { "available": false },
+  "observations": [
+    {
+      "kind": "disclosure_attempt",
+      "observedAt": "2026-09-02T14:00:02.000Z",
+      "text": "A meeting agent is present in this test meeting and will produce a transcript."
+    }
+  ]
+}

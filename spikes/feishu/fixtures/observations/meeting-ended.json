@@ -1,0 +1,11 @@
+{
+  "sessionId": "sess_replay_0000000000000006",
+  "tileIdentities": {},
+  "chatControl": { "available": true },
+  "observations": [
+    {
+      "kind": "meeting_ended",
+      "observedAt": "2026-09-02T14:30:00.000Z"
+    }
+  ]
+}

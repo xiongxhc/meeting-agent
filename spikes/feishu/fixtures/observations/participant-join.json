@@ -1,0 +1,22 @@
+{
+  "sessionId": "sess_replay_0000000000000004",
+  "tileIdentities": {},
+  "chatControl": { "available": true },
+  "observations": [
+    {
+      "kind": "roster_snapshot",
+      "observedAt": "2026-09-02T14:00:00.000Z",
+      "participants": []
+    },
+    {
+      "kind": "roster_snapshot",
+      "observedAt": "2026-09-02T14:00:05.000Z",
+      "participants": [
+        {
+          "feishuUserId": "ou_00000000000000000000000000000a",
+          "displayName": "Test Participant One"
+        }
+      ]
+    }
+  ]
+}

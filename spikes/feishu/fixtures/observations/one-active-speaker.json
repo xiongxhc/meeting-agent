@@ -1,0 +1,14 @@
+{
+  "sessionId": "sess_replay_0000000000000001",
+  "tileIdentities": {
+    "tile-1": { "feishuUserId": "ou_00000000000000000000000000000a" }
+  },
+  "chatControl": { "available": true },
+  "observations": [
+    {
+      "kind": "speaker_highlight",
+      "observedAt": "2026-09-02T14:00:10.000Z",
+      "highlightedTileIds": ["tile-1"]
+    }
+  ]
+}

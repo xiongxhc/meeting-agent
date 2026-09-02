@@ -1,0 +1,31 @@
+{
+  "sessionId": "sess_replay_0000000000000005",
+  "tileIdentities": {},
+  "chatControl": { "available": true },
+  "observations": [
+    {
+      "kind": "roster_snapshot",
+      "observedAt": "2026-09-02T14:00:00.000Z",
+      "participants": [
+        {
+          "feishuUserId": "ou_00000000000000000000000000000a",
+          "displayName": "Test Participant One"
+        },
+        {
+          "feishuUserId": "ou_00000000000000000000000000000b",
+          "displayName": "Test Participant Two"
+        }
+      ]
+    },
+    {
+      "kind": "roster_snapshot",
+      "observedAt": "2026-09-02T14:00:30.000Z",
+      "participants": [
+        {
+          "feishuUserId": "ou_00000000000000000000000000000a",
+          "displayName": "Test Participant One"
+        }
+      ]
+    }
+  ]
+}
