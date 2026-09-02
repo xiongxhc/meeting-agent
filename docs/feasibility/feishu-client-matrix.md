@@ -217,15 +217,23 @@ named test file or an explicit "not measured"; nothing here claims a
 real-client observation that did not happen.
 
 **Meeting entry paths.** `bridges/mac/Sources/FeishuBridgeSpike/FeishuClientAdapter.swift`
-has code paths for all five join rows this matrix names — direct invite,
-calendar invite, waiting-room admission, host transfer, and reconnect after
-force-closing the bridge — and `FeishuClientAdapterTests.swift` exercises the
-adapter's join/leave/disclosure logic against fake accessibility trees (18
-tests, all passing; see the Task 7 report for the run). None of the five has
-ever been exercised against a real Feishu client, a real tenant, or a real
-meeting. They are **built, not supported** — "supported" is reserved for a
-path that has met the four-consecutive-clean-run Gate in the Join paths table
-above, and every cell in that table is still `not tested`.
+has one generic `join(meetingOccurrenceId:meetingNo:)` implementation with no
+branching on invite mechanism — it is invite-mechanism-agnostic by design, and
+nothing in `bridges/mac/Sources/` distinguishes a direct invite from a
+calendar invite, models a host-transfer event, or gives reconnect its own
+code path. The one difference between paths that exists anywhere in the
+source is timing, not branching: `joinDeadline` (default 60s) is a single
+constructor parameter generous enough to cover a waiting-room admission,
+which can take as long as the host takes to admit, but the same deadline and
+the same method apply to every join regardless of which of the five rows
+produced it. All 18 `FeishuClientAdapterTests` drive that same generic method
+against the same fake-tree shape (all passing; see the Task 7 report for the
+run); none simulates a calendar-invite-, host-transfer-, or
+reconnect-specific flow, because no such flow exists to simulate. None of the
+five rows has ever been exercised against a real Feishu client, a real
+tenant, or a real meeting. They are **built, not supported** — "supported" is
+reserved for a path that has met the four-consecutive-clean-run Gate in the
+Join paths table above, and every cell in that table is still `not tested`.
 
 **Required permissions.** The design requires the macOS **Accessibility**
 permission (`bridges/mac/README.md`, `FeishuClientAdapter.swift`'s
