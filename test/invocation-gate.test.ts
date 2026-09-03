@@ -5,17 +5,22 @@
 // this suite is organized around the boundary between a genuine vocative
 // invocation and everything that merely mentions the agent's name.
 //
-// ROUND 2 (post-review): a round-1 reviewer ran the matcher against real
-// utterances and found it authorized on hyphenated names/identifiers ("Mei-
-// Ling", "Meetbot-api", "eng-meetbot") and refused genuine leading-filler
-// and bare-imperative vocatives ("Hey Meetbot, ...", "Meetbot what did we
-// decide"), while also authorizing on appositive/agenda-style mentions
-// ("Meetbot, the note taker, is broken again.", "Agenda: Meetbot"). This
-// suite pins the reviewer's exact fixture lists (see the two "acceptance
-// matrix" blocks below) in addition to the original matrices, plus a
-// second property test targeting the exact defect class the first property
-// test could not catch (it only samples alias-FREE text; the bugs above
-// all contain the alias).
+// ROUND 5 (R43) is the current rule: a clause beside the alias is an
+// address only if it is a REQUEST -- interrogative ("?"/"？"), or opening
+// with an explicit request marker ("please", "kindly", "请", "麻烦",
+// "帮我"). The address-cue lexicon rounds 2-4 used (wh-words, modals, and a
+// growing anti-cue list of exclamative idioms in front of it) is deleted:
+// English exclamatives share their opening word with questions, so the
+// opening word was never the signal, and each round found a fresh crop of
+// counter-examples. The separator requirement (R41) and the anti-cue list
+// survive as outer guards -- see the tests named for each.
+//
+// Rounds 2-4 (still pinned below): the matcher must not fire inside
+// hyphenated names/identifiers ("Mei-Ling", "Meetbot-api", "eng-meetbot")
+// or possessives ("Mei's"), must not treat an appositive or agenda label
+// as an address ("Meetbot, the note taker, is broken again.",
+// "Agenda: Meetbot"), and must not accept a cue-shaped word that merely
+// appears somewhere in the segment.
 //
 // Matrices covered: configured name/aliases at utterance boundaries,
 // punctuation variants, casing, accents, multilingual (CJK, which has no
@@ -100,6 +105,16 @@ test("KNOWN LIMITATION (R41): no separator at all, even with a leading cue word,
   assert.equal(decision.matchedAlias, "Meetbot");
 });
 
+test("R41 is still load-bearing at the START under R43: no separator, even with an interrogative clause", () => {
+  // R43 made most of the old no-separator false positives negative for a
+  // second, independent reason (they are not requests). These two are not:
+  // both are genuine interrogatives, so ONLY the separator requirement
+  // keeps them out. Without this test, deleting R41's leading-position
+  // check would break nothing else in the suite.
+  assertNegative(decide(segment("Meetbot what did we decide?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot can you summarize?"), IDENTITY), "incidental_mention");
+});
+
 // ---------------------------------------------------------------------------
 // Punctuation variants
 // ---------------------------------------------------------------------------
@@ -180,8 +195,29 @@ test("CJK alias at the start, full-width-comma-separated, with a request marker,
   assertPositive(decide(segment("会议机器人，请总结一下", true), CJK_IDENTITY), "会议机器人");
 });
 
-test("CJK alias at the end, full-width-comma-separated, authorizes", () => {
-  assertPositive(decide(segment("可以总结了吗，会议机器人", true), CJK_IDENTITY), "会议机器人");
+test("CJK alias at the end, full-width-comma-separated, with a request marker, authorizes", () => {
+  assertPositive(decide(segment("请总结一下，会议机器人", true), CJK_IDENTITY), "会议机器人");
+});
+
+test("KNOWN LIMITATION (R43, CJK): a marker-free Chinese question does not authorize", () => {
+  // Round 4 authorized this through the cue "可以" ("can"). R43 deletes the
+  // cue lexicon, and round 5's Han carve-out (see clauseIsRequest) does not
+  // let interrogative punctuation stand in for a marker in Chinese either,
+  // because Chinese topic-comment fronting ("会议机器人，是不是又坏了？" --
+  // a question ABOUT the agent) is structurally identical to a vocative
+  // question. A Chinese request must say 请 / 麻烦 / 帮我, or the operator
+  // adds their own marker via additionalRequestMarkers. Documented false
+  // negative, per the zero-tolerance-on-false-positives rule.
+  assertNegative(decide(segment("可以总结了吗，会议机器人", true), CJK_IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("会议机器人，能总结一下吗？", true), CJK_IDENTITY), "incidental_mention");
+});
+
+test("KNOWN LIMITATION (R43, CJK): the operator's own marker restores a marker-free phrasing", () => {
+  const extended: InvocationGateIdentity = {
+    ...CJK_IDENTITY,
+    additionalRequestMarkers: ["能"],
+  };
+  assertPositive(decide(segment("会议机器人，能总结一下吗？", true), extended), "会议机器人");
 });
 
 test("CJK alias alone as the entire segment authorizes", () => {
@@ -360,27 +396,26 @@ test("ROUND 3 Critical 2: a possessive with a typographic (curly) apostrophe doe
 });
 
 // ---------------------------------------------------------------------------
-// ROUND 3 (found by adversarial probing, not the review): a wh-word
-// contraction ("what's", "who's", "where's", ...) is an extremely common
-// way to open a real question and must still count as the cue "what" /
-// "who" / "where" even though the apostrophe survives token-edge
-// stripping (it's internal to the token, not at either edge).
+// ROUND 5 (R43): questions open however a speaker likes. Round 3 needed a
+// special case so that a wh-word CONTRACTION ("what's") still matched the
+// cue "what"; R43 deletes the cue lexicon and with it that special case --
+// what makes these questions is the question mark, so a contraction, a
+// missing apostrophe, and an ASR misspelling all behave the same.
 // ---------------------------------------------------------------------------
 
-test("a wh-word contraction still counts as its cue", () => {
+test("a wh-word contraction opens a question and authorizes", () => {
   assertPositive(decide(segment("Meetbot: what's the plan?"), IDENTITY), "Meetbot");
 });
 
-test("a different wh-word contraction still counts as its cue", () => {
+test("a different wh-word contraction opens a question and authorizes", () => {
   assertPositive(decide(segment("Meetbot, who's next?"), IDENTITY), "Meetbot");
 });
 
-test("a non-contracted misspelling ('whats', no apostrophe) does not get the contraction leniency", () => {
-  // Deliberately NOT extended to bare misspellings -- the contraction
-  // fix targets a specific, unambiguous apostrophe shape, not fuzzy
-  // matching.
-  const decision = decide(segment("Meetbot: whats the plan?"), IDENTITY);
-  assertNegative(decision, "incidental_mention");
+test("an ASR misspelling of the same question still authorizes -- punctuation, not vocabulary, decides", () => {
+  // Round 3/4 rejected this (the token "whats" was not in the cue list).
+  // Under R43 the missing apostrophe is irrelevant: the clause ends in a
+  // question mark, so it is a request.
+  assertPositive(decide(segment("Meetbot: whats the plan?"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -465,10 +500,20 @@ test("ROUND 4 adversarial finding (fixed, CJK): exclamatory slang starting with 
   assertNegative(decide(segment("会议机器人，什么玩意", true), CJK_IDENTITY), "incidental_mention");
 });
 
-test("ROUND 4 adversarial finding: a genuine '什么' question elsewhere still authorizes", () => {
-  // Confirms the new Chinese anti-cues are scoped to the exact idioms, not
-  // to "什么" generally.
-  assertPositive(decide(segment("会议机器人，什么都行", true), CJK_IDENTITY), "会议机器人");
+test("ROUND 5 (R43) corrects a round-4 claim: '什么都行' is not a request and no longer authorizes", () => {
+  // Round 4 pinned this as a POSITIVE, on the argument that the cue "什么"
+  // fired for a genuine question. That was wrong on its own terms:
+  // "什么都行" means "anything works" -- a statement, not a question and
+  // not a request. R43 rejects it, which is the correct outcome, and this
+  // test now pins the correction rather than the earlier claim.
+  assertNegative(decide(segment("会议机器人，什么都行", true), CJK_IDENTITY), "incidental_mention");
+});
+
+test("ROUND 5 (R43): the Chinese anti-cues match as a raw prefix, so a trailing particle does not escape them", () => {
+  // Round 4 matched anti-cues with a Latin word boundary, so "什么鬼啊"
+  // (the same slang with an exclamative particle) slipped past the "什么鬼"
+  // entry. clauseStartsWithPhrase now uses a raw prefix for a Han phrase.
+  assertNegative(decide(segment("会议机器人，什么鬼啊？", true), CJK_IDENTITY), "incidental_mention");
 });
 
 test("ROUND 4: the anti-cue phrase must be a whole phrase, not a bare string prefix", () => {
@@ -480,28 +525,20 @@ test("ROUND 4: the anti-cue phrase must be a whole phrase, not a bare string pre
 });
 
 test("additionalAntiCues extends (not replaces) the default anti-cue lexicon", () => {
-  const baseline = decide(segment("Meetbot, seriously though."), IDENTITY);
-  // "seriously though" has no cue at all, so it's already negative for an
-  // unrelated reason -- use a phrase that WOULD authorize under the
-  // default lexicon (opens with a real cue) to prove the anti-cue
-  // extension actually suppresses it.
-  const wouldAuthorizeByDefault = decide(segment("Meetbot, what a strange thing to ask about the budget."), IDENTITY);
-  assertNegative(wouldAuthorizeByDefault, "incidental_mention"); // already caught by the default "what a"
+  // The question mark is what would authorize this one -- an anti-cue is
+  // the only thing that can still suppress it, which is exactly the job
+  // the list has left under R43.
+  const baselineWithoutExtension = decide(segment("Meetbot, can we not do this today?"), IDENTITY);
+  assertPositive(baselineWithoutExtension, "Meetbot");
 
   const extended: InvocationGateIdentity = {
     ...IDENTITY,
     additionalAntiCues: ["can we not"],
   };
-  const baselineWithoutExtension = decide(segment("Meetbot, can we not do this today."), IDENTITY);
-  assertPositive(baselineWithoutExtension, "Meetbot"); // "can" opens the clause -- authorizes by default
-
-  const withExtension = decide(segment("Meetbot, can we not do this today."), extended);
-  assertNegative(withExtension, "incidental_mention"); // now suppressed by the operator's own anti-cue
+  assertNegative(decide(segment("Meetbot, can we not do this today?"), extended), "incidental_mention");
 
   // The built-in anti-cues still work under the extended identity too.
-  const stillBuiltIn = decide(segment("Meetbot, what a mess.", true), extended);
-  assertNegative(stillBuiltIn, "incidental_mention");
-  void baseline;
+  assertNegative(decide(segment("Meetbot, what a mess?", true), extended), "incidental_mention");
 });
 
 // ---------------------------------------------------------------------------
@@ -543,6 +580,118 @@ test("ROUND 4 (R41, CJK): even WITH a comma, the idiom '总结起来' does not a
   // alone would not have caught it, since a real comma IS present here).
   const decision = decide(segment("会议机器人，总结起来都是问题", true), CJK_IDENTITY);
   assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (R43): the request test itself. The address-cue lexicon is gone;
+// a clause beside the alias is an address only if it is a REQUEST --
+// interrogative, or opening with an explicit request marker.
+// ---------------------------------------------------------------------------
+
+test("R43: an interrogative clause after the alias authorizes", () => {
+  assertPositive(decide(segment("Meetbot, did you catch that?"), IDENTITY), "Meetbot");
+});
+
+test("R43: the SAME clause without the question mark does not authorize", () => {
+  // The whole point of the redesign in one pair: nothing about the words
+  // changed, only the punctuation that makes it a request. ("did" was a
+  // recognized cue word in round 4, so this authorized then.)
+  assertNegative(decide(segment("Meetbot, did you catch that."), IDENTITY), "incidental_mention");
+});
+
+test("R43: a full-width question mark counts", () => {
+  const mixed: InvocationGateIdentity = { aliases: ["Meetbot"] };
+  assertPositive(decide(segment("Meetbot, can you summarize？"), mixed), "Meetbot");
+});
+
+test("R43: the question mark must terminate the ADJOINING clause, not merely appear later", () => {
+  // "the note taker" is the clause beside the alias and it ends at the
+  // comma; the question mark belongs to a later clause and cannot reach
+  // back. This is what keeps an appositive negative even when the sentence
+  // it sits in happens to be a question.
+  assertNegative(decide(segment("Meetbot, the note taker, did anyone configure it?"), IDENTITY), "incidental_mention");
+});
+
+test("R43: a request marker authorizes without any question mark", () => {
+  assertPositive(decide(segment("Meetbot, kindly send the notes."), IDENTITY), "Meetbot");
+});
+
+test("R43: the request marker must OPEN the clause, not merely appear in it", () => {
+  assertNegative(decide(segment("Meetbot, someone should please fix this."), IDENTITY), "incidental_mention");
+});
+
+test("R43: a trailing vocative reads the SEGMENT's terminal question mark", () => {
+  assertPositive(decide(segment("So what should we do here, Meetbot?"), IDENTITY), "Meetbot");
+});
+
+test("R43: the same trailing vocative with a full stop does not authorize", () => {
+  assertNegative(decide(segment("So that is the plan, Meetbot."), IDENTITY), "incidental_mention");
+});
+
+test("R43: a trailing vocative authorizes on a request marker with no question mark", () => {
+  assertPositive(decide(segment("Please take a note, Meetbot."), IDENTITY), "Meetbot");
+});
+
+test("R43: a terminal question mark inside a closing quote still counts", () => {
+  assertPositive(decide(segment("Can you summarize, Meetbot?”"), IDENTITY), "Meetbot");
+});
+
+test("R43: the anti-cue list still earns its place -- an exclamative written with a question mark", () => {
+  // Without the anti-cue list these would pass the interrogative test.
+  // This is the one hole the punctuation signal cannot cover on its own,
+  // and the reason the list is kept as an outer guard rather than deleted
+  // along with the cue lexicon.
+  assertNegative(decide(segment("Meetbot, what a mess?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, how dare you?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("What a mess, Meetbot?"), IDENTITY), "incidental_mention");
+});
+
+test("R43: the deleted cue words no longer authorize anything on their own", () => {
+  // One per word class the old DEFAULT_ADDRESS_CUES list carried: wh-word,
+  // modal, auxiliary, and the CJK cues 可以 / 怎么 / 一下 / 总结. Each of
+  // these authorized in round 4 as soon as it opened the adjoining clause.
+  for (const text of [
+    "Meetbot, what nonsense.",
+    "Meetbot, will you look at that.",
+    "Meetbot, would you believe it.",
+    "Meetbot, how ridiculous.",
+    "Meetbot, do tell.",
+    "Meetbot, did that ever work.",
+    "Meetbot, who knows.",
+  ]) {
+    assertNegative(decide(segment(text), IDENTITY), "incidental_mention");
+  }
+  for (const text of [
+    "会议机器人，可以处理很多任务",
+    "会议机器人，怎么老是这样",
+    "会议机器人，一下就修好了",
+    "会议机器人，总结起来都是问题",
+  ]) {
+    assertNegative(decide(segment(text, true), CJK_IDENTITY), "incidental_mention");
+  }
+});
+
+test("KNOWN LIMITATION (R43): an imperative with no question mark and no request marker does not authorize", () => {
+  // The reviewer's named limitation. "tell us what we decided" is a
+  // genuine instruction, but it is neither interrogative nor marked as a
+  // request, and no closed lexicon can tell it apart from the appositive
+  // "Meetbot, the note taker, ..." without parsing it as a verb phrase.
+  // Documented false negative; add "tell" via additionalRequestMarkers to
+  // recover it in a deployment that needs it.
+  const decision = decide(segment("Meetbot, tell us what we decided."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Meetbot");
+});
+
+test("KNOWN LIMITATION (R43): a disfluency inside the adjoining clause truncates it before the question mark", () => {
+  // "Meetbot, can you, uh, summarize?" -- the clause beside the alias ends
+  // at the first comma ("can you"), so the terminating punctuation the
+  // interrogative test reads is that comma, not the question mark. Found
+  // by round 5's own adversarial probing. Kept as a false negative rather
+  // than widening the clause, because widening it is exactly what lets an
+  // appositive reach a later question mark (see the R43 clause-boundary
+  // test above).
+  assertNegative(decide(segment("Meetbot, can you, uh, summarize?"), IDENTITY), "incidental_mention");
 });
 
 // ---------------------------------------------------------------------------
@@ -741,21 +890,22 @@ test("a caller cannot apply one segment's decision under a different segment's i
 // Configuration extends the default cue lexicons, does not replace them
 // ---------------------------------------------------------------------------
 
-test("additionalAddressCues extends (not replaces) the default lexicon", () => {
-  // "summarize" is not in the shipped default cue list -- without the
-  // extension this stays negative, same as the pinned known-limitation
-  // case above.
+test("additionalRequestMarkers extends (not replaces) the default markers", () => {
+  // "summarize" is not a shipped request marker -- without the extension
+  // this stays negative, same as the pinned known-limitation case above.
   const baseline = decide(segment("Meetbot, summarize the decisions."), IDENTITY);
   assertNegative(baseline, "incidental_mention");
 
   const extended: InvocationGateIdentity = {
     ...IDENTITY,
-    additionalAddressCues: ["summarize"],
+    additionalRequestMarkers: ["summarize"],
   };
   assertPositive(decide(segment("Meetbot, summarize the decisions."), extended), "Meetbot");
 
-  // The built-in cues still work under the extended identity too --
+  // The built-in markers still work under the extended identity too --
   // proving the extension is additive, not a replacement.
+  assertPositive(decide(segment("Meetbot, please help."), extended), "Meetbot");
+  // And so does the interrogative half of the request test.
   assertPositive(decide(segment("Meetbot, can you help?"), extended), "Meetbot");
 });
 
@@ -776,22 +926,31 @@ test("additionalLeadingFillers extends (not replaces) the default lexicon", () =
 // ---------------------------------------------------------------------------
 // Acceptance matrix -- required NEGATIVE fixtures
 //
-// Every entry here comes directly from the round-2 review's acceptance
-// list. False positives are zero-tolerance for this gate; every one of
-// these must never authorize, regardless of the reason token it resolves
-// to.
+// The reviewer's acceptance list, cumulative across rounds 2-5. False
+// positives are zero-tolerance for this gate; every one of these must never
+// authorize, regardless of the reason token it resolves to.
 // ---------------------------------------------------------------------------
 
-const REQUIRED_NEGATIVES: ReadonlyArray<{ readonly text: string; readonly note: string }> = [
+type Fixture = {
+  readonly text: string;
+  readonly identity?: InvocationGateIdentity;
+  readonly note: string;
+};
+
+const REQUIRED_NEGATIVES: ReadonlyArray<Fixture> = [
   { text: "I asked Meetbot about it yesterday.", note: "bare incidental mention, mid-sentence" },
   { text: "Meetbot usually handles the notes.", note: "third-person discussion" },
   {
     text: "Meetbot, the note taker, is broken again.",
-    note: "appositive: alias at a comma-separated start, no address cue follows",
+    note: "appositive: the adjoining clause is a noun phrase, not a request",
+  },
+  {
+    text: "Meetbot, the note taker, did leave early.",
+    note: "same appositive shape, verb past the first comma",
   },
   {
     text: "Meetbot, yeah, it keeps dropping the audio.",
-    note: "filler-shaped word ('yeah') after the alias is not an address cue",
+    note: "filler-shaped word ('yeah') after the alias is not a request",
   },
   {
     text: "Meetbot, our transcription tool, costs too much.",
@@ -807,42 +966,63 @@ const REQUIRED_NEGATIVES: ReadonlyArray<{ readonly text: string; readonly note: 
   { text: "Mei-Ling usually takes the notes.", note: "alias is a substring of a hyphenated human name" },
   { text: "Meetbot-api is throwing 500s.", note: "alias is a substring of a hyphenated identifier" },
   { text: "Amelie-Rose, are you there?", note: "alias is a substring of a hyphenated human name" },
-  // ROUND 3, Critical 1 (reproduced as confirmed round-2 false positives
-  // by the second review): a cue word appearing anywhere in the unbounded
-  // rest of the segment is not enough -- it must open the clause
-  // immediately adjoining the alias.
-  { text: "Meetbot said he can help with that.", note: "cue 'can' is past the first clause boundary, reported speech" },
-  { text: "Meetbot mentioned he will join later.", note: "cue 'will' does not open the adjoining clause" },
-  {
-    text: "Meetbot broke it, and honestly nobody will fix it.",
-    note: "cue 'will' is beyond the first comma boundary",
-  },
+  { text: "Meetbot said he can help with that.", note: "reported speech, no separator" },
+  { text: "Meetbot mentioned he will join later.", note: "reported intent, no separator" },
+  { text: "Meetbot broke it, and honestly nobody will fix it.", note: "adjoining clause is a statement" },
   {
     text: "Please don't blame Meetbot.",
-    note: "cue 'please' opens the SENTENCE, but the alias is a trailing object with no separator before it",
+    note: "R41: the preceding clause DOES open with a request marker, but the alias has no separator beside it",
   },
-  {
-    text: "Meetbot, the note taker, did leave early.",
-    note: "same appositive shape as the pinned copula fixture, with 'did' beyond the first comma",
-  },
-  // ROUND 3, Critical 2: apostrophe is now a word-continuation character.
   { text: "Mei's phone is ringing, can someone check?", note: "possessive using the short alias" },
   { text: "Meetbot's log shows what happened.", note: "possessive using the primary alias" },
-  // ROUND 4, Critical: exclamatory idioms that open with an ordinary cue
-  // word but are never a genuine address (reproduced as confirmed round-3
-  // false positives by the third review).
-  { text: "Meetbot, what a mess.", note: "exclamatory 'what a' idiom, not a question" },
-  { text: "Meetbot, what a day.", note: "exclamatory 'what a' idiom, not a question" },
-  { text: "Meetbot, how about that game last night.", note: "exclamatory 'how about' idiom" },
-  { text: "Meetbot, how dare you.", note: "exclamatory 'how dare' idiom" },
-  { text: "Meetbot, why me.", note: "exclamatory 'why me' idiom" },
-  { text: "Meetbot, do tell.", note: "exclamatory idiom; 'do' is a cue word but the anti-cue wins" },
-  { text: "What a mess, Meetbot.", note: "same exclamatory idiom, trailing position" },
+  { text: "Did Meetbot get that?", note: "a question ABOUT the agent; the alias is mid-segment" },
+  { text: "Can Meetbot do that?", note: "a question ABOUT the agent; the alias is mid-segment" },
+  { text: "Should we ask Meetbot what it thinks?", note: "a question about the agent, alias mid-segment" },
+  // R43: exclamatives. Every one of these opens with a word the deleted
+  // cue lexicon recognized, and none of them is interrogative.
+  { text: "Meetbot, what a mess.", note: "exclamative opening with the old cue 'what'" },
+  { text: "Meetbot, what a day.", note: "exclamative opening with the old cue 'what'" },
+  { text: "Meetbot, what nonsense.", note: "exclamative opening with the old cue 'what'" },
+  { text: "Meetbot, how about that game last night.", note: "exclamative opening with the old cue 'how'" },
+  { text: "Meetbot, how dare you.", note: "exclamative opening with the old cue 'how'" },
+  { text: "Meetbot, how ridiculous.", note: "exclamative opening with the old cue 'how'" },
+  { text: "Meetbot, why me.", note: "exclamative opening with the old cue 'why'" },
+  { text: "Meetbot, do tell.", note: "exclamative opening with the old cue 'do'" },
+  { text: "Meetbot, will you look at that.", note: "exclamative opening with the old cue 'will'" },
+  { text: "Meetbot, would you believe it.", note: "exclamative opening with the old cue 'would'" },
+  { text: "What a mess, Meetbot.", note: "same exclamative, trailing position" },
+  {
+    text: "I told Meetbot, can you believe it?",
+    note: "interrogative, but the alias is mid-segment with no separator beside it",
+  },
+  { text: "Ask Meetbot, will you?", note: "interrogative; the alias is a grammatical object, mid-segment" },
+  { text: "Forget Meetbot, can we move on?", note: "interrogative; the alias is a grammatical object" },
+  { text: "So much for Meetbot, what a waste.", note: "alias mid-segment behind a filler-shaped opener" },
+  // R43 (CJK). The first seven have no separator at all (R41); the last
+  // two DO carry a full-width comma and are rejected by the request test
+  // -- they open with the deleted cues 可以 / 怎么 and carry no marker.
+  { text: "会议机器人说他可以处理这个问题", identity: CJK_IDENTITY, note: "reported speech, no separator" },
+  { text: "会议机器人今天什么都没做", identity: CJK_IDENTITY, note: "third-person statement, no separator" },
+  { text: "会议机器人可以处理很多任务", identity: CJK_IDENTITY, note: "declarative, no separator" },
+  { text: "会议机器人一下就修好了", identity: CJK_IDENTITY, note: "declarative, no separator" },
+  { text: "会议机器人总结起来都是问题", identity: CJK_IDENTITY, note: "the idiom 总结起来, no separator" },
+  { text: "会议机器人怎么老是这样", identity: CJK_IDENTITY, note: "rhetorical complaint, no separator" },
+  { text: "会议机器人为什么大家都在讨论它", identity: CJK_IDENTITY, note: "question about the agent, no separator" },
+  {
+    text: "会议机器人，可以处理很多任务",
+    identity: CJK_IDENTITY,
+    note: "R43: has a separator, opens with the deleted cue 可以, carries no request marker",
+  },
+  {
+    text: "会议机器人，怎么老是这样",
+    identity: CJK_IDENTITY,
+    note: "R43: has a separator, opens with the deleted cue 怎么, carries no request marker",
+  },
 ];
 
-for (const { text, note } of REQUIRED_NEGATIVES) {
+for (const { text, identity, note } of REQUIRED_NEGATIVES) {
   test(`acceptance matrix (negative): "${text}" does not authorize -- ${note}`, () => {
-    const decision = decide(segment(text), IDENTITY);
+    const decision = decide(segment(text), identity ?? IDENTITY);
     assert.equal(
       decision.authorize,
       false,
@@ -850,24 +1030,6 @@ for (const { text, note } of REQUIRED_NEGATIVES) {
     );
   });
 }
-
-test("acceptance matrix (negative): any non-final segment does not authorize, whatever its text", () => {
-  for (const { text } of REQUIRED_NEGATIVES) {
-    const decision = decide(segment(text, false), IDENTITY);
-    assertNegative(decision, "non_final_segment");
-  }
-  // Also the required positive texts, made partial -- the hardest version
-  // of "whatever its text": a perfectly-shaped vocative that is not final.
-  for (const text of ["Meetbot", "Meetbot, what did we decide?", "Hey Meetbot, can you summarize?"]) {
-    const decision = decide(segment(text, false), IDENTITY);
-    assertNegative(decision, "non_final_segment");
-  }
-  // And the CJK required positive, separately (different identity).
-  {
-    const decision = decide(segment("会议机器人，请总结一下", false), CJK_IDENTITY);
-    assertNegative(decision, "non_final_segment");
-  }
-});
 
 // ---------------------------------------------------------------------------
 // Acceptance matrix -- required POSITIVE fixtures
@@ -884,43 +1046,85 @@ const REQUIRED_POSITIVES: ReadonlyArray<{
     text: "Meetbot, what did we decide?",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "comma + wh-word cue",
+    note: "separator + interrogative clause",
   },
   {
     text: "Hey Meetbot, can you summarize?",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "leading filler + modal cue",
+    note: "leading filler + interrogative clause",
   },
   {
     text: "So, Meetbot, can you summarize?",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "leading filler with its own comma + modal cue",
+    note: "leading filler with its own comma + interrogative clause",
   },
   {
     text: "OK Meetbot, what did we decide?",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "leading filler + wh-word cue",
+    note: "leading filler + interrogative clause",
   },
   {
     text: "Meetbot, please summarize the decisions.",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "politeness cue",
+    note: "request marker, no question mark",
+  },
+  {
+    text: "Meetbot, can you hear me?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "interrogative clause",
+  },
+  {
+    text: "Meetbot, could you repeat that?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "interrogative clause",
+  },
+  {
+    text: "Hey Meetbot, please take a note.",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "leading filler + request marker",
   },
   {
     text: "Can you take a note, Meetbot?",
     identity: IDENTITY,
     matchedAlias: "Meetbot",
-    note: "end position, preceding clause carries the modal cue",
+    note: "trailing vocative; the question mark falls after the alias",
+  },
+  {
+    text: "Could you summarize, Meetbot?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "trailing vocative; the question mark falls after the alias",
+  },
+  {
+    text: "What did we decide, Meetbot?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "trailing vocative; the question mark falls after the alias",
   },
   {
     text: "会议机器人，请总结一下",
     identity: CJK_IDENTITY,
     matchedAlias: "会议机器人",
-    note: "CJK, full-width comma + request marker",
+    note: "CJK, full-width comma + the request marker 请",
+  },
+  {
+    text: "会议机器人：请总结",
+    identity: CJK_IDENTITY,
+    matchedAlias: "会议机器人",
+    note: "CJK, full-width colon + the request marker 请",
+  },
+  {
+    text: "会议机器人，帮我总结一下",
+    identity: CJK_IDENTITY,
+    matchedAlias: "会议机器人",
+    note: "CJK, full-width comma + the request marker 帮我",
   },
 ];
 
@@ -929,6 +1133,18 @@ for (const { text, identity, matchedAlias, note } of REQUIRED_POSITIVES) {
     assertPositive(decide(segment(text), identity), matchedAlias);
   });
 }
+
+test("acceptance matrix (negative): any non-final segment does not authorize, whatever its text", () => {
+  for (const { text, identity } of REQUIRED_NEGATIVES) {
+    assertNegative(decide(segment(text, false), identity ?? IDENTITY), "non_final_segment");
+  }
+  // And every required POSITIVE text, made partial -- the hardest version
+  // of "whatever its text": a perfectly-shaped vocative that is not final.
+  for (const { text, identity } of REQUIRED_POSITIVES) {
+    assertNegative(decide(segment(text, false), identity), "non_final_segment");
+  }
+});
+
 
 // ---------------------------------------------------------------------------
 // Property test 1: arbitrary segments containing no configured alias never
@@ -1046,12 +1262,25 @@ test("property 1: arbitrary generated text containing no configured alias never 
 });
 
 // ---------------------------------------------------------------------------
-// Property test 2: an alias embedded in random filler at a NON-vocative
-// position (real, non-empty content on both sides) never authorizes. This
-// is the property that would have caught round 1's exact defect class: the
-// hyphen-as-separator bug and the appositive/agenda bug both involve the
-// alias sitting where random filler surrounds it on both sides, not where
-// it's alone or at a true segment edge.
+// Property test 2: an alias that is NOT the target of a request never
+// authorizes -- whether it is buried mid-segment, or sitting at a genuine
+// segment edge behind a real separator with a non-request clause beside it.
+//
+// Three generation modes, round-robin by sample index. Modes 1-3 put the
+// alias exactly where isVocativeBoundary looks (offset 0 followed by a
+// separator, or the segment's end preceded by one), so clauseIsRequest is
+// genuinely invoked on generated content -- which is what lets this
+// property fail on the defect classes it names:
+//   - a request marker ANYWHERE in the clause counting as "opens with"
+//     (the generators put the marker at token index 2 or later, and never
+//     at the opening);
+//   - a question mark anywhere in the SEGMENT counting as "this clause is
+//     interrogative" for a leading vocative (mode 3 puts a question mark
+//     past the adjoining clause's own boundary);
+//   - the request test collapsing to "any adjoining clause is an address".
+// Mode 0 keeps round 3's fully-embedded case, which exercises the
+// hyphen/apostrophe/word-continuation adjacency guard instead; it does not
+// reach clauseIsRequest, and does not claim to.
 // ---------------------------------------------------------------------------
 
 const EMBED_ALPHABET = [
@@ -1080,14 +1309,14 @@ function randomNonEmptyText(rng: () => number, minLength: number, maxLength: num
 }
 
 function randomJoiner(rng: () => number): string {
-  // Round 3: added the straight and typographic apostrophe -- the exact
-  // joiner class Critical 2 found missing from WORD_CONTINUATION.
-  const joiners = ["-", " ", ", ", ": ", "", "'", "\u2019"];
+  // The joiner set includes the straight and typographic apostrophe -- the
+  // exact class round 3's Critical 2 found missing from WORD_CONTINUATION.
+  const joiners = ["-", " ", ", ", ": ", "", "'", "’"];
   return joiners[Math.floor(rng() * joiners.length)] ?? " ";
 }
 
 // Ordinary filler words a real appositive/reported-speech sentence would
-// use, deliberately disjoint from BURIED_CUE_POOL below.
+// use, deliberately disjoint from BURIED_MARKER_POOL below.
 const WORD_POOL = [
   "the",
   "team",
@@ -1114,59 +1343,31 @@ const WORD_POOL = [
   "topic",
 ];
 
-// The same cue words decide() recognizes.
-const BURIED_CUE_POOL = ["can", "could", "would", "will", "do", "does", "did", "what", "who", "where", "when", "why", "how", "please"];
+// The request markers decide() ships with.
+const BURIED_MARKER_POOL = ["please", "kindly"];
 
 function randomWord(rng: () => number, pool: readonly string[]): string {
   return pool[Math.floor(rng() * pool.length)] ?? pool[0]!;
 }
 
-/** A multi-word phrase with a cue word placed somewhere in it (position 1
- * or 2, i.e. NOT the opening word). Used as filler CONTENT for the fully-
- * embedded mode below, where the alias never reaches a segment edge at
- * all -- so this phrase is never actually passed to clauseIsAddress, and
- * only adds word-shaped (rather than character-noise) realism to that
- * mode's coverage of the adjacency guard. It is NOT what makes property 2
- * exercise clauseIsAddress's position-sensitivity -- see
- * randomDeeplyBuriedCuePhrase and the boundary-position modes below, which
- * is what round 4 added specifically because this generator's cue can
- * land at index 1, still inside the "first two tokens" window
- * clauseIsAddress legitimately allows, so even a directly-checked clause
- * built from it would not reliably prove anything either way. */
-function randomBuriedCuePhrase(rng: () => number): string {
-  const leadWordCount = 1 + Math.floor(rng() * 2);
-  const words: string[] = [];
-  for (let i = 0; i < leadWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
-  words.push(randomWord(rng, BURIED_CUE_POOL));
-  const trailWordCount = Math.floor(rng() * 3);
-  for (let i = 0; i < trailWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
-  return words.join(" ");
-}
-
-/** A multi-word phrase with a cue word placed strictly at index 2 or
- * later -- OUTSIDE clauseIsAddress's "first two tokens" window, so this
- * phrase genuinely could not authorize via the cue, no matter where in
- * the sentence it sits. This is the one used in the BOUNDARY-position
- * modes below (where the phrase actually IS the clause clauseIsAddress
- * evaluates), because it is designed to fail if -- and only if -- the
- * matcher regresses to "a cue word anywhere in the clause is enough"
- * (round 2's Critical 1 defect class). */
-function randomDeeplyBuriedCuePhrase(rng: () => number): string {
+/** A multi-word phrase carrying a request marker at token index 2 or later
+ * -- never opening the phrase. Used as the CLAUSE in the boundary modes,
+ * where it is what clauseIsRequest actually evaluates, so it fails if and
+ * only if the marker check regresses from "opens with" to "contains". */
+function randomBuriedMarkerPhrase(rng: () => number): string {
   const leadWordCount = 2 + Math.floor(rng() * 2);
   const words: string[] = [];
   for (let i = 0; i < leadWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
-  words.push(randomWord(rng, BURIED_CUE_POOL));
+  words.push(randomWord(rng, BURIED_MARKER_POOL));
   const trailWordCount = Math.floor(rng() * 3);
   for (let i = 0; i < trailWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
   return words.join(" ");
 }
 
 function randomEmbeddingText(rng: () => number): string {
-  // Half character noise (catches generic/hyphen/apostrophe-class issues),
-  // half a word-shaped phrase (more realistic filler content). NEITHER
-  // half reaches clauseIsAddress in this (embedded, non-edge) mode -- see
-  // the "embedded" case in the main loop below.
-  return rng() < 0.5 ? randomNonEmptyText(rng, 1, 25) : randomBuriedCuePhrase(rng);
+  // Half character noise, half a word-shaped phrase. Neither reaches
+  // clauseIsRequest in the embedded mode -- see the mode-0 branch below.
+  return rng() < 0.5 ? randomNonEmptyText(rng, 1, 25) : randomBuriedMarkerPhrase(rng);
 }
 
 const BOUNDARY_SEPARATORS = [",", ":"];
@@ -1175,29 +1376,33 @@ function randomBoundarySeparator(rng: () => number): string {
   return BOUNDARY_SEPARATORS[Math.floor(rng() * BOUNDARY_SEPARATORS.length)] ?? ",";
 }
 
-test("property 2: an alias with a cue buried outside the checked window never authorizes, at a real edge or embedded", () => {
+// Deliberately never "?" -- a question mark is what would legitimately
+// authorize these, and the property is about clauses that are NOT requests.
+const NON_INTERROGATIVE_TERMINATORS = [".", "!", ""];
+
+function randomTerminator(rng: () => number): string {
+  return NON_INTERROGATIVE_TERMINATORS[Math.floor(rng() * NON_INTERROGATIVE_TERMINATORS.length)] ?? ".";
+}
+
+test("property 2: an alias beside a non-request clause never authorizes, at a real segment edge or embedded", () => {
   const SEED = 0x656d_6265; // "embe", arbitrary fixed constant -- deterministic across runs
   const rng = mulberry32(SEED);
-  const SAMPLES = 300;
+  const SAMPLES = 400;
   const identity = IDENTITY;
   const alias = "Meetbot";
   const foldedFillers = new Set(["hey", "hi", "hello", "so", "ok", "okay", "um", "uh"]);
 
   for (let i = 0; i < SAMPLES; i += 1) {
-    // Three generation modes, round-robin by sample index:
-    //   0. EMBEDDED (round 3's original mode): the alias sits between a
-    //      non-empty prefix AND a non-empty suffix, so it never reaches a
-    //      segment edge -- clauseIsAddress is never invoked at all. This
-    //      still exercises the adjacency/hyphen/apostrophe guard.
-    //   1. LEADING BOUNDARY (round 4 addition -- Finding D): the alias
-    //      genuinely opens the segment, followed by a real separator and
-    //      a clause whose cue word is deliberately placed OUTSIDE the
-    //      first-two-tokens window clauseIsAddress checks. THIS mode
-    //      would fail if the matcher ever regressed to "a cue anywhere in
-    //      the clause is enough" (round 2's Critical 1 defect class).
-    //   2. TRAILING BOUNDARY (round 4 addition): the mirror image, alias
-    //      at the genuine end of the segment.
-    const mode = i % 3;
+    // 0. EMBEDDED: non-empty content on BOTH sides, so the alias never
+    //    reaches a segment edge and clauseIsRequest is never invoked --
+    //    this mode covers the adjacency guard, not the request test.
+    // 1. LEADING BOUNDARY: alias at offset 0, real separator, non-request
+    //    clause, non-interrogative terminator.
+    // 2. TRAILING BOUNDARY: the mirror image, alias at the segment's end.
+    // 3. LEADING BOUNDARY WITH A LATER QUESTION: same as mode 1, plus a
+    //    second clause that DOES end in "?" -- the question mark must not
+    //    reach back across the clause boundary.
+    const mode = i % 4;
 
     if (mode === 0) {
       let prefix = randomEmbeddingText(rng);
@@ -1227,10 +1432,10 @@ test("property 2: an alias with a cue buried outside the checked window never au
       continue;
     }
 
-    let clause = randomDeeplyBuriedCuePhrase(rng);
+    let clause = randomBuriedMarkerPhrase(rng);
     let guard = 0;
     while (containsAnyAliasSubstring(clause, identity) && guard < 15) {
-      clause = randomDeeplyBuriedCuePhrase(rng);
+      clause = randomBuriedMarkerPhrase(rng);
       guard += 1;
     }
     assert.ok(
@@ -1239,12 +1444,30 @@ test("property 2: an alias with a cue buried outside the checked window never au
     );
 
     const sep = randomBoundarySeparator(rng);
-    const text = mode === 1 ? `${alias}${sep} ${clause}` : `${clause}${sep} ${alias}`;
+    let text: string;
+    if (mode === 1) {
+      text = `${alias}${sep} ${clause}${randomTerminator(rng)}`;
+    } else if (mode === 2) {
+      text = `${clause}${sep} ${alias}${randomTerminator(rng)}`;
+    } else {
+      let tail = randomBuriedMarkerPhrase(rng);
+      let tailGuard = 0;
+      while (containsAnyAliasSubstring(tail, identity) && tailGuard < 15) {
+        tail = randomBuriedMarkerPhrase(rng);
+        tailGuard += 1;
+      }
+      assert.ok(
+        !containsAnyAliasSubstring(tail, identity),
+        `seed=${SEED} sample=${i} (later question): could not generate a clean tail after ${tailGuard} retries`,
+      );
+      text = `${alias}${sep} ${clause}, ${tail}?`;
+    }
+
     const decision = decide({ segmentId: `boundary-${i}`, text, final: true }, identity);
     assert.equal(
       decision.authorize,
       false,
-      `seed=${SEED} sample=${i} (boundary, mode=${mode}) text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
+      `seed=${SEED} sample=${i} (mode=${mode}) text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
     );
   }
 });

@@ -11,17 +11,16 @@
 //   - A bare incidental mention ("I asked Meetbot about it yesterday") is
 //     negative -- somebody talking ABOUT the agent, not TO it.
 //   - Third-person discussion ("Meetbot usually handles the notes", "Meetbot
-//     said he can help with that") is negative for the same reason, EVEN
-//     WHEN a cue word appears somewhere later in the sentence -- the cue
-//     must OPEN the clause immediately adjoining the alias, not merely
-//     occur anywhere in it.
+//     said he can help with that") is negative for the same reason.
 //   - An appositive/agenda-style mention ("Meetbot, the note taker, is
 //     broken again.", "Agenda: Meetbot") is negative -- the alias sits at
-//     a segment edge with a separator, but the adjoining clause never
-//     actually opens with an address to it.
-//   - An exclamatory idiom that happens to start with a cue word ("Meetbot,
-//     what a mess.", "Meetbot, how dare you.") is negative -- see ROUND 4's
-//     anti-cue list below.
+//     a segment edge with a separator, but the adjoining clause is not a
+//     request.
+//   - An exclamatory idiom ("Meetbot, what a mess.", "Meetbot, how
+//     ridiculous.", "Meetbot, will you look at that.") is negative -- it is
+//     not interrogative and carries no request marker, and the small
+//     anti-cue list below catches the ones a transcriber writes with a
+//     question mark anyway.
 //   - A quoted mention (somebody reading a sentence aloud that happens to
 //     contain the name) is negative.
 //   - A short alias must never fire merely because it is a textual prefix
@@ -29,68 +28,83 @@
 //     "Meiling"), a possessive ("Mei's"), or a compound identifier
 //     ("Meetbot-api", "eng-meetbot").
 //   - A mention with NO real separator between the alias and the adjoining
-//     text is negative, full stop -- see ROUND 4 (R41) below. This is what
-//     "Meetbot usually handles the notes" and "Please don't blame
-//     Meetbot." both fail on, and it is also why two formerly-required
-//     positives ("Meetbot what did we decide", "会议机器人总结一下") are now
-//     documented known limitations instead of authorizing.
+//     text is negative, full stop -- see R41 below. This is what "Meetbot
+//     usually handles the notes" and "Please don't blame Meetbot." both
+//     fail on, and it is also why two formerly-required positives
+//     ("Meetbot what did we decide", "会议机器人总结一下") are documented
+//     known limitations instead of authorizing.
 //   - A partial transcript NEVER authorizes, whatever it contains. This is
 //     structural: finality is the first thing decide() checks, and nothing
 //     below that check can produce a positive outcome for a partial
 //     segment -- see decide() below.
 //
-// ROUND 4 (R41, third post-review pass): the no-separator authorize path
-// was itself the recurring root cause across rounds 2 and 3 -- both
-// Critical findings traced back to "alias directly touching more text,
-// with only a cue-lexicon check standing between that and authorize."
-// R41 removes that path entirely: authorize now requires EITHER the alias
-// to be the whole utterance, OR an actual separator character (comma,
-// colon, or their CJK full-width forms -- REQUIRED_SEPARATOR) immediately
-// on the side of the alias facing the adjoining clause. No separator, no
-// authorize, regardless of what cue words follow. This is strictly
-// narrower than round 3: two formerly-required positives no longer
-// authorize --
-//   - "Meetbot what did we decide" (no punctuation at all)
-//   - "会议机器人总结一下" (no punctuation at all)
-// -- and are pinned as documented known limitations (see the test file)
-// rather than silently dropped. The upside: this single change also
-// eliminates an entire class of Chinese false positives on its own
-// (ordinary declarative sentences with the alias as subject and no comma
-// after it, e.g. "会议机器人可以处理很多任务") without any Han-specific
-// carve-out, because a required separator is by definition never a
-// word-continuation character in EITHER script -- so R41 also removes the
-// last vestige of Han/Latin branching in the boundary-adjacency check
-// itself (only clauseIsAddress's OPENS-WITH check remains script-specific).
+// R41 (round 4): authorize requires EITHER the alias to be the whole
+// utterance, OR an actual separator character (comma, colon, or their CJK
+// full-width forms -- REQUIRED_SEPARATOR) immediately on the side of the
+// alias facing the adjoining clause. No separator, no authorize, whatever
+// the adjoining clause says. This single requirement also subsumes the
+// word-continuation adjacency guard on both sides in both scripts (a real
+// separator is never a letter/digit/hyphen/underscore/apostrophe), and it
+// kills an entire class of Chinese false positives on its own (ordinary
+// declaratives with the alias as subject and no comma after it, e.g.
+// "会议机器人可以处理很多任务") with no Han-specific carve-out.
 //
-// R41 also removes "总结" from the Chinese cue list: it existed only to
-// make the now-removed unpunctuated positive reachable, and keeping it
-// would let a punctuated but non-address clause like "会议机器人，总结起来
-// 都是问题" ("summarizing, it's all problems" -- an idiom, not a request)
-// authorize on the same ambiguity the English cue list already avoids by
-// excluding copulas.
+// R43 (round 5): THE ADDRESS-CUE LEXICON IS GONE. Rounds 2-4 decided
+// "is the adjoining clause an address?" by looking at the word that OPENS
+// it -- wh-words, modals, "please", and Chinese equivalents -- with a
+// growing anti-cue list of exclamative idioms in front of it. That rule
+// cannot work, and each round proved it again with a fresh crop of
+// counter-examples ("Meetbot, what nonsense.", "Meetbot, will you look at
+// that.", "Meetbot, how ridiculous.", "会议机器人，可以处理很多任务",
+// "会议机器人，怎么老是这样"): English exclamatives share their opening word
+// with questions, so the opening word is simply not the signal.
 //
-// A second, independent fix this round: an ANTI-CUE list
-// (DEFAULT_ANTI_CUES). A comma-separated clause that opens with a cue WORD
-// used as ordinary exclamatory vocabulary ("Meetbot, what a mess.",
-// "Meetbot, how dare you.", "What a mess, Meetbot.") is not an address,
-// whatever cue word starts it. Anti-cues are checked BEFORE cues, in both
-// leading and trailing positions, and are a small, closed, stable set of
-// idioms -- a narrower and more stable surface than the cue list itself,
-// and (like the cue/filler lists) extendable via
-// InvocationGateIdentity.additionalAntiCues.
+// The clause now has to pass a REQUEST TEST instead. It is an address only
+// if it is a request, and a request is:
+//   1. INTERROGATIVE -- it ends with "?" or "？". For a LEADING vocative
+//      that is the terminator of the clause immediately after the alias;
+//      for a TRAILING vocative the question mark falls after the alias, so
+//      the segment's own terminal punctuation is what is tested.
+//   2. Or it OPENS WITH AN EXPLICIT REQUEST MARKER from a small closed set
+//      (DEFAULT_REQUEST_MARKERS: "please", "kindly", "请", "麻烦", "帮我"
+//      and obvious siblings) -- words whose only job is to mark a request.
+//      Deployment-extensible via additionalRequestMarkers.
+// Interrogative punctuation is a real signal ASR emits, and it is precisely
+// what exclamatives lack: "what a mess", "how ridiculous", "will you look
+// at that", "可以处理很多任务" and "怎么老是这样" all fail both tests, while
+// every required positive passes one.
+//
+// One carve-out, added by round 5's own adversarial probing rather than by
+// the ruling: the interrogative half of the test applies only to a clause
+// that is NOT Chinese. Chinese fronts a topic before a comma as ordinary
+// grammar, so "会议机器人，是不是又坏了？" ("as for Meetbot, is it broken
+// again?") is structurally identical to a vocative question and the
+// question mark discriminates nothing there. A Chinese clause must carry an
+// explicit request marker. See clauseIsRequest for the evidence and the
+// false negative it costs.
+//
+// The separator requirement (R41) and the anti-cue list stay as OUTER
+// guards around the request test, and both still carry weight:
+//   - The separator is what rejects "Please don't blame Meetbot." -- a
+//     preceding clause that does open with a request marker, but whose
+//     alias has no separator beside it.
+//   - The anti-cues (DEFAULT_ANTI_CUES) are the answer to an exclamation a
+//     transcriber wrote with a question mark ("Meetbot, what a mess?",
+//     "会议机器人，什么鬼？"), which the interrogative test alone would let
+//     through. They are checked FIRST, in both positions.
 //
 // Multilingual note: a "word boundary" only exists as whitespace in
 // space-delimited languages, and Chinese has none at all. This module
-// therefore uses two different mechanisms for "does the cue open the
-// clause" depending on the alias's own script (Script=Han vs not) --
-// clauseIsAddress's token-based check for Latin, prefix-based for Han --
-// but ONE mechanism for everything else (the separator requirement, clause
-// truncation at the next real punctuation boundary, anti-cue matching),
-// applied identically to both. Coverage: the shipped defaults distinguish
-// address from mention in English and Chinese; an operator deploying a
-// third language passes additionalAddressCues/additionalLeadingFillers/
-// additionalAntiCues with that language's question words, request modals,
-// greeting fillers, and exclamatory idioms.
+// therefore uses two mechanisms for "does the clause OPEN with this
+// phrase" depending on the script -- a first-token test for Latin, a raw
+// string prefix for Han -- but ONE mechanism for everything else (the
+// separator requirement, clause truncation at the next real punctuation
+// boundary, the interrogative test), applied identically to both.
+// Coverage: the shipped defaults distinguish request from mention in
+// English and Chinese; an operator deploying a third language passes
+// additionalRequestMarkers/additionalLeadingFillers/additionalAntiCues with
+// that language's request markers, greeting fillers, and exclamatory
+// idioms. Interrogative punctuation needs no per-language configuration.
 
 /** A candidate transcript segment, exactly as decide() needs it. Deliberately
  * NOT the Conversation Runtime port's segment shape -- that port is Task 5's
@@ -113,15 +127,15 @@ export type InvocationCandidateSegment = {
  * src/config.ts, so callers can pass that object directly without coupling
  * this module to config.ts.
  *
- * `additionalAddressCues`, `additionalLeadingFillers`, and
- * `additionalAntiCues` EXTEND the shipped defaults (see DEFAULT_ADDRESS_CUES
- * / DEFAULT_LEADING_FILLERS / DEFAULT_ANTI_CUES below) -- they never
- * replace them. This is deployment configuration, the same class of thing
- * the aliases already are: closed lists of literal words/phrases, not a
- * pattern language, not a scoring model. */
+ * `additionalRequestMarkers`, `additionalLeadingFillers`, and
+ * `additionalAntiCues` EXTEND the shipped defaults (see
+ * DEFAULT_REQUEST_MARKERS / DEFAULT_LEADING_FILLERS / DEFAULT_ANTI_CUES
+ * below) -- they never replace them. This is deployment configuration, the
+ * same class of thing the aliases already are: closed lists of literal
+ * words/phrases, not a pattern language, not a scoring model. */
 export type InvocationGateIdentity = {
   readonly aliases: readonly string[];
-  readonly additionalAddressCues?: readonly string[];
+  readonly additionalRequestMarkers?: readonly string[];
   readonly additionalLeadingFillers?: readonly string[];
   readonly additionalAntiCues?: readonly string[];
 };
@@ -178,15 +192,17 @@ export type InvocationDecision =
  *      the segment's start (optionally preceded by a single recognized
  *      leading filler word) immediately followed by a real separator
  *      character (R41 -- see REQUIRED_SEPARATOR) and then a clause that
- *      either is empty or is an address (opens with a cue and does not
- *      open with an anti-cue); or symmetrically the segment's end,
- *      immediately preceded by a real separator character and an address
- *      clause before it -> positive, "vocative_invocation".
+ *      either is empty or is a REQUEST (R43: interrogative, or opening
+ *      with a request marker, and not opening with an anti-cue); or
+ *      symmetrically the segment's end, immediately preceded by a real
+ *      separator character and a request clause before it -> positive,
+ *      "vocative_invocation".
  *   4. An alias's text appears anywhere else in the segment -> negative,
  *      "incidental_mention" (covers third-person discussion, appositive/
- *      agenda mentions, unpunctuated mentions, exclamatory idioms, "I asked
- *      X about it yesterday", and any hyphenated/possessive/longer-word
- *      occurrence that never had a chance to authorize).
+ *      agenda mentions, unpunctuated mentions, exclamatory idioms and
+ *      non-interrogative statements beside the alias, "I asked X about it
+ *      yesterday", and any hyphenated/possessive/longer-word occurrence
+ *      that never had a chance to authorize).
  *   5. No alias's text anywhere -> negative, "no_alias_match".
  */
 export function decide(
@@ -208,9 +224,9 @@ export function decide(
     return { segmentId, authorize: false, matchedAlias: null, reason: "no_alias_match" };
   }
 
-  const addressCues = [...DEFAULT_ADDRESS_CUES, ...(identity.additionalAddressCues ?? [])]
+  const requestMarkers = [...DEFAULT_REQUEST_MARKERS, ...(identity.additionalRequestMarkers ?? [])]
     .map(fold)
-    .filter((cue) => cue !== "");
+    .filter((marker) => marker !== "");
   const leadingFillers = [...DEFAULT_LEADING_FILLERS, ...(identity.additionalLeadingFillers ?? [])]
     .map(fold)
     .filter((filler) => filler !== "");
@@ -235,7 +251,7 @@ export function decide(
   const foldedText = fold(trimmed);
 
   const vocativeAlias = aliases.find(({ folded }) =>
-    isVocativeBoundary(foldedText, folded, addressCues, antiCues, leadingFillers),
+    isVocativeBoundary(foldedText, folded, requestMarkers, antiCues, leadingFillers),
   );
   if (vocativeAlias) {
     return {
@@ -359,59 +375,36 @@ function containsPlainSubstring(haystack: string, needle: string): boolean {
 
 // ---------------------------------------------------------------------------
 // Default lexicons -- deployment configuration, extended (not replaced) by
-// InvocationGateIdentity.additionalAddressCues / additionalLeadingFillers /
-// additionalAntiCues. Cover English and Chinese; an operator deploying a
-// third language adds that language's question words / request modals /
-// greeting fillers / exclamatory idioms.
+// InvocationGateIdentity.additionalRequestMarkers / additionalLeadingFillers
+// / additionalAntiCues. Cover English and Chinese; an operator deploying a
+// third language adds that language's request markers, greeting fillers,
+// and exclamatory idioms. The interrogative half of the request test needs
+// no per-language configuration at all.
 // ---------------------------------------------------------------------------
 
-/** Words that mark the clause immediately adjoining the alias as an actual
- * address -- a question or a request -- rather than a third-person or
- * appositive mention. A cue only counts when it OPENS the (already
- * boundary-truncated) clause AND the clause does not open with an
- * anti-cue -- see clauseIsAddress. Deliberately excludes generic copulas
- * ("is"/"are"): including them would turn appositive mentions like
- * "Meetbot, the note taker, is broken again." into false positives even
- * with clause truncation.
+/** R43: the small, closed set of words whose only job is to MARK A
+ * REQUEST. A clause that opens with one of these is an address even
+ * without a question mark ("Meetbot, please summarize the decisions.",
+ * "会议机器人，帮我总结一下").
  *
- * "总结" (summarize) was removed in round 4 (R41): it existed only to
- * make an unpunctuated CJK positive reachable, and that positive itself
- * was removed as a required case -- keeping the cue would have let a
- * punctuated idiom ("总结起来", "in summary") falsely authorize instead. */
-const DEFAULT_ADDRESS_CUES: readonly string[] = [
-  // English: wh-question words, yes/no-question modals/auxiliaries, and
-  // the one politeness marker that reliably signals a request.
-  "what",
-  "who",
-  "where",
-  "when",
-  "why",
-  "how",
-  "can",
-  "could",
-  "would",
-  "will",
-  "do",
-  "does",
-  "did",
+ * This is NOT the old address-cue lexicon under a new name. That list held
+ * wh-words and modals -- "what", "how", "will", "do", "可以", "怎么" --
+ * every one of which English and Chinese also use to open an exclamation or
+ * a third-person remark, which is why three rounds of anti-cue patching
+ * never converged. Nothing below has a non-request reading when it opens a
+ * clause. Kept deliberately small and deployment-extensible via
+ * InvocationGateIdentity.additionalRequestMarkers.
+ *
+ * The other half of the request test is punctuation, not vocabulary: a
+ * clause that ends in "?"/"？" is a request whatever it opens with -- see
+ * clauseIsRequest and isVocativeBoundary. */
+const DEFAULT_REQUEST_MARKERS: readonly string[] = [
   "please",
-  // Chinese: question particles/words and request markers. "吗"/"呢" are
-  // grammatically clause-final in ordinary Chinese and so rarely satisfy
-  // the strict-prefix Han rule below in practice (a known, documented
-  // limitation -- see the test file) -- kept anyway since they are
-  // harmless and occasionally fire in unusual phrasing.
+  "kindly",
   "请",
-  "一下",
-  "可以",
-  "能不能",
-  "能否",
-  "什么",
-  "谁",
-  "哪里",
-  "为什么",
-  "怎么",
-  "吗",
-  "呢",
+  "麻烦",
+  "帮我",
+  "帮忙",
 ];
 
 /** Short address/greeting fillers that may precede a leading vocative
@@ -433,16 +426,18 @@ const DEFAULT_LEADING_FILLERS: readonly string[] = [
   "喂",
 ];
 
-/** ROUND 4: a closed set of exclamatory idioms that open with an ordinary
- * cue WORD but are never a genuine address, whatever follows --
- * "Meetbot, what a mess." opens with "what" (a cue) but is not a question
- * to Meetbot. Checked BEFORE the cue list, in both leading and trailing
- * positions -- see clauseIsAddress. A small, closed, stable set of
- * multi-word phrases, deliberately narrower and more stable than the cue
- * list itself (an open class of question words and modals). Matched as a
- * whole-phrase PREFIX of the clause (the phrase itself, or the phrase
- * followed by a word boundary) so "how about" does not fire inside an
- * unrelated longer word. */
+/** A closed set of exclamatory idioms that are never a genuine address.
+ *
+ * Under R43 these are the answer to ONE specific hole in the interrogative
+ * test: an exclamation a transcriber (or an over-eager ASR punctuator)
+ * wrote with a question mark -- "Meetbot, what a mess?",
+ * "会议机器人，什么鬼？". Without the question mark the request test already
+ * rejects every one of them, so this list is now a narrow guard on a
+ * punctuation accident rather than the load-bearing rule it was in round 4.
+ * Checked FIRST, before the interrogative and marker tests, in both leading
+ * and trailing positions. Matched as a whole-phrase prefix of the clause
+ * (see clauseStartsWithPhrase) and extendable via
+ * InvocationGateIdentity.additionalAntiCues. */
 const DEFAULT_ANTI_CUES: readonly string[] = [
   "what a",
   "what an",
@@ -452,15 +447,12 @@ const DEFAULT_ANTI_CUES: readonly string[] = [
   "why me",
   "do tell",
   // Deliberately the FULL idiom "would you look at that", not the bare
-  // "would you look" -- found by adversarial probing that the shorter
-  // phrase also swallowed a genuine request ("Meetbot, would you look
-  // into this bug?"). The full idiom still catches the named exclamatory
-  // example while no longer colliding with "look into"/"look over"/etc.
+  // "would you look" -- round 4's adversarial probing found that the
+  // shorter phrase also swallowed a genuine request ("Meetbot, would you
+  // look into this bug?").
   "would you look at that",
-  // Chinese: found by adversarial probing (not named by the review) --
-  // both are unambiguous exclamatory slang that happen to open with the
-  // cue "什么" ("what"), the same bug class as the English "what a mess"
-  // idiom, and just as closed/stable a set.
+  // Chinese exclamatory slang. Matched as a raw prefix (Chinese has no
+  // whitespace), so "什么鬼啊" is caught too -- see clauseStartsWithPhrase.
   "什么鬼",
   "什么玩意",
 ];
@@ -505,13 +497,12 @@ const TRAILING_CLAUSE_STRIP = /[\s,:;、，：；.!?]+$/u;
 // considering "did" (in the clause beyond the first comma) at all.
 const CLAUSE_BOUNDARY = /[,.;:?!，。；：？！]/u;
 
-/** Only the text up to (not including) the next clause-boundary character,
- * or the whole string if none exists. Used for a LEADING vocative: the
- * clause immediately after the alias. */
-function truncateAtNextClauseBoundary(s: string): string {
-  const idx = s.search(CLAUSE_BOUNDARY);
-  return idx === -1 ? s : s.slice(0, idx);
-}
+// R43: the interrogative half of the request test. A question mark --
+// straight or CJK full-width -- is the one punctuation mark ASR emits that
+// genuinely separates a question from an exclamation, and it is what
+// "what a mess", "how ridiculous", "will you look at that",
+// "可以处理很多任务" and "怎么老是这样" all lack.
+const INTERROGATIVE_TERMINATOR = /[?？]/u;
 
 /** Only the text after the LAST clause-boundary character, or the whole
  * string if none exists. Used for a TRAILING vocative: the clause
@@ -526,56 +517,88 @@ function truncateAtPreviousClauseBoundary(s: string): string {
   return lastIdx === -1 ? s : s.slice(lastIdx + 1);
 }
 
-/** True if `clause` (already folded) either equals `phrase` exactly or
- * starts with `phrase` followed by a word boundary (space) -- so "what a"
- * matches "what a mess" but not "what another day" (a real word, not the
- * same phrase, would otherwise falsely match a bare string prefix). */
+/** True if `clause` (already folded) opens with `phrase`.
+ *
+ * For a Latin phrase that means the clause equals it exactly or is followed
+ * by a space -- so "what a" matches "what a mess" but not "what another
+ * day". For a phrase containing Han characters there is no whitespace to
+ * anchor on, so a raw string prefix is the boundary: "什么鬼" matches both
+ * "什么鬼" and "什么鬼啊". */
 function clauseStartsWithPhrase(clause: string, phrase: string): boolean {
   if (phrase === "") return false;
+  if (isHanText(phrase)) return clause.startsWith(phrase);
   return clause === phrase || clause.startsWith(`${phrase} `);
 }
 
-/** True if `clause` (already folded, already bounded to the adjoining
- * clause via truncateAtNext/PreviousClauseBoundary, already trimmed)
- * either has no content at all -- the alias plus an optional filler was
- * essentially the whole utterance -- or is a genuine ADDRESS: it does not
- * open with a recognized anti-cue idiom (checked first -- ROUND 4), and it
- * opens with one of `cues`.
+/** The first whitespace-delimited token of `clause`, stripped of leading and
+ * trailing non-alphanumerics. "" when the clause has no such token. */
+function firstToken(clause: string): string {
+  const raw = clause.split(/\s+/u)[0] ?? "";
+  return raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+}
+
+/**
+ * R43 -- the request test. True if `clause` (already folded, already
+ * bounded to the clause adjoining the alias, already trimmed) is a REQUEST,
+ * and therefore an address rather than a mention.
  *
- * "Opens with" means: for a Latin/other-script alias, one of the clause's
- * first two whitespace-separated tokens exactly equals a cue word (not "a
- * cue word appears somewhere in the clause"), or that same token with a
- * trailing wh-word contraction ("'s"/"’s") removed. For a Han-script
- * alias, the clause's raw text starts with a Han cue as a literal prefix,
- * since Chinese has no whitespace to tokenize on. */
-function clauseIsAddress(
+ * In order:
+ *   1. An EMPTY clause -- the alias plus an optional filler was essentially
+ *      the whole utterance -- is an address. There is no clause content for
+ *      anything to hide in.
+ *   2. A clause opening with a recognized exclamatory anti-cue is NOT an
+ *      address, whatever else is true of it. This is the guard against an
+ *      exclamation someone punctuated as a question.
+ *   3. A Chinese clause must carry an explicit request marker, matched as a
+ *      raw prefix -- see THE HAN CARVE-OUT below.
+ *   4. Otherwise an INTERROGATIVE clause is a request. `interrogative` is
+ *      computed by the caller, because where the question mark lives
+ *      depends on which side of the alias the clause is on -- see
+ *      isVocativeBoundary.
+ *   5. So is a clause whose first token is a request marker, question mark
+ *      or not.
+ * Anything else is a mention.
+ *
+ * The script test is on the CLAUSE, not on the alias: how to read a clause
+ * follows from the language the clause is written in, not from the language
+ * the agent happens to be named in.
+ *
+ * THE HAN CARVE-OUT (round 5, from this round's own adversarial probing,
+ * not from the ruling). Chinese fronts a topic before a comma as a matter
+ * of ordinary grammar: "会议机器人，是不是又坏了？" is "as for Meetbot, is it
+ * broken again?", a question ABOUT the agent put to a human, and it is
+ * structurally identical to a vocative followed by a question.
+ * Interrogative punctuation therefore does not discriminate in Chinese the
+ * way it does in English, and accepting it authorized a whole family of
+ * probed false positives ("会议机器人，怎么老是这样？",
+ * "会议机器人，可以处理很多任务吗？", "会议机器人，为什么大家都在讨论它？").
+ * Requiring a marker closes that class outright rather than shrinking it by
+ * enumeration, and it costs no required positive -- every Chinese positive
+ * in the acceptance list is marker-based. What it does cost is a documented
+ * false negative: "会议机器人，能总结一下吗？" (a genuine marker-free polite
+ * question) no longer authorizes, and an operator whose meetings phrase
+ * requests that way adds their own marker via additionalRequestMarkers.
+ * That trade is the standing ruling applied literally: false positives are
+ * zero-tolerance, documented false negatives are acceptable.
+ */
+function clauseIsRequest(
   clause: string,
-  cues: readonly string[],
+  interrogative: boolean,
+  requestMarkers: readonly string[],
   antiCues: readonly string[],
-  aliasIsHan: boolean,
 ): boolean {
   if (clause === "") return true;
 
   if (antiCues.some((phrase) => clauseStartsWithPhrase(clause, phrase))) return false;
 
-  if (aliasIsHan) {
-    return cues.some((cue) => cue !== "" && isHanText(cue) && clause.startsWith(cue));
+  if (isHanText(clause)) {
+    return requestMarkers.some((marker) => marker !== "" && clause.startsWith(marker));
   }
 
-  const tokens = clause
-    .split(/\s+/u)
-    .map((token) => token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
-    .filter((token) => token !== "");
-  const firstTwo = tokens.slice(0, 2);
-  return firstTwo.some((token) => {
-    if (cues.includes(token)) return true;
-    // A wh-word contraction ("what's", "who's", "where's", ...) is an
-    // extremely common way to open a real question; the apostrophe
-    // survives token-edge stripping since it's internal to the token, not
-    // at either edge.
-    const contracted = token.replace(/['’]s$/u, "");
-    return contracted !== token && cues.includes(contracted);
-  });
+  if (interrogative) return true;
+
+  const opener = firstToken(clause);
+  return opener !== "" && requestMarkers.includes(opener);
 }
 
 /**
@@ -585,8 +608,19 @@ function clauseIsAddress(
  * (optionally preceded by a single recognized leading filler word) with
  * either nothing else following at all, or a REAL separator character
  * (REQUIRED_SEPARATOR -- R41) immediately after it and then a clause that
- * is an address; or symmetrically the segment's end, with a real separator
- * character immediately before it and an address clause before that.
+ * passes the request test (R43 -- clauseIsRequest); or symmetrically the
+ * segment's end, with a real separator character immediately before it and
+ * a request clause before that.
+ *
+ * The interrogative half of the request test is computed here, per
+ * position, because the question mark of a vocative question does not sit
+ * in the same place on the two sides:
+ *   - LEADING ("Meetbot, can you hear me?") -- the clause runs from the
+ *     separator to the next clause boundary, and THAT boundary character is
+ *     the clause's terminator. It is interrogative if it is "?" or "？".
+ *   - TRAILING ("Can you take a note, Meetbot?") -- the question mark falls
+ *     after the alias, at the very end of the segment, so the segment's own
+ *     terminal punctuation is what is tested.
  *
  * A real separator is, by construction, never a word-continuation
  * character in either script, so no additional Han/Latin-specific
@@ -595,7 +629,7 @@ function clauseIsAddress(
 function isVocativeBoundary(
   foldedText: string,
   foldedAlias: string,
-  addressCues: readonly string[],
+  requestMarkers: readonly string[],
   antiCues: readonly string[],
   leadingFillers: readonly string[],
 ): boolean {
@@ -603,8 +637,6 @@ function isVocativeBoundary(
 
   const core = foldedText.replace(EDGE_STRIP, "");
   if (core === foldedAlias) return true;
-
-  const aliasIsHan = isHanText(foldedAlias);
 
   // START: try the segment's literal start, then (for each recognized
   // leading filler) the text immediately after that filler.
@@ -628,17 +660,19 @@ function isVocativeBoundary(
     if (trimmedRemainder === "") {
       // A leading filler (if any) plus the alias, with nothing else at
       // all following -- e.g. "Hey Meetbot" alone. Zero clause content
-      // means zero risk of the cue-anywhere/bare-adjacency abuse R41
-      // exists to close, so this is treated the same as the whole-segment
-      // case rather than requiring a separator that has nothing to
-      // separate.
+      // means there is nothing for a non-request statement to hide in, so
+      // this is treated the same as the whole-segment case rather than
+      // requiring a separator that has nothing to separate.
       return true;
     }
     const separatorChar = trimmedRemainder.charAt(0);
     if (!REQUIRED_SEPARATOR.test(separatorChar)) continue;
     const stripped = trimmedRemainder.replace(LEADING_CLAUSE_STRIP, "");
-    const clause = truncateAtNextClauseBoundary(stripped).trim();
-    if (clauseIsAddress(clause, addressCues, antiCues, aliasIsHan)) return true;
+    const boundaryIdx = stripped.search(CLAUSE_BOUNDARY);
+    const clause = (boundaryIdx === -1 ? stripped : stripped.slice(0, boundaryIdx)).trim();
+    const terminator = boundaryIdx === -1 ? "" : stripped.charAt(boundaryIdx);
+    const interrogative = INTERROGATIVE_TERMINATOR.test(terminator);
+    if (clauseIsRequest(clause, interrogative, requestMarkers, antiCues)) return true;
   }
 
   // END: the segment's literal end (after stripping trailing terminal
@@ -656,11 +690,26 @@ function isVocativeBoundary(
     if (separatorChar !== "" && REQUIRED_SEPARATOR.test(separatorChar)) {
       const stripped = prefixFull.replace(TRAILING_CLAUSE_STRIP, "");
       const clause = truncateAtPreviousClauseBoundary(stripped).trim();
-      if (clauseIsAddress(clause, addressCues, antiCues, aliasIsHan)) return true;
+      const interrogative = segmentIsInterrogative(foldedText);
+      if (clauseIsRequest(clause, interrogative, requestMarkers, antiCues)) return true;
     }
   }
 
   return false;
+}
+
+// Closing wrappers stripped before reading a segment's terminal
+// punctuation: whitespace and closing quote/bracket characters, but NOT
+// punctuation itself -- the punctuation is exactly what is being read.
+const TRAILING_WRAPPER = /[\s'"“”‘’«»」』)\]]+$/u;
+
+/** True when the whole segment ends in a question mark (straight or CJK
+ * full-width), ignoring any closing quote/bracket after it. This is the
+ * interrogative signal for a TRAILING vocative, where the question mark
+ * falls after the alias rather than inside the clause. */
+function segmentIsInterrogative(foldedText: string): boolean {
+  const unwrapped = foldedText.replace(TRAILING_WRAPPER, "");
+  return INTERROGATIVE_TERMINATOR.test(unwrapped.charAt(unwrapped.length - 1));
 }
 
 // Matching open/close quote pairs recognized when they wrap the ENTIRE
