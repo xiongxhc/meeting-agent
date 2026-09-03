@@ -6,11 +6,18 @@
   "engines": {
     "node": ">=22"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/src/config.d.ts",
+      "import": "./dist/src/config.js"
+    }
+  },
   "scripts": {
     "test": "node --test \"spikes/**/*.test.ts\" \"bridges/**/*.test.ts\" \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc"
+    "build": "tsc",
+    "start": "node dist/src/main.js"
   },
   "devDependencies": {
     "@eslint/js": "^9.37.0",
