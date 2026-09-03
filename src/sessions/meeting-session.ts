@@ -343,6 +343,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let joinCommandSent = false;
   let disposePromise: Promise<void> | null = null;
   let activeJoinPromise: Promise<void> | null = null;
+  let inactiveRequested = false;
   let inactiveNotified = false;
 
   const observedGaps: ObservedAudioGap[] = [];
@@ -1026,7 +1027,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   }
 
   function markInactive(): void {
-    if (inactiveNotified) return;
+    inactiveRequested = true;
+    if (inactiveNotified || activeJoinPromise !== null) return;
     inactiveNotified = true;
     options.onInactive?.();
   }
@@ -1112,10 +1114,14 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     bridgeSessionId,
 
     join(): Promise<void> {
+      if (activeJoinPromise !== null) {
+        return Promise.reject(new Error(`meeting session has already joined (phase "${phase}")`));
+      }
       const operation = performJoin();
       activeJoinPromise = operation;
       void operation.finally(() => {
         if (activeJoinPromise === operation) activeJoinPromise = null;
+        if (inactiveRequested) markInactive();
       }).catch(() => {});
       return operation;
     },

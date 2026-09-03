@@ -165,6 +165,172 @@ test("application close waits for a stalled join to cancel and clean up before r
   }
 });
 
+test("terminal cleanup retains a session until its stalled connect_media send settles", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-application-terminal-join-race-"));
+  const stalledConnectMedia = deferredVoid();
+  let joinPromise: Promise<void> | null = null;
+  let closePromise: Promise<void> | null = null;
+  try {
+    const config: MeetingAgentConfig = {
+      feishu: { appId: "synthetic-app", appSecret: new RedactedSecret("synthetic-secret") },
+      conversationRuntime: { endpoint: "https://runtime.example.invalid/", profile: "online" },
+      agentIdentity: { aliases: ["Meetbot"] },
+      dataPaths: { recordingsDir: path.join(dir, "recordings"), outboxDir: path.join(dir, "outbox"), receiptsDir: path.join(dir, "receipts"), teamVaultDir: path.join(dir, "vault") },
+    };
+    const bridge = fakeBridge("application-terminal-join-race");
+    const runtime = fakeRuntime();
+    const realSend = bridge.send.bind(bridge);
+    let connectMediaStarted = false;
+    bridge.send = async (message) => {
+      if (message.type === "connect_media") {
+        connectMediaStarted = true;
+        await stalledConnectMedia.promise;
+      }
+      await realSend(message);
+    };
+    const app = createMeetingAgentApplication({
+      config,
+      adapters: {
+        bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-terminal-join-race" }),
+        runtimeFor: () => runtime,
+      },
+    });
+    try {
+      const identity = buildMeetingIdentity({ providerMeetingId: "terminal-race", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "terminal race", organizer: null });
+      const session = app.createSession(identity);
+      joinPromise = session.join();
+      await flushMacrotask();
+      assert.equal(connectMediaStarted, true, "the join must be stalled inside connect_media");
+
+      bridge.emit(bridge.event({ type: "left", reason: "removed" }));
+      await session.settled();
+
+      let closeResolved = false;
+      closePromise = app.close().then(() => { closeResolved = true; });
+      await flushMacrotask();
+      assert.equal(closeResolved, false, "close must wait for the live connect_media send");
+      assert.equal(app.liveSessionCount(), 1, "terminal cleanup must retain the in-flight join");
+      assert.deepEqual(bridge.sent.map((command) => command.type), ["join"]);
+
+      stalledConnectMedia.resolve();
+      await assert.rejects(joinPromise, /disposed|cancelled/i);
+      await closePromise;
+
+      assert.equal(app.liveSessionCount(), 0);
+      assert.deepEqual(bridge.sent.map((command) => command.type), ["join", "connect_media"]);
+      assert.equal(runtime.callsOf("startVoiceSession").length, 1);
+      assert.equal(runtime.callsOf("close").length, 1);
+      assert.equal(bridge.subscriberCount(), 0);
+      assert.equal(runtime.subscriberCount(), 0);
+
+      const commandsAfterClose = bridge.sent.length;
+      const runtimeCallsAfterClose = runtime.calls.length;
+      await flushMacrotask();
+      assert.equal(bridge.sent.length, commandsAfterClose, "no bridge side effect may finish after close");
+      assert.equal(runtime.calls.length, runtimeCallsAfterClose, "no runtime side effect may finish after close");
+
+      const verificationStore = openSessionStore({ filename: path.join(config.dataPaths.outboxDir, "orchestration.db") });
+      try {
+        assert.equal(verificationStore.getActiveLease(identity.occurrenceId), null);
+        assert.equal(verificationStore.getSession(identity.occurrenceId)?.state, "failed");
+        assert.equal(verificationStore.getSession(identity.occurrenceId)?.terminalReason, "removed");
+      } finally {
+        verificationStore.close();
+      }
+    } finally {
+      stalledConnectMedia.resolve();
+      if (joinPromise !== null) await Promise.allSettled([joinPromise]);
+      if (closePromise !== null) await Promise.allSettled([closePromise]);
+      await app.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("duplicate join rejection preserves the first stalled join for application close", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-application-duplicate-join-race-"));
+  const stalledJoinSend = deferredVoid();
+  let firstJoinPromise: Promise<void> | null = null;
+  let closePromise: Promise<void> | null = null;
+  try {
+    const config: MeetingAgentConfig = {
+      feishu: { appId: "synthetic-app", appSecret: new RedactedSecret("synthetic-secret") },
+      conversationRuntime: { endpoint: "https://runtime.example.invalid/", profile: "online" },
+      agentIdentity: { aliases: ["Meetbot"] },
+      dataPaths: { recordingsDir: path.join(dir, "recordings"), outboxDir: path.join(dir, "outbox"), receiptsDir: path.join(dir, "receipts"), teamVaultDir: path.join(dir, "vault") },
+    };
+    const bridge = fakeBridge("application-duplicate-join-race");
+    const runtime = fakeRuntime();
+    const realSend = bridge.send.bind(bridge);
+    let firstJoinSendStarted = false;
+    bridge.send = async (message) => {
+      if (message.type === "join") {
+        firstJoinSendStarted = true;
+        await stalledJoinSend.promise;
+      }
+      await realSend(message);
+    };
+    const app = createMeetingAgentApplication({
+      config,
+      adapters: {
+        bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-duplicate-join-race" }),
+        runtimeFor: () => runtime,
+      },
+    });
+    try {
+      const identity = buildMeetingIdentity({ providerMeetingId: "duplicate-race", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "duplicate race", organizer: null });
+      const session = app.createSession(identity);
+      firstJoinPromise = session.join();
+      await flushMacrotask();
+      assert.equal(firstJoinSendStarted, true, "the first join must be stalled inside its send");
+
+      await assert.rejects(session.join(), /already joined|joining/i);
+
+      let closeResolved = false;
+      closePromise = app.close().then(() => { closeResolved = true; });
+      await flushMacrotask();
+      assert.equal(closeResolved, false, "close must still wait for the first join after a duplicate rejection");
+      assert.equal(app.liveSessionCount(), 1);
+      assert.equal(bridge.sent.length, 0);
+      assert.equal(runtime.callsOf("startVoiceSession").length, 0);
+
+      stalledJoinSend.resolve();
+      await assert.rejects(firstJoinPromise, /disposed|cancelled/i);
+      await closePromise;
+
+      assert.equal(app.liveSessionCount(), 0);
+      assert.deepEqual(bridge.sent.map((command) => command.type), ["join", "leave"]);
+      assert.equal(runtime.callsOf("startVoiceSession").length, 0);
+      assert.equal(runtime.callsOf("close").length, 0);
+      assert.equal(bridge.subscriberCount(), 0);
+      assert.equal(runtime.subscriberCount(), 0);
+
+      const commandsAfterClose = bridge.sent.length;
+      const runtimeCallsAfterClose = runtime.calls.length;
+      await flushMacrotask();
+      assert.equal(bridge.sent.length, commandsAfterClose, "the first join cannot finish a bridge side effect after close");
+      assert.equal(runtime.calls.length, runtimeCallsAfterClose, "the first join cannot start runtime after close");
+
+      const verificationStore = openSessionStore({ filename: path.join(config.dataPaths.outboxDir, "orchestration.db") });
+      try {
+        assert.equal(verificationStore.getActiveLease(identity.occurrenceId), null);
+        assert.equal(verificationStore.getSession(identity.occurrenceId)?.state, "failed");
+        assert.equal(verificationStore.getSession(identity.occurrenceId)?.terminalReason, "join_failed");
+      } finally {
+        verificationStore.close();
+      }
+    } finally {
+      stalledJoinSend.resolve();
+      if (firstJoinPromise !== null) await Promise.allSettled([firstJoinPromise]);
+      if (closePromise !== null) await Promise.allSettled([closePromise]);
+      await app.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("completed and explicitly disposed sessions leave application tracking immediately", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-application-retention-"));
   try {
