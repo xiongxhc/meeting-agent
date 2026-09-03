@@ -5,13 +5,26 @@
 // this suite is organized around the boundary between a genuine vocative
 // invocation and everything that merely mentions the agent's name.
 //
+// ROUND 2 (post-review): a round-1 reviewer ran the matcher against real
+// utterances and found it authorized on hyphenated names/identifiers ("Mei-
+// Ling", "Meetbot-api", "eng-meetbot") and refused genuine leading-filler
+// and bare-imperative vocatives ("Hey Meetbot, ...", "Meetbot what did we
+// decide"), while also authorizing on appositive/agenda-style mentions
+// ("Meetbot, the note taker, is broken again.", "Agenda: Meetbot"). This
+// suite pins the reviewer's exact fixture lists (see the two "acceptance
+// matrix" blocks below) in addition to the original matrices, plus a
+// second property test targeting the exact defect class the first property
+// test could not catch (it only samples alias-FREE text; the bugs above
+// all contain the alias).
+//
 // Matrices covered: configured name/aliases at utterance boundaries,
 // punctuation variants, casing, accents, multilingual (CJK, which has no
 // whitespace word boundaries) text, partial transcripts, quoted mentions,
-// third-person discussion, a human participant name that contains a
-// configured alias as a substring, repeated segments, and unrelated
-// background speech (e.g. background TV). Plus a property test: arbitrary
-// generated text containing no configured alias must never authorize.
+// third-person discussion, appositive/agenda-style mentions, hyphenated
+// names/identifiers containing an alias as a substring, a human participant
+// name that contains a configured alias as a substring, leading-filler
+// address ("Hey Meetbot, ..."), repeated segments, unrelated background
+// speech, and a documented known-limitation case. Plus two property tests.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -56,24 +69,26 @@ test("alias alone as the entire segment authorizes", () => {
   assertPositive(decide(segment("Meetbot"), IDENTITY), "Meetbot");
 });
 
-test("alias at the start, comma-separated, authorizes", () => {
+test("alias at the start, comma-separated, with an address cue, authorizes", () => {
   assertPositive(decide(segment("Meetbot, can you summarize that?"), IDENTITY), "Meetbot");
 });
 
-test("alias at the end, comma-separated, authorizes", () => {
+test("alias at the end, comma-separated, with an address cue, authorizes", () => {
   assertPositive(decide(segment("Can you summarize that, Meetbot?"), IDENTITY), "Meetbot");
 });
 
-test("alias at the end, colon-separated, authorizes", () => {
-  assertPositive(decide(segment("One question for you: Meetbot"), IDENTITY), "Meetbot");
+test("alias at the start, colon-separated, with an address cue, authorizes", () => {
+  assertPositive(decide(segment("Meetbot: can you summarize?"), IDENTITY), "Meetbot");
 });
 
-test("alias at the start, colon-separated, authorizes", () => {
-  assertPositive(decide(segment("Meetbot: give us the summary"), IDENTITY), "Meetbot");
+test("a short configured alias at a boundary, with an address cue, authorizes", () => {
+  assertPositive(decide(segment("Mei, can you take a note?"), IDENTITY), "Mei");
 });
 
-test("a short configured alias at a boundary authorizes", () => {
-  assertPositive(decide(segment("Mei, take a note"), IDENTITY), "Mei");
+test("alias with no punctuation at all but a leading question-word cue authorizes", () => {
+  // No comma anywhere in this segment -- the boundary is whitespace, and
+  // the disambiguator is the cue word "what", not punctuation.
+  assertPositive(decide(segment("Meetbot what did we decide"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -96,8 +111,8 @@ test("no punctuation at all, alias alone, still authorizes", () => {
   assertPositive(decide(segment("  Meetbot  "), IDENTITY), "Meetbot");
 });
 
-test("trailing question mark after a comma-separated end-position alias authorizes", () => {
-  assertPositive(decide(segment("Are you still there, Meetbot?"), IDENTITY), "Meetbot");
+test("trailing question mark after a comma-separated end-position alias with a cue authorizes", () => {
+  assertPositive(decide(segment("Can you still hear us, Meetbot?"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -105,15 +120,15 @@ test("trailing question mark after a comma-separated end-position alias authoriz
 // ---------------------------------------------------------------------------
 
 test("all-caps alias authorizes", () => {
-  assertPositive(decide(segment("MEETBOT, mute yourself"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("MEETBOT, can you mute yourself?"), IDENTITY), "Meetbot");
 });
 
 test("all-lowercase alias authorizes", () => {
-  assertPositive(decide(segment("meetbot, mute yourself"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("meetbot, can you mute yourself?"), IDENTITY), "Meetbot");
 });
 
 test("mixed-case alias authorizes", () => {
-  assertPositive(decide(segment("MeEtBoT, mute yourself"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("MeEtBoT, can you mute yourself?"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -121,12 +136,29 @@ test("mixed-case alias authorizes", () => {
 // ---------------------------------------------------------------------------
 
 test("configured alias carries an accent; unaccented transcript text still matches", () => {
-  assertPositive(decide(segment("Amelie, peux-tu resumer"), IDENTITY), "Amelie");
+  const accentIdentity: InvocationGateIdentity = { aliases: ["Amélie"] };
+  assertPositive(decide(segment("Amelie, can you help us?"), accentIdentity), "Amélie");
 });
 
 test("configured alias has no accent; accented transcript text still matches", () => {
   // ASR sometimes emits accents even for a plain-ASCII configured alias.
-  assertPositive(decide(segment("Amélie, peux-tu résumer"), IDENTITY), "Amelie");
+  assertPositive(decide(segment("Amélie, can you help us?"), IDENTITY), "Amelie");
+});
+
+// ---------------------------------------------------------------------------
+// Leading fillers: "Hey Meetbot, ..." must not be defeated by the filler word
+// ---------------------------------------------------------------------------
+
+test("a leading 'Hey' filler before the alias does not defeat the start boundary", () => {
+  assertPositive(decide(segment("Hey Meetbot, can you summarize?"), IDENTITY), "Meetbot");
+});
+
+test("a leading 'So,' filler before the alias does not defeat the start boundary", () => {
+  assertPositive(decide(segment("So, Meetbot, can you summarize?"), IDENTITY), "Meetbot");
+});
+
+test("a leading 'OK' filler before the alias does not defeat the start boundary", () => {
+  assertPositive(decide(segment("OK Meetbot, what did we decide?"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -135,7 +167,7 @@ test("configured alias has no accent; accented transcript text still matches", (
 
 const CJK_IDENTITY: InvocationGateIdentity = { aliases: ["会议机器人"] };
 
-test("CJK alias at the start, full-width-comma-separated, authorizes", () => {
+test("CJK alias at the start, full-width-comma-separated, with a request marker, authorizes", () => {
   assertPositive(decide(segment("会议机器人，请总结一下", true), CJK_IDENTITY), "会议机器人");
 });
 
@@ -147,14 +179,25 @@ test("CJK alias alone as the entire segment authorizes", () => {
   assertPositive(decide(segment("会议机器人", true), CJK_IDENTITY), "会议机器人");
 });
 
-test("CJK third-person mention, no separator, does not authorize", () => {
-  // Correctly negative either way, but note the reason: with no whitespace
-  // to delimit words, an alias embedded between two other CJK characters
-  // (here 说 before, 通 after) is adjacent to letters on BOTH sides, same
-  // mechanism as the "Meiling" vs "Mei" case -- so it cannot even be
-  // confirmed as a genuine word occurrence, and resolves to
-  // "no_alias_match" rather than "incidental_mention". See report for the
-  // multilingual design rationale.
+test("CJK alias with NO separator at all still authorizes via the '一下' request-softener cue", () => {
+  // Chinese has no whitespace, so there is no punctuation-free "boundary"
+  // the way English has one; the disambiguator here is the address-cue
+  // lexicon (一下), not adjacency to a non-letter character.
+  assertPositive(decide(segment("会议机器人总结一下", true), CJK_IDENTITY), "会议机器人");
+});
+
+test("CJK third-person mention, no separator, no cue in the following clause, does not authorize", () => {
+  const decision = decide(segment("会议机器人今天没来", true), CJK_IDENTITY);
+  assertNegative(decision, "no_alias_match");
+  assert.equal(decision.matchedAlias, null);
+});
+
+test("CJK third-person mention, embedded mid-sentence, does not authorize", () => {
+  // With no whitespace to delimit words, an alias embedded between two
+  // other CJK characters (说 before, 通 after) is adjacent to letters on
+  // BOTH sides -- same mechanism as the "Meiling" vs "Mei" case -- so it
+  // cannot even be confirmed as a genuine word occurrence, and resolves to
+  // "no_alias_match" rather than "incidental_mention".
   const decision = decide(segment("他说会议机器人通常负责记录", true), CJK_IDENTITY);
   assertNegative(decision, "no_alias_match");
   assert.equal(decision.matchedAlias, null);
@@ -198,21 +241,6 @@ test("a whole segment quoted with curly quotes does not authorize", () => {
 test("a whole segment quoted with single quotes does not authorize", () => {
   const decision = decide(segment("'Meetbot, take notes'"), IDENTITY);
   assertNegative(decision, "quoted_mention");
-});
-
-// ---------------------------------------------------------------------------
-// Third-person discussion (about the agent, not to it)
-// ---------------------------------------------------------------------------
-
-test("third-person discussion mid-sentence does not authorize", () => {
-  const decision = decide(segment("Honestly, Meetbot usually handles the notes for us."), IDENTITY);
-  assertNegative(decision, "incidental_mention");
-  assert.equal(decision.matchedAlias, "Meetbot");
-});
-
-test("third-person discussion referencing the agent at the end does not authorize", () => {
-  const decision = decide(segment("The notes are usually taken by Meetbot for us."), IDENTITY);
-  assertNegative(decision, "incidental_mention");
 });
 
 // ---------------------------------------------------------------------------
@@ -276,6 +304,29 @@ test("decide() accepts no speaker or rank parameter -- the type itself forbids l
 });
 
 // ---------------------------------------------------------------------------
+// A known, documented limitation: an open-class imperative with no
+// recognized cue word cannot be distinguished from a third-person/
+// appositive mention by a closed lexicon, and the acceptance rule for this
+// gate is that false positives are zero-tolerance while false negatives may
+// have documented exceptions. This is deliberately pinned as a NEGATIVE.
+// ---------------------------------------------------------------------------
+
+test("KNOWN LIMITATION: an open-class imperative with no recognized cue word does not authorize", () => {
+  // Contrast with the required positive "Meetbot, please summarize the
+  // decisions." (has the cue word "please"). Without "please" (or a
+  // wh-word/modal), this segment is structurally indistinguishable, by
+  // pure lexicon lookup, from a third-person or appositive mention that
+  // must stay negative -- e.g. "Meetbot, the note taker, is broken
+  // again." Telling them apart would require parsing "summarize the
+  // decisions" as an imperative verb phrase, which is exactly the NLP/
+  // scoring this task is scoped to avoid. Documented false negative, kept
+  // per the "false positives are zero-tolerance" acceptance rule.
+  const decision = decide(segment("Meetbot, summarize the decisions."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Meetbot");
+});
+
+// ---------------------------------------------------------------------------
 // The invocation sink: apply a decision exactly once per segmentId
 // ---------------------------------------------------------------------------
 
@@ -297,12 +348,22 @@ function createFakeSink(): InvocationSink & {
   };
 }
 
+test("decide() carries the segment's runtime segmentId on the decision", () => {
+  const decision = decide(segment("Meetbot, can you help?", true, "seg-42"), IDENTITY);
+  assert.equal(decision.segmentId, "seg-42");
+});
+
+test("a partial segment's decision still carries its segmentId", () => {
+  const decision = decide(segment("anything", false, "seg-partial"), IDENTITY);
+  assert.equal(decision.segmentId, "seg-partial");
+});
+
 test("a positive decision authorizes the runtime segmentId on the sink", () => {
   const sink = createFakeSink();
   const dispatcher = createInvocationDispatcher(sink);
   const decision = decide(segment("Meetbot, can you help?", true, "seg-42"), IDENTITY);
 
-  dispatcher.apply("seg-42", decision);
+  dispatcher.apply(decision);
 
   assert.deepEqual(sink.authorized, [{ segmentId: "seg-42", matchedAlias: "Meetbot" }]);
   assert.deepEqual(sink.skipped, []);
@@ -313,7 +374,7 @@ test("a negative decision skips the runtime segmentId on the sink", () => {
   const dispatcher = createInvocationDispatcher(sink);
   const decision = decide(segment("I asked Meetbot about it yesterday.", true, "seg-7"), IDENTITY);
 
-  dispatcher.apply("seg-7", decision);
+  dispatcher.apply(decision);
 
   assert.deepEqual(sink.skipped, [{ segmentId: "seg-7", reason: "incidental_mention" }]);
   assert.deepEqual(sink.authorized, []);
@@ -324,9 +385,9 @@ test("applying the same segmentId twice authorizes only once", () => {
   const dispatcher = createInvocationDispatcher(sink);
   const decision = decide(segment("Meetbot, can you help?", true, "seg-99"), IDENTITY);
 
-  dispatcher.apply("seg-99", decision);
-  dispatcher.apply("seg-99", decision);
-  dispatcher.apply("seg-99", decision);
+  dispatcher.apply(decision);
+  dispatcher.apply(decision);
+  dispatcher.apply(decision);
 
   assert.equal(sink.authorized.length, 1);
   assert.deepEqual(sink.authorized, [{ segmentId: "seg-99", matchedAlias: "Meetbot" }]);
@@ -337,8 +398,8 @@ test("applying the same segmentId twice skips only once", () => {
   const dispatcher = createInvocationDispatcher(sink);
   const decision = decide(segment("no alias here at all", true, "seg-100"), IDENTITY);
 
-  dispatcher.apply("seg-100", decision);
-  dispatcher.apply("seg-100", decision);
+  dispatcher.apply(decision);
+  dispatcher.apply(decision);
 
   assert.equal(sink.skipped.length, 1);
 });
@@ -350,7 +411,7 @@ test("a repeated final segment (retry/redelivery) is applied exactly once end to
   // (retry after a dropped ack, at-least-once delivery, etc).
   for (let i = 0; i < 5; i += 1) {
     const decision = decide(segment("Meetbot, please summarize.", true, "seg-dup"), IDENTITY);
-    dispatcher.apply("seg-dup", decision);
+    dispatcher.apply(decision);
   }
   assert.equal(sink.authorized.length, 1);
   assert.equal(sink.skipped.length, 0);
@@ -359,13 +420,200 @@ test("a repeated final segment (retry/redelivery) is applied exactly once end to
 test("different segmentIds are independent -- applying one does not suppress another", () => {
   const sink = createFakeSink();
   const dispatcher = createInvocationDispatcher(sink);
-  dispatcher.apply("seg-a", decide(segment("Meetbot, help", true, "seg-a"), IDENTITY));
-  dispatcher.apply("seg-b", decide(segment("Meetbot, help again", true, "seg-b"), IDENTITY));
+  dispatcher.apply(decide(segment("Meetbot, can you help?", true, "seg-a"), IDENTITY));
+  dispatcher.apply(decide(segment("Meetbot, can you help again?", true, "seg-b"), IDENTITY));
   assert.equal(sink.authorized.length, 2);
 });
 
+test("a caller cannot apply one segment's decision under a different segment's id", () => {
+  // decide()'s output carries its own segmentId; apply() takes only the
+  // decision, so there is no separate id parameter through which a caller
+  // could mismatch them. Verified structurally: apply() has arity 1.
+  const sink = createFakeSink();
+  const dispatcher = createInvocationDispatcher(sink);
+  assert.equal(dispatcher.apply.length, 1);
+
+  const decision = decide(segment("Meetbot, can you help?", true, "seg-real"), IDENTITY);
+  dispatcher.apply(decision);
+  assert.deepEqual(sink.authorized, [{ segmentId: "seg-real", matchedAlias: "Meetbot" }]);
+});
+
 // ---------------------------------------------------------------------------
-// Property test: arbitrary segments containing no configured alias never
+// Configuration extends the default cue lexicons, does not replace them
+// ---------------------------------------------------------------------------
+
+test("additionalAddressCues extends (not replaces) the default lexicon", () => {
+  // "summarize" is not in the shipped default cue list -- without the
+  // extension this stays negative, same as the pinned known-limitation
+  // case above.
+  const baseline = decide(segment("Meetbot, summarize the decisions."), IDENTITY);
+  assertNegative(baseline, "incidental_mention");
+
+  const extended: InvocationGateIdentity = {
+    ...IDENTITY,
+    additionalAddressCues: ["summarize"],
+  };
+  assertPositive(decide(segment("Meetbot, summarize the decisions."), extended), "Meetbot");
+
+  // The built-in cues still work under the extended identity too --
+  // proving the extension is additive, not a replacement.
+  assertPositive(decide(segment("Meetbot, can you help?"), extended), "Meetbot");
+});
+
+test("additionalLeadingFillers extends (not replaces) the default lexicon", () => {
+  const baseline = decide(segment("Yo Meetbot, can you help?"), IDENTITY);
+  assertNegative(baseline, "incidental_mention");
+
+  const extended: InvocationGateIdentity = {
+    ...IDENTITY,
+    additionalLeadingFillers: ["yo"],
+  };
+  assertPositive(decide(segment("Yo Meetbot, can you help?"), extended), "Meetbot");
+
+  // The built-in fillers still work under the extended identity too.
+  assertPositive(decide(segment("Hey Meetbot, can you help?"), extended), "Meetbot");
+});
+
+// ---------------------------------------------------------------------------
+// Acceptance matrix -- required NEGATIVE fixtures
+//
+// Every entry here comes directly from the round-2 review's acceptance
+// list. False positives are zero-tolerance for this gate; every one of
+// these must never authorize, regardless of the reason token it resolves
+// to.
+// ---------------------------------------------------------------------------
+
+const REQUIRED_NEGATIVES: ReadonlyArray<{ readonly text: string; readonly note: string }> = [
+  { text: "I asked Meetbot about it yesterday.", note: "bare incidental mention, mid-sentence" },
+  { text: "Meetbot usually handles the notes.", note: "third-person discussion" },
+  {
+    text: "Meetbot, the note taker, is broken again.",
+    note: "appositive: alias at a comma-separated start, no address cue follows",
+  },
+  {
+    text: "Meetbot, yeah, it keeps dropping the audio.",
+    note: "filler-shaped word ('yeah') after the alias is not an address cue",
+  },
+  {
+    text: "Meetbot, our transcription tool, costs too much.",
+    note: "appositive describing the agent, not addressing it",
+  },
+  {
+    text: "We evaluated three: Fireflies, Otter, Meetbot.",
+    note: "alias is the last item in a list, not addressed",
+  },
+  { text: "Agenda: Meetbot", note: "alias is an agenda item, not addressed" },
+  { text: "Next topic, Meetbot.", note: "alias is a topic label, not addressed" },
+  { text: "the slack channel is eng-meetbot", note: "alias is a substring of a hyphenated identifier" },
+  { text: "Mei-Ling usually takes the notes.", note: "alias is a substring of a hyphenated human name" },
+  { text: "Meetbot-api is throwing 500s.", note: "alias is a substring of a hyphenated identifier" },
+  { text: "Amelie-Rose, are you there?", note: "alias is a substring of a hyphenated human name" },
+];
+
+for (const { text, note } of REQUIRED_NEGATIVES) {
+  test(`acceptance matrix (negative): "${text}" does not authorize -- ${note}`, () => {
+    const decision = decide(segment(text), IDENTITY);
+    assert.equal(
+      decision.authorize,
+      false,
+      `expected authorize=false for ${JSON.stringify(text)}, got ${JSON.stringify(decision)}`,
+    );
+  });
+}
+
+test("acceptance matrix (negative): any non-final segment does not authorize, whatever its text", () => {
+  for (const { text } of REQUIRED_NEGATIVES) {
+    const decision = decide(segment(text, false), IDENTITY);
+    assertNegative(decision, "non_final_segment");
+  }
+  // Also the required positive texts, made partial -- the hardest version
+  // of "whatever its text": a perfectly-shaped vocative that is not final.
+  for (const text of [
+    "Meetbot",
+    "Meetbot, what did we decide?",
+    "Hey Meetbot, can you summarize?",
+    "会议机器人总结一下",
+  ]) {
+    const decision = decide(segment(text, false), IDENTITY.aliases.includes("会议机器人") ? IDENTITY : CJK_IDENTITY);
+    assertNegative(decision, "non_final_segment");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Acceptance matrix -- required POSITIVE fixtures
+// ---------------------------------------------------------------------------
+
+const REQUIRED_POSITIVES: ReadonlyArray<{
+  readonly text: string;
+  readonly identity: InvocationGateIdentity;
+  readonly matchedAlias: string;
+  readonly note: string;
+}> = [
+  { text: "Meetbot", identity: IDENTITY, matchedAlias: "Meetbot", note: "alias alone" },
+  {
+    text: "Meetbot, what did we decide?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "comma + wh-word cue",
+  },
+  {
+    text: "Meetbot what did we decide",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "no punctuation, wh-word cue alone disambiguates",
+  },
+  {
+    text: "Hey Meetbot, can you summarize?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "leading filler + modal cue",
+  },
+  {
+    text: "So, Meetbot, can you summarize?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "leading filler with its own comma + modal cue",
+  },
+  {
+    text: "OK Meetbot, what did we decide?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "leading filler + wh-word cue",
+  },
+  {
+    text: "Meetbot, please summarize the decisions.",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "politeness cue",
+  },
+  {
+    text: "Can you take a note, Meetbot?",
+    identity: IDENTITY,
+    matchedAlias: "Meetbot",
+    note: "end position, preceding clause carries the modal cue",
+  },
+  {
+    text: "会议机器人，请总结一下",
+    identity: CJK_IDENTITY,
+    matchedAlias: "会议机器人",
+    note: "CJK, full-width comma + request marker",
+  },
+  {
+    text: "会议机器人总结一下",
+    identity: CJK_IDENTITY,
+    matchedAlias: "会议机器人",
+    note: "CJK, no separator at all, '一下' softener is the sole cue",
+  },
+];
+
+for (const { text, identity, matchedAlias, note } of REQUIRED_POSITIVES) {
+  test(`acceptance matrix (positive): "${text}" authorizes -- ${note}`, () => {
+    assertPositive(decide(segment(text), identity), matchedAlias);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Property test 1: arbitrary segments containing no configured alias never
 // authorize. Seeded, deterministic, prints the seed and the failing sample
 // on failure.
 // ---------------------------------------------------------------------------
@@ -400,33 +648,33 @@ const PROPERTY_ALPHABET = [
   '"',
   "(",
   ")",
-  "，", // ，
-  "。", // 。
-  "！", // ！
-  "？", // ？
-  "、", // 、
-  "你", // 你
-  "好", // 好
-  "会", // 会
-  "议", // 议
-  "机", // 机
-  "器", // 器
-  "人", // 人
-  "的", // 的
-  "了", // 了
-  "在", // 在
-  "是", // 是
-  "我", // 我
-  "他", // 他
-  "们", // 们
-  "这", // 这
-  "个", // 个
-  "有", // 有
-  "和", // 和
-  "é", // é
-  "ñ", // ñ
-  "ü", // ü
-  "ö", // ö
+  "，",
+  "。",
+  "！",
+  "？",
+  "、",
+  "你",
+  "好",
+  "会",
+  "议",
+  "机",
+  "器",
+  "人",
+  "的",
+  "了",
+  "在",
+  "是",
+  "我",
+  "他",
+  "们",
+  "这",
+  "个",
+  "有",
+  "和",
+  "é",
+  "ñ",
+  "ü",
+  "ö",
 ];
 
 function randomText(rng: () => number, maxLength: number): string {
@@ -448,7 +696,7 @@ function containsAnyAliasSubstring(text: string, identity: InvocationGateIdentit
   return identity.aliases.some((alias) => folded.includes(foldForContainmentCheck(alias)));
 }
 
-test("property: arbitrary generated text containing no configured alias never authorizes", () => {
+test("property 1: arbitrary generated text containing no configured alias never authorizes", () => {
   const SEED = 0x6d61_6f63; // "maoc", arbitrary fixed constant -- deterministic across runs
   const rng = mulberry32(SEED);
   const SAMPLES = 500;
@@ -471,6 +719,87 @@ test("property: arbitrary generated text containing no configured alias never au
     );
 
     const decision = decide({ segmentId: `prop-${i}`, text, final: true }, identity);
+    assert.equal(
+      decision.authorize,
+      false,
+      `seed=${SEED} sample=${i} text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Property test 2: an alias embedded in random filler at a NON-vocative
+// position (real, non-empty content on both sides) never authorizes. This
+// is the property that would have caught round 1's exact defect class: the
+// hyphen-as-separator bug and the appositive/agenda bug both involve the
+// alias sitting where random filler surrounds it on both sides, not where
+// it's alone or at a true segment edge.
+// ---------------------------------------------------------------------------
+
+const EMBED_ALPHABET = [
+  ..."abcdefghijklmnopqrstuvwxyz",
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  ..."0123456789",
+  " ",
+  " ",
+  ",",
+  ".",
+  "-",
+  "!",
+  "?",
+  ":",
+  ";",
+];
+
+function randomNonEmptyText(rng: () => number, minLength: number, maxLength: number): string {
+  const length = minLength + Math.floor(rng() * (maxLength - minLength + 1));
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    const idx = Math.floor(rng() * EMBED_ALPHABET.length);
+    out += EMBED_ALPHABET[idx];
+  }
+  return out;
+}
+
+function randomJoiner(rng: () => number): string {
+  const joiners = ["-", " ", ", ", ": ", ""];
+  return joiners[Math.floor(rng() * joiners.length)] ?? " ";
+}
+
+test("property 2: an alias embedded in random filler on both sides (never at a segment edge) never authorizes", () => {
+  const SEED = 0x656d_6265; // "embe", arbitrary fixed constant -- deterministic across runs
+  const rng = mulberry32(SEED);
+  const SAMPLES = 300;
+  const identity = IDENTITY;
+  const alias = "Meetbot";
+
+  for (let i = 0; i < SAMPLES; i += 1) {
+    let prefix = randomNonEmptyText(rng, 1, 25);
+    let suffix = randomNonEmptyText(rng, 1, 25);
+    let guard = 0;
+    // Guard against: (a) the random prefix/suffix accidentally spelling out
+    // another occurrence of a configured alias, which would make the
+    // "no alias elsewhere" premise false, and (b) the prefix folding down
+    // to exactly a recognized leading filler word, which would legitimately
+    // make this a real (non-embedded) vocative and defeat the point of the
+    // test.
+    const foldedFillers = new Set(["hey", "hi", "hello", "so", "ok", "okay", "um", "uh"]);
+    function isProblematic(): boolean {
+      if (containsAnyAliasSubstring(prefix, identity) || containsAnyAliasSubstring(suffix, identity)) {
+        return true;
+      }
+      const foldedPrefix = foldForContainmentCheck(prefix).trim().replace(/[,.\-!?:;]+$/u, "");
+      return foldedFillers.has(foldedPrefix);
+    }
+    while (isProblematic() && guard < 15) {
+      prefix = randomNonEmptyText(rng, 1, 25);
+      suffix = randomNonEmptyText(rng, 1, 25);
+      guard += 1;
+    }
+    assert.ok(!isProblematic(), `seed=${SEED} sample=${i}: could not generate a clean embedding after ${guard} retries`);
+
+    const text = `${prefix}${randomJoiner(rng)}${alias}${randomJoiner(rng)}${suffix}`;
+    const decision = decide({ segmentId: `embed-${i}`, text, final: true }, identity);
     assert.equal(
       decision.authorize,
       false,
