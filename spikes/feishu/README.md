@@ -99,7 +99,7 @@ The seven required scenarios, one fixture file each:
 | `two-highlighted-tiles.json` | two tiles highlighted at once, both individually resolvable | `active_speaker` (`ambiguous`, `feishuUserId: null`) — **never** a chosen participant |
 | `participant-join.json` | roster grows by one | `participant_joined` |
 | `participant-leave.json` | roster shrinks by one (after two joins) | `participant_joined` × 2, then `participant_left` |
-| `meeting-ended.json` | UI shows the meeting ended | `left` (`reason: "ended"`) |
+| `meeting-ended.json` | UI shows the meeting ended | `left` (`reason: "ended"`), and nothing after it — a session is terminal once it has left |
 | `missing-chat-control.json` | disclosure attempted, no chat control found | `chat_disclosure` (`outcome: "unavailable"`) |
 
 ## Evidence fields
@@ -148,7 +148,8 @@ test` runs the `*.test.ts` files.
 npm test
 ```
 
-runs every `**/*.test.ts` in the repo, including `spikes/feishu/test/reducer.test.ts`
+runs every `*.test.ts` under `spikes/`, `bridges/`, `src/` and `test/`,
+including `spikes/feishu/test/reducer.test.ts`
 (unit-level ambiguity-policy and sequencing tests against hand-built fake
 ports) and `spikes/feishu/test/replay.test.ts` (the seven fixture scenarios,
 each asserting the full ordered `BridgeEvent` list, plus stream-validator and

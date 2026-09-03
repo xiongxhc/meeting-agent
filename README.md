@@ -14,14 +14,18 @@ fixtures/contracts/ the frozen contract bytes both languages test against
 spikes/feishu/      platform-neutral half: validator, recorder, observation
                     reducer (the reference ambiguity policy), replay harness
 bridges/mac/        Swift package: accessibility observer, client adapter,
-                    JSONL recorder — unit-tested against synthetic trees only
-docs/feasibility/   what a human will measure; empty until they measure it
+                    duplex audio bridge, JSONL recorder — unit-tested against
+                    synthetic trees and marker bytes only
+bridges/linux-browser/  agent-box web-client probe: meeting discovery and
+                    capability classification, over recorded synthetic DOM
+docs/feasibility/   the client matrix and the Mac language decision — both
+                    written, both with every measurement cell still empty
 docs/HUMAN-CHECKLIST.md  steps deliberately not attempted by an agent
 ```
 
 ## Running the tests
 
 ```
-npm test                        # TypeScript: node --test over **/*.test.ts
+npm test                        # TypeScript: node --test over the source trees
 cd bridges/mac && swift test    # Swift: no external dependencies, no network
 ```

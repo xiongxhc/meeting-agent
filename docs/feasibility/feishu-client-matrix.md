@@ -210,8 +210,8 @@ and must happen before any row below can be filled.
 
 This section is the plan's final statement, written after every row above was
 confirmed still empty. It is not "Swift passed" or "Linux failed" — it is a
-statement of what exists proven in software (unit tests, run locally, see
-`docs/HUMAN-CHECKLIST.md`'s companion report) versus what has never been
+statement of what exists proven in software (unit tests, run locally with
+`npm test` and `cd bridges/mac && swift test`) versus what has never been
 measured against a real client. Every claim below is checkable against a
 named test file or an explicit "not measured"; nothing here claims a
 real-client observation that did not happen.
@@ -227,8 +227,8 @@ constructor parameter generous enough to cover a waiting-room admission,
 which can take as long as the host takes to admit, but the same deadline and
 the same method apply to every join regardless of which of the five rows
 produced it. All 18 `FeishuClientAdapterTests` drive that same generic method
-against the same fake-tree shape (all passing; see the Task 7 report for the
-run); none simulates a calendar-invite-, host-transfer-, or
+against the same fake-tree shape (all passing; `cd bridges/mac && swift test`);
+none simulates a calendar-invite-, host-transfer-, or
 reconnect-specific flow, because no such flow exists to simulate. None of the
 five rows has ever been exercised against a real Feishu client, a real
 tenant, or a real meeting. They are **built, not supported** — "supported" is
@@ -252,7 +252,7 @@ empty.
 
 **Degraded behaviours — proven in unit tests, not on a real client.** Four
 degraded-path guarantees exist in the code and each has a passing unit test
-(see the Task 7 report's `npm test` / `swift test` output):
+(`npm test`, and `cd bridges/mac && swift test`):
 - An accessibility read that cannot locate the meeting window does not claim
   the meeting ended. One such frame is reported as unobservable and emits
   nothing; three consecutive ones emit `left(reason: "bridge_failure")`, which
@@ -297,7 +297,7 @@ decision.
 **Linux standalone: not tested, not failed.** The agent-box probe's
 meeting-discovery and failure-classification logic exists and is unit-tested
 (`bridges/linux-browser/src/probe.ts`, `bridges/linux-browser/test/probe.test.ts`,
-15 tests, all passing) against recorded synthetic DOM fixtures only. No real
+15 tests, all passing under `npm test`) against recorded synthetic DOM fixtures only. No real
 browser, no real Feishu web client, no network call, and no agent-box access
 has ever occurred — every row in the **agent-box standalone** table above is
 `not tested`, and that word is deliberate: `not tested` and `failed` are
@@ -310,8 +310,8 @@ coordinator-plus-Mac profile — that profile depends on the Mac bridge
 sections of this matrix and on `mac-bridge-decision.md`, not on this section.
 
 **What this verdict is, plainly stated.** Every task in this plan built
-working, unit-tested software: 69 TypeScript tests and 86 Swift tests pass
-(see the Task 7 report for the full run). Not one of those tests, and no
+working, unit-tested software: 72 TypeScript tests and 92 Swift tests pass
+(`npm test`, and `cd bridges/mac && swift test`). Not one of those tests, and no
 other activity in this plan, has driven a real Feishu client, joined a real
 meeting, captured real audio, or probed agent-box. That is by design — every
 such step is listed, with its exact procedure, in `docs/HUMAN-CHECKLIST.md`,

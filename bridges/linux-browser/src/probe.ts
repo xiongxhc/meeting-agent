@@ -13,8 +13,7 @@
  * implementation used by those tests; a real implementation would query the
  * live page's DOM through whatever automation the agent-box session uses --
  * nothing here assumes which one, and this package adds none (see
- * bridges/linux-browser/README, if one exists, or the Task 6 report for why
- * no browser-automation dependency was introduced).
+ * bridges/linux-browser/README.md, "No browser automation").
  *
  * The rule this file exists to hold: a capability the probe never attempted
  * to exercise must classify as `not tested`, and that must never be
@@ -67,6 +66,13 @@ export const ALL_CAPABILITIES: readonly CapabilityId[] = [
  * `docs/feasibility/feishu-client-matrix.md`. `not tested` is the default
  * for a capability the probe never attempted -- it is never inferred from a
  * failure or an absence, only from an empty attempt log.
+ *
+ * The words match; the bar behind two of them does not. `proven` here means
+ * "every attempt actually made succeeded", which one attempt satisfies. The
+ * join-path rows of that matrix use `proven` (and `unreliable`) against a
+ * four-consecutive-clean-runs bar. The matrix states the difference in full
+ * in its agent-box section, above the capability table; a `proven` produced
+ * here is not a claim that the four-run bar was met.
  */
 export type CapabilityResult = "proven" | "unreliable" | "unavailable" | "not tested";
 

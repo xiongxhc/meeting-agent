@@ -20,8 +20,20 @@ public let bridgeSessionSchema = "bridge-session/v1"
 
 // MARK: - rejections
 
-/// Machine-readable rejection reasons, sharing the vocabulary of
-/// `BridgeRejectionCode` in the TypeScript view.
+/// Machine-readable rejection reasons. Every case below spells the same string
+/// as its `BridgeRejectionCode` counterpart in the TypeScript view, but the set
+/// is a strict subset of it: five of that type's codes have no producer here.
+///
+///   - `not_an_object` — `JSONDecoder` fails with its own type mismatch before
+///     any contract check in this file runs, so nothing here can raise it.
+///   - `session_mismatch`, `sequence_duplicate`, `sequence_out_of_order` — the
+///     stream rules, which live in `BridgeRecorder` and are reported by
+///     returning `false` from `record`, not by throwing a contract error.
+///   - `unknown_command_id` — needs the set of commands a session issued, which
+///     the coordinator holds. This package never validates a `command_result`
+///     against it.
+///
+/// A Swift case is added here only when Swift code can actually produce it.
 public struct BridgeContractError: Error, Equatable, CustomStringConvertible {
     public enum Code: String, Sendable {
         case schemaUnknown = "schema_unknown"

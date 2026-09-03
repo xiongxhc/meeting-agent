@@ -26,9 +26,10 @@ task.
 The task's six bullets split in two. Bullets 1-3 (write unit tests against fake
 accessibility trees; implement the smallest adapter with localized labels in one
 mapping file; run `swift test` and the protocol replay tests) are done in code —
-see `bridges/mac/` and the Task 3 report. Bullets 4-6 need a real Feishu test
-tenant, five real meeting joins, a real typed disclosure, and real client and OS
-versions. They were not attempted and not simulated, and nothing has been
+see `bridges/mac/` — reproduce with `cd bridges/mac && swift test`. Bullets
+4-6 need a real Feishu test tenant, five real meeting joins, a real typed
+disclosure, and real client and OS versions. They were not attempted and not
+simulated, and nothing has been
 written into `docs/feasibility/feishu-client-matrix.md` that claims a
 measurement. They are below.
 
@@ -66,7 +67,11 @@ attempted.
    and a test target, no executable, so there is nothing to launch. Whoever
    builds items 2 and 3 must also add the executable target that wires an
    adapter, an observer, a reducer, and a `BridgeRecorder` together and writes
-   the JSONL evidence file that 3.1 and 3.2 ask for.
+   the JSONL evidence file that 3.1 and 3.2 ask for. **Name that executable
+   `FeishuBridgeSpike`.** Sections 5.1 criteria 3 and 6 match the running
+   process with `pkill -f FeishuBridgeSpike` and `pgrep -f FeishuBridgeSpike`;
+   under any other name those commands match nothing and the two criteria
+   cannot be measured as written.
 
 #### 3.0a Capture the real accessibility identifiers
 
@@ -99,7 +104,8 @@ notice: it is the only evidence from which the bridge claims the meeting ended.
 Without it, three consecutive frames in which no meeting window could be located
 report `left(reason: "bridge_failure")` instead — the bridge gave up reading the
 client — so on a client with no such notice every session ends that way, and the
-coordinator has no observation that the meeting itself finished. Do not paste a full tree dump into the repository — it will contain
+coordinator has no observation that the meeting itself finished. Do not paste a
+full tree dump into the repository — it will contain
 real participant names.
 
 #### 3.0b Establish whether a participant identity is resolvable at all
@@ -220,8 +226,9 @@ playback gap events, mute state and immediate playback cancellation; prove with
 a fake media endpoint that frames travel directly between the bridge and the
 Rust endpoint with no Node.js process in the frame path; run `swift test`) are
 done in code — see `bridges/mac/Sources/FeishuBridgeSpike/AudioBridge.swift`,
-`LoopbackMediaClient.swift`, and the Task 4 report. Bullets 4-5 need a real
-Feishu test meeting, a real calibration phrase, a returned tone, real latency
+`LoopbackMediaClient.swift` — reproduce with `cd bridges/mac && swift test`.
+Bullets 4-5 need a real Feishu test meeting, a real calibration phrase, a
+returned tone, real latency
 and interruption measurements, and a one-hour two-participant run. They were
 not attempted and not simulated. **No latency, echo, or stop-time number exists
 anywhere in this repository**, and no row of
@@ -461,8 +468,8 @@ or verdict exists anywhere in this repository for this task.
 
 ### 5.0 Prerequisite
 
-Sections 3.0, 3.1, 3.2, 4.0, and 4.1 in this checklist (Tasks 3 and 4) must be
-done first — most of the seven criteria below are scored from those same runs,
+Sections 3.0, 3.1, 3.2, 4.0, 4.1, and 4.2 in this checklist (Tasks 3 and 4)
+must be done first — criterion 6 is sampled during 4.2's one-hour run — most of the seven criteria below are scored from those same runs,
 not from separate ones. Criteria 2 (system audio capture), 4 (binary
 distribution), and 6 (CPU use) need work beyond Tasks 3/4 that this checklist
 does not create; see the "How to measure it" column in
@@ -518,7 +525,7 @@ revoked after an OS update or after the binary was rebuilt/re-signed.
 sample the bridge process's CPU use at least ten times:
 
 ```
-top -pid $(pgrep -f FeishuBridgeSpike) -l 10 -stats pid,cpu -s 30
+top -pid $(pgrep -f FeishuBridgeSpike | head -1) -l 10 -stats pid,cpu -s 30
 ```
 
 Record steady-state (typical sample) and peak (highest sample) CPU percentage.
@@ -547,8 +554,9 @@ language, on preference alone.
 The task's four bullets split in two. Bullet 1 (unit-test browser meeting
 discovery and failure classification using recorded DOM fixtures, no
 credentials, no tenant HTML) is done in code — see
-`bridges/linux-browser/src/probe.ts`, `bridges/linux-browser/test/probe.test.ts`,
-and the Task 6 report. Bullets 2-4 need an isolated agent-box test session
+`bridges/linux-browser/src/probe.ts` and
+`bridges/linux-browser/test/probe.test.ts` — reproduce with `npm test`.
+Bullets 2-4 need an isolated agent-box test session
 and a real Feishu web client login. They were not attempted and not
 simulated, and every result cell added to
 `docs/feasibility/feishu-client-matrix.md`'s **agent-box standalone**
@@ -571,9 +579,10 @@ section is `not tested`. They are below.
   the same `classifyCapability` / `classifyAllCapabilities` logic already
   unit-tested here. Writing that real driver (a real `PagePort`
   implementation backed by actual browser automation) is itself part of this
-  human-gated work, not something this repository's automated tests do —
-  see the YAGNI note in the Task 6 report for why no browser-automation
-  dependency was added to the package.
+  human-gated work, not something this repository's automated tests do.
+  The package deliberately adds no browser-automation dependency: nothing in
+  it opens a browser, so the dependency would ship with no caller. See
+  `bridges/linux-browser/README.md`, "No browser automation".
 
 ### 6.1 Brief bullets 2-3 — probe each capability, record evidence
 
@@ -650,7 +659,9 @@ The task's five bullets split in two. Bullets 1, 3, 4, and 5 (run `npm test`,
 `bridges/mac`; structure the verdict section in
 `docs/feasibility/feishu-client-matrix.md`; run a secret scan; review the
 scoped branch diff) are done — see `docs/feasibility/feishu-client-matrix.md`'s
-**Feasibility verdict (Task 7)** section and the Task 7 report. Bullet 2 needs
+**Feasibility verdict (Task 7)** section; reproduce the runs behind it with
+`npm test`, `npm run typecheck`, `npm run lint`, `npm run build`, and
+`cd bridges/mac && swift test`. Bullet 2 needs
 a real Feishu client freshly launched from a cold start. It was not attempted
 and not simulated. It is below.
 

@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test \"**/*.test.ts\"",
+    "test": "node --test \"spikes/**/*.test.ts\" \"bridges/**/*.test.ts\" \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc"

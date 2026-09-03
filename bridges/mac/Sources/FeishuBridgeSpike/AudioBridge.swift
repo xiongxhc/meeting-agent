@@ -267,6 +267,13 @@ public final class AudioBridge {
         playbackFramesDroppedByCancellation = 0
         playbackCancelled = false
         openPlaybackGapStartedAt = nil
+        // The capture continuity baseline is session state too. `disconnect`
+        // already clears it, and the guard above means a live session cannot be
+        // reconnected over, so today it is always nil here — it is reset anyway
+        // so the invariant this comment states is the one the code enforces,
+        // not one that happens to hold.
+        lastCaptureMonotonic = nil
+        lastCaptureObservedAt = nil
         mediaClient.setPlaybackSink { [weak self] frame in self?.receivePlayback(frame) }
         controlPlane.emit(.mediaConnected(endpoint: endpoint), observedAt: observedAt)
         return .connected(requested)
@@ -328,8 +335,11 @@ public final class AudioBridge {
         let frame = AudioFrame(
             direction: .capture, sequence: captureSequence, timestampMilliseconds: monotonic,
             payload: payload)
-        mediaClient.send(frame)
+        // Counted before the send, not after: `send` re-enters `receivePlayback`
+        // synchronously through a loopback sink, so anything the playback path
+        // reads must already be true when the call is made.
         capturedFramesSent += 1
+        mediaClient.send(frame)
         return frame
     }
 
