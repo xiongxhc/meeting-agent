@@ -56,7 +56,7 @@ import {
   createBridgeSessionValidator,
   type BridgeEventMessage,
 } from "../contracts/bridge-session-v1.ts";
-import { createRuntimeInvocationSink } from "../adapters/conversation-runtime-client.ts";
+import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import {
   BridgeContractError,
@@ -73,12 +73,30 @@ import type {
   RecordingHandle,
   RuntimeEvent,
 } from "../ports/conversation-runtime.ts";
+import type { TeamVaultIndexPort, TeamVaultSearchResult } from "../ports/knowledge.ts";
 import type { Clock, SessionCoordinator, TerminalOutcome } from "./coordinator.ts";
 import {
   createInvocationDispatcher,
   decide,
   type InvocationGateIdentity,
+  type InvocationSink,
 } from "./invocation-gate.ts";
+import { createRetrievalRouter, type RetrievalRouter } from "./retrieval-router.ts";
+
+/** Used when the session was given neither `options.retrieval` nor
+ * `options.teamVaultDir`: the router still answers from the current
+ * meeting alone, and states plainly that historical team memory is
+ * unavailable for anything the current meeting alone cannot cover -- the
+ * same degraded path a broken checkout takes (see
+ * createTeamVaultIndexOrDegraded), never a silently-empty vault. */
+const UNCONFIGURED_VAULT: TeamVaultIndexPort = {
+  search(): TeamVaultSearchResult {
+    throw new Error(
+      "no Team Vault checkout is configured for this session (neither options.retrieval " +
+        "nor options.teamVaultDir was set)",
+    );
+  },
+};
 
 export { BridgeContractError } from "../ports/bridge.ts";
 
@@ -231,6 +249,20 @@ export type CreateMeetingSessionOptions = {
   /** Injected so command ids are deterministic under test. Defaults to a
    * per-session counter, which is already deterministic. */
   readonly nextCommandId?: () => string;
+  /** The published Team Vault checkout this session's retrieval router
+   * reads (`config.dataPaths.teamVaultDir`). The session never opens it
+   * directly -- it builds a read-only index once via
+   * `createTeamVaultIndexOrDegraded`, which never throws: a missing or
+   * broken checkout degrades to an always-"vault unavailable" index rather
+   * than failing the session (see src/adapters/team-vault-index.ts).
+   * Ignored when `retrieval` is provided. Omitting both leaves retrieval
+   * permanently in the same degraded state, answering from the current
+   * meeting alone. */
+  readonly teamVaultDir?: string;
+  /** Test/advanced-caller override: an already-built retrieval router
+   * (e.g. wired to a fake Team Vault index), used instead of the session
+   * building one from `teamVaultDir`. */
+  readonly retrieval?: RetrievalRouter;
 };
 
 type QueueItem =
@@ -293,11 +325,72 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let unsubscribeBridge: (() => void) | null = null;
   let unsubscribeRuntime: (() => void) | null = null;
 
+  // What the agent knows when it answers: current-meeting memory first,
+  // this session's Team Vault index second -- see
+  // src/sessions/retrieval-router.ts, the ordering's owner. `options.retrieval`
+  // (tests, advanced callers) wins outright; otherwise a router is built
+  // from `options.teamVaultDir` via the non-throwing constructor, so a
+  // missing or broken checkout degrades retrieval instead of failing the
+  // session (see createTeamVaultIndexOrDegraded and UNCONFIGURED_VAULT
+  // above).
+  const retrievalRouter: RetrievalRouter =
+    options.retrieval ??
+    createRetrievalRouter({
+      vault:
+        options.teamVaultDir === undefined
+          ? UNCONFIGURED_VAULT
+          : createTeamVaultIndexOrDegraded({ teamVaultDir: options.teamVaultDir }),
+      sink: runtime,
+    });
+
+  // A transcript_final segment's text, captured just long enough for the
+  // sink's authorizeVoiceResponse (below) to hand it to the retrieval
+  // router -- the gate's own sink contract (InvocationSink, src/sessions/
+  // invocation-gate.ts) carries segmentId and matchedAlias only, never the
+  // segment text, so this is what supplies the router something to search
+  // for. Removed the moment it is consumed either way (skip or authorize).
+  const pendingQueryText = new Map<string, string>();
+  // In-flight retrieval-then-authorize work the sink kicks off without the
+  // pump loop awaiting it (see the "not awaited here, deliberately" note
+  // below) -- tracked so settled() can still wait for it. Without this, a
+  // caller awaiting settled() could observe the queue as idle before the
+  // runtime actually received seedContext/authorizeVoiceResponse, since
+  // seeding context adds a real await the runtime call alone did not have.
+  const pendingSinkWork = new Set<Promise<void>>();
+
   // The gate's sink and dispatcher. The dispatcher owns "one decision applied
-  // per segmentId"; this module never re-derives a decision.
-  const sink = createRuntimeInvocationSink(runtime, (segmentId, error) => {
-    runtimeErrors.push({ segmentId, error });
-  });
+  // per segmentId"; this module never re-derives a decision. The retrieval
+  // router slots in HERE, between the gate's positive decision and the
+  // runtime actually being told to speak: authorizeVoiceResponse searches
+  // current-meeting memory first, the Team Vault only if that was
+  // insufficient, seeds the bounded result through the runtime's context
+  // API, and only THEN authorizes.
+  const sink: InvocationSink = {
+    skipVoiceResponse(segmentId: string, reason): void {
+      pendingQueryText.delete(segmentId);
+      runtime.skipVoiceResponse(segmentId, reason).catch((error: unknown) => {
+        runtimeErrors.push({ segmentId, error });
+      });
+    },
+    authorizeVoiceResponse(segmentId: string, matchedAlias: string): void {
+      const queryText = pendingQueryText.get(segmentId) ?? "";
+      pendingQueryText.delete(segmentId);
+      // Not awaited here, deliberately -- matching every other runtime call
+      // in this module (see skipVoiceResponse above, and finalizeRecording
+      // below): the pump never blocks on a runtime round-trip. Tracked in
+      // pendingSinkWork instead, so settled() still waits for it.
+      const work = retrievalRouter
+        .answer({ segmentId, authorize: true, matchedAlias }, queryText)
+        .then(() => {})
+        .catch((error: unknown) => {
+          runtimeErrors.push({ segmentId, error });
+        });
+      pendingSinkWork.add(work);
+      void work.finally(() => {
+        pendingSinkWork.delete(work);
+      });
+    },
+  };
   const dispatcher = createInvocationDispatcher(sink);
 
   // ---- outbound ---------------------------------------------------------
@@ -449,6 +542,37 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     await handleRuntimeEvent(item.event);
   }
 
+  /**
+   * Resolves once BOTH the local event queue is drained AND every
+   * retrieval-then-authorize call the queue's own synchronous dispatch
+   * kicked off (see sink.authorizeVoiceResponse) has settled.
+   *
+   * Those two are different things: the queue can go idle -- `pumping`
+   * false, nothing left to shift -- while a `pendingSinkWork` entry it
+   * started is still awaiting `seedContext`/`authorizeVoiceResponse`
+   * against the runtime, because that work is deliberately NOT awaited
+   * inline (the pump never blocks on a runtime round-trip; see the sink's
+   * own comment). Looping rather than checking once matters here: while
+   * this function awaits the current sink work, the queue could receive
+   * (and finish draining) a new item, so a single check could return before
+   * everything genuinely in flight has settled.
+   */
+  async function whenIdle(): Promise<void> {
+    for (;;) {
+      if (pumping || queue.length > 0) {
+        await new Promise<void>((resolve) => {
+          idleWaiters.push(resolve);
+        });
+        continue;
+      }
+      if (pendingSinkWork.size > 0) {
+        await Promise.allSettled([...pendingSinkWork]);
+        continue;
+      }
+      return;
+    }
+  }
+
   // ---- inbound: bridge --------------------------------------------------
 
   async function handleBridgeMessage(raw: unknown): Promise<void> {
@@ -547,10 +671,18 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         const segmentId = event.segment.segmentId;
         if (settledTurns.has(segmentId) || openTurns.has(segmentId)) return; // redelivery
 
+        const meetingSegment = {
+          segmentId,
+          text: event.segment.text,
+          final: event.segment.final,
+        };
+
         if (speaking === "aborted") {
           // Higher priority than the gate: the runtime is still TOLD to stay
           // silent -- silence is a decision it is informed of, not an absence
-          // of one -- but no branch here can authorize.
+          // of one -- but no branch here can authorize. Meeting knowledge
+          // still accrues: capture is not gated on the ability to speak.
+          retrievalRouter.prepare(meetingSegment);
           await runtime.skipVoiceResponse(segmentId, "speaking_aborted").catch((error: unknown) => {
             runtimeErrors.push({ segmentId, error });
           });
@@ -558,8 +690,25 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           return;
         }
 
+        // Read by sink.authorizeVoiceResponse if the gate authorizes this
+        // segment below; discarded either way once consumed there or in
+        // sink.skipVoiceResponse.
+        pendingQueryText.set(segmentId, event.segment.text);
         const decision = decide(event.segment, agentIdentity);
         dispatcher.apply(decision);
+
+        // Recorded into current-meeting memory AFTER dispatching the
+        // decision, deliberately: sink.authorizeVoiceResponse (above) runs
+        // its retrieval search SYNCHRONOUSLY up to its first await, inside
+        // dispatcher.apply's own call stack -- so recording this segment
+        // before that point would let a question answer ITSELF (its own
+        // text trivially "covers" its own query terms, which would make
+        // every current-meeting search look sufficient and the Team Vault
+        // never get reached). Recording here means this segment becomes
+        // available to LATER questions without ever being retrievable by
+        // its own.
+        retrievalRouter.prepare(meetingSegment);
+
         if (decision.authorize) {
           openTurns.add(segmentId);
         } else {
@@ -880,10 +1029,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     },
 
     settled(): Promise<void> {
-      if (!pumping && queue.length === 0) return Promise.resolve();
-      return new Promise<void>((resolve) => {
-        idleWaiters.push(resolve);
-      });
+      return whenIdle();
     },
 
     dispose(): void {

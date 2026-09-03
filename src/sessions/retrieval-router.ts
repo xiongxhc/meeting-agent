@@ -218,6 +218,20 @@ function boundHits(hits: readonly KnowledgeHit[]): {
     // budget -- EXCERPT_MAX_CHARS is already well under
     // MAX_SEEDED_CONTEXT_CHARS, so this only guards against a future bound
     // change making the two inconsistent, not against a real case today.
+    //
+    // BREAK, NOT CONTINUE: hits arrive here sorted best-score-first, and the
+    // moment one hit would push the running total over budget, the loop
+    // stops outright rather than skipping that hit and trying the next
+    // (lower-scoring, possibly smaller) one. The policy this produces is
+    // "the context is the best-scoring hits that fit contiguously from the
+    // top," not "pack in as many hits as the budget allows" -- a smaller
+    // but lower-scoring hit further down the list is never substituted in
+    // to fill the remaining budget, even when it would fit. This is a
+    // deliberate, predictable choice (a reader can tell which hits are
+    // seeded from the score order alone, without also having to reason
+    // about excerpt sizes), not an oversight; the trade-off is that a
+    // border-line-sized top hit can leave budget unused that a later,
+    // smaller hit would have filled.
     if (boundedHits.length > 0 && usedChars + excerpt.length > MAX_SEEDED_CONTEXT_CHARS) break;
     boundedHits.push({ ...hit, excerpt });
     if (truncated) truncatedHitCount += 1;

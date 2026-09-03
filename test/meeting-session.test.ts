@@ -54,8 +54,14 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { createRuntimeInvocationSink } from "../src/adapters/conversation-runtime-client.ts";
 import { buildMeetingIdentity, type MeetingIdentity } from "../src/domain/meeting.ts";
 import { createCoordinator, type SessionCoordinator } from "../src/sessions/coordinator.ts";
+import { createRetrievalRouter, type RetrievalRouter } from "../src/sessions/retrieval-router.ts";
 import { collectImports } from "./lib/import-scanner.ts";
 import type { SessionStore } from "../src/ports/session-store.ts";
+import type {
+  KnowledgeHit,
+  TeamVaultIndexPort,
+  TeamVaultSearchResult,
+} from "../src/ports/knowledge.ts";
 import { createMeetingSession, type MeetingSession } from "../src/sessions/meeting-session.ts";
 import { fakeBridge, fakeClock, fakeRuntime, type FakeBridge, type FakeRuntime } from "./lib/session-fakes.ts";
 
@@ -93,6 +99,11 @@ type Harness = {
 type HarnessOptions = {
   readonly runtime?: FakeRuntime;
   readonly maxQueuedEvents?: number;
+  /** Test/advanced-caller override, threaded straight to
+   * CreateMeetingSessionOptions.retrieval -- see meeting-session.ts. Used
+   * by the retrieval-wiring suite to inject a router built against a
+   * call-tracking fake Team Vault index. */
+  readonly retrieval?: RetrievalRouter;
 };
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -120,6 +131,7 @@ function harness(options: HarnessOptions = {}): Harness {
     bridgeSessionId: BRIDGE_SESSION_ID,
     disclosureText: DISCLOSURE_TEXT,
     ...(options.maxQueuedEvents === undefined ? {} : { maxQueuedEvents: options.maxQueuedEvents }),
+    ...(options.retrieval === undefined ? {} : { retrieval: options.retrieval }),
   });
 
   return {
@@ -163,6 +175,24 @@ function transcript(segmentId: string, text: string, final = true) {
       final,
       startedAt: "2026-09-02T14:05:00Z",
       endedAt: "2026-09-02T14:05:04Z",
+    },
+  };
+}
+
+/** A call-tracking Team Vault index fake, for the retrieval-wiring suite --
+ * the whole point of those tests is to assert on whether the SESSION ever
+ * reaches this fake, not merely that an answer came back right. */
+function fakeVaultIndex(respond: () => readonly KnowledgeHit[]): TeamVaultIndexPort & {
+  readonly calls: number;
+} {
+  let calls = 0;
+  return {
+    get calls() {
+      return calls;
+    },
+    search(): TeamVaultSearchResult {
+      calls += 1;
+      return { hits: respond(), indexedRevision: "synthetic-rev-0001", stale: false };
     },
   };
 }
@@ -2029,5 +2059,162 @@ test("a cleanup failure during a failed join does not replace the error that fai
     h.coordinator.releaseBridgeLease = realRelease;
   } finally {
     h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Retrieval wiring: the router (src/sessions/retrieval-router.ts) actually
+// sits between the gate's positive decision and the runtime being told to
+// speak, in the REAL session -- not merely in the router's own isolated
+// suite (test/retrieval-router.test.ts). Task 11's exit criteria ("named
+// question -> vault lookup -> response", "uses current context before Team
+// Vault") can only be proven end to end here: this is that proof.
+// ---------------------------------------------------------------------------
+
+test("a named question the current meeting already answers is seeded and authorized without ever reaching the Team Vault", async () => {
+  const runtime = fakeRuntime();
+  const vault = fakeVaultIndex(() => {
+    throw new Error("the vault must never be called when the current meeting sufficed");
+  });
+  const retrieval = createRetrievalRouter({ vault, sink: runtime });
+  const h = harness({ runtime, retrieval });
+  try {
+    await joined(h);
+
+    // Establishes current-meeting content well BEFORE any question is
+    // asked -- this segment never mentions the agent at all.
+    h.runtime.emit(transcript("seg-fact", "The launch budget is fifty thousand dollars."));
+    await h.session.settled();
+
+    h.runtime.emit(transcript("seg-q", "Meetbot, what is the launch budget?"));
+    await h.session.settled();
+
+    assert.equal(vault.calls, 0, "the Team Vault index must never be reached");
+
+    const seedCalls = h.runtime.callsOf("seedContext");
+    assert.equal(seedCalls.length, 1);
+    const seeded = seedCalls[0];
+    assert.ok(seeded && seeded.method === "seedContext");
+    assert.equal(seeded.context.segmentId, "seg-q");
+    assert.equal(seeded.context.vaultQueried, false);
+    assert.equal(seeded.context.vaultUnavailable, false);
+    assert.ok(seeded.context.hits.every((h2) => h2.source === "current_meeting"));
+    assert.match(seeded.context.text, /fifty thousand dollars/);
+
+    assert.deepEqual(h.runtime.callsOf("authorizeVoiceResponse"), [
+      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+    ]);
+
+    // Context is seeded strictly before the segment is authorized, in the
+    // REAL runtime's own call log -- not merely in the router's isolated
+    // unit test.
+    const seedIndex = h.runtime.calls.findIndex((c) => c.method === "seedContext");
+    const authorizeIndex = h.runtime.calls.findIndex((c) => c.method === "authorizeVoiceResponse");
+    assert.ok(seedIndex >= 0 && authorizeIndex >= 0 && seedIndex < authorizeIndex);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a named question the current meeting cannot answer reaches the Team Vault, and its hit is seeded", async () => {
+  const runtime = fakeRuntime();
+  const vault = fakeVaultIndex(() => [
+    {
+      source: "team_vault",
+      sourcePath: "notes/vendor-contract.md",
+      excerpt: "The vendor contract renewal was pushed to Q4 pending legal review.",
+      score: 0.9,
+      indexedRevision: "synthetic-rev-0001",
+    },
+  ]);
+  const retrieval = createRetrievalRouter({ vault, sink: runtime });
+  const h = harness({ runtime, retrieval });
+  try {
+    await joined(h);
+
+    // No current-meeting content precedes this question at all -- the
+    // current meeting cannot possibly be sufficient, so the router must
+    // reach the vault.
+    h.runtime.emit(
+      transcript("seg-q", "Meetbot, what did we decide about the vendor contract renewal?"),
+    );
+    await h.session.settled();
+
+    assert.equal(vault.calls, 1, "the Team Vault index must be reached exactly once");
+
+    const seedCalls = h.runtime.callsOf("seedContext");
+    assert.equal(seedCalls.length, 1);
+    const seeded = seedCalls[0];
+    assert.ok(seeded && seeded.method === "seedContext");
+    assert.equal(seeded.context.vaultQueried, true);
+    assert.equal(seeded.context.vaultUnavailable, false);
+    assert.ok(seeded.context.hits.some((h2) => h2.source === "team_vault"));
+    assert.match(seeded.context.text, /vendor contract renewal was pushed to Q4/);
+
+    assert.deepEqual(h.runtime.callsOf("authorizeVoiceResponse"), [
+      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+    ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a broken Team Vault checkout degrades the session's retrieval instead of failing it", async () => {
+  const runtime = fakeRuntime();
+  const missingCheckout = path.join(
+    os.tmpdir(),
+    "meeting-agent-session-retrieval-fixture-does-not-exist",
+  );
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-session-"));
+  const store = openSessionStore({ filename: path.join(dir, "orchestration.db"), nowMs: BASE_MS });
+  const clock = fakeClock(BASE_MS);
+  const coordinator = createCoordinator({
+    store,
+    clock,
+    bridgeLeaseTtlMs: LEASE_TTL_MS,
+    maxConcurrentSessions: 2,
+  });
+  coordinator.discover(IDENTITY);
+  const bridge = fakeBridge(BRIDGE_SESSION_ID);
+
+  // teamVaultDir points at a directory that does not exist -- exactly the
+  // startup condition Important 3 (task-6 review round 1) requires be
+  // reachable at runtime, not only against a hand-written throwing fake.
+  const session = createMeetingSession({
+    identity: IDENTITY,
+    bridge,
+    runtime,
+    coordinator,
+    clock,
+    agentIdentity: { aliases: ["Meetbot"] },
+    bridgeId: "bridge-mac-synthetic",
+    bridgeSessionId: BRIDGE_SESSION_ID,
+    disclosureText: DISCLOSURE_TEXT,
+    teamVaultDir: missingCheckout,
+  });
+
+  try {
+    await session.join();
+    bridge.emit(bridge.event({ type: "joined", meetingOccurrenceId: IDENTITY.occurrenceId }));
+    await session.settled();
+
+    runtime.emit(transcript("seg-q", "Meetbot, what did we decide about the roadmap?"));
+    await session.settled();
+
+    const seedCalls = runtime.callsOf("seedContext");
+    assert.equal(seedCalls.length, 1);
+    const seeded = seedCalls[0];
+    assert.ok(seeded && seeded.method === "seedContext");
+    assert.equal(seeded.context.vaultQueried, true);
+    assert.equal(seeded.context.vaultUnavailable, true);
+    assert.match(seeded.context.text, /historical team memory.*unavailable/i);
+
+    assert.deepEqual(runtime.callsOf("authorizeVoiceResponse"), [
+      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+    ]);
+  } finally {
+    session.dispose();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

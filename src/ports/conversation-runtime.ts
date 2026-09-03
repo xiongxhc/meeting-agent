@@ -22,6 +22,14 @@
 //      anything here. Meeting Agent never calls a provider directly; the
 //      runtime does, and this port is the whole of what the Meeting Agent may
 //      ask of it.
+//
+// `SeededContext` (below, on `seedContext`) is imported from
+// src/ports/knowledge.ts, a Task 6 addition -- the one place this port
+// depends on another one in this codebase. That is the retrieval/knowledge
+// domain reaching into the conversation port it has to seed, not the other
+// direction: knowledge.ts does not import from this file.
+
+import type { SeededContext } from "./knowledge.ts";
 
 /** Meeting Agent v1 pins `online` explicitly per session; the runtime's own
  * default stays `offline` and is never switched silently. Both values are
@@ -112,6 +120,17 @@ export type RuntimeEvent =
 
 export type ConversationRuntimePort = {
   startVoiceSession(input: StartVoiceSessionInput): Promise<VoiceSessionHandle>;
+
+  /** Seeds the context the runtime should draw on when it composes a
+   * response for `segmentId` -- current-meeting and Team Vault retrieval
+   * results, already bounded, with any unavailability or staleness fact
+   * spelled out as text rather than left for the runtime to infer. Must be
+   * called before `authorizeVoiceResponse` for the same `segmentId`.
+   * Meeting Agent never calls a model provider directly; this is the one
+   * door through which retrieved knowledge reaches the runtime that does.
+   * See src/sessions/retrieval-router.ts, the only production caller, and
+   * src/ports/knowledge.ts for `SeededContext`'s shape. */
+  seedContext(context: SeededContext): Promise<void>;
 
   /** The invocation gate said this segment invoked the agent by name. */
   authorizeVoiceResponse(segmentId: string): Promise<void>;

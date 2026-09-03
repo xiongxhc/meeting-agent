@@ -314,6 +314,38 @@ test("hits beyond MAX_HITS / MAX_SEEDED_CONTEXT_CHARS are omitted, and the omiss
   assert.ok(totalExcerptChars <= MAX_SEEDED_CONTEXT_CHARS);
 });
 
+test("the character budget alone can omit a hit well before MAX_HITS is reached", async () => {
+  const memory = createCurrentMeetingMemory();
+  // Four hits at exactly EXCERPT_MAX_CHARS (post-truncation) sum to exactly
+  // MAX_SEEDED_CONTEXT_CHARS (4 * 400 = 1600) -- right at the boundary, all
+  // four fit. A fifth, same-sized hit would push the running total to 2000,
+  // over budget, so it is dropped by the CHAR bound while only 4 hits have
+  // been admitted -- one short of MAX_HITS (5). This isolates the char
+  // budget as the reason for the omission, distinct from the MAX_HITS test
+  // above (which reaches the count cap well before any char bound bites).
+  const filler = "x".repeat(500); // truncates to exactly EXCERPT_MAX_CHARS
+  for (let i = 0; i < 5; i += 1) {
+    memory.record({ segmentId: `seg_${i}`, text: `keyword ${filler}`, final: true });
+  }
+
+  const vault = fakeVault(() => ({ hits: [], indexedRevision: null, stale: false }));
+  const sink = fakeSink();
+  const router = createRetrievalRouter({ vault, sink, memory });
+
+  const context = await router.answer(invocation, "keyword");
+
+  assert.equal(context.hits.length, 4, "only 4 of 5 equally-scored hits fit the character budget");
+  assert.ok(
+    context.hits.length < MAX_HITS,
+    "the omission must happen before the MAX_HITS count cap is even reached",
+  );
+  assert.equal(context.omittedHitCount, 1);
+  assert.match(context.text, /omitted/i);
+
+  const totalExcerptChars = context.hits.reduce((sum, h) => sum + h.excerpt.length, 0);
+  assert.equal(totalExcerptChars, MAX_SEEDED_CONTEXT_CHARS);
+});
+
 // ---------------------------------------------------------------------------
 // Partial transcripts: prepare never authorizes, never a second path to speech
 // ---------------------------------------------------------------------------

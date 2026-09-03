@@ -22,6 +22,7 @@ import type {
   StartVoiceSessionInput,
   VoiceSessionHandle,
 } from "../../src/ports/conversation-runtime.ts";
+import type { SeededContext } from "../../src/ports/knowledge.ts";
 
 // ---------------------------------------------------------------------------
 // Clock
@@ -107,6 +108,7 @@ export function fakeBridge(sessionId: string, observedAt = "2026-09-02T14:00:00Z
 
 export type RuntimeCall =
   | { readonly method: "startVoiceSession"; readonly input: StartVoiceSessionInput }
+  | { readonly method: "seedContext"; readonly context: SeededContext }
   | { readonly method: "authorizeVoiceResponse"; readonly segmentId: string }
   | { readonly method: "skipVoiceResponse"; readonly segmentId: string; readonly reason: string }
   | { readonly method: "processText"; readonly text: string }
@@ -171,6 +173,9 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
       calls.push({ method: "startVoiceSession", input });
       if (options.startVoiceSessionError) throw options.startVoiceSessionError;
       return handle;
+    },
+    async seedContext(context: SeededContext): Promise<void> {
+      calls.push({ method: "seedContext", context });
     },
     async authorizeVoiceResponse(segmentId: string): Promise<void> {
       calls.push({ method: "authorizeVoiceResponse", segmentId });

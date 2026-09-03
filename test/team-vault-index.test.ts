@@ -15,7 +15,7 @@ import path from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createTeamVaultIndex } from "../src/adapters/team-vault-index.ts";
+import { createTeamVaultIndex, createTeamVaultIndexOrDegraded } from "../src/adapters/team-vault-index.ts";
 
 function withTempGitVault(run: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(os.tmpdir(), "team-vault-fixture-"));
@@ -137,4 +137,44 @@ test("constructing the index over a directory that is not a git working tree thr
 test("constructing the index over a missing directory throws", () => {
   const missing = path.join(os.tmpdir(), "team-vault-index-fixture-does-not-exist");
   assert.throws(() => createTeamVaultIndex({ teamVaultDir: missing }));
+});
+
+// ---------------------------------------------------------------------------
+// createTeamVaultIndexOrDegraded: the construction-failure path a real
+// session actually reaches (see src/sessions/meeting-session.ts's wiring).
+// A broken checkout must degrade retrieval, not crash session construction.
+// ---------------------------------------------------------------------------
+
+test("createTeamVaultIndexOrDegraded never throws for a missing checkout, and its search() rethrows the original failure", () => {
+  const missing = path.join(os.tmpdir(), "team-vault-index-degraded-fixture-does-not-exist");
+
+  const index = createTeamVaultIndexOrDegraded({ teamVaultDir: missing });
+
+  assert.throws(() => index.search("anything"));
+});
+
+test("createTeamVaultIndexOrDegraded never throws for a non-git checkout, and its search() rethrows the original failure", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "team-vault-degraded-not-git-"));
+  try {
+    writeFileSync(path.join(dir, "roadmap.md"), "content\n");
+
+    const index = createTeamVaultIndexOrDegraded({ teamVaultDir: dir });
+
+    assert.throws(() => index.search("anything"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("createTeamVaultIndexOrDegraded returns a fully working index for a healthy checkout", () => {
+  withTempGitVault((dir) => {
+    writeFileSync(path.join(dir, "roadmap.md"), "The launch date moved to October.\n");
+    commitAll(dir, "publish");
+
+    const index = createTeamVaultIndexOrDegraded({ teamVaultDir: dir });
+    const result = index.search("launch date October");
+
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0]?.sourcePath, "roadmap.md");
+  });
 });

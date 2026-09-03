@@ -5,13 +5,21 @@
 // src/sessions/retrieval-router.ts for the ordering itself; this file only
 // declares the shapes.
 //
-// RuntimeContextSink is declared locally for the same reason
-// src/ports/conversation-runtime.ts is: the real Conversation Runtime SDK
-// does not yet expose a context-seeding call (see that port's header --
-// `@conversation/runtime` is still being built in another repository). This
-// is the same "narrow, structurally-compatible port, no coupling to a
-// port another lane owns" choice src/sessions/invocation-gate.ts already
-// made for its own InvocationSink and InvocationCandidateSegment.
+// RuntimeContextSink is a narrow, EXPLICITLY-DERIVED slice of
+// ConversationRuntimePort (src/ports/conversation-runtime.ts) --
+// `Pick<ConversationRuntimePort, "seedContext" | "authorizeVoiceResponse">`,
+// not a separately-declared type that merely happens to line up. The two
+// files import each other's types (this file's SeededContext; that file's
+// ConversationRuntimePort) -- both are type-only imports, erased at compile
+// time by verbatimModuleSyntax, so there is no runtime import cycle, only a
+// type-level one TypeScript resolves lazily. Deriving via Pick means a
+// value typed ConversationRuntimePort (the real port, or
+// test/lib/session-fakes.ts's fake) satisfies RuntimeContextSink directly,
+// with no adapter needed -- and any future rename/retyping of either method
+// on ConversationRuntimePort is a compile error here too, instead of a
+// silent drift between two independently-declared shapes.
+
+import type { ConversationRuntimePort } from "./conversation-runtime.ts";
 
 /** One retrieved piece of knowledge, with full provenance. Verbatim from the
  * task brief. `sourcePath` is the file path within the Team Vault checkout
@@ -126,10 +134,10 @@ export type SeededContext = {
   readonly text: string;
 };
 
-/** The narrow sink the router calls: seed context, THEN authorize.
- * Declared locally for the same "real SDK isn't built yet" reason as
- * RuntimeContextSink's neighbours in this file -- see the module header. */
-export type RuntimeContextSink = {
-  seedContext(context: SeededContext): Promise<void>;
-  authorizeVoiceResponse(segmentId: string): Promise<void>;
-};
+/** The narrow sink the router calls: seed context, THEN authorize. See the
+ * module header -- this is Pick<ConversationRuntimePort, ...>, not an
+ * independently-declared shape. */
+export type RuntimeContextSink = Pick<
+  ConversationRuntimePort,
+  "seedContext" | "authorizeVoiceResponse"
+>;

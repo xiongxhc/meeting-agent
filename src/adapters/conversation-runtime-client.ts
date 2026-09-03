@@ -25,12 +25,18 @@ import type {
   StartVoiceSessionInput,
   VoiceSessionHandle,
 } from "../ports/conversation-runtime.ts";
+import type { SeededContext } from "../ports/knowledge.ts";
 import type { InvocationDecisionReason, InvocationSink } from "../sessions/invocation-gate.ts";
 
 /** The surface `@conversation/runtime`'s client announces. Structural, so the
- * real client satisfies it without this module importing the package. */
+ * real client satisfies it without this module importing the package.
+ * `seedContext` is a Task 6 addition to the port (src/ports/conversation-
+ * runtime.ts) -- the real SDK's actual method for this is unknown until
+ * runtime-sdk-ready.md exists; Task 11's compile-check against the built
+ * SDK needs to confirm this name and shape, or adjust the forward below. */
 export type ConversationRuntimeSdk = {
   startVoiceSession(input: StartVoiceSessionInput): Promise<VoiceSessionHandle>;
+  seedContext(context: SeededContext): Promise<void>;
   authorizeVoiceResponse(segmentId: string): Promise<void>;
   skipVoiceResponse(segmentId: string, reason: string): Promise<void>;
   processText(text: string): Promise<void>;
@@ -55,6 +61,7 @@ export function createConversationRuntimeClient(
 ): ConversationRuntimePort {
   return {
     startVoiceSession: (input) => sdk.startVoiceSession(input),
+    seedContext: (context) => sdk.seedContext(context),
     authorizeVoiceResponse: (segmentId) => sdk.authorizeVoiceResponse(segmentId),
     skipVoiceResponse: (segmentId, reason) => sdk.skipVoiceResponse(segmentId, reason),
     processText: (text) => sdk.processText(text),

@@ -123,6 +123,37 @@ function splitParagraphs(content: string): readonly string[] {
     .filter((paragraph) => paragraph.length > 0);
 }
 
+/**
+ * Never throws. Wraps `createTeamVaultIndex`: on any construction failure
+ * (missing/unreadable checkout, not a git working tree), returns a
+ * `TeamVaultIndexPort` whose `search()` always rethrows that same failure
+ * instead of a working index.
+ *
+ * This is what makes the spec's "Team Vault search fails -> continue from
+ * current context and say historical memory is unavailable" row reachable
+ * at RUNTIME rather than only against a hand-written throwing fake: a real
+ * checkout that is missing or broken at session start would otherwise never
+ * reach `src/sessions/retrieval-router.ts`'s `vaultUnavailable` branch at
+ * all -- construction would simply throw before a `TeamVaultIndexPort` ever
+ * existed for the router to call. Wiring (src/sessions/meeting-session.ts)
+ * uses this constructor, never the throwing one, precisely so a broken
+ * checkout degrades the session's retrieval instead of crashing it.
+ */
+export function createTeamVaultIndexOrDegraded(
+  options: CreateTeamVaultIndexOptions,
+): TeamVaultIndexPort {
+  try {
+    return createTeamVaultIndex(options);
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    return {
+      search(): TeamVaultSearchResult {
+        throw failure;
+      },
+    };
+  }
+}
+
 function readGitRevision(dir: string): string {
   const revision = tryReadGitRevision(dir);
   if (revision === null) {
