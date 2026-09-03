@@ -30,11 +30,14 @@ CREATE TABLE recordings (
   sha256           TEXT NOT NULL,
   duration_ms      INTEGER NOT NULL,
   finalized_at_ms  INTEGER NOT NULL,
-  -- A token: no whitespace, no punctuation beyond what an id, a path or a URI
-  -- needs. Prose cannot satisfy this, and neither can a transcript excerpt.
+  -- The runtime's own rule (interim handoff runtime-sdk-ready.md): the
+  -- lowercase hexadecimal spelling of a per-recording random binding, so
+  -- ^[a-z0-9]+$ and at most MAX_RECORDING_HANDLE_BYTES = 128 bytes. Prose
+  -- cannot satisfy this, and neither can a transcript excerpt -- nor can any
+  -- handle the runtime could not have issued.
   CHECK (
-    length(handle) BETWEEN 1 AND 200
-    AND handle NOT GLOB '*[^A-Za-z0-9_./:@+=~%-]*'
+    length(handle) BETWEEN 1 AND 128
+    AND handle NOT GLOB '*[^a-z0-9]*'
   ),
   CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
   CHECK (duration_ms >= 0),

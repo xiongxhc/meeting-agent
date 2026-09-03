@@ -715,3 +715,107 @@ of the redacted evidence file, and the UTC date. Record the outcome as a note
 under this section rather than in the matrix's per-path rows — those rows are
 for the four-consecutive-run series in 3.1, and this run is a single
 confirmation pass, not a fifth attempt to fold into that count.
+
+## Plan 3 Task 4: Invocation gate — two parked limitations to measure on a real device
+
+Recorded during Plan 3 Task 7 (ruling R57). Both limitations are in
+`src/sessions/invocation-gate.ts` and are pinned as `KNOWN LIMITATION` tests in
+`test/invocation-gate.test.ts`; neither can be closed in code under this plan
+(the first needs word segmentation, which the plan forbids; the second is a
+deliberate rule whose cost depends on the streaming STT's punctuation, which
+only a real device shows). The real-device run must record how often each
+actually happens. Nothing here changes the gate; it tells the run what to
+count, and states in advance the numbers that would reopen each rule.
+
+Reproduce the pinned behaviour before the run, so the baseline is on record:
+
+```
+npm test -- --test-name-pattern="KNOWN LIMITATION"
+```
+
+### 4.1 Parked (R48): Chinese request-marker prefix false positives
+
+The Chinese path treats a clause that begins with a request marker (`请`,
+`麻烦`, `帮我`, `帮忙`) after the agent's name and a comma as an address. Chinese
+has no whitespace to tokenize on, so the marker is matched as a raw string
+prefix — and an ordinary word that merely begins with one of those characters
+authorizes too. Pinned instances:
+
+```
+会议机器人，请假条怎么写        # 请假条 = leave-of-absence form; authorizes today
+会议机器人，帮我们省了不少事    # 帮我们… = "saved us a lot of trouble"; authorizes today
+```
+
+During the one-hour two-participant run (Task 4, section 4.2) and every later
+real meeting under test, have participants speak the agent's configured name
+followed by a natural Chinese remark that is NOT a request at least ten times,
+including remarks whose first word begins with 请 / 麻烦 / 帮 (请假, 请求, 请客,
+帮派, 麻烦事 …). Then replay the streaming STT's final texts through the gate
+exactly as the session sees them, with the configured aliases:
+
+```
+# one final transcript_final text per line in addresses.txt, exported from the
+# run's evidence (never committed: it is meeting speech)
+node --input-type=module -e '
+const { decide } = await import("./src/sessions/invocation-gate.ts");
+const identity = { aliases: ["<configured Chinese alias>"] };
+const lines = (await import("node:fs")).readFileSync("addresses.txt", "utf8").split("\n").filter(Boolean);
+let fired = 0;
+for (const [i, text] of lines.entries()) {
+  const d = decide({ segmentId: String(i), text, final: true }, identity);
+  if (d.authorize) { fired += 1; console.log("AUTHORIZED", JSON.stringify(text)); }
+}
+console.log(`${fired}/${lines.length} non-request remarks authorized`);
+'
+```
+
+**Evidence to record:** the count of non-request Chinese remarks spoken, how
+many the gate authorized, and each authorized text verbatim (redacted of any
+personal content). **Threshold that reopens R48:** more than one false
+positive per hour of Chinese-language meeting, or any false positive whose
+opening word is not one of the two pinned instances above — either means the
+prefix collision is a live problem, not a corner case, and the plan-level ban
+on word segmentation must be revisited rather than worked around with a
+longer anti-cue list.
+
+### 4.2 Deliberate (R41): an address with no punctuation between name and request never authorizes
+
+The gate requires a real separator — a comma or colon, ASCII or full-width —
+immediately beside the agent's name before it will read the adjoining clause
+as a request. `Meetbot what did we decide` and `会议机器人总结一下` do not
+authorize, by design; `Meetbot, what did we decide?` and `会议机器人，总结一下`
+do. The rule kills a whole class of false positives (third-person mentions,
+Chinese declaratives with the name as subject) and was chosen knowing its
+cost: if the streaming STT does not render the vocative pause as punctuation,
+every genuine address is silently ignored.
+
+Whether it does is a property of the STT, in each language, and has never
+been measured. During the same runs, have each participant address the agent
+by name at least twenty times in English and twenty in Chinese, with the
+natural pause a person makes before a request (`Meetbot, …` / `会议机器人，…`),
+and count how the final segments came back:
+
+```
+# addresses-en.txt / addresses-zh.txt: one final transcript_final text per
+# genuine spoken address, exported from the run's evidence (never committed)
+for f in addresses-en.txt addresses-zh.txt; do
+  total=$(grep -c . "$f")
+  punct=$(grep -cE '^[^,:，：]*(Meetbot|<configured alias>)[,:，：]' "$f")
+  echo "$f: $punct/$total addresses rendered with a comma or colon after the name"
+done
+```
+
+Also run the gate replay from 4.1 over each file and record how many of the
+genuine addresses it authorized: that number, not the punctuation count alone,
+is the user-facing miss rate.
+
+**Evidence to record:** per language, the number of genuine addresses spoken,
+how many the STT rendered with a comma or colon directly after the name, how
+many the gate authorized, the STT provider and model string the runtime's
+`online` profile resolved to, and the client and OS versions from the Task 3
+matrix. **Threshold that reopens R41:** fewer than 90% of genuine addresses
+punctuated in either language, or fewer than 85% authorized. Below that, the
+unpunctuated form is common speech rather than an edge case, and the separator
+rule is costing the product its loudest requirement in the other direction —
+an agent that never answers when called. Above it, R41 stands and the miss
+rate is recorded as a known cost.

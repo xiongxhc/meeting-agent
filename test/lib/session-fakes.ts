@@ -18,6 +18,7 @@ import type {
   ConversationRuntimePort,
   RecordingGap,
   RecordingHandle,
+  RecordingReconciliation,
   RuntimeEvent,
   StartVoiceSessionInput,
   VoiceSessionHandle,
@@ -111,9 +112,17 @@ export type RuntimeCall =
   | { readonly method: "seedContext"; readonly context: SeededContext }
   | { readonly method: "authorizeVoiceResponse"; readonly segmentId: string }
   | { readonly method: "skipVoiceResponse"; readonly segmentId: string; readonly reason: string }
-  | { readonly method: "processText"; readonly text: string }
+  | {
+      readonly method: "processText";
+      readonly text: string;
+      /** `refused_live_session` is the runtime's answer to a processText
+       * during a live voice session (ruling R54). Recorded so a test can see
+       * the attempt was made, and that it did not go through. */
+      readonly outcome: "accepted" | "refused_live_session";
+    }
   | { readonly method: "finalizeRecording"; readonly observedGaps: readonly RecordingGap[] }
-  | { readonly method: "reconcileRecording"; readonly gaps: readonly RecordingGap[] }
+  | { readonly method: "reconcileRecordingGaps"; readonly gaps: readonly RecordingGap[] }
+  | { readonly method: "reconcileRecording"; readonly recordingHandle: string }
   | { readonly method: "close" };
 
 export type FakeRuntimeOptions = {
@@ -127,6 +136,16 @@ export type FakeRuntimeOptions = {
    * to reconcile" case, which is the only way to reach `unreconciled`. */
   readonly reconciledGaps?: readonly RecordingGap[];
   readonly startVoiceSessionError?: Error;
+  /** What reconcileRecording resolves with. Defaults to an empty
+   * reconciliation (no segments, no warnings). */
+  readonly reconciliation?: RecordingReconciliation;
+  /** `local` reproduces the local SpeechBrain sidecar (ruling R55): the same
+   * segments and clusters as `reconciliation`, with EMPTY text -- the runtime
+   * clustered voices without transcribing. `online` (default) returns
+   * `reconciliation` as given. */
+  readonly diarizationBackend?: "online" | "local";
+  /** When set, reconcileRecording rejects with this instead. */
+  readonly reconcileRecordingError?: Error;
 };
 
 export type FakeRuntime = ConversationRuntimePort & {
@@ -150,7 +169,9 @@ const DEFAULT_HANDLE: VoiceSessionHandle = {
 };
 
 const DEFAULT_RECORDING: RecordingHandle = {
-  handle: "rec_synthetic_0001",
+  // Lowercase alphanumerics only, like the runtime's real handles (the
+  // lowercase hex spelling of a random binding) -- see migrations/002.
+  handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
   sha256: "0".repeat(64),
   durationMs: 3_600_000,
   gaps: [],
@@ -161,8 +182,25 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
   const listeners = new Set<(event: RuntimeEvent) => void>();
   const handle: VoiceSessionHandle = { ...DEFAULT_HANDLE, ...options.handle };
 
+  // Ruling R54: the runtime refuses processText and reconcileRecording while
+  // a voice session or turn is live on the session, to protect the 300 ms
+  // barge-in budget on its control channel. This fake takes startVoiceSession
+  // as the start of "live" and finalizeRecording (or close) as its end -- the
+  // meeting session finalizes the recording on `left` and never calls close.
+  // If the real runtime needs an explicit end-of-voice-session call, Task 11's
+  // compile-check is where that surfaces.
+  let liveVoiceSession = false;
+
   function recordingFor(gaps: readonly RecordingGap[]): RecordingHandle {
     return { ...DEFAULT_RECORDING, ...options.recording, gaps };
+  }
+
+  function refuseWhileLive(method: string): void {
+    if (liveVoiceSession) {
+      throw new Error(
+        `${method} is refused while a voice session is live on this session (ruling R54); it is post-meeting only`,
+      );
+    }
   }
 
   return {
@@ -172,6 +210,7 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
     async startVoiceSession(input: StartVoiceSessionInput): Promise<VoiceSessionHandle> {
       calls.push({ method: "startVoiceSession", input });
       if (options.startVoiceSessionError) throw options.startVoiceSessionError;
+      liveVoiceSession = true;
       return handle;
     },
     async seedContext(context: SeededContext): Promise<void> {
@@ -184,19 +223,37 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
       calls.push({ method: "skipVoiceResponse", segmentId, reason });
     },
     async processText(text: string): Promise<void> {
-      calls.push({ method: "processText", text });
+      if (liveVoiceSession) {
+        calls.push({ method: "processText", text, outcome: "refused_live_session" });
+        refuseWhileLive("processText");
+      }
+      calls.push({ method: "processText", text, outcome: "accepted" });
     },
     async finalizeRecording(input: {
       readonly observedGaps: readonly RecordingGap[];
     }): Promise<RecordingHandle> {
       calls.push({ method: "finalizeRecording", observedGaps: input.observedGaps });
+      liveVoiceSession = false;
       return recordingFor(options.finalizedGaps ?? input.observedGaps);
     },
-    async reconcileRecording(input: {
+    async reconcileRecordingGaps(input: {
       readonly gaps: readonly RecordingGap[];
     }): Promise<RecordingHandle> {
-      calls.push({ method: "reconcileRecording", gaps: input.gaps });
+      calls.push({ method: "reconcileRecordingGaps", gaps: input.gaps });
       return recordingFor(options.reconciledGaps ?? input.gaps);
+    },
+    async reconcileRecording(input: { readonly recordingHandle: string }): Promise<RecordingReconciliation> {
+      calls.push({ method: "reconcileRecording", recordingHandle: input.recordingHandle });
+      refuseWhileLive("reconcileRecording");
+      if (options.reconcileRecordingError) throw options.reconcileRecordingError;
+      const reconciliation = options.reconciliation ?? { segments: [], warnings: [] };
+      if (options.diarizationBackend === "local") {
+        return {
+          segments: reconciliation.segments.map((segment) => ({ ...segment, text: "" })),
+          warnings: reconciliation.warnings,
+        };
+      }
+      return reconciliation;
     },
     subscribe(listener: (event: RuntimeEvent) => void): () => void {
       listeners.add(listener);
@@ -210,6 +267,7 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
     subscriberCount: () => listeners.size,
     async close(): Promise<void> {
       calls.push({ method: "close" });
+      liveVoiceSession = false;
     },
   };
 }

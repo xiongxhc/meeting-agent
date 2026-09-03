@@ -21,6 +21,7 @@ import type {
   ConversationRuntimePort,
   RecordingGap,
   RecordingHandle,
+  RecordingReconciliation,
   RuntimeEvent,
   StartVoiceSessionInput,
   VoiceSessionHandle,
@@ -41,7 +42,13 @@ export type ConversationRuntimeSdk = {
   skipVoiceResponse(segmentId: string, reason: string): Promise<void>;
   processText(text: string): Promise<void>;
   finalizeRecording(input: { readonly observedGaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
-  reconcileRecording(input: { readonly gaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
+  /** No counterpart in the interim handoff (runtime-sdk-ready.md); Task 11's
+   * compile-check settles whether the SDK has one or the port drops it. */
+  reconcileRecordingGaps(input: { readonly gaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
+  /** The SDK takes `{ sessionId, recordingHandle }` and returns bigint
+   * milliseconds; the sessionId is the adapter's to supply and the bigints
+   * its to convert. Structural here, until Task 11 binds the real client. */
+  reconcileRecording(input: { readonly recordingHandle: string }): Promise<RecordingReconciliation>;
   on(listener: (event: RuntimeEvent) => void): () => void;
   close(): Promise<void>;
 };
@@ -66,6 +73,7 @@ export function createConversationRuntimeClient(
     skipVoiceResponse: (segmentId, reason) => sdk.skipVoiceResponse(segmentId, reason),
     processText: (text) => sdk.processText(text),
     finalizeRecording: (input) => sdk.finalizeRecording(input),
+    reconcileRecordingGaps: (input) => sdk.reconcileRecordingGaps(input),
     reconcileRecording: (input) => sdk.reconcileRecording(input),
     subscribe: (listener) =>
       sdk.on((event) => {

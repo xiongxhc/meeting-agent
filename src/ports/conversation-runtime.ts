@@ -3,11 +3,14 @@
 // WHY THIS PORT EXISTS AS AN IN-REPO TYPE RATHER THAN AN IMPORT.
 // `@conversation/runtime` is adding startVoiceSession, authorizeVoiceResponse,
 // skipVoiceResponse, finalizeRecording, reconcileRecording and processText in
-// another repository, and that SDK is not built yet -- the lane handoff file
-// runtime-sdk-ready.md does not exist. This plan therefore does NOT take a
-// dependency on it. Everything here is declared locally, every test in this
-// task runs against the in-repo fake, and the compile-check against the real
-// built SDK is deferred to Task 11. src/adapters/conversation-runtime-client.ts
+// another repository. When this port was written the lane handoff file
+// runtime-sdk-ready.md did not exist; an INTERIM version now does, and the
+// types this port consumes from it -- `DiarizedSegment`,
+// `RecordingReconciliation`, the `reconcileRecording` shape, the R54 refusal
+// rule -- are mirrored below with that file as their authority. This plan
+// still does NOT take a dependency on the package. Everything here is declared
+// locally, every test runs against the in-repo fake, and the compile-check
+// against the real built SDK is deferred to Task 11. src/adapters/conversation-runtime-client.ts
 // is the one place that will need to change when it lands: it maps an
 // SDK-shaped object onto this port, structurally, with no wire codec of its
 // own -- the SDK owns the wire.
@@ -94,6 +97,32 @@ export type RecordingHandle = {
   readonly gaps: readonly RecordingGap[];
 };
 
+/**
+ * One stretch of speech from a reconciled recording, mirroring the SDK's
+ * `DiarizedSegment` with `number` milliseconds where the SDK has `bigint`
+ * (the adapter converts; every other duration on this port is a number).
+ *
+ * Times are on the MEDIA timeline -- the recording's own clock, from the
+ * start of the recording, advancing by recorded audio plus the gaps between
+ * it -- not the wall clock. `speakerCluster` is an anonymous label such as
+ * `cluster-1` and never names a person. `text` is EMPTY when the runtime's
+ * diarization backend is the local SpeechBrain sidecar, which clusters
+ * voices without transcribing (ruling R55); the online backend fills it.
+ */
+export type DiarizedSegment = {
+  readonly segmentId: string;
+  readonly startedAtMs: number;
+  readonly endedAtMs: number;
+  readonly text: string;
+  readonly speakerCluster: string | null;
+};
+
+/** A whole recording's reconciliation. `warnings` are the runtime's own. */
+export type RecordingReconciliation = {
+  readonly segments: readonly DiarizedSegment[];
+  readonly warnings: readonly string[];
+};
+
 /** A finalized transcript segment. Structurally satisfies the invocation
  * gate's `InvocationCandidateSegment`, so the gate needs no adapter and no
  * knowledge of this port. `final` is present and always true on this event --
@@ -140,11 +169,19 @@ export type ConversationRuntimePort = {
    * not an absence of one. */
   skipVoiceResponse(segmentId: string, reason: string): Promise<void>;
 
-  /** Text-in, for a caller that has text the runtime should process. The
-   * meeting session NEVER calls this: disclosure is meeting-chat text posted
-   * by the bridge, and routing it here would be exactly the spoken disclosure
-   * the spec forbids. Declared because the SDK declares it, and asserted
-   * un-called by test/meeting-session.test.ts. */
+  /** Text-in, for a caller that has text the runtime should process.
+   *
+   * POST-MEETING ONLY (ruling R54). The runtime REFUSES this call while a
+   * voice session or turn is live on the same session, to protect the 300 ms
+   * barge-in budget on its control channel. Meeting Agent may call it only
+   * after the meeting has ended: note synthesis (the artifact builder) and
+   * backfill are the two callers. The test fake enforces the refusal, so an
+   * in-meeting call fails in the suite rather than at staging.
+   *
+   * The meeting session NEVER calls this: disclosure is meeting-chat text
+   * posted by the bridge, and routing it here would be exactly the spoken
+   * disclosure the spec forbids. Asserted un-called by
+   * test/meeting-session.test.ts. */
   processText(text: string): Promise<void>;
 
   /** Closes the recording. `observedGaps` are the gaps the BRIDGE reported, so
@@ -153,8 +190,22 @@ export type ConversationRuntimePort = {
 
   /** Re-derives the recording's gap accounting against an authoritative set.
    * Called only when the finalized handle's gaps differ from what the bridge
-   * actually observed -- see the meeting session's "exact gap recording". */
-  reconcileRecording(input: { readonly gaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
+   * actually observed -- see the meeting session's "exact gap recording".
+   * Renamed from `reconcileRecording` when the SDK's own method of that name
+   * landed (below) with a different job; the interim handoff announces no
+   * counterpart for THIS method, which Task 11's compile-check must settle. */
+  reconcileRecordingGaps(input: { readonly gaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
+
+  /** Post-meeting diarization of the ENCRYPTED recording, by the persisted
+   * handle `finalizeRecording` returned. Same shape as the SDK's
+   * `reconcileRecording` (interim handoff runtime-sdk-ready.md), minus the
+   * runtime session id the adapter supplies. POST-MEETING ONLY, refused while
+   * a voice session is live, exactly like `processText`.
+   *
+   * The result groups speech by anonymous voice cluster and NEVER names a
+   * person; with the local SpeechBrain backend it also carries no text
+   * (ruling R55). src/sessions/speaker-reconciler.ts is the one consumer. */
+  reconcileRecording(input: { readonly recordingHandle: string }): Promise<RecordingReconciliation>;
 
   /** Returns an unsubscribe function. Calling it must stop delivery. */
   subscribe(listener: (event: RuntimeEvent) => void): () => void;

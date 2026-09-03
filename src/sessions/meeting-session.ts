@@ -58,6 +58,7 @@ import {
 } from "../contracts/bridge-session-v1.ts";
 import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
+import type { ActiveSpeakerObservation } from "../domain/transcript.ts";
 import {
   BridgeContractError,
   createDisclosurePublisher,
@@ -72,6 +73,7 @@ import type {
   RecordingGap,
   RecordingHandle,
   RuntimeEvent,
+  TranscriptSegment,
 } from "../ports/conversation-runtime.ts";
 import type { TeamVaultIndexPort, TeamVaultSearchResult } from "../ports/knowledge.ts";
 import type { Clock, SessionCoordinator, TerminalOutcome } from "./coordinator.ts";
@@ -214,6 +216,17 @@ export type MeetingSessionState = {
   readonly ignoredAfterTerminal: number;
   readonly runtimeErrors: readonly RuntimeCallFailure[];
   readonly routingErrors: readonly RoutingFailure[];
+  /** The bridge's active-speaker observations, verbatim and in order, with
+   * the bridge's own observedAt. PROVISIONAL EVIDENCE, not attribution: no
+   * segment here carries a speaker, and nothing in this module correlates
+   * the two. src/sessions/speaker-reconciler.ts consumes both after the
+   * meeting, together with the persisted recording handle. */
+  readonly speakerEvidence: readonly ActiveSpeakerObservation[];
+  /** Every FINAL transcript segment, in arrival order -- the live wording the
+   * reconciler falls back to when the diarization backend supplies none
+   * (ruling R55). In memory only; the orchestration database never holds
+   * transcript text. */
+  readonly liveTranscript: readonly TranscriptSegment[];
 };
 
 export type MeetingSession = {
@@ -318,6 +331,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   const rejectedInbound: InboundRejection[] = [];
   const runtimeErrors: RuntimeCallFailure[] = [];
   const routingErrors: RoutingFailure[] = [];
+  const speakerEvidence: ActiveSpeakerObservation[] = [];
+  const liveTranscript: TranscriptSegment[] = [];
   const turns: TurnRecord[] = [];
   const settledTurns = new Set<string>();
   const openTurns = new Set<string>();
@@ -648,12 +663,23 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         reconnectAttempts = event.attempt;
         return;
 
-      // Attendance is reduced by src/domain/participants.ts and speaker
-      // identity is reconciled in a later task. Routed and counted here so the
-      // "every routed type is a declared contract type" evidence is complete.
+      case "active_speaker":
+        // Retained as provisional evidence -- the observation, its two legal
+        // shapes intact, and the bridge's own timestamp. Not correlated with
+        // any segment here: attribution is src/sessions/speaker-reconciler.ts's
+        // job, after the meeting, and it is allowed to say "cannot say".
+        speakerEvidence.push(
+          event.confidence === "ui_exact"
+            ? { observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId }
+            : { observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null },
+        );
+        return;
+
+      // Attendance is reduced by src/domain/participants.ts. Routed and
+      // counted here so the "every routed type is a declared contract type"
+      // evidence is complete.
       case "participant_joined":
       case "participant_left":
-      case "active_speaker":
         return;
     }
   }
@@ -670,6 +696,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       case "transcript_final": {
         const segmentId = event.segment.segmentId;
         if (settledTurns.has(segmentId) || openTurns.has(segmentId)) return; // redelivery
+
+        // Final segments only: a partial is neither transcript nor evidence.
+        if (event.segment.final) liveTranscript.push(event.segment);
 
         const meetingSegment = {
           segmentId,
@@ -819,7 +848,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * session's terminal transition.
    *
    * The guard is the WHOLE body, not one await. Round 1 wrapped
-   * finalizeRecording() and stopped one line short of the reconcileRecording()
+   * finalizeRecording() and stopped one line short of the reconcileRecordingGaps()
    * beneath it, whose throw escaped this function entirely and took
    * applyTerminalTransition() with it -- leaving the row at "listening" with a
    * NULL finalizationError, which reads as a clean pending session. Guarding
@@ -851,7 +880,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       recording = finalizedHandle;
       gapReconciliation = "unreconciled";
 
-      const reconciled = await runtime.reconcileRecording({ gaps: observed });
+      const reconciled = await runtime.reconcileRecordingGaps({ gaps: observed });
       recording = reconciled;
       gapReconciliation = gapsEqual(reconciled.gaps, observed) ? "reconciled" : "unreconciled";
     } catch (error) {
@@ -1021,6 +1050,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         ignoredAfterTerminal,
         runtimeErrors: [...runtimeErrors],
         routingErrors: [...routingErrors],
+        speakerEvidence: [...speakerEvidence],
+        liveTranscript: [...liveTranscript],
       };
     },
 

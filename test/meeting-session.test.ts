@@ -1220,7 +1220,7 @@ test("session end stores the finalized handle, hash, duration and gaps", async (
     await h.session.settled();
 
     assert.deepEqual(h.session.state().recording, {
-      handle: "rec_synthetic_0001",
+      handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
       sha256: "0".repeat(64),
       durationMs: 3_600_000,
       gaps: [],
@@ -1240,8 +1240,8 @@ test("a runtime whose gap accounting disagrees with the bridge is reconciled aga
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    assert.deepEqual(h.runtime.callsOf("reconcileRecording"), [
-      { method: "reconcileRecording", gaps: GAPS },
+    assert.deepEqual(h.runtime.callsOf("reconcileRecordingGaps"), [
+      { method: "reconcileRecordingGaps", gaps: GAPS },
     ]);
     assert.deepEqual(h.session.state().recording?.gaps, GAPS);
     assert.equal(h.session.state().gapReconciliation, "reconciled");
@@ -1263,8 +1263,8 @@ test("a runtime that still disagrees after reconciling is left marked unreconcil
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    assert.deepEqual(h.runtime.callsOf("reconcileRecording"), [
-      { method: "reconcileRecording", gaps: GAPS },
+    assert.deepEqual(h.runtime.callsOf("reconcileRecordingGaps"), [
+      { method: "reconcileRecordingGaps", gaps: GAPS },
     ]);
     assert.equal(h.session.state().gapReconciliation, "unreconciled");
     // The recording is still stored -- losing it would be worse -- but the
@@ -1287,6 +1287,96 @@ test("finalizeRecording runs exactly once, however many terminal signals arrive"
 
     assert.equal(h.runtime.callsOf("finalizeRecording").length, 1);
     assert.equal(h.session.state().terminalReason, "ended");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the recordings table refuses a handle outside ^[a-z0-9]{1,128}$ (ruling R56)", async () => {
+  // The interim runtime handoff gives the real rule: lowercase hexadecimal
+  // spelling of a random binding, so lowercase alphanumerics only, at most
+  // MAX_RECORDING_HANDLE_BYTES (128). The old CHECK was a guessed superset that
+  // let an underscore through; a handle that the runtime could never have
+  // issued must fail the write, same as prose.
+  for (const handle of ["REC0001", "rec_0001", "rec-0001", "a".repeat(129)]) {
+    const h = harness({ runtime: fakeRuntime({ recording: { handle } }) });
+    try {
+      await joined(h);
+      h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+      await h.session.settled();
+      assert.equal(h.store.getRecording(IDENTITY.occurrenceId), null, `accepted handle ${JSON.stringify(handle)}`);
+      assert.equal(h.session.state().routingErrors.length, 1);
+    } finally {
+      h.cleanup();
+    }
+  }
+  const h = harness({ runtime: fakeRuntime({ recording: { handle: "a".repeat(128) } }) });
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "a".repeat(128));
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 9a. Provisional speaker evidence, and what may run only after the meeting
+// ---------------------------------------------------------------------------
+
+test("active_speaker observations and finalized segments are retained as provisional evidence, not as answers", async () => {
+  // The session stores what it saw, in order, with the bridge's own
+  // observedAt -- inputs for src/sessions/speaker-reconciler.ts after the
+  // meeting. Nothing here attributes anything: there is no speaker field on
+  // a live segment, and the ambiguous observation keeps its null identity.
+  const h = harness();
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "active_speaker", feishuUserId: "ou_synthetic_1", confidence: "ui_exact" }));
+    h.runtime.emit(transcript("seg_01", "we should ship on friday"));
+    h.bridge.emit(h.bridge.event({ type: "active_speaker", feishuUserId: null, confidence: "ambiguous" }));
+    h.runtime.emit(transcript("seg_02", "partial words", false));
+    h.runtime.emit(transcript("seg_03", "and freeze on thursday"));
+    await h.session.settled();
+
+    assert.deepEqual(h.session.state().speakerEvidence, [
+      { observedAt: "2026-09-02T14:00:00Z", confidence: "ui_exact", feishuUserId: "ou_synthetic_1" },
+      { observedAt: "2026-09-02T14:00:00Z", confidence: "ambiguous", feishuUserId: null },
+    ]);
+    // Final segments only: a partial can neither authorize nor be transcript.
+    assert.deepEqual(
+      h.session.state().liveTranscript.map((segment) => segment.segmentId),
+      ["seg_01", "seg_03"],
+    );
+    assert.equal("speaker" in (h.session.state().liveTranscript[0] ?? {}), false);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the runtime fake refuses processText while the voice session is live (ruling R54), and accepts it once the meeting has ended", async () => {
+  // The real runtime refuses processText and reconcileRecording while a voice
+  // session or turn is live on that session, to protect the 300 ms barge-in
+  // budget on the control channel. Task 8's note synthesis and Task 9a's
+  // backfill inherit this fake, so an in-meeting call is caught here rather
+  // than at staging.
+  const h = harness();
+  try {
+    await joined(h);
+    await assert.rejects(h.runtime.processText("summarize the decisions"), /live/);
+    assert.deepEqual(h.runtime.callsOf("processText"), [
+      { method: "processText", text: "summarize the decisions", outcome: "refused_live_session" },
+    ]);
+
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+    await h.runtime.processText("summarize the decisions");
+    assert.equal(h.runtime.callsOf("processText").at(-1)?.method, "processText");
+    assert.equal(
+      (h.runtime.callsOf("processText").at(-1) as { outcome: string }).outcome,
+      "accepted",
+    );
   } finally {
     h.cleanup();
   }
@@ -1763,7 +1853,7 @@ test("a clean session end persists the handle, hash, duration and gaps", async (
 
     const stored = h.store.getRecording(IDENTITY.occurrenceId);
     assert.ok(stored !== null, "the recording must survive the process");
-    assert.equal(stored.handle, "rec_synthetic_0001");
+    assert.equal(stored.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
     assert.equal(stored.sha256, "0".repeat(64));
     assert.equal(stored.durationMs, 3_600_000);
     assert.equal(stored.finalizedAtMs, BASE_MS);
@@ -1822,7 +1912,7 @@ test("the recording survives closing and reopening the database", async () => {
 
     const reopened = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
     try {
-      assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+      assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
       assert.equal(reopened.getSession(IDENTITY.occurrenceId)?.state, "finalizing");
       assert.deepEqual(reopened.foreignKeyCheck(), []);
     } finally {
@@ -1888,7 +1978,7 @@ test("a bridge_failure end persists the recording alongside the failed transitio
     const row = h.coordinator.get(IDENTITY.occurrenceId);
     assert.equal(row?.state, "failed");
     assert.equal(row?.terminalReason, "bridge_failure");
-    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
   } finally {
     h.cleanup();
   }
@@ -1933,7 +2023,7 @@ test("a reconcileRecording failure keeps the handle, is typed, and still applies
   // exactly the ambiguity round 1's finding existed to remove.
   const boom = new Error("synthetic reconciliation failure");
   const runtime = fakeRuntime({ finalizedGaps: [] });
-  runtime.reconcileRecording = async () => {
+  runtime.reconcileRecordingGaps = async () => {
     throw boom;
   };
   const h = harness({ runtime });
@@ -1951,9 +2041,9 @@ test("a reconcileRecording failure keeps the handle, is typed, and still applies
     // The handle from finalizeRecording is the ONLY reference to the encrypted
     // audio. It is kept, and durably, rather than thrown away because the gap
     // bookkeeping could not be reconciled.
-    assert.equal(h.session.state().recording?.handle, "rec_synthetic_0001");
+    assert.equal(h.session.state().recording?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
     assert.equal(h.session.state().gapReconciliation, "unreconciled");
-    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
 
     // And the row is not stranded.
     assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
