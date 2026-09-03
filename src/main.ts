@@ -24,7 +24,11 @@ export function main(): void {
     throw error;
   }
 
-  console.log("meeting-agent: configuration loaded", describeConfig(config));
+  // The public composition needs deployment-injected bridge/runtime adapters.
+  // This executable deliberately has none: reporting ready here would claim
+  // a service can join/capture when it cannot, so it fails closed instead.
+  console.error("meeting-agent: adapter composition is required before service start", describeConfig(config));
+  process.exitCode = 1;
 }
 
 // pathToFileURL (not a hand-built `file://${...}` template) so a path

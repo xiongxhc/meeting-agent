@@ -8,8 +8,8 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/src/config.d.ts",
-      "import": "./dist/src/config.js"
+      "types": "./dist/src/application.d.ts",
+      "import": "./dist/src/application.js"
     }
   },
   "scripts": {

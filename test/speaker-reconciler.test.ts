@@ -610,8 +610,11 @@ test("local backend: a diarized segment the STT heard nothing in is dropped, not
 const RECORDING_ROW: RecordingRow = {
   occurrenceId: "synthetic-meeting-0001@2026-09-02T14:00:00Z",
   handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  encryptedPath: "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
   sha256: "0".repeat(64),
   durationMs: 3_600_000,
+  format: "ogg/opus",
+  keyId: "runtime-key-20260902",
   finalizedAtMs: Date.parse(ENDED_AT),
   gaps: [],
 };

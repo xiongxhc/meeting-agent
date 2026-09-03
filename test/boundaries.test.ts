@@ -31,6 +31,7 @@ import { test } from "node:test";
 
 import {
   collectImports,
+  findForbiddenRuntimeBoundaryAccess,
   findForbiddenPathLiterals,
   findForbiddenSqliteDependencies,
   findOpaqueConstructs,
@@ -321,6 +322,51 @@ test("reading from the Team Vault directory is never flagged (only write-shaped 
     );
     const violations = findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls);
     assert.deepEqual(violations, []);
+  });
+});
+
+test("negative control: flags a renamed Team Vault capability reaching a write", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-renamed-vault-write.ts"),
+      [
+        'import fs from "node:fs";',
+        "",
+        "export function writeNote(publishedVault: string) {",
+        '  fs.writeFileSync(publishedVault + "/note.md", "hi");',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    assert.equal(findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls).length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 3b: provider and recording-key access may not bypass the runtime.
+// ---------------------------------------------------------------------------
+
+test("src/ makes no provider HTTP call or reads a provider/recording-key environment variable", () => {
+  assert.deepEqual(findForbiddenRuntimeBoundaryAccess(scanProductionTree(SRC_ROOT)), []);
+});
+
+test("negative control: flags direct provider HTTP and recording-key environment access", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-runtime-boundary.ts"),
+      [
+        'export async function bypass() {',
+        '  await fetch("https://api.openai.com/v1/responses");',
+        '  return process.env.MEETING_RECORDING_KEY;',
+        '}',
+        '',
+      ].join("\n"),
+    );
+    const violations = findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir));
+    assert.deepEqual(violations.map((violation) => violation.rule).sort(), [
+      "direct provider HTTP outside runtime",
+      "provider or recording-key environment access",
+    ]);
   });
 });
 

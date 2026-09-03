@@ -53,6 +53,8 @@ export type ScanResult = {
   readonly callArgumentLiterals: CallArgumentLiteral[];
   readonly opaqueConstructs: OpaqueConstruct[];
   readonly writeLikeCalls: WriteLikeCall[];
+  readonly runtimeBoundaryCalls: WriteLikeCall[];
+  readonly environmentAccesses: Array<{ readonly file: string; readonly text: string }>;
 };
 
 const SKIP_DIRS = new Set(["node_modules", "dist", ".build"]);
@@ -87,6 +89,8 @@ export function scanProductionTree(rootDir: string): ScanResult {
     callArgumentLiterals: [],
     opaqueConstructs: [],
     writeLikeCalls: [],
+    runtimeBoundaryCalls: [],
+    environmentAccesses: [],
   };
   for (const file of walkTsFiles(rootDir)) {
     const source = readFileSync(file, "utf8");
@@ -181,6 +185,15 @@ function visit(
         argumentsText: node.arguments.map((a) => a.getText(sourceFile)).join(", "),
       });
     }
+    if (calleeName === "fetch" || calleeName === "request" || calleeName === "get") {
+      result.runtimeBoundaryCalls.push({
+        file,
+        calleeText: node.expression.getText(sourceFile),
+        argumentsText: node.arguments.map((a) => a.getText(sourceFile)).join(", "),
+      });
+    }
+  } else if (ts.isPropertyAccessExpression(node) && node.getText(sourceFile).startsWith("process.env.")) {
+    result.environmentAccesses.push({ file, text: node.getText(sourceFile) });
   }
 
   ts.forEachChild(node, (child) => visit(child, sourceFile, file, result));
@@ -319,15 +332,33 @@ export const TEAM_VAULT_DIR_FIELD_NAME = "teamVaultDir";
 
 export function findTeamVaultWriteAttempts(
   calls: readonly WriteLikeCall[],
-  marker: string = TEAM_VAULT_DIR_FIELD_NAME,
+  marker: RegExp = /(?:teamVaultDir|(?:team|published)?Vault(?:Dir|Root|Path)?)/i,
 ): Violation[] {
   return calls
-    .filter((call) => call.argumentsText.includes(marker))
+    .filter((call) => marker.test(call.argumentsText))
     .map((call) => ({
       file: call.file,
       specifier: call.calleeText,
       rule: "writable fs call reachable from the Team Vault directory",
     }));
+}
+
+/** Direct provider HTTP and provider/recording-key environment access belong
+ * only to the runtime adapter. The Meeting Agent control plane may use Feishu
+ * HTTPS in its dedicated adapter, but must never make model-provider calls. */
+export function findForbiddenRuntimeBoundaryAccess(result: ScanResult): Violation[] {
+  const violations: Violation[] = [];
+  for (const call of result.runtimeBoundaryCalls) {
+    if (/openai|provider/i.test(call.argumentsText)) {
+      violations.push({ file: call.file, specifier: call.calleeText, rule: "direct provider HTTP outside runtime" });
+    }
+  }
+  for (const access of result.environmentAccesses) {
+    if (/(OPENAI|PROVIDER|RECORDING.*KEY|KEY.*RECORDING)/i.test(access.text)) {
+      violations.push({ file: access.file, specifier: access.text, rule: "provider or recording-key environment access" });
+    }
+  }
+  return violations;
 }
 
 /**
@@ -372,7 +403,11 @@ export function findUnconfinedSqliteImports(
   repoRoot: string,
 ): Violation[] {
   return records
-    .filter((record) => /sqlite/i.test(record.specifier))
+    // This gate confines the *driver*, not every local module whose filename
+    // happens to describe the store.  The application composition is allowed
+    // to import the store adapter; only importing better-sqlite3 itself would
+    // leak the database driver past that adapter boundary.
+    .filter((record) => record.specifier === SANCTIONED_SQLITE_DEPENDENCY)
     .filter(
       (record) =>
         normalizeRelative(path.relative(repoRoot, record.file)) !==

@@ -633,7 +633,7 @@ test("a media descriptor the bridge could not parse never leaves the coordinator
   });
   try {
     await assert.rejects(() => h.session.join(), /media_format/);
-    assert.deepEqual(sentTypes(h.bridge), ["join"]);
+    assert.deepEqual(sentTypes(h.bridge), ["join", "leave"]);
     assert.equal(h.session.state().terminalReason, "media_format_rejected");
     assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "failed");
   } finally {
@@ -1156,7 +1156,7 @@ test("an explicit leave asks the bridge, and the bridge's left is what ends the 
   }
 });
 
-test("the coordinator reaches finalizing on a clean end and failed on a bridge failure", async () => {
+test("the coordinator reaches finalizing on a clean end and keeps a recoverable occurrence listening after bridge failure", async () => {
   const clean = harness();
   try {
     await joined(clean);
@@ -1173,8 +1173,8 @@ test("the coordinator reaches finalizing on a clean end and failed on a bridge f
     broken.bridge.emit(broken.bridge.event({ type: "left", reason: "bridge_failure" }));
     await broken.session.settled();
     const row = broken.coordinator.get(IDENTITY.occurrenceId);
-    assert.equal(row?.state, "failed");
-    assert.equal(row?.terminalReason, "bridge_failure");
+    assert.equal(row?.state, "listening");
+    assert.equal(row?.terminalReason, null);
   } finally {
     broken.cleanup();
   }
@@ -1221,8 +1221,11 @@ test("session end stores the finalized handle, hash, duration and gaps", async (
 
     assert.deepEqual(h.session.state().recording, {
       handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      encryptedPath: "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
       sha256: "0".repeat(64),
       durationMs: 3_600_000,
+      format: "ogg/opus",
+      keyId: "runtime-key-20260902",
       gaps: [],
     });
   } finally {
@@ -1842,7 +1845,7 @@ test("only a genuine terminal left is admitted over the bound", async () => {
 // only in a dead process's heap.
 // ---------------------------------------------------------------------------
 
-test("a clean session end persists the handle, hash, duration and gaps", async () => {
+test("a clean session end persists the encrypted locator, format, key id, handle, hash, duration and gaps", async () => {
   const h = harness();
   try {
     await joined(h);
@@ -1854,6 +1857,9 @@ test("a clean session end persists the handle, hash, duration and gaps", async (
     const stored = h.store.getRecording(IDENTITY.occurrenceId);
     assert.ok(stored !== null, "the recording must survive the process");
     assert.equal(stored.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
+    assert.equal(stored.encryptedPath, "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc");
+    assert.equal(stored.format, "ogg/opus");
+    assert.equal(stored.keyId, "runtime-key-20260902");
     assert.equal(stored.sha256, "0".repeat(64));
     assert.equal(stored.durationMs, 3_600_000);
     assert.equal(stored.finalizedAtMs, BASE_MS);
@@ -1913,6 +1919,12 @@ test("the recording survives closing and reopening the database", async () => {
     const reopened = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
     try {
       assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
+      assert.equal(
+        reopened.getRecording(IDENTITY.occurrenceId)?.encryptedPath,
+        "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
+      );
+      assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.format, "ogg/opus");
+      assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.keyId, "runtime-key-20260902");
       assert.equal(reopened.getSession(IDENTITY.occurrenceId)?.state, "finalizing");
       assert.deepEqual(reopened.foreignKeyCheck(), []);
     } finally {
@@ -1968,7 +1980,7 @@ test("a failed finalization still applies the terminal transition, with no recor
   }
 });
 
-test("a bridge_failure end persists the recording alongside the failed transition", async () => {
+test("a bridge_failure ends only that bridge generation and permits a fresh lease/session for the same occurrence", async () => {
   const h = harness();
   try {
     await joined(h);
@@ -1976,9 +1988,32 @@ test("a bridge_failure end persists the recording alongside the failed transitio
     await h.session.settled();
 
     const row = h.coordinator.get(IDENTITY.occurrenceId);
-    assert.equal(row?.state, "failed");
-    assert.equal(row?.terminalReason, "bridge_failure");
-    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
+    assert.equal(row?.state, "listening");
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    const failedLeaseId = h.store
+      .listLeases(IDENTITY.occurrenceId)
+      .find((lease) => lease.releasedAtMs !== null)?.leaseId;
+    assert.ok(failedLeaseId, "the failed bridge generation must release its own lease");
+
+    const nextBridge = fakeBridge("sess_0000000000000002");
+    const nextRuntime = fakeRuntime();
+    const recovery = createMeetingSession({
+      identity: IDENTITY,
+      bridge: nextBridge,
+      runtime: nextRuntime,
+      coordinator: h.coordinator,
+      clock: fakeClock(BASE_MS),
+      agentIdentity: { aliases: ["Meetbot"] },
+      bridgeId: "bridge-mac-synthetic",
+      bridgeSessionId: "sess_0000000000000002",
+      disclosureText: DISCLOSURE_TEXT,
+    });
+    await recovery.join();
+    nextBridge.emit(nextBridge.event({ type: "joined", meetingOccurrenceId: IDENTITY.occurrenceId }));
+    await recovery.settled();
+    assert.equal(nextRuntime.callsOf("startVoiceSession").length, 1);
+    assert.notEqual(failedLeaseId, h.coordinator.activeBridgeLease(IDENTITY.occurrenceId)?.leaseId);
+    recovery.dispose();
   } finally {
     h.cleanup();
   }
@@ -2306,5 +2341,135 @@ test("a broken Team Vault checkout degrades the session's retrieval instead of f
     session.dispose();
     store.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Retrospective Plan 3 Tasks 1-6: cancellation and rollback regressions.
+// ---------------------------------------------------------------------------
+
+function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {
+  let resolvePromise: (() => void) | null = null;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve(): void {
+      resolvePromise?.();
+    },
+  };
+}
+
+async function flushMacrotask(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+for (const abort of ["provider", "overflow", "left"] as const) {
+  test(`a stalled retrieval cannot authorize after ${abort} cancels its turn`, async () => {
+    const runtime = fakeRuntime();
+    const stalled = deferredVoid();
+    const realSeed = runtime.seedContext.bind(runtime);
+    runtime.seedContext = async (context) => {
+      await realSeed(context);
+      await stalled.promise;
+    };
+    const h = harness({ runtime, ...(abort === "overflow" ? { maxQueuedEvents: 1 } : {}) });
+    try {
+      await joined(h);
+      runtime.emit(transcript("seg-cancel", "Meetbot, can you summarize that?"));
+      await flushMacrotask();
+
+      if (abort === "provider") {
+        runtime.emit({ type: "provider_unavailable", detail: "synthetic outage" });
+      } else if (abort === "left") {
+        h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+      } else {
+        for (let i = 0; i < 4; i += 1) {
+          h.bridge.emit(h.bridge.event({ type: "media_connected", endpoint: "udp://127.0.0.1:40001" }));
+        }
+      }
+      await flushMacrotask();
+      stalled.resolve();
+      await h.session.settled();
+
+      assert.equal(runtime.callsOf("authorizeVoiceResponse").length, 0);
+      assert.equal(h.session.turns().filter((turn) => turn.segmentId === "seg-cancel").length, 1);
+      assert.ok(
+        runtime
+          .callsOf("skipVoiceResponse")
+          .some((call) => call.method === "skipVoiceResponse" && call.segmentId === "seg-cancel"),
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+}
+
+for (const failedMethod of ["seedContext", "authorizeVoiceResponse"] as const) {
+  test(`a rejected ${failedMethod} settles the turn once and fail-closes it`, async () => {
+    const runtime = fakeRuntime();
+    const failure = new Error(`synthetic ${failedMethod} failure`);
+    if (failedMethod === "seedContext") {
+      runtime.seedContext = async () => {
+        throw failure;
+      };
+    } else {
+      runtime.authorizeVoiceResponse = async () => {
+        throw failure;
+      };
+    }
+    const h = harness({ runtime });
+    try {
+      await joined(h);
+      runtime.emit(transcript("seg-reject", "Meetbot, can you summarize that?"));
+      await h.session.settled();
+
+      assert.deepEqual(
+        h.session.turns().filter((turn) => turn.segmentId === "seg-reject").map((turn) => turn.outcome),
+        ["failed"],
+      );
+      assert.ok(
+        runtime
+          .callsOf("skipVoiceResponse")
+          .some((call) => call.method === "skipVoiceResponse" && call.segmentId === "seg-reject"),
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+}
+
+test("a throwing second subscription rolls back the lease, first subscription, runtime, and coordinator state", async () => {
+  const h = harness();
+  const subscriptionFailure = new Error("synthetic runtime subscription failure");
+  const realSubscribe = h.runtime.subscribe.bind(h.runtime);
+  h.runtime.subscribe = () => {
+    throw subscriptionFailure;
+  };
+  try {
+    await assert.rejects(() => h.session.join(), (error: unknown) => error === subscriptionFailure);
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "failed");
+    assert.equal(h.runtime.callsOf("close").length, 0, "a runtime that never started is not closed");
+  } finally {
+    h.runtime.subscribe = realSubscribe;
+    h.cleanup();
+  }
+});
+
+test("a joined session closes the runtime on terminal left and on dispose", async () => {
+  const h = harness();
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+    assert.equal(h.runtime.callsOf("close").length, 1);
+    h.session.dispose();
+    assert.equal(h.runtime.callsOf("close").length, 1, "cleanup must be idempotent");
+  } finally {
+    h.cleanup();
   }
 });

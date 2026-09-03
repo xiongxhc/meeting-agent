@@ -69,6 +69,16 @@ export function makeOccurrenceId(meetingId: string, startedAt: string): Occurren
       `occurrence id: startedAt must be a whole-second UTC instant like "2026-09-02T14:00:00Z", got "${startedAt}"`,
     );
   }
+  // Date.parse normalizes impossible calendar fields (for example April 31)
+  // on some engines. Construct from fields and require the canonical UTC
+  // spelling to round-trip, so every accepted occurrence names a real instant.
+  const parsedMs = Date.parse(startedAt);
+  if (
+    !Number.isFinite(parsedMs) ||
+    new Date(parsedMs).toISOString().replace(".000Z", "Z") !== startedAt
+  ) {
+    throw new Error(`occurrence id: startedAt is not a real UTC instant: "${startedAt}"`);
+  }
   return `${meetingId}@${startedAt}` as OccurrenceId;
 }
 
@@ -136,8 +146,17 @@ export function parseOccurrencePathSegment(segment: string): OccurrenceId {
     throw new Error(`invalid occurrence path segment (empty meeting id): "${segment}"`);
   }
   const startedAt = fromCompactInstant(compact);
-  const meetingId = decodeURIComponent(encodedMeetingId);
-  return makeOccurrenceId(meetingId, startedAt);
+  let meetingId: string;
+  try {
+    meetingId = decodeURIComponent(encodedMeetingId);
+  } catch {
+    throw new Error(`invalid occurrence path segment (bad percent encoding): "${segment}"`);
+  }
+  const occurrenceId = makeOccurrenceId(meetingId, startedAt);
+  if (occurrencePathSegment(occurrenceId) !== segment) {
+    throw new Error(`invalid occurrence path segment (noncanonical spelling): "${segment}"`);
+  }
+  return occurrenceId;
 }
 
 /**

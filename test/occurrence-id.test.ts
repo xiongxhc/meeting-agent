@@ -117,6 +117,27 @@ test("makeOccurrenceId rejects a startedAt with fractional seconds or a non-UTC 
   assert.throws(() => makeOccurrenceId("vc:1", "2026-09-02 14:00:00Z"));
 });
 
+test("makeOccurrenceId rejects impossible whole-second UTC instants", () => {
+  // These match the spelling rule but are not instants. A regex-only check
+  // would make them durable occurrence identities that no UTC clock can name.
+  for (const startedAt of [
+    "2026-02-29T12:00:00Z",
+    "2026-04-31T12:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T12:60:00Z",
+    "2026-01-01T12:00:60Z",
+  ]) {
+    assert.throws(() => makeOccurrenceId("vc:impossible", startedAt));
+  }
+});
+
+test("parseOccurrencePathSegment rejects noncanonical percent spellings", () => {
+  const canonical = occurrencePathSegment(makeOccurrenceId("vc!", "2026-09-02T14:00:00Z"));
+  assert.equal(canonical, "vc%21_20260902T140000Z");
+  assert.throws(() => parseOccurrencePathSegment("vc!_20260902T140000Z"));
+  assert.throws(() => parseOccurrencePathSegment("vc%21_20260902T140000z"));
+});
+
 test("shortOccurrenceId is the first 8 lowercase hex characters of sha256 of the ENCODED path segment, not the raw id", () => {
   const id = makeOccurrenceId("vc:9f3a/board-sync", "2026-09-02T14:00:00Z");
   const segment = occurrencePathSegment(id);

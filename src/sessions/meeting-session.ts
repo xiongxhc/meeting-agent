@@ -83,7 +83,11 @@ import {
   type InvocationGateIdentity,
   type InvocationSink,
 } from "./invocation-gate.ts";
-import { createRetrievalRouter, type RetrievalRouter } from "./retrieval-router.ts";
+import {
+  RetrievalAuthorizationCancelled,
+  createRetrievalRouter,
+  type RetrievalRouter,
+} from "./retrieval-router.ts";
 
 /** Used when the session was given neither `options.retrieval` nor
  * `options.teamVaultDir`: the router still answers from the current
@@ -259,6 +263,7 @@ export type CreateMeetingSessionOptions = {
   readonly bridgeSessionId: string;
   readonly disclosureText: string;
   readonly maxQueuedEvents?: number;
+  readonly bridgeFailureRetryLimit?: number;
   /** Injected so command ids are deterministic under test. Defaults to a
    * per-session counter, which is already deterministic. */
   readonly nextCommandId?: () => string;
@@ -295,6 +300,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     disclosureText,
   } = options;
   const maxQueuedEvents = options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS;
+  const bridgeFailureRetryLimit = options.bridgeFailureRetryLimit ?? 2;
+  // A freshly constructed session is either the occurrence's first bridge
+  // generation (discovered) or a recovery generation after bridge_failure.
+  // This is captured before join so a duplicate `joined` on one generation is
+  // still a protocol error rather than being mistaken for recovery.
+  const isRecoveryGeneration = coordinator.get(identity.occurrenceId)?.state === "listening";
 
   const validator = createBridgeSessionValidator(bridgeSessionId);
   const issuedCommandTypes = new Map<string, BridgeCommand["type"]>();
@@ -323,6 +334,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let leaseId: string | null = null;
   let finalized = false;
   let disposed = false;
+  let cancellationGeneration = 0;
+  let runtimeStarted = false;
+  let runtimeClosed = false;
+  let joinCommandSent = false;
 
   const observedGaps: ObservedAudioGap[] = [];
   const commandResults: BridgeCommandResult[] = [];
@@ -365,6 +380,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // segment text, so this is what supplies the router something to search
   // for. Removed the moment it is consumed either way (skip or authorize).
   const pendingQueryText = new Map<string, string>();
+  const turnGenerations = new Map<string, number>();
   // In-flight retrieval-then-authorize work the sink kicks off without the
   // pump loop awaiting it (see the "not awaited here, deliberately" note
   // below) -- tracked so settled() can still wait for it. Without this, a
@@ -390,15 +406,27 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     authorizeVoiceResponse(segmentId: string, matchedAlias: string): void {
       const queryText = pendingQueryText.get(segmentId) ?? "";
       pendingQueryText.delete(segmentId);
+      const turnGeneration = turnGenerations.get(segmentId);
       // Not awaited here, deliberately -- matching every other runtime call
       // in this module (see skipVoiceResponse above, and finalizeRecording
       // below): the pump never blocks on a runtime round-trip. Tracked in
       // pendingSinkWork instead, so settled() still waits for it.
       const work = retrievalRouter
-        .answer({ segmentId, authorize: true, matchedAlias }, queryText)
+        .answer({ segmentId, authorize: true, matchedAlias }, queryText, {
+          mayAuthorize: () =>
+            turnGeneration !== undefined &&
+            cancellationGeneration === turnGeneration &&
+            terminalReason === null &&
+            phase === "listening" &&
+            speaking === "enabled" &&
+            openTurns.has(segmentId),
+        })
         .then(() => {})
         .catch((error: unknown) => {
-          runtimeErrors.push({ segmentId, error });
+          if (!(error instanceof RetrievalAuthorizationCancelled)) {
+            runtimeErrors.push({ segmentId, error });
+          }
+          failClosedTurn(segmentId, error instanceof RetrievalAuthorizationCancelled ? "authorization_cancelled" : "retrieval_failed");
         });
       pendingSinkWork.add(work);
       void work.finally(() => {
@@ -428,6 +456,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     }
     issuedCommandTypes.set(commandId, command.type);
     await bridge.send(accepted.value);
+    if (command.type === "join") joinCommandSent = true;
   }
 
   // Handed ONE capability. src/ports/bridge.ts imports nothing from the
@@ -443,6 +472,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     if (settledTurns.has(segmentId)) return;
     settledTurns.add(segmentId);
     openTurns.delete(segmentId);
+    turnGenerations.delete(segmentId);
     turns.push({ segmentId, outcome, detail, atMs: clock.now() });
   }
 
@@ -450,6 +480,14 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     if (speaking === "aborted") return; // The first reason is the true one.
     speaking = "aborted";
     speakingAbortReason = reason;
+    cancellationGeneration += 1;
+  }
+
+  function failClosedTurn(segmentId: string, reason: string): void {
+    if (!settledTurns.has(segmentId)) settle(segmentId, "failed", reason);
+    runtime.skipVoiceResponse(segmentId, reason).catch((error: unknown) => {
+      runtimeErrors.push({ segmentId, error });
+    });
   }
 
   // ---- bounded queue ----------------------------------------------------
@@ -607,7 +645,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     switch (event.type) {
       case "joined":
         phase = "listening";
-        coordinator.advance(identity.occurrenceId, "listening");
+        if (coordinator.get(identity.occurrenceId)?.state === "joining") {
+          coordinator.advance(identity.occurrenceId, "listening");
+        } else if (!isRecoveryGeneration) {
+          throw new Error("duplicate joined event for an already-listening bridge generation");
+        }
         return;
 
       case "left":
@@ -723,6 +765,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // segment below; discarded either way once consumed there or in
         // sink.skipVoiceResponse.
         pendingQueryText.set(segmentId, event.segment.text);
+        turnGenerations.set(segmentId, cancellationGeneration);
         const decision = decide(event.segment, agentIdentity);
         dispatcher.apply(decision);
 
@@ -796,7 +839,16 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // recording handle does not exist until the runtime returns it, and the
       // two have to be written together. See applyTerminalTransition.
       await finalizeRecording();
-      applyTerminalTransition(reason);
+      if (reason === "bridge_failure") {
+        const recovery = coordinator.recordBridgeFailure(
+          identity.occurrenceId,
+          bridgeFailureRetryLimit,
+          observedGaps.map((gap) => ({ ...gap })),
+        );
+        if (!recovery.retryAllowed) coordinator.fail(identity.occurrenceId, "bridge_failure_exhausted");
+      } else {
+        applyTerminalTransition(reason);
+      }
     } finally {
       // In a `finally`, because a finalization that throws must not leave the
       // session subscribed to two planes it has already declared itself
@@ -804,6 +856,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // losing the subscriptions on top of it would make the session
       // "structurally deaf after a left" false in exactly the branch where it
       // matters most.
+      await closeRuntime();
       unsubscribe();
     }
   }
@@ -901,12 +954,30 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   /** Releases everything join() had already taken, and makes the session
    * terminal for `reason`. Terminal, not merely "already joined": a retry
    * means a NEW session against a NEW lease, exactly as after a `left`. */
-  function failJoin(reason: string): void {
+  async function closeRuntime(): Promise<void> {
+    if (!runtimeStarted || runtimeClosed) return;
+    runtimeClosed = true;
+    try {
+      await runtime.close();
+    } catch (error) {
+      routingErrors.push({ source: "join_cleanup", error });
+    }
+  }
+
+  async function failJoin(reason: string): Promise<void> {
     if (terminalReason !== null) return;
     terminalReason = reason;
     phase = "ended";
     abortSpeaking(reason);
     try {
+      if (joinCommandSent) {
+        try {
+          await issue({ type: "leave", reason: "coordinator_stop" });
+        } catch (error) {
+          routingErrors.push({ source: "join_cleanup", error });
+        }
+      }
+      await closeRuntime();
       if (leaseId !== null) {
         coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
         leaseId = null;
@@ -953,20 +1024,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       }
 
       phase = "joining";
-      coordinator.advance(identity.occurrenceId, "joining");
-      const lease = coordinator.acquireBridgeLease(identity.occurrenceId, {
-        bridgeId,
-        bridgeSessionId,
-      });
-      leaseId = lease.leaseId;
-
-      unsubscribeBridge = bridge.subscribe((raw) => {
-        enqueue({ source: "bridge", raw });
-      });
-      unsubscribeRuntime = runtime.subscribe((event) => {
-        enqueue({ source: "runtime", event });
-      });
-
+      const existing = coordinator.get(identity.occurrenceId);
+      if (existing?.state === "discovered") coordinator.advance(identity.occurrenceId, "joining");
+      else if (existing?.state !== "listening") {
+        throw new Error(`occurrence cannot start a bridge generation from state "${existing?.state ?? "missing"}"`);
+      }
       // ONE cleanup for every way the rest of join can fail. The lease is
       // already taken by this point, and nothing sweeps an abandoned one: the
       // coordinator recovers a stale lease only inside a subsequent
@@ -976,6 +1038,19 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // planes subscribed, the row sitting in "joining" with no terminal
       // reason and no way to retry.
       try {
+        const lease = coordinator.acquireBridgeLease(identity.occurrenceId, {
+          bridgeId,
+          bridgeSessionId,
+        });
+        leaseId = lease.leaseId;
+
+        unsubscribeBridge = bridge.subscribe((raw) => {
+          enqueue({ source: "bridge", raw });
+        });
+        unsubscribeRuntime = runtime.subscribe((event) => {
+          enqueue({ source: "runtime", event });
+        });
+
         await issue({
           type: "join",
           meetingOccurrenceId: identity.occurrenceId,
@@ -992,6 +1067,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           responseMode: PINNED_RESPONSE_MODE,
         });
         runtimeSessionId = handle.runtimeSessionId;
+        runtimeStarted = true;
 
         if (handle.profile !== PINNED_PROFILE) {
           abortSpeaking("profile_mismatch");
@@ -1007,7 +1083,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // too, and it keeps its own, more specific reason so an operator can
         // tell a bad media format from a runtime outage at a glance. Everything
         // else is a plain failed join.
-        failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
+        await failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
         throw error;
       }
 
@@ -1066,7 +1142,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     dispose(): void {
       if (disposed) return;
       disposed = true;
+      cancellationGeneration += 1;
       queue.length = 0;
+      void closeRuntime();
       unsubscribe();
     },
   };

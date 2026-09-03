@@ -92,8 +92,13 @@ export type RecordingHandle = {
   /** An opaque reference to the ENCRYPTED recording. Meeting Agent never holds
    * the recording key and never sees plaintext audio. */
   readonly handle: string;
+  /** Runtime-owned locator for encrypted bytes. It is metadata, never bytes. */
+  readonly encryptedPath: string;
   readonly sha256: string;
   readonly durationMs: number;
+  readonly format: string;
+  /** Identifies the runtime-held key; the key itself never crosses this port. */
+  readonly keyId: string;
   readonly gaps: readonly RecordingGap[];
 };
 

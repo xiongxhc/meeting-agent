@@ -9,7 +9,7 @@
 // temp directory this test creates and removes itself.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -121,6 +121,53 @@ test("a checkout that advances after the index was built is reported stale, with
     // Still searching the CONTENT read at construction time (v1's wording),
     // not whatever is on disk now.
     assert.match(result.hits[0]?.excerpt ?? "", /October/);
+  });
+});
+
+test("refuses a dirty checkout instead of attributing uncommitted Markdown to HEAD", () => {
+  withTempGitVault((dir) => {
+    writeFileSync(path.join(dir, "roadmap.md"), "Published October decision.\n");
+    commitAll(dir, "publish roadmap");
+    writeFileSync(path.join(dir, "roadmap.md"), "Unpublished secret December decision.\n");
+
+    assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }), /clean|stable|dirty/i);
+  });
+});
+
+test("refuses untracked Markdown instead of indexing it under an unrelated HEAD", () => {
+  withTempGitVault((dir) => {
+    writeFileSync(path.join(dir, "roadmap.md"), "Published October decision.\n");
+    commitAll(dir, "publish roadmap");
+    writeFileSync(path.join(dir, "draft.md"), "Untracked November decision.\n");
+
+    assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }), /clean|stable|dirty/i);
+  });
+});
+
+test("refuses a Markdown symlink that escapes the published checkout", () => {
+  const outside = mkdtempSync(path.join(os.tmpdir(), "team-vault-outside-"));
+  try {
+    writeFileSync(path.join(outside, "outside.md"), "Escaped confidential Markdown.\n");
+    withTempGitVault((dir) => {
+      writeFileSync(path.join(dir, "roadmap.md"), "Published October decision.\n");
+      symlinkSync(path.join(outside, "outside.md"), path.join(dir, "escape.md"));
+      commitAll(dir, "publish roadmap and bad link");
+
+      assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }), /symlink|escape/i);
+    });
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("a revision-read failure makes an existing index unavailable, never falsely fresh", () => {
+  withTempGitVault((dir) => {
+    writeFileSync(path.join(dir, "roadmap.md"), "Published October decision.\n");
+    commitAll(dir, "publish roadmap");
+    const index = createTeamVaultIndex({ teamVaultDir: dir });
+    rmSync(path.join(dir, ".git"), { recursive: true, force: true });
+
+    assert.throws(() => index.search("October"), /revision|git|vault/i);
   });
 });
 

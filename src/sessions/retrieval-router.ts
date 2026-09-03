@@ -136,8 +136,22 @@ export type RetrievalRouter = {
   /** Retrieves, bounds, seeds the runtime's context, and THEN authorizes
    * the segment. Only callable with a decision the gate itself produced
    * (see AuthorizedInvocation). */
-  answer(invocation: AuthorizedInvocation, queryText: string): Promise<SeededContext>;
+  answer(
+    invocation: AuthorizedInvocation,
+    queryText: string,
+    options?: { readonly mayAuthorize?: () => boolean },
+  ): Promise<SeededContext>;
 };
+
+/** The session invalidated this turn after retrieval began. This is not a
+ * retrieval failure: it is the expected fail-closed result of a provider
+ * outage, overflow, terminal left, or disposal racing a stalled seed call. */
+export class RetrievalAuthorizationCancelled extends Error {
+  constructor() {
+    super("retrieval authorization was cancelled before runtime authorization");
+    this.name = "RetrievalAuthorizationCancelled";
+  }
+}
 
 export function createRetrievalRouter(options: CreateRetrievalRouterOptions): RetrievalRouter {
   const memory = options.memory ?? createCurrentMeetingMemory();
@@ -148,7 +162,11 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
       memory.record(segment);
     },
 
-    async answer(invocation: AuthorizedInvocation, queryText: string): Promise<SeededContext> {
+    async answer(
+      invocation: AuthorizedInvocation,
+      queryText: string,
+      answerOptions: { readonly mayAuthorize?: () => boolean } = {},
+    ): Promise<SeededContext> {
       const meetingHits = memory.search(queryText);
       const bestMeetingScore = meetingHits[0]?.score ?? 0;
 
@@ -191,6 +209,9 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
       };
 
       await sink.seedContext(context);
+      if (answerOptions.mayAuthorize !== undefined && !answerOptions.mayAuthorize()) {
+        throw new RetrievalAuthorizationCancelled();
+      }
       await sink.authorizeVoiceResponse(invocation.segmentId);
 
       return context;

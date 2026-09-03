@@ -33,6 +33,7 @@ import {
   type LeaseRow,
   type RecordingGapRow,
   type RecordingRow,
+  type BridgeRecoveryResult,
   type MigrationRow,
   type SessionRow,
   type SessionState,
@@ -89,6 +90,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
 
     finalizeSession: (input) => finalizeSession(db, input),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
+    recordBridgeFailure: (input) => recordBridgeFailure(db, input),
 
     acquireLease: (input) => acquireLease(db, input),
     releaseLease: (occurrenceId, leaseId, reason, nowMs) =>
@@ -381,13 +383,17 @@ function finalizeSession(
     const session = transition(db, input.transition);
     withConstraintTranslation(() => {
       db.prepare(
-        `INSERT INTO recordings (occurrence_id, handle, sha256, duration_ms, finalized_at_ms)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO recordings
+           (occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         occurrenceId,
         input.recording.handle,
+        input.recording.encryptedPath,
         input.recording.sha256,
         input.recording.durationMs,
+        input.recording.format,
+        input.recording.keyId,
         nowMs,
       );
       const insertGap = db.prepare(
@@ -407,15 +413,18 @@ function finalizeSession(
 function getRecording(db: Database.Database, occurrenceId: string): RecordingRow | null {
   const raw = db
     .prepare(
-      `SELECT occurrence_id, handle, sha256, duration_ms, finalized_at_ms
+      `SELECT occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms
          FROM recordings WHERE occurrence_id = ?`,
     )
     .get(occurrenceId) as
     | {
         occurrence_id: string;
         handle: string;
+        encrypted_path: string;
         sha256: string;
         duration_ms: number;
+        format: string;
+        key_id: string;
         finalized_at_ms: number;
       }
     | undefined;
@@ -436,8 +445,11 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
   return {
     occurrenceId: raw.occurrence_id,
     handle: raw.handle,
+    encryptedPath: raw.encrypted_path,
     sha256: raw.sha256,
     durationMs: raw.duration_ms,
+    format: raw.format,
+    keyId: raw.key_id,
     finalizedAtMs: raw.finalized_at_ms,
     gaps: gaps.map(
       (gap): RecordingGapRow => ({
@@ -448,6 +460,40 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
       }),
     ),
   };
+}
+
+function recordBridgeFailure(
+  db: Database.Database,
+  input: {
+    readonly occurrenceId: string;
+    readonly nowMs: number;
+    readonly maxRetries: number;
+    readonly gaps: FinalizeSessionInput["recording"]["gaps"];
+  },
+): BridgeRecoveryResult {
+  const run = db.transaction(() => {
+    if (selectSessionRaw(db, input.occurrenceId) === undefined) {
+      throw new OrchestrationError("unknown_session", `no session exists for occurrence "${input.occurrenceId}"`);
+    }
+    const current = db
+      .prepare("SELECT failure_count FROM bridge_recoveries WHERE occurrence_id = ?")
+      .get(input.occurrenceId) as { failure_count: number } | undefined;
+    const attempt = (current?.failure_count ?? 0) + 1;
+    db.prepare(
+      `INSERT INTO bridge_recoveries (occurrence_id, failure_count, last_failed_at_ms) VALUES (?, ?, ?)
+       ON CONFLICT(occurrence_id) DO UPDATE SET failure_count = excluded.failure_count,
+         last_failed_at_ms = excluded.last_failed_at_ms`,
+    ).run(input.occurrenceId, attempt, input.nowMs);
+    const insertGap = db.prepare(
+      `INSERT INTO bridge_recovery_gaps (occurrence_id, attempt, ordinal, direction, started_at, ended_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    input.gaps.forEach((gap, ordinal) => {
+      insertGap.run(input.occurrenceId, attempt, ordinal, gap.direction, gap.startedAt, gap.endedAt);
+    });
+    return { attempt, retryAllowed: attempt <= input.maxRetries };
+  });
+  return run();
 }
 
 function toTransitionRow(raw: {
@@ -526,6 +572,16 @@ function selectActiveLeaseRaw(db: Database.Database, occurrenceId: string): Leas
     .get(occurrenceId) as LeaseRowRaw | undefined;
 }
 
+function selectActiveLeaseForBridgeRaw(db: Database.Database, bridgeId: string): LeaseRowRaw | undefined {
+  return db
+    .prepare(
+      `SELECT lease_id, occurrence_id, bridge_id, bridge_session_id, acquired_at_ms, expires_at_ms,
+              released_at_ms, release_reason
+       FROM bridge_leases WHERE bridge_id = ? AND released_at_ms IS NULL`,
+    )
+    .get(bridgeId) as LeaseRowRaw | undefined;
+}
+
 function getActiveLease(db: Database.Database, occurrenceId: string): LeaseRow | null {
   const raw = selectActiveLeaseRaw(db, occurrenceId);
   return raw ? toLeaseRow(raw) : null;
@@ -554,6 +610,21 @@ function acquireLease(db: Database.Database, input: AcquireLeaseInput): LeaseRow
         db.prepare(
           `UPDATE bridge_leases SET released_at_ms = ?, release_reason = 'stale_recovered' WHERE lease_id = ?`,
         ).run(input.nowMs, active.lease_id);
+      });
+    }
+
+    const bridgeActive = selectActiveLeaseForBridgeRaw(db, input.bridgeId);
+    if (bridgeActive !== undefined) {
+      if (bridgeActive.expires_at_ms > input.nowMs) {
+        throw new OrchestrationError(
+          "lease_held",
+          `bridge "${input.bridgeId}" already leases occurrence "${bridgeActive.occurrence_id}" (expires at ${bridgeActive.expires_at_ms})`,
+        );
+      }
+      withConstraintTranslation(() => {
+        db.prepare(
+          `UPDATE bridge_leases SET released_at_ms = ?, release_reason = 'stale_recovered' WHERE lease_id = ?`,
+        ).run(input.nowMs, bridgeActive.lease_id);
       });
     }
 

@@ -14,7 +14,7 @@
 // all, not by working around the scanner's heuristic.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -51,8 +51,17 @@ export type CreateTeamVaultIndexOptions = {
  */
 export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): TeamVaultIndexPort {
   const { teamVaultDir } = options;
-  const files = readMarkdownFiles(teamVaultDir);
+  // A HEAD revision is provenance only for the bytes committed at that HEAD.
+  // Refuse a dirty tree rather than silently attaching untracked/draft text to
+  // an unrelated published revision. Verify before and after the read so a
+  // checkout advancing during construction cannot create a mixed snapshot.
+  assertCleanWorkingTree(teamVaultDir);
   const indexedRevision = readGitRevision(teamVaultDir);
+  const files = readMarkdownFiles(teamVaultDir);
+  assertCleanWorkingTree(teamVaultDir);
+  if (readGitRevision(teamVaultDir) !== indexedRevision) {
+    throw new Error("Team Vault checkout advanced while its index was being built");
+  }
 
   return {
     search(query: string): TeamVaultSearchResult {
@@ -71,7 +80,10 @@ export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): Team
       hits.sort((a, b) => b.score - a.score);
 
       const currentRevision = tryReadGitRevision(teamVaultDir);
-      const stale = currentRevision !== null && currentRevision !== indexedRevision;
+      if (currentRevision === null) {
+        throw new Error("Team Vault revision is unavailable; refusing stale provenance");
+      }
+      const stale = currentRevision !== indexedRevision;
 
       return { hits, indexedRevision, stale };
     },
@@ -101,6 +113,9 @@ function readMarkdownFiles(rootDir: string): readonly IndexedFile[] {
 function walk(rootDir: string, currentDir: string, out: IndexedFile[]): void {
   for (const entry of readdirSync(currentDir)) {
     const full = path.join(currentDir, entry);
+    if (lstatSync(full).isSymbolicLink()) {
+      throw new Error(`Team Vault index refuses symlink entry "${full}"`);
+    }
     const info = statSync(full);
     if (info.isDirectory()) {
       if (entry === GIT_DIR_NAME) continue;
@@ -170,5 +185,20 @@ function tryReadGitRevision(dir: string): string | null {
     }).trim();
   } catch {
     return null;
+  }
+}
+
+function assertCleanWorkingTree(dir: string): void {
+  try {
+    const status = execFileSync("git", ["-C", dir, "status", "--porcelain=v1", "--untracked-files=all"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (status.trim() !== "") {
+      throw new Error("Team Vault checkout is dirty or has untracked files");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("dirty or has untracked")) throw error;
+    throw new Error(`Team Vault checkout at "${dir}" is not a clean readable git working tree`);
   }
 }

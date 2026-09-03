@@ -172,8 +172,11 @@ const DEFAULT_RECORDING: RecordingHandle = {
   // Lowercase alphanumerics only, like the runtime's real handles (the
   // lowercase hex spelling of a random binding) -- see migrations/002.
   handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  encryptedPath: "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
   sha256: "0".repeat(64),
   durationMs: 3_600_000,
+  format: "ogg/opus",
+  keyId: "runtime-key-20260902",
   gaps: [],
 };
 

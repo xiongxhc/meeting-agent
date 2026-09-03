@@ -172,10 +172,13 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 2);
+      assert.equal(store.schemaVersion, 5);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
+        { version: 3, name: "003_bridge_capacity.sql", appliedAtMs: BASE_MS },
+        { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
+        { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -220,12 +223,15 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 2);
+      assert.equal(second.schemaVersion, 5);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
+        { version: 3, name: "003_bridge_capacity.sql", appliedAtMs: BASE_MS },
+        { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
+        { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -766,6 +772,46 @@ test("a bridge lease is unique per occurrence while it is live", () => {
   }
 });
 
+test("one physical bridge cannot hold leases for two occurrences, while different bridges can", () => {
+  const h = harness();
+  try {
+    const store = h.open();
+    const clock = fakeClock();
+    const coordinator = coordinatorFor(store, clock);
+    try {
+      const first = identity(1);
+      const second = identity(2);
+      const third = identity(3);
+      coordinator.discover(first);
+      coordinator.discover(second);
+      coordinator.discover(third);
+
+      coordinator.acquireBridgeLease(first.occurrenceId, {
+        bridgeId: "fake-bridge-shared",
+        bridgeSessionId: "bridge-session-first",
+      });
+      assert.throws(
+        () =>
+          coordinator.acquireBridgeLease(second.occurrenceId, {
+            bridgeId: "fake-bridge-shared",
+            bridgeSessionId: "bridge-session-second",
+          }),
+        isOrchestrationError("lease_held"),
+      );
+      assert.doesNotThrow(() =>
+        coordinator.acquireBridgeLease(third.occurrenceId, {
+          bridgeId: "fake-bridge-other",
+          bridgeSessionId: "bridge-session-third",
+        }),
+      );
+    } finally {
+      store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("a stale lease is recoverable once its bounded timeout has passed, using an injected clock", () => {
   const h = harness();
   try {
@@ -864,6 +910,40 @@ test("a bridge_failure release is terminal for that lease exactly like `left`", 
       assert.throws(() => coordinator.releaseBridgeLease(id.occurrenceId, lease.leaseId, "left"), isOrchestrationError("unknown_lease"));
     } finally {
       store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("bridge failure recovery is durable, bounded, and keeps the occurrence reusable until exhaustion", () => {
+  const h = harness();
+  try {
+    const first = h.open();
+    const clock = fakeClock();
+    const coordinator = coordinatorFor(first, clock);
+    const id = identity(73);
+    coordinator.discover(id);
+    coordinator.advance(id.occurrenceId, "joining");
+    coordinator.advance(id.occurrenceId, "listening");
+    const firstFailure = coordinator.recordBridgeFailure(id.occurrenceId, 1, [
+      { direction: "capture", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" },
+    ]);
+    assert.deepEqual(firstFailure, { attempt: 1, retryAllowed: true });
+    first.close();
+
+    const resumed = h.open();
+    try {
+      const resumedCoordinator = coordinatorFor(resumed, clock);
+      assert.equal(resumedCoordinator.get(id.occurrenceId)?.state, "listening");
+      assert.deepEqual(resumedCoordinator.recordBridgeFailure(id.occurrenceId, 1, []), {
+        attempt: 2,
+        retryAllowed: false,
+      });
+      resumedCoordinator.fail(id.occurrenceId, "bridge_failure_exhausted");
+      assert.equal(resumedCoordinator.get(id.occurrenceId)?.state, "failed");
+    } finally {
+      resumed.close();
     }
   } finally {
     h.cleanup();
