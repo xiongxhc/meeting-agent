@@ -343,6 +343,13 @@ export function findTeamVaultWriteAttempts(
 export const SANCTIONED_SQLITE_DEPENDENCY = "better-sqlite3";
 export const SANCTIONED_SQLITE_IMPORTER_RELATIVE_PATH = "src/adapters/sqlite-session-store.ts";
 
+// The runtime driver's own @types/* package is not itself a SQLite
+// dependency -- it ships no code, only ambient type declarations for the
+// sanctioned driver above -- so it is named explicitly here rather than
+// widening the /sqlite/i match itself. Any OTHER SQLite-shaped package
+// (sqlite3, node:sqlite polyfills, @types/sqlite3, ...) is still caught.
+export const SANCTIONED_SQLITE_TYPES_DEPENDENCY = "@types/better-sqlite3";
+
 export type PackageJsonLike = {
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
@@ -353,7 +360,11 @@ export function findForbiddenSqliteDependencies(pkg: PackageJsonLike): string[] 
     ...Object.keys(pkg.dependencies ?? {}),
     ...Object.keys(pkg.devDependencies ?? {}),
   ];
-  return names.filter((name) => /sqlite/i.test(name) && name !== SANCTIONED_SQLITE_DEPENDENCY);
+  const allowed: ReadonlySet<string> = new Set([
+    SANCTIONED_SQLITE_DEPENDENCY,
+    SANCTIONED_SQLITE_TYPES_DEPENDENCY,
+  ]);
+  return names.filter((name) => /sqlite/i.test(name) && !allowed.has(name));
 }
 
 export function findUnconfinedSqliteImports(

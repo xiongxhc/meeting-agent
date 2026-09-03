@@ -415,6 +415,22 @@ test("the sanctioned SQLite dependency alone is never flagged by the dependency 
   assert.deepEqual(findForbiddenSqliteDependencies(pkg), []);
 });
 
+test("the sanctioned driver's own @types package is never flagged, even though its name matches /sqlite/i", () => {
+  const pkg: PackageJsonLike = {
+    dependencies: { "better-sqlite3": "^13.0.0" },
+    devDependencies: { "@types/better-sqlite3": "^9.6.0" },
+  };
+  assert.deepEqual(findForbiddenSqliteDependencies(pkg), []);
+});
+
+test("negative control: a DIFFERENT @types/*sqlite* package is still flagged (the exception names one exact package)", () => {
+  const pkg: PackageJsonLike = {
+    dependencies: { "better-sqlite3": "^13.0.0" },
+    devDependencies: { "@types/sqlite3": "^3.1.0" },
+  };
+  assert.deepEqual(findForbiddenSqliteDependencies(pkg), ["@types/sqlite3"]);
+});
+
 test("negative control: flags better-sqlite3 imported from outside the sanctioned adapter", () => {
   const repoRoot = "/repo";
   const records = [
