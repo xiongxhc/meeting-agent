@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The media half of the bridge.
@@ -75,6 +76,14 @@ public struct AudioFrame: Equatable, Sendable {
         self.timestampMilliseconds = timestampMilliseconds
         self.payload = payload
     }
+}
+
+/// A redaction-safe capture continuity checkpoint for endpoint-side evidence.
+/// It carries no payload: the hash is a SHA-256 chain over ordered frame bytes.
+public struct CaptureEvidenceCheckpoint: Equatable, Sendable {
+    public let frameCount: Int
+    public let lastSequence: Int?
+    public let frameHash: String?
 }
 
 // MARK: - ports
@@ -180,6 +189,8 @@ public final class AudioBridge {
     /// silence, so an explained silence cannot become a gap.
     private var lastCaptureMonotonic: Int?
     private var lastCaptureObservedAt: String?
+    private var openCaptureGapStartedAt: String?
+    private var captureHash = Data()
     /// Start instant of a playback gap that is open — dropping is still
     /// happening, so its end has not been observed.
     private var openPlaybackGapStartedAt: String?
@@ -274,6 +285,8 @@ public final class AudioBridge {
         // not one that happens to hold.
         lastCaptureMonotonic = nil
         lastCaptureObservedAt = nil
+        openCaptureGapStartedAt = nil
+        captureHash = Data()
         mediaClient.setPlaybackSink { [weak self] frame in self?.receivePlayback(frame) }
         controlPlane.emit(.mediaConnected(endpoint: endpoint), observedAt: observedAt)
         return .connected(requested)
@@ -291,6 +304,8 @@ public final class AudioBridge {
         jitterBuffer.removeAll()
         lastCaptureMonotonic = nil
         lastCaptureObservedAt = nil
+        openCaptureGapStartedAt = nil
+        captureHash = Data()
         openPlaybackGapStartedAt = nil
         mediaClient.close(reason: reason)
         controlPlane.emit(.mediaDisconnected(reason: reason), observedAt: clock.now())
@@ -321,7 +336,12 @@ public final class AudioBridge {
         // A gap is claimed between two frames that were both observed: the last
         // capture this bridge saw, and this one. `startedAt` is therefore the
         // instant of the last observed capture, not a computed end-of-audio.
-        if let last = lastCaptureMonotonic, let lastObservedAt = lastCaptureObservedAt,
+        if let startedAt = openCaptureGapStartedAt {
+            openCaptureGapStartedAt = nil
+            controlPlane.emit(
+                .audioGap(direction: .capture, startedAt: startedAt, endedAt: observedAt),
+                observedAt: observedAt)
+        } else if let last = lastCaptureMonotonic, let lastObservedAt = lastCaptureObservedAt,
             monotonic - last > captureGapToleranceMilliseconds
         {
             controlPlane.emit(
@@ -339,8 +359,51 @@ public final class AudioBridge {
         // synchronously through a loopback sink, so anything the playback path
         // reads must already be true when the call is made.
         capturedFramesSent += 1
+        updateCaptureHash(payload: payload, sequence: captureSequence)
         mediaClient.send(frame)
         return frame
+    }
+
+    /// Called by an endpoint-side timer independent of capture callbacks. It
+    /// exposes a deterministic count/sequence/hash checkpoint and opens a
+    /// capture gap even when the next frame never arrives.
+    @discardableResult
+    public func captureWatchdogTick() -> CaptureEvidenceCheckpoint? {
+        guard negotiatedFormat != nil, !isMuted else { return nil }
+        guard let last = lastCaptureMonotonic, let startedAt = lastCaptureObservedAt else {
+            return captureEvidenceCheckpoint()
+        }
+
+        let monotonic = clock.monotonicMilliseconds()
+        if monotonic < last {
+            disconnect(reason: "media_clock_regressed")
+            return nil
+        }
+        if monotonic - last > captureGapToleranceMilliseconds, openCaptureGapStartedAt == nil {
+            let observedAt = clock.now()
+            openCaptureGapStartedAt = startedAt
+            controlPlane.emit(
+                .audioGap(direction: .capture, startedAt: startedAt, endedAt: nil),
+                observedAt: observedAt)
+        }
+        return captureEvidenceCheckpoint()
+    }
+
+    /// A checkpoint is safe to persist and hash: it contains ordered frame
+    /// accounting and a one-way digest, never audio bytes.
+    public func captureEvidenceCheckpoint() -> CaptureEvidenceCheckpoint {
+        CaptureEvidenceCheckpoint(
+            frameCount: capturedFramesSent,
+            lastSequence: captureSequence == 0 ? nil : captureSequence,
+            frameHash: captureSequence == 0 ? nil : captureHash.map { String(format: "%02x", $0) }.joined())
+    }
+
+    private func updateCaptureHash(payload: [UInt8], sequence: Int) {
+        var material = captureHash
+        var bigEndianSequence = UInt64(sequence).bigEndian
+        withUnsafeBytes(of: &bigEndianSequence) { material.append(contentsOf: $0) }
+        material.append(contentsOf: payload)
+        captureHash = Data(SHA256.hash(data: material))
     }
 
     /// Muting stops frames reaching the endpoint. It is not an `audio_gap`: the
@@ -351,6 +414,7 @@ public final class AudioBridge {
         isMuted = muted
         lastCaptureMonotonic = nil
         lastCaptureObservedAt = nil
+        openCaptureGapStartedAt = nil
     }
 
     // MARK: playback — the frame path in

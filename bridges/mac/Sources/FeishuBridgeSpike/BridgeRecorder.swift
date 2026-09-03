@@ -56,35 +56,60 @@ public final class SequentialClock: BridgeClock {
 }
 
 public enum BridgeRecord: Equatable, Sendable {
-    case command(recordedAt: String, message: BridgeCommandMessage)
+    case command(recordedAt: String, message: EvidenceCommandMessage)
     case event(recordedAt: String, message: BridgeEventMessage)
+}
+
+/// The persisted command shape. `connect_media.sessionToken` remains in the
+/// live bridge command only; it is never available through evidence records or
+/// their JSONL encoding.
+public struct EvidenceCommandMessage: Equatable, Sendable, Encodable {
+    private let source: BridgeCommandMessage
+
+    init(_ source: BridgeCommandMessage) {
+        self.source = source
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: BridgeCodingKey.self)
+        try container.encode(bridgeSessionSchema, forKey: .schema)
+        try container.encode(source.sessionId, forKey: .sessionId)
+        try container.encode(source.commandId, forKey: .commandId)
+        try container.encode(source.command.typeName, forKey: .type)
+
+        switch source.command {
+        case .join(let meetingOccurrenceId, let meetingNo, let leaseId):
+            try container.encode(meetingOccurrenceId, forKey: .meetingOccurrenceId)
+            try container.encode(meetingNo, forKey: .meetingNo)
+            try container.encode(leaseId, forKey: .leaseId)
+        case .connectMedia(let endpoint, _, let format, let expiresAt):
+            try container.encode(endpoint, forKey: .endpoint)
+            try container.encode(format, forKey: .format)
+            try container.encode(expiresAt, forKey: .expiresAt)
+        case .postDisclosure(let text):
+            try container.encode(text, forKey: .text)
+        case .leave(let reason):
+            try container.encode(reason.rawValue, forKey: .reason)
+        case .releaseLease(let leaseId):
+            try container.encode(leaseId, forKey: .leaseId)
+        }
+    }
 }
 
 /// JSONL evidence recorder for one bridge session — the Swift counterpart of
 /// `spikes/feishu/src/recorder.ts`, writing the same record shape:
 /// `{"direction":…,"message":{…},"recordedAt":…}`, one JSON object per line.
 ///
-/// Two differences from the TypeScript recorder, both deliberate. Keys are
-/// written sorted, because Swift's encoder does not promise insertion order and
-/// deterministic bytes matter more than matching JavaScript's key order. And the
-/// per-message shape checks happen before a message gets here rather than in
-/// this file: the types rule out one combination on their own — `ActiveSpeaker`
-/// cannot hold a user id beside an ambiguous confidence — but they do not make a
-/// non-empty string, a Z-suffixed UTC timestamp or a `sequence` of at least 1
-/// unrepresentable, since every initialiser takes a bare `String`/`Int`. Those
-/// are checked by `BridgeEventMessage.contractViolation`, which
-/// `SessionObservationReducer.emit` runs before it builds an event. A message
-/// built by some other means is recorded as it was given, so a producer that
-/// skips that check can still put an unreadable line in the evidence.
-///
-/// What this file checks is the stream rules, which no type expresses: the
-/// session must match, and `sequence` must strictly increase (gaps allowed,
-/// repeats and regressions rejected).
+/// Keys are written sorted, because Swift's encoder does not promise insertion
+/// order and deterministic bytes matter more than matching JavaScript's key
+/// order. Every direct constructor is validated here, where persistence starts;
+/// stream and command-result references are validated alongside it.
 public final class BridgeRecorder {
     public let sessionId: String
     public private(set) var records: [BridgeRecord] = []
     private let clock: any BridgeClock
     private var lastSequence = 0
+    private var issuedCommandIds: Set<String> = []
 
     public init(sessionId: String, clock: any BridgeClock) {
         self.sessionId = sessionId
@@ -95,14 +120,27 @@ public final class BridgeRecorder {
     ///   reaches the evidence file.
     @discardableResult
     public func record(command: BridgeCommandMessage) -> Bool {
-        guard command.sessionId == sessionId else { return false }
-        records.append(.command(recordedAt: clock.now(), message: command))
+        guard command.sessionId == sessionId,
+            BridgeCommandMessage.contractViolation(
+                sessionId: command.sessionId, commandId: command.commandId, command: command.command) == nil
+        else { return false }
+        records.append(.command(recordedAt: clock.now(), message: EvidenceCommandMessage(command)))
+        issuedCommandIds.insert(command.commandId)
         return true
     }
 
     @discardableResult
     public func record(event: BridgeEventMessage) -> Bool {
-        guard event.sessionId == sessionId, event.sequence > lastSequence else { return false }
+        guard event.sessionId == sessionId, event.sequence > lastSequence,
+            BridgeEventMessage.contractViolation(
+                sessionId: event.sessionId, sequence: event.sequence,
+                observedAt: event.observedAt, event: event.event) == nil
+        else { return false }
+        if case .commandResult(let commandId, _, _) = event.event,
+            !issuedCommandIds.contains(commandId)
+        {
+            return false
+        }
         lastSequence = event.sequence
         records.append(.event(recordedAt: clock.now(), message: event))
         return true

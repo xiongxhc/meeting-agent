@@ -108,4 +108,57 @@ final class BridgeRecorderTests: XCTestCase {
             sessionId: "s", clock: SequentialClock(start: "2026-09-02T00:00:00.000Z"))
         XCTAssertEqual(try recorder.jsonl(), "")
     }
+
+    func testRedactsConnectMediaSessionTokenFromPersistedEvidence() throws {
+        let recorder = BridgeRecorder(
+            sessionId: "sess_mac_0000000000000001",
+            clock: SequentialClock(start: "2026-09-02T00:00:00.000Z"))
+        let token = "tok_must_not_reach_evidence"
+
+        XCTAssertTrue(recorder.record(
+            command: BridgeCommandMessage(
+                sessionId: "sess_mac_0000000000000001",
+                commandId: "cmd_media",
+                command: .connectMedia(
+                    endpoint: "udp://127.0.0.1:40001", sessionToken: token,
+                    format: "pcm_s16le/48000/1/20ms", expiresAt: "2026-09-02T15:00:00Z"))))
+
+        let jsonl = try recorder.jsonl()
+        XCTAssertFalse(jsonl.contains(token))
+        XCTAssertFalse(jsonl.contains("sessionToken"))
+        XCTAssertTrue(jsonl.contains("udp://127.0.0.1:40001"))
+    }
+
+    func testRejectsDirectlyConstructedMessagesThatDoNotMeetTheContract() {
+        let recorder = BridgeRecorder(
+            sessionId: "sess_mac_0000000000000001",
+            clock: SequentialClock(start: "2026-09-02T00:00:00.000Z"))
+
+        XCTAssertFalse(recorder.record(
+            command: BridgeCommandMessage(
+                sessionId: "sess_mac_0000000000000001", commandId: "cmd_bad",
+                command: .postDisclosure(text: ""))))
+        XCTAssertFalse(recorder.record(
+            event: BridgeEventMessage(
+                sessionId: "sess_mac_0000000000000001", sequence: 1,
+                observedAt: "not-a-timestamp", event: .reconnecting(attempt: 1))))
+        XCTAssertEqual(recorder.records.count, 0)
+    }
+
+    func testRejectsCommandResultsThatDoNotReferenceARecordedCommand() {
+        let recorder = BridgeRecorder(
+            sessionId: "sess_mac_0000000000000001",
+            clock: SequentialClock(start: "2026-09-02T00:00:00.000Z"))
+        let result = BridgeEventMessage(
+            sessionId: "sess_mac_0000000000000001", sequence: 1,
+            observedAt: "2026-09-02T14:00:00.000Z",
+            event: .commandResult(commandId: "cmd_known", outcome: .ok, detail: nil))
+
+        XCTAssertFalse(recorder.record(event: result))
+        XCTAssertTrue(recorder.record(
+            command: BridgeCommandMessage(
+                sessionId: "sess_mac_0000000000000001", commandId: "cmd_known",
+                command: .leave(reason: .coordinatorStop))))
+        XCTAssertTrue(recorder.record(event: result))
+    }
 }

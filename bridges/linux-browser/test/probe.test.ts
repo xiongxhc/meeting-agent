@@ -35,6 +35,14 @@ test("classifyCapability: a control the probe looked for and never found is unav
   strictEqual(classifyCapability(attempts), "unavailable");
 });
 
+test("classifyCapability: mixed absent and UI-only observations remain unobservable", () => {
+  const attempts: CapabilityAttempt[] = [
+    { capability: "chat", outcome: "control_absent" },
+    { capability: "chat", outcome: "ui_observed" },
+  ];
+  strictEqual(classifyCapability(attempts), "unobservable");
+});
+
 test("classifyCapability: absent (never looked) and unavailable (looked, absent) are different results for the same capability", () => {
   // The failure mode this task exists to prevent: collapsing "never looked"
   // and "looked, genuinely absent" into the same value. Same capability
@@ -48,44 +56,44 @@ test("classifyCapability: absent (never looked) and unavailable (looked, absent)
   strictEqual(lookedAndAbsent, "unavailable");
 });
 
-test("classifyCapability: every attempt succeeding is proven", () => {
+test("classifyCapability: only capability-specific verified successes are proven", () => {
   const attempts: CapabilityAttempt[] = [
-    { capability: "reconnect", outcome: "succeeded" },
-    { capability: "reconnect", outcome: "succeeded" },
+    { capability: "reconnect", outcome: "verified_succeeded" },
+    { capability: "reconnect", outcome: "verified_succeeded" },
   ];
   strictEqual(classifyCapability(attempts), "proven");
 });
 
-test("classifyCapability: a mix of succeeded and failed attempts is unreliable", () => {
+test("classifyCapability: a mix of verified success and failure is unreliable", () => {
   const attempts: CapabilityAttempt[] = [
-    { capability: "active_speaker", outcome: "succeeded" },
-    { capability: "active_speaker", outcome: "failed" },
+    { capability: "active_speaker", outcome: "verified_succeeded" },
+    { capability: "active_speaker", outcome: "verified_failed" },
   ];
   strictEqual(classifyCapability(attempts), "unreliable");
 });
 
-test("classifyCapability: a mix of succeeded and control_absent attempts is unreliable, not proven and not unavailable", () => {
+test("classifyCapability: a mix of verified success and control_absent attempts is unreliable, not proven and not unavailable", () => {
   const attempts: CapabilityAttempt[] = [
-    { capability: "actual_participants", outcome: "succeeded" },
+    { capability: "actual_participants", outcome: "verified_succeeded" },
     { capability: "actual_participants", outcome: "control_absent" },
   ];
   strictEqual(classifyCapability(attempts), "unreliable");
 });
 
-test("classifyCapability: every attempt failing, with the control always reachable, is unreliable rather than unavailable", () => {
+test("classifyCapability: every verified failure is unreliable rather than unavailable", () => {
   // "unavailable" is reserved for a control that could not be reached at
   // all. A control that was reachable every time but never once produced a
   // correct result did not prove out, but it was never simply missing
   // either -- that distinction matters to whoever reads this table next.
   const attempts: CapabilityAttempt[] = [
-    { capability: "microphone_input", outcome: "failed" },
-    { capability: "microphone_input", outcome: "failed" },
+    { capability: "microphone_input", outcome: "verified_failed" },
+    { capability: "microphone_input", outcome: "verified_failed" },
   ];
   strictEqual(classifyCapability(attempts), "unreliable");
 });
 
 test("classifyAllCapabilities: a capability absent from the attempt log defaults to not tested", () => {
-  const result = classifyAllCapabilities([{ capability: "chat", outcome: "succeeded" }]);
+  const result = classifyAllCapabilities([{ capability: "chat", outcome: "verified_succeeded" }]);
   strictEqual(result.chat, "proven");
   strictEqual(result.meeting_join, "not tested");
   strictEqual(result.reconnect, "not tested");
@@ -114,16 +122,16 @@ test("discoverMeeting: a visible meeting container is an in-meeting discovery", 
   });
 });
 
-test("discoverMeeting: no meeting container in the DOM at all is not in a meeting", () => {
+test("discoverMeeting: no meeting container in the DOM is unknown, not a positive no-meeting claim", () => {
   const fixture = loadDomFixture(fixturePath("not-in-meeting.json"));
   const port = createPagePortFromFixture(fixture);
-  deepStrictEqual(discoverMeeting(port), { status: "not_in_meeting" });
+  deepStrictEqual(discoverMeeting(port), { status: "unknown" });
 });
 
-test("discoverMeeting: a meeting container present but not visible is not in a meeting, never guessed from stale DOM", () => {
+test("discoverMeeting: a hidden meeting container is unknown, never guessed from stale DOM", () => {
   const fixture = loadDomFixture(fixturePath("meeting-container-hidden.json"));
   const port = createPagePortFromFixture(fixture);
-  deepStrictEqual(discoverMeeting(port), { status: "not_in_meeting" });
+  deepStrictEqual(discoverMeeting(port), { status: "unknown" });
 });
 
 // ---------------------------------------------------------------------------
@@ -140,13 +148,13 @@ test("attemptCapabilityByControlPresence: a control missing from the fixture is 
   });
 });
 
-test("probeAllCapabilities: a fully populated fixture yields a succeeded attempt for every capability, classifying proven throughout", () => {
+test("probeAllCapabilities: a fully populated fixture records UI observation without claiming capability proof", () => {
   const fixture = loadDomFixture(fixturePath("joined-meeting.json"));
   const port = createPagePortFromFixture(fixture);
   const attempts = probeAllCapabilities(port);
   const results = classifyAllCapabilities(attempts);
   for (const capability of ALL_CAPABILITIES) {
-    strictEqual(results[capability], "proven", `expected ${capability} to be proven`);
+    strictEqual(results[capability], "unobservable", `expected ${capability} to remain unobservable`);
   }
 });
 
@@ -157,13 +165,13 @@ test("probeAllCapabilities: a fixture mixing absent, error, and ok controls clas
 
   // microphone_meter is absent from this fixture on purpose.
   strictEqual(results.microphone_input, "unavailable");
-  // chat_panel is present but reports state "error" on purpose.
-  strictEqual(results.chat, "unreliable");
-  // everything else in this fixture is present and ok.
-  strictEqual(results.authentication_persistence, "proven");
-  strictEqual(results.meeting_join, "proven");
-  strictEqual(results.actual_participants, "proven");
-  strictEqual(results.active_speaker, "proven");
-  strictEqual(results.speaker_output, "proven");
-  strictEqual(results.reconnect, "proven");
+  // chat_panel reports a UI error, which still is not an end-to-end result.
+  strictEqual(results.chat, "unobservable");
+  // Everything else is present and ok, which is UI observation only.
+  strictEqual(results.authentication_persistence, "unobservable");
+  strictEqual(results.meeting_join, "unobservable");
+  strictEqual(results.actual_participants, "unobservable");
+  strictEqual(results.active_speaker, "unobservable");
+  strictEqual(results.speaker_output, "unobservable");
+  strictEqual(results.reconnect, "unobservable");
 });

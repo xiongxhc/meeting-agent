@@ -20,8 +20,13 @@ export interface BridgeClock {
 }
 
 export type BridgeRecord =
-  | { recordedAt: string; direction: "command"; message: BridgeCommandMessage }
+  | { recordedAt: string; direction: "command"; message: EvidenceCommandMessage }
   | { recordedAt: string; direction: "event"; message: BridgeEventMessage };
+
+/** A command shape safe to persist as evidence. Media credentials never leave memory. */
+export type EvidenceCommandMessage =
+  | Exclude<BridgeCommandMessage, { type: "connect_media" }>
+  | Omit<Extract<BridgeCommandMessage, { type: "connect_media" }>, "sessionToken">;
 
 export interface BridgeRecorder {
   recordCommand(input: unknown): BridgeResult<BridgeCommandMessage>;
@@ -39,6 +44,26 @@ export function createJsonlRecorder(options: {
   const { clock, validator } = options;
   const records: BridgeRecord[] = [];
 
+  function snapshot<T>(value: T): T {
+    return structuredClone(value);
+  }
+
+  function projectCommand(message: BridgeCommandMessage): EvidenceCommandMessage {
+    if (message.type === "connect_media") {
+      const redacted: Omit<Extract<BridgeCommandMessage, { type: "connect_media" }>, "sessionToken"> = {
+        schema: message.schema,
+        sessionId: message.sessionId,
+        commandId: message.commandId,
+        type: message.type,
+        endpoint: message.endpoint,
+        format: message.format,
+        expiresAt: message.expiresAt,
+      };
+      return snapshot(redacted);
+    }
+    return snapshot(message);
+  }
+
   return {
     recordCommand(input) {
       const result = validator.acceptCommand(input);
@@ -46,7 +71,7 @@ export function createJsonlRecorder(options: {
         records.push({
           recordedAt: clock.now(),
           direction: "command",
-          message: result.value,
+          message: projectCommand(result.value),
         });
       }
       return result;
@@ -58,14 +83,14 @@ export function createJsonlRecorder(options: {
         records.push({
           recordedAt: clock.now(),
           direction: "event",
-          message: result.value,
+          message: snapshot(result.value),
         });
       }
       return result;
     },
 
     records() {
-      return [...records];
+      return snapshot(records);
     },
 
     toJsonl() {

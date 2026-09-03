@@ -422,6 +422,52 @@ final class AudioBridgeTests: XCTestCase {
             "with no negotiated format there is no tolerance in force to report")
     }
 
+    func testCaptureWatchdogRecordsATerminalStallWithoutWaitingForAnotherFrame() {
+        let harness = makeHarness()
+        connect(harness)
+        harness.controlPlane.reset()
+
+        harness.bridge.captureFrame(payload: payload(1))
+        harness.clock.advance(41)
+        let checkpoint = harness.bridge.captureWatchdogTick()
+
+        XCTAssertEqual(checkpoint?.frameCount, 1)
+        XCTAssertEqual(checkpoint?.lastSequence, 1)
+        XCTAssertNotNil(checkpoint?.frameHash)
+        XCTAssertEqual(
+            harness.controlPlane.events,
+            [.audioGap(
+                direction: .capture, startedAt: "2026-09-02T14:00:00.000Z", endedAt: nil)],
+            "the watchdog makes a terminal silence evidence-visible even when no next frame arrives")
+    }
+
+    func testCaptureWatchdogClosesItsOwnGapWhenCaptureResumesAndAdvancesTheCheckpoint() {
+        let harness = makeHarness()
+        connect(harness)
+        harness.controlPlane.reset()
+
+        harness.bridge.captureFrame(payload: payload(1))
+        harness.clock.advance(41)
+        let stalled = harness.bridge.captureWatchdogTick()
+        harness.clock.advance(20)
+        harness.bridge.captureFrame(payload: payload(2))
+        let resumed = harness.bridge.captureEvidenceCheckpoint()
+
+        XCTAssertEqual(stalled?.frameCount, 1)
+        XCTAssertEqual(resumed.frameCount, 2)
+        XCTAssertEqual(resumed.lastSequence, 2)
+        XCTAssertNotEqual(stalled?.frameHash, resumed.frameHash)
+        XCTAssertEqual(
+            harness.controlPlane.events,
+            [
+                .audioGap(
+                    direction: .capture, startedAt: "2026-09-02T14:00:00.000Z", endedAt: nil),
+                .audioGap(
+                    direction: .capture, startedAt: "2026-09-02T14:00:00.000Z",
+                    endedAt: "2026-09-02T14:00:00.061Z"),
+            ])
+    }
+
     // MARK: - mute
 
     func testMuteStopsFramesReachingTheEndpointAndIsNotReportedAsAGap() {

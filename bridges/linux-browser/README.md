@@ -3,7 +3,7 @@
 The agent-box half of the Feishu feasibility spike: it reads a Feishu web
 client's DOM through an injected port, decides whether a meeting is discoverable,
 and classifies each of the eight capabilities the Task 6 brief lists into one of
-`proven`, `unreliable`, `unavailable`, `not tested`.
+`proven`, `unreliable`, `unavailable`, `unobservable`, `not tested`.
 
 **Nothing here has been run against a real Feishu web client.** No browser is
 opened, no network call is made, and agent-box has never been touched from this
@@ -29,10 +29,11 @@ test/fixtures/dom/*.json  the synthetic DOM snapshots those tests read
 - **A control that was always reachable but never worked is `unreliable`, not
   `unavailable`.** It was never missing, and whoever reads the matrix next needs
   that distinction.
-- **DOM reachability is not end-to-end proof.** A microphone meter present in
-  the DOM says the control is reachable; it says nothing about whether real
-  audio ever reached it. This module only ever produces the reachability half of
-  the evidence.
+- **DOM reachability is not end-to-end proof.** A visible control produces
+  `ui_observed`, which classifies as `unobservable`; a capability reaches
+  `proven` only after a human-gated driver supplies a capability-specific
+  `verified_succeeded` outcome. A missing or hidden meeting container is
+  `unknown`, never a positive `not_in_meeting` claim.
 - **`proven` here has no run-count floor.** One successful attempt satisfies it,
   because the Task 6 brief states no run count. The join-path rows in
   `docs/feasibility/feishu-client-matrix.md` use the same word against a

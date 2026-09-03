@@ -24,6 +24,7 @@ decision either — it is a template, same as this one.
 | `proven` | Four consecutive runs of this path completed with no wrong meeting, no wrong participant, no duplicate disclosure, and no guessed speaker. |
 | `unreliable` | The path worked at least once but failed, needed a retry, or produced a wrong or ambiguous outcome within four consecutive runs. |
 | `unavailable` | The control the path depends on could not be reached at all on this client build — for the disclosure row this is the expected, acceptable outcome, and it never blocks joining. |
+| `unobservable` | UI-only evidence was seen, but no capability-specific outcome was verified. This is used by the agent-box probe, never as a substitute for `proven`. |
 | `not tested` | No run has been performed. Every row starts here. |
 
 ## Join paths
@@ -51,12 +52,13 @@ under test is the one where Node.js is never in the frame path.
 
 **Count gaps, not events.** A playback gap is written as two `audio_gap`
 records — an opening one with a null `endedAt`, and a closing one carrying the
-same `startedAt` once the end was observed — while a capture gap is written as
-one, already closed. Grepping for `audio_gap` lines therefore overcounts, and
-grepping for `"endedAt":null` overcounts the gaps that were never closed. Every
-gap figure below is a count of **distinct gaps keyed by `direction` plus
-`startedAt`**; section 4.2 of the checklist carries a command that does the
-keying.
+same `startedAt` once the end was observed. A capture gap found by the next
+frame is one closed event, while a terminal capture stall found by the endpoint
+watchdog opens the same two-event form. Grepping for `audio_gap` lines therefore
+overcounts, and grepping for `"endedAt":null` overcounts the gaps that were
+never closed. Every gap figure below is a count of **distinct gaps keyed by
+`direction` plus `startedAt`**; section 4.2 of the checklist carries a command
+that does the keying and validates continuous count/sequence/hash checkpoints.
 
 Procedure and commands: `docs/HUMAN-CHECKLIST.md` section **Plan 1 Task 4**.
 The pass condition for this whole block is that task's Gate — reliable full
@@ -118,13 +120,13 @@ Feishu web client login; the exact procedure is
 `docs/HUMAN-CHECKLIST.md`, section **Plan 1 Task 6**. Fill a row only from a
 run actually performed.
 
-Each result is one of the same four words used throughout this file
-(`proven`, `unreliable`, `unavailable`, `not tested` — see Result vocabulary
-above), reached the same way `bridges/linux-browser/src/probe.ts` reaches
-it: `not tested` for a capability never attempted, `unavailable` only for one
-the human genuinely could not reach (never merely never looked at),
-`unreliable` for one that worked at least once but not consistently, and
-`proven` for one that worked every time it was attempted.
+UI reachability is separate from capability outcome. The synthetic DOM probe
+returns `unobservable` for a visible or error-state control and `unknown` for a
+missing/hidden meeting container; neither is proof of a meeting state, audio
+flow, reconnect, or participant accuracy. A human-gated driver must supply a
+capability-specific verified outcome before `proven` or `unreliable` is valid.
+`not tested` means no attempt, and `unavailable` means a genuinely unreachable
+capability — never merely an absent DOM observation.
 
 **`proven` carries no run-count floor in this section, unlike the join-path
 rows above.** The Result vocabulary table's `proven` (and `unreliable`) are

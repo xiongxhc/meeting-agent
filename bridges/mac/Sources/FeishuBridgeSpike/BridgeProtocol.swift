@@ -301,6 +301,36 @@ extension BridgeEventMessage {
     }
 }
 
+extension BridgeCommandMessage {
+    /// The command counterpart of `BridgeEventMessage.contractViolation`.
+    /// Recorder callers can construct these values directly, so recording must
+    /// apply the same checks the decoder applies before evidence is accepted.
+    public static func contractViolation(
+        sessionId: String, commandId: String, command: BridgeCommand
+    ) -> BridgeContractError? {
+        if let failure = contractNonEmpty(sessionId, "/sessionId") { return failure }
+        if let failure = contractNonEmpty(commandId, "/commandId") { return failure }
+
+        switch command {
+        case .join(let meetingOccurrenceId, let meetingNo, let leaseId):
+            return contractNonEmpty(meetingOccurrenceId, "/meetingOccurrenceId")
+                ?? contractNonEmpty(meetingNo, "/meetingNo")
+                ?? contractNonEmpty(leaseId, "/leaseId")
+        case .connectMedia(let endpoint, let sessionToken, let format, let expiresAt):
+            return contractNonEmpty(endpoint, "/endpoint")
+                ?? contractNonEmpty(sessionToken, "/sessionToken")
+                ?? contractNonEmpty(format, "/format")
+                ?? contractUtcTimestamp(expiresAt, "/expiresAt")
+        case .postDisclosure(let text):
+            return contractNonEmpty(text, "/text")
+        case .leave:
+            return nil
+        case .releaseLease(let leaseId):
+            return contractNonEmpty(leaseId, "/leaseId")
+        }
+    }
+}
+
 /// One whole recorded session: exactly the shape of
 /// `fixtures/contracts/bridge-session-v1.json`.
 public struct BridgeSessionTranscript: Equatable, Sendable {

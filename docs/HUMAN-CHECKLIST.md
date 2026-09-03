@@ -4,6 +4,37 @@ Steps that need a human (real accounts, live services, or repo hosting
 decisions) and were deliberately not attempted by the agent. Grouped by plan
 task.
 
+## Evidence handling before any live run
+
+Read `evidence/README.md` before writing a recorder file. `connect_media`
+`sessionToken` is omitted by the recorder's persisted projection, but do not
+retain a pre-projection command log. Before hashing any run artifact, scan both
+the bridge JSONL and capture-checkpoint sidecar; a match means the artifact is
+unsafe and must not be retained or hashed:
+
+```
+python3 - ~/meeting-agent-evidence/<redacted-artifact>.jsonl <<'PY'
+import json, sys
+for line_number, line in enumerate(open(sys.argv[1]), 1):
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"sessionToken", "authorization", "accessToken", "refreshToken"}:
+                    raise SystemExit(f"unsafe credential field {key!r} on line {line_number}")
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(json.loads(line))
+print("credential-field scan: clean")
+PY
+shasum -a 256 ~/meeting-agent-evidence/<redacted-artifact>.jsonl
+```
+
+Hash only artifacts that print `credential-field scan: clean`. Do not use this
+scan to legitimise real meeting URLs, participant names, raw audio, screenshots,
+or transcripts; those remain prohibited from git and public evidence.
+
 ## Plan 1 Task 0: Bootstrap the public package
 
 - [ ] Create the GitHub repository `xiongxhc/meeting-agent`. The local `origin`
@@ -385,8 +416,12 @@ run look broken:
   `"endedAt":null` at the moment dropping began, and — only if the end was
   actually observed — a closing one carrying the **same `startedAt`** and a real
   `endedAt`. A playback gap that resolved therefore appears twice.
-- A **capture** gap is written as **one** event, already closed. Both of its
-  ends were observed by the time it could be reported at all.
+- A **capture** gap found by the next captured frame is written as **one**
+  already-closed event. A terminal capture stall found by the endpoint-side
+  watchdog is written as an opening event with `"endedAt":null`; if capture
+  later resumes, the bridge writes a matching closing event with the same
+  `startedAt`. A terminal open capture gap is evidence of failure, not a full
+  hour of silence to infer from first/last event timestamps.
 - So the ratio of events to gaps is not constant, and three provoked playback
   interruptions that all resolve produce six events. Count **distinct gaps**,
   keyed by `direction` plus `startedAt` — never lines.
@@ -417,9 +452,27 @@ GAPS
 ```
 
 ```
-head -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
-tail -1 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
-shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl
+python3 - ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl <<'CHECKPOINTS'
+import json, sys
+previous_count = previous_sequence = -1
+for line in open(sys.argv[1]):
+    item = json.loads(line)
+    if item["frameCount"] <= previous_count or item["lastSequence"] <= previous_sequence:
+        raise SystemExit("non-continuous capture checkpoint")
+    if len(item["frameHash"]) != 64:
+        raise SystemExit("missing SHA-256 capture hash")
+    previous_count, previous_sequence = item["frameCount"], item["lastSequence"]
+print("continuous checkpoints:", previous_count, previous_sequence)
+CHECKPOINTS
+python3 - ~/meeting-agent-evidence/task4-duplex-1h.jsonl <<'PY'
+import json, sys
+for line_number, line in enumerate(open(sys.argv[1]), 1):
+    if any(key in line for key in ('"sessionToken"', '"authorization"', '"accessToken"', '"refreshToken"')):
+        raise SystemExit(f"unsafe credential field on line {line_number}")
+    json.loads(line)
+print("credential-field scan: clean")
+PY
+shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl
 ```
 
 Read the results this way, and do not soften any of them:
@@ -436,16 +489,17 @@ Read the results this way, and do not soften any of them:
   explained, and the bridge drops an open gap at a barge-in rather than closing
   it across the silence. Confirm the file agrees; a gap opening or closing at
   either moment means the bridge is reporting a silence it caused itself.
-- "Complete" in the Gate means the first and last record bracket the full hour
-  with no missing stretch. Check the first and last `recordedAt` and confirm the
-  `sequence` values only ever increase.
+- "Complete" in the Gate means the endpoint-side watchdog ran for the whole
+  hour and the redacted checkpoint sidecar has continuous increasing
+  `frameCount`, `lastSequence`, and 64-character hash checkpoints. First/last
+  event timestamps alone do not prove a terminal capture failure did not occur.
 
-**Evidence to record:** the run's duration from the file's own first and last
-`recordedAt`, the **distinct gap** count, the count whose end was never
-observed, the capture gap tolerance the bridge ran with (see 4.0 item 5 — a gap
-count means nothing without it), the three provoked interruptions matched to
-their gaps, any unexplained gap, the `shasum -a 256` of the redacted file, and
-the UTC date. Put the one-word result
+**Evidence to record:** the watchdog interval and run duration, continuous
+checkpoint count/final sequence/final hash, the **distinct gap** count, the
+count whose end was never observed, the capture gap tolerance the bridge ran
+with (see 4.0 item 5 — a gap count means nothing without it), the three provoked
+interruptions matched to their gaps, any unexplained gap, and the `shasum -a
+256` of both redacted artifacts after the credential scan. Put the one-word result
 in the media rows of `docs/feasibility/feishu-client-matrix.md`. Do not commit
 the evidence file, and never commit audio: plaintext audio never touches disk,
 and this repository is public.
@@ -625,14 +679,14 @@ shasum -a 256 <path-to-evidence-file>
 **Evidence to record**, per capability, in the **agent-box standalone**
 section of `docs/feasibility/feishu-client-matrix.md`: the Feishu web client
 version, the browser and its version, the `shasum -a 256` of the redacted
-evidence, the one-word result, and the UTC date. Apply the same classification
-rule `bridges/linux-browser/src/probe.ts` codes: `not tested` only if the
-capability was never attempted, `unavailable` only if it was attempted and the
-control or capability genuinely could not be reached (never used for "did not
-get to it"), `unreliable` if it worked at least once but not every time, and
-`proven` only if every attempt succeeded. Do not paste real meeting numbers,
-participant ids, display names, tenant names, screenshots, audio, or
-transcripts into the matrix file — it is committed to a public repository.
+evidence, the one-word result, and the UTC date. A DOM-only observation is
+`unobservable`, not a capability result: only capability-specific verified
+outcomes may produce `proven` or `unreliable`. `not tested` applies only if the
+capability was never attempted; `unavailable` only if it genuinely could not be
+reached (never "did not get to it"). A missing or hidden meeting container is
+`unknown`, not proof that no meeting is open. Do not paste real meeting numbers,
+participant ids, display names, tenant names, screenshots, audio, or transcripts
+into the matrix file — it is committed to a public repository.
 
 ### 6.2 Brief bullet 4 — the deferred rule
 

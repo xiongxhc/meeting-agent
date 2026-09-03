@@ -74,22 +74,29 @@ export const ALL_CAPABILITIES: readonly CapabilityId[] = [
  * in its agent-box section, above the capability table; a `proven` produced
  * here is not a claim that the four-run bar was met.
  */
-export type CapabilityResult = "proven" | "unreliable" | "unavailable" | "not tested";
+export type CapabilityResult =
+  | "proven"
+  | "unreliable"
+  | "unavailable"
+  | "unobservable"
+  | "not tested";
 
 /**
  * One observed attempt to exercise a capability's control.
  *   - "control_absent": the probe looked, and the control genuinely was not
  *     present -- a legal, expected finding, never a cue to guess and never
  *     represented any other way.
- *   - "succeeded": the probe looked, the control was present, and it showed
- *     no error state.
- *   - "failed": the probe looked, the control was present, but it reported
- *     an explicit error state.
+ *   - "ui_observed" / "ui_error": the probe saw the control state. Neither
+ *     proves the underlying capability worked or failed end to end.
+ *   - "verified_succeeded" / "verified_failed": capability-specific outcome
+ *     evidence from a real exercise, supplied by the human-gated driver.
  */
 export type CapabilityAttempt =
   | { readonly capability: CapabilityId; readonly outcome: "control_absent" }
-  | { readonly capability: CapabilityId; readonly outcome: "succeeded" }
-  | { readonly capability: CapabilityId; readonly outcome: "failed" };
+  | { readonly capability: CapabilityId; readonly outcome: "ui_observed" }
+  | { readonly capability: CapabilityId; readonly outcome: "ui_error" }
+  | { readonly capability: CapabilityId; readonly outcome: "verified_succeeded" }
+  | { readonly capability: CapabilityId; readonly outcome: "verified_failed" };
 
 /**
  * Folds every attempt recorded for one capability into exactly one of the
@@ -99,22 +106,25 @@ export type CapabilityAttempt =
  *     `not tested`; nothing below ever produces it from data.
  *   - Every attempt found the control genuinely absent, with no success and
  *     no failure recorded -> `unavailable`.
- *   - Every attempt succeeded, with no absence and no failure -> `proven`.
- *   - Anything else -- a mix of outcomes, or every attempt reaching the
- *     control but never once succeeding -> `unreliable`. `unavailable` is
- *     reserved for a control that could not be reached at all; a control
- *     that was reachable every time but never produced a correct result did
- *     not prove out, but it was never simply missing either, and that
- *     distinction matters to whoever reads this table next.
+ *   - DOM-only observations -> `unobservable`: they establish UI reachability,
+ *     not capability success. A visible microphone meter or Connected banner
+ *     cannot stand in for audio flow or reconnect.
+ *   - Every capability-specific outcome succeeded, with no absence or failure
+ *     -> `proven`. A verified failure or mixed positive/negative evidence ->
+ *     `unreliable`.
  */
 export function classifyCapability(attempts: readonly CapabilityAttempt[]): CapabilityResult {
   if (attempts.length === 0) return "not tested";
 
   const everAbsent = attempts.some((a) => a.outcome === "control_absent");
-  const everSucceeded = attempts.some((a) => a.outcome === "succeeded");
-  const everFailed = attempts.some((a) => a.outcome === "failed");
+  const everUiObserved = attempts.some(
+    (a) => a.outcome === "ui_observed" || a.outcome === "ui_error",
+  );
+  const everSucceeded = attempts.some((a) => a.outcome === "verified_succeeded");
+  const everFailed = attempts.some((a) => a.outcome === "verified_failed");
 
-  if (everAbsent && !everSucceeded && !everFailed) return "unavailable";
+  if (everAbsent && !everUiObserved && !everSucceeded && !everFailed) return "unavailable";
+  if (!everSucceeded && !everFailed) return "unobservable";
   if (everSucceeded && !everFailed && !everAbsent) return "proven";
   return "unreliable";
 }
@@ -183,20 +193,19 @@ export interface PagePort {
 
 export type MeetingDiscoveryResult =
   | { readonly status: "in_meeting"; readonly meetingTitle: string | null }
-  | { readonly status: "not_in_meeting" };
+  | { readonly status: "unknown" };
 
 /**
  * Discovers whether the page is currently showing a joined meeting by
  * looking at `meeting_container` alone. A container that is present in the
  * DOM but not visible (some clients keep a collapsed shell mounted between
- * meetings) still reads `not_in_meeting` -- a claim is made only once the
- * UI positively shows it, matching the same rule the Mac bridge holds for
- * its own "meeting ended" detection (see bridges/mac/README.md).
+ * meetings) reads `unknown`. This probe has no positive no-meeting signal, so
+ * absence is never promoted to a claim about the meeting state.
  */
 export function discoverMeeting(port: PagePort): MeetingDiscoveryResult {
   const container = port.findControl("meeting_container");
   if (container === null || !container.visible) {
-    return { status: "not_in_meeting" };
+    return { status: "unknown" };
   }
   return { status: "in_meeting", meetingTitle: container.text };
 }
@@ -231,7 +240,7 @@ const CONTROL_FOR_CAPABILITY: Readonly<Record<CapabilityId, ControlName>> = {
   reconnect: "reconnect_banner",
 };
 
-/** Exercises one capability by checking whether its DOM control is present, visible, and free of an error state. */
+/** Records a DOM observation; only a human-gated driver may add a verified outcome. */
 export function attemptCapabilityByControlPresence(
   port: PagePort,
   capability: CapabilityId,
@@ -242,9 +251,9 @@ export function attemptCapabilityByControlPresence(
     return { capability, outcome: "control_absent" };
   }
   if (snapshot.state === "error") {
-    return { capability, outcome: "failed" };
+    return { capability, outcome: "ui_error" };
   }
-  return { capability, outcome: "succeeded" };
+  return { capability, outcome: "ui_observed" };
 }
 
 /** One full probe pass: an attempt for every capability in `ALL_CAPABILITIES`, in order. */

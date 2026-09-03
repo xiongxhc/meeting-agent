@@ -586,3 +586,32 @@ test("bridge recorder does not expose its evidence log for mutation", () => {
   strictEqual(recorder.toJsonl(), before);
   ok(!recorder.toJsonl().includes("forged"));
 });
+
+test("bridge recorder persists a redacted connect_media projection and snapshots it deeply", () => {
+  const recorder = createJsonlRecorder({
+    clock: { now: () => "2026-09-02T14:00:00.000Z" },
+    validator: createBridgeSessionValidator(fixture.sessionId),
+  });
+  const command = structuredClone(
+    fixture.commands.find((candidate) => candidate.type === "connect_media"),
+  ) as WireMessage;
+  const originalToken = command.sessionToken;
+
+  strictEqual(recorder.recordCommand(command).ok, true);
+  command.endpoint = "udp://mutated.invalid:1";
+  command.sessionToken = "mutated-token";
+
+  const snapshot = recorder.records() as unknown as Array<{ message: Record<string, unknown> }>;
+  const firstRecord = snapshot[0];
+  if (firstRecord !== undefined) {
+    firstRecord.message.endpoint = "udp://snapshot-mutated.invalid:2";
+  }
+  const jsonl = recorder.toJsonl();
+  const record = JSON.parse(jsonl) as { message: Record<string, unknown> };
+
+  strictEqual(record.message.endpoint, "udp://127.0.0.1:40001");
+  strictEqual("sessionToken" in record.message, false);
+  ok(!jsonl.includes(String(originalToken)));
+  ok(!jsonl.includes("mutated-token"));
+  ok(!jsonl.includes("snapshot-mutated.invalid"));
+});
