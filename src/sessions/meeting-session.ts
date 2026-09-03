@@ -151,7 +151,7 @@ export type RuntimeCallFailure = {
  * graph does not allow, so letting a throw escape would end the drain for
  * every later event -- one duplicate `joined` would cost the meeting. */
 export type RoutingFailure = {
-  readonly source: "bridge" | "runtime";
+  readonly source: "bridge" | "runtime" | "join_cleanup";
   readonly error: unknown;
 };
 
@@ -180,6 +180,10 @@ export type MeetingSessionState = {
   readonly commandResults: readonly BridgeCommandResult[];
   readonly overflows: readonly QueueOverflow[];
   readonly maxQueuedEvents: number;
+  /** Events queued but not yet drained, right now. Never exceeds
+   * `maxQueuedEvents`; the one terminal `left` admitted over the bound is
+   * admitted at most once per session. */
+  readonly queuedEvents: number;
   /** Every contract type this session actually routed, in order. The evidence
    * for "an audio frame never reached the coordinator": every entry is a
    * declared bridge-session/v1 event type, because nothing else can get past
@@ -343,6 +347,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // ---- bounded queue ----------------------------------------------------
 
   const queue: QueueItem[] = [];
+  let terminalLeftAdmitted = false;
   let pumping = false;
   let idleWaiters: Array<() => void> = [];
 
@@ -357,7 +362,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // terminal `left` is admitted over the bound. The admission is recorded
       // like any other over-bound arrival, and it does not abort speaking --
       // nothing was lost, and the session is ending anyway.
-      if (item.source === "bridge" && looksLikeTerminalLeft(item.raw)) {
+      //
+      // ONCE per session, which is what makes the bound a bound. The
+      // over-bound test is re-evaluated per message, so while terminate() is
+      // awaiting something slow -- and the queue is therefore not draining --
+      // every further `left`-shaped message would otherwise be independently
+      // judged over-bound and pushed, without limit. One is enough: the
+      // session is terminal after the first, and bridge-session/v1 has no
+      // re-open, so every later `left` is redundant by the contract's own
+      // rule. The rest fall through to the ordinary drop path below.
+      if (item.source === "bridge" && !terminalLeftAdmitted && looksLikeTerminalLeft(item.raw)) {
+        terminalLeftAdmitted = true;
         overflows.push({
           source: item.source,
           queueDepth: queue.length,
@@ -387,8 +402,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * message plausibly this session's own terminal `left`? It decides only
    * whether one message may occupy a queue slot over the bound. Whatever it
    * admits still passes through `acceptEvent` when it is handled, so a forged
-   * or malformed message is rejected there exactly as before -- the worst a
-   * lie can buy is one queue slot. */
+   * or malformed message is rejected there exactly as before. Combined with
+   * the once-per-session cap in enqueue, the worst a lie can buy is ONE queue
+   * slot for the whole session -- a cap, not a per-message allowance. */
   function looksLikeTerminalLeft(raw: unknown): boolean {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
     const record = raw as Record<string, unknown>;
@@ -648,35 +664,60 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     }
   }
 
+  /**
+   * Closes the recording. NEVER THROWS -- every failure lands on
+   * `finalizationError` instead, so terminate() can always go on to apply the
+   * session's terminal transition.
+   *
+   * The guard is the WHOLE body, not one await. Round 1 wrapped
+   * finalizeRecording() and stopped one line short of the reconcileRecording()
+   * beneath it, whose throw escaped this function entirely and took
+   * applyTerminalTransition() with it -- leaving the row at "listening" with a
+   * NULL finalizationError, which reads as a clean pending session. Guarding
+   * the body means an await added here later is covered by construction rather
+   * than by whoever adds it remembering.
+   */
   async function finalizeRecording(): Promise<void> {
     if (finalized) return;
     finalized = true;
 
     const observed: RecordingGap[] = observedGaps.map((gap) => ({ ...gap }));
-    let handle: RecordingHandle;
     try {
-      handle = await runtime.finalizeRecording({ observedGaps: observed });
+      const finalizedHandle = await runtime.finalizeRecording({ observedGaps: observed });
+
+      // "Exact gap recording": the stored gaps must be the gaps the bridge
+      // actually observed. If the runtime's own accounting disagrees, the
+      // bridge is authoritative -- it is the thing that watched the media
+      // socket -- so the runtime is asked to reconcile against it rather than
+      // the difference being averaged away or silently preferred.
+      if (gapsEqual(finalizedHandle.gaps, observed)) {
+        recording = finalizedHandle;
+        return;
+      }
+
+      // The handle is secured BEFORE the reconcile await, and the pessimistic
+      // verdict recorded with it. It is the only reference to the encrypted
+      // audio; losing the recording because the gap BOOKKEEPING could not be
+      // reconciled would be the wrong thing to protect.
+      recording = finalizedHandle;
+      gapReconciliation = "unreconciled";
+
+      const reconciled = await runtime.reconcileRecording({ gaps: observed });
+      recording = reconciled;
+      gapReconciliation = gapsEqual(reconciled.gaps, observed) ? "reconciled" : "unreconciled";
     } catch (error) {
       // Recorded as its own typed fact rather than a generic routing error:
       // "there is no recording" and "finalization was attempted and failed"
       // need different operator responses, and `recording === null` alone
-      // cannot tell them apart. There is no retry -- runtime finalization is
-      // not known to be idempotent, and re-running it is not this session's
-      // call to make.
+      // cannot tell them apart. Read it together with `recording`:
+      //   recording null + error set     -> nothing was finalized;
+      //   recording set  + error set     -> the handle is safe, the gap
+      //                                     reconciliation is not (see
+      //                                     gapReconciliation).
+      // There is no retry -- runtime finalization is not known to be
+      // idempotent, and re-running it is not this session's call to make.
       finalizationError = error;
-      return;
     }
-
-    // "Exact gap recording": the stored gaps must be the gaps the bridge
-    // actually observed. If the runtime's own accounting disagrees, the bridge
-    // is authoritative -- it is the thing that watched the media socket -- so
-    // the runtime is asked to reconcile against it rather than the difference
-    // being averaged away or silently preferred.
-    if (!gapsEqual(handle.gaps, observed)) {
-      handle = await runtime.reconcileRecording({ gaps: observed });
-      gapReconciliation = gapsEqual(handle.gaps, observed) ? "reconciled" : "unreconciled";
-    }
-    recording = handle;
   }
 
   /** Releases everything join() had already taken, and makes the session
@@ -687,15 +728,27 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     terminalReason = reason;
     phase = "ended";
     abortSpeaking(reason);
-    if (leaseId !== null) {
-      coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
-      leaseId = null;
+    try {
+      if (leaseId !== null) {
+        coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
+        leaseId = null;
+      }
+      const state = coordinator.get(identity.occurrenceId)?.state ?? null;
+      if (state !== null && state !== "notified" && state !== "failed") {
+        coordinator.fail(identity.occurrenceId, reason);
+      }
+    } catch (error) {
+      // A store failure while cleaning up must NOT replace the error that
+      // actually failed the join: join()'s caller needs to know why the join
+      // failed, not that the tidy-up afterwards also failed. Recorded, and
+      // swallowed here so the original error is what join() rethrows.
+      routingErrors.push({ source: "join_cleanup", error });
+    } finally {
+      // Same reason as terminate()'s finally: a cleanup that throws must not
+      // leave the session subscribed to two planes it has already declared
+      // itself terminal for.
+      unsubscribe();
     }
-    const state = coordinator.get(identity.occurrenceId)?.state ?? null;
-    if (state !== null && state !== "notified" && state !== "failed") {
-      coordinator.fail(identity.occurrenceId, reason);
-    }
-    unsubscribe();
   }
 
   function unsubscribe(): void {
@@ -813,6 +866,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         commandResults: [...commandResults],
         overflows: [...overflows],
         maxQueuedEvents,
+        queuedEvents: queue.length,
         routedEventTypes: [...routedEventTypes],
         rejectedInbound: [...rejectedInbound],
         ignoredAfterTerminal,

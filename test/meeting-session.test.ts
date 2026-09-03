@@ -1884,3 +1884,150 @@ test("the recording tables hold no column that could carry audio or transcript t
     h.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 16. Review round 2: the sweep, finished
+//
+// Both findings below are the same defect class as rounds 1 and 2 found before
+// them -- an unguarded await, or an unbounded admission, one line from the
+// guarded/bounded version. The audit in the round-2 fix report enumerates every
+// await on a port call in the session so a fourth round does not need to.
+// ---------------------------------------------------------------------------
+
+test("a reconcileRecording failure keeps the handle, is typed, and still applies the transition", async () => {
+  // Review round 2, Important 1. The round-1 guard covered finalizeRecording()
+  // and stopped one line short of the reconcileRecording() beneath it: the
+  // throw escaped finalizeRecording entirely, so applyTerminalTransition never
+  // ran, the row stayed at "listening", the recording was null, and
+  // finalizationError was null -- which reads as a clean pending session,
+  // exactly the ambiguity round 1's finding existed to remove.
+  const boom = new Error("synthetic reconciliation failure");
+  const runtime = fakeRuntime({ finalizedGaps: [] });
+  runtime.reconcileRecording = async () => {
+    throw boom;
+  };
+  const h = harness({ runtime });
+  try {
+    await joined(h);
+    for (const gap of GAPS) h.bridge.emit(h.bridge.event({ type: "audio_gap", ...gap }));
+    await h.session.settled();
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    // Typed, not a generic routing error.
+    assert.equal(h.session.state().finalizationError, boom);
+    assert.deepEqual(h.session.state().routingErrors, []);
+
+    // The handle from finalizeRecording is the ONLY reference to the encrypted
+    // audio. It is kept, and durably, rather than thrown away because the gap
+    // bookkeeping could not be reconciled.
+    assert.equal(h.session.state().recording?.handle, "rec_synthetic_0001");
+    assert.equal(h.session.state().gapReconciliation, "unreconciled");
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+
+    // And the row is not stranded.
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a flood of left-shaped messages during a stalled terminal cannot grow the queue", async () => {
+  // Review round 2, Important 2. `queue.length >= maxQueuedEvents` is
+  // re-evaluated per message, so while terminate() awaits something slow the
+  // queue is not draining and EVERY further left-shaped message was
+  // independently judged over-bound and pushed. The code comment and the fix
+  // report both claimed "the worst a lie can buy is one queue slot"; this is
+  // the test that makes the claim true instead of merely stated.
+  const runtime = fakeRuntime();
+  const deferred: { resolve: () => void } = { resolve: () => {} };
+  const stalled = new Promise<void>((resolve) => {
+    deferred.resolve = resolve;
+  });
+  const realFinalize = runtime.finalizeRecording.bind(runtime);
+  runtime.finalizeRecording = async (input) => {
+    await stalled;
+    return realFinalize(input);
+  };
+
+  const h = harness({ runtime, maxQueuedEvents: 4 });
+  try {
+    await joined(h);
+
+    // Fill past the bound, then deliver the terminal `left` -- admitted.
+    for (let i = 0; i < 8; i += 1) {
+      h.bridge.emit(h.bridge.event({ type: "media_connected", endpoint: "udp://127.0.0.1:40001" }));
+    }
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    // Flush every pending microtask, so the pump has drained what it could and
+    // is now parked inside terminate() on the stalled finalize. Nothing drains
+    // from here until the deferred is resolved -- which is exactly the window
+    // the unbounded admission lived in.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const droppedBefore = h.session.state().overflows.filter((o) => o.disposition === "dropped").length;
+    const queuedBefore = h.session.state().queuedEvents;
+    for (let i = 0; i < 5000; i += 1) {
+      h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    }
+
+    const after = h.session.state();
+    assert.ok(
+      after.queuedEvents <= after.maxQueuedEvents,
+      `the queue must stay bounded, got ${after.queuedEvents}`,
+    );
+    const admitted = after.overflows.filter((o) => o.disposition === "admitted");
+    assert.equal(admitted.length, 1, "at most ONE terminal left may be admitted per session");
+    // Full accounting: every one of the 5000 either took an ordinary queue slot
+    // or was recorded as dropped. None was admitted over the bound.
+    const newlyDropped = after.overflows.filter((o) => o.disposition === "dropped").length - droppedBefore;
+    assert.equal(newlyDropped + (after.queuedEvents - queuedBefore), 5000);
+
+    deferred.resolve();
+    await h.session.settled();
+    assert.equal(h.session.state().phase, "ended");
+    assert.ok(h.session.state().recording !== null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a cleanup failure during a failed join does not replace the error that failed the join", async () => {
+  // Review round 2, Minor. failJoin() lacked the try/finally terminate() was
+  // given: a store I/O failure in releaseBridgeLease or fail() skipped
+  // unsubscribe() AND replaced the original join error, so the caller never
+  // learned why the join actually failed.
+  const joinFailure = new Error("synthetic runtime outage");
+  const cleanupFailure = new Error("synthetic store failure");
+  const h = harness({ runtime: fakeRuntime({ startVoiceSessionError: joinFailure }) });
+  try {
+    const realRelease = h.coordinator.releaseBridgeLease.bind(h.coordinator);
+    h.coordinator.releaseBridgeLease = () => {
+      throw cleanupFailure;
+    };
+
+    await assert.rejects(
+      () => h.session.join(),
+      (error: unknown) => {
+        assert.equal(error, joinFailure, "the ORIGINAL join failure must be what propagates");
+        return true;
+      },
+    );
+
+    // The subscriptions still go, and the cleanup failure is on the record
+    // rather than swallowed.
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+    assert.equal(h.session.state().terminalReason, "join_failed");
+    assert.deepEqual(
+      h.session.state().routingErrors.map((failure) => failure.error),
+      [cleanupFailure],
+    );
+
+    h.coordinator.releaseBridgeLease = realRelease;
+  } finally {
+    h.cleanup();
+  }
+});
