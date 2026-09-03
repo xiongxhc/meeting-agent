@@ -7,15 +7,5 @@ dist/
 coverage/
 .DS_Store
 *.tsbuildinfo
-/evidence/*.jsonl
-/evidence/*.wav
-/evidence/*.aiff
-/evidence/*.flac
-/evidence/*.mp3
-/evidence/*.m4a
-/evidence/*.ogg
-/evidence/*.png
-/evidence/*.jpg
-/evidence/*.jpeg
-/evidence/*.webp
-/evidence/*.heic
+/evidence/**
+!/evidence/README.md

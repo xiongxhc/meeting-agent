@@ -13,22 +13,23 @@ the bridge JSONL and capture-checkpoint sidecar; a match means the artifact is
 unsafe and must not be retained or hashed:
 
 ```
-python3 - ~/meeting-agent-evidence/<redacted-artifact>.jsonl <<'PY'
+python3 - ~/meeting-agent-evidence/<bridge-evidence>.jsonl ~/meeting-agent-evidence/<checkpoint-sidecar>.jsonl <<'PY'
 import json, sys
-for line_number, line in enumerate(open(sys.argv[1]), 1):
-    def walk(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"sessionToken", "authorization", "accessToken", "refreshToken"}:
-                    raise SystemExit(f"unsafe credential field {key!r} on line {line_number}")
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-    walk(json.loads(line))
+for path in sys.argv[1:]:
+    for line_number, line in enumerate(open(path), 1):
+        def walk(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"sessionToken", "authorization", "accessToken", "refreshToken"}:
+                        raise SystemExit(f"unsafe credential field {key!r} in {path}:{line_number}")
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        walk(json.loads(line))
 print("credential-field scan: clean")
 PY
-shasum -a 256 ~/meeting-agent-evidence/<redacted-artifact>.jsonl
+shasum -a 256 ~/meeting-agent-evidence/<bridge-evidence>.jsonl ~/meeting-agent-evidence/<checkpoint-sidecar>.jsonl
 ```
 
 Hash only artifacts that print `credential-field scan: clean`. Do not use this
@@ -452,24 +453,53 @@ GAPS
 ```
 
 ```
-python3 - ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl <<'CHECKPOINTS'
-import json, sys
-previous_count = previous_sequence = -1
-for line in open(sys.argv[1]):
-    item = json.loads(line)
-    if item["frameCount"] <= previous_count or item["lastSequence"] <= previous_sequence:
-        raise SystemExit("non-continuous capture checkpoint")
-    if len(item["frameHash"]) != 64:
-        raise SystemExit("missing SHA-256 capture hash")
-    previous_count, previous_sequence = item["frameCount"], item["lastSequence"]
-print("continuous checkpoints:", previous_count, previous_sequence)
+python3 - ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl 60 3600 <<'CHECKPOINTS'
+import datetime as dt, json, re, sys
+path, interval_seconds, required_seconds = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+items = [json.loads(line) for line in open(path)]
+if len(items) < 2:
+    raise SystemExit("need at least two capture checkpoints")
+def timestamp(value):
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise SystemExit("checkpoint recordedAt must be a Z-suffixed UTC timestamp")
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+previous_at = timestamp(items[0].get("recordedAt"))
+previous_count = previous_sequence = 0
+previous_hash = None
+for index, item in enumerate(items):
+    current_at = timestamp(item.get("recordedAt"))
+    if item.get("schema") != "capture-checkpoint/v1":
+        raise SystemExit(f"checkpoint {index} has the wrong schema")
+    if index and not (current_at > previous_at):
+        raise SystemExit(f"checkpoint {index} timestamp did not increase")
+    if index and (current_at - previous_at).total_seconds() > interval_seconds:
+        raise SystemExit(f"checkpoint {index} exceeded the {interval_seconds}s cadence")
+    count, sequence, digest = item.get("frameCount"), item.get("lastSequence"), item.get("frameHash")
+    if not isinstance(count, int) or not isinstance(sequence, int) or count < 1 or sequence != count:
+        raise SystemExit(f"checkpoint {index} has inconsistent frame count/sequence")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise SystemExit(f"checkpoint {index} has an invalid SHA-256 hash")
+    if index and (count <= previous_count or digest == previous_hash):
+        raise SystemExit(f"checkpoint {index} made no capture/hash-chain progress")
+    previous_at, previous_count, previous_sequence, previous_hash = current_at, count, sequence, digest
+if (previous_at - timestamp(items[0]["recordedAt"])).total_seconds() < required_seconds:
+    raise SystemExit(f"capture checkpoint duration is below the {required_seconds}s gate")
+print("continuous one-hour checkpoints:", len(items), previous_count, previous_sequence)
 CHECKPOINTS
-python3 - ~/meeting-agent-evidence/task4-duplex-1h.jsonl <<'PY'
+python3 - ~/meeting-agent-evidence/task4-duplex-1h.jsonl ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl <<'PY'
 import json, sys
-for line_number, line in enumerate(open(sys.argv[1]), 1):
-    if any(key in line for key in ('"sessionToken"', '"authorization"', '"accessToken"', '"refreshToken"')):
-        raise SystemExit(f"unsafe credential field on line {line_number}")
-    json.loads(line)
+for path in sys.argv[1:]:
+    for line_number, line in enumerate(open(path), 1):
+        def walk(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"sessionToken", "authorization", "accessToken", "refreshToken"}:
+                        raise SystemExit(f"unsafe credential field {key!r} in {path}:{line_number}")
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        walk(json.loads(line))
 print("credential-field scan: clean")
 PY
 shasum -a 256 ~/meeting-agent-evidence/task4-duplex-1h.jsonl ~/meeting-agent-evidence/task4-duplex-1h.checkpoints.jsonl
@@ -490,9 +520,11 @@ Read the results this way, and do not soften any of them:
   it across the silence. Confirm the file agrees; a gap opening or closing at
   either moment means the bridge is reporting a silence it caused itself.
 - "Complete" in the Gate means the endpoint-side watchdog ran for the whole
-  hour and the redacted checkpoint sidecar has continuous increasing
-  `frameCount`, `lastSequence`, and 64-character hash checkpoints. First/last
-  event timestamps alone do not prove a terminal capture failure did not occur.
+  hour and the redacted checkpoint sidecar passes the 60-second cadence and
+  3600-second duration verifier: increasing UTC timestamps, count equal to
+  sequence, progress at every checkpoint, and a changing valid SHA-256 chain.
+  First/last generic event timestamps alone do not prove a terminal capture
+  failure did not occur.
 
 **Evidence to record:** the watchdog interval and run duration, continuous
 checkpoint count/final sequence/final hash, the **distinct gap** count, the

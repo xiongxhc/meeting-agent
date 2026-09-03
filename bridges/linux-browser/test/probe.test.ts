@@ -30,30 +30,28 @@ test("classifyCapability: zero attempts is not tested, never guessed as anything
   strictEqual(classifyCapability([]), "not tested");
 });
 
-test("classifyCapability: a control the probe looked for and never found is unavailable", () => {
-  const attempts: CapabilityAttempt[] = [{ capability: "chat", outcome: "control_absent" }];
+test("classifyCapability: a verified unavailable outcome is unavailable", () => {
+  const attempts: CapabilityAttempt[] = [{ capability: "chat", outcome: "verified_unavailable" }];
   strictEqual(classifyCapability(attempts), "unavailable");
 });
 
-test("classifyCapability: mixed absent and UI-only observations remain unobservable", () => {
+test("classifyCapability: UI-only observations remain unobservable", () => {
   const attempts: CapabilityAttempt[] = [
-    { capability: "chat", outcome: "control_absent" },
+    { capability: "chat", outcome: "ui_unobserved" },
     { capability: "chat", outcome: "ui_observed" },
   ];
   strictEqual(classifyCapability(attempts), "unobservable");
 });
 
-test("classifyCapability: absent (never looked) and unavailable (looked, absent) are different results for the same capability", () => {
-  // The failure mode this task exists to prevent: collapsing "never looked"
-  // and "looked, genuinely absent" into the same value. Same capability
-  // (chat), two different attempt logs, and the two results below must read
-  // differently even though both describe a capability with no working
-  // evidence -- asserted against each vocabulary word by name, not just
-  // against each other, so a future typo in either literal still fails loud.
+test("classifyCapability: absent DOM evidence is distinct from a verified unavailable outcome", () => {
   const neverLooked = classifyCapability([]);
-  const lookedAndAbsent = classifyCapability([{ capability: "chat", outcome: "control_absent" }]);
+  const domAbsent = classifyCapability([{ capability: "chat", outcome: "ui_unobserved" }]);
+  const verifiedUnavailable = classifyCapability([
+    { capability: "chat", outcome: "verified_unavailable" },
+  ]);
   strictEqual(neverLooked, "not tested");
-  strictEqual(lookedAndAbsent, "unavailable");
+  strictEqual(domAbsent, "unobservable");
+  strictEqual(verifiedUnavailable, "unavailable");
 });
 
 test("classifyCapability: only capability-specific verified successes are proven", () => {
@@ -72,12 +70,12 @@ test("classifyCapability: a mix of verified success and failure is unreliable", 
   strictEqual(classifyCapability(attempts), "unreliable");
 });
 
-test("classifyCapability: a mix of verified success and control_absent attempts is unreliable, not proven and not unavailable", () => {
+test("classifyCapability: a verified success is not weakened by a UI-only absence", () => {
   const attempts: CapabilityAttempt[] = [
     { capability: "actual_participants", outcome: "verified_succeeded" },
-    { capability: "actual_participants", outcome: "control_absent" },
+    { capability: "actual_participants", outcome: "ui_unobserved" },
   ];
-  strictEqual(classifyCapability(attempts), "unreliable");
+  strictEqual(classifyCapability(attempts), "proven");
 });
 
 test("classifyCapability: every verified failure is unreliable rather than unavailable", () => {
@@ -139,12 +137,12 @@ test("discoverMeeting: a hidden meeting container is unknown, never guessed from
 // classified per capability.
 // ---------------------------------------------------------------------------
 
-test("attemptCapabilityByControlPresence: a control missing from the fixture is control_absent, not a thrown error", () => {
+test("attemptCapabilityByControlPresence: a control missing from the fixture is UI-unobserved, not unavailable", () => {
   const fixture = loadDomFixture(fixturePath("not-in-meeting.json"));
   const port = createPagePortFromFixture(fixture);
   deepStrictEqual(attemptCapabilityByControlPresence(port, "chat"), {
     capability: "chat",
-    outcome: "control_absent",
+    outcome: "ui_unobserved",
   });
 });
 
@@ -164,7 +162,7 @@ test("probeAllCapabilities: a fixture mixing absent, error, and ok controls clas
   const results = classifyAllCapabilities(probeAllCapabilities(port));
 
   // microphone_meter is absent from this fixture on purpose.
-  strictEqual(results.microphone_input, "unavailable");
+  strictEqual(results.microphone_input, "unobservable");
   // chat_panel reports a UI error, which still is not an end-to-end result.
   strictEqual(results.chat, "unobservable");
   // Everything else is present and ok, which is UI observation only.

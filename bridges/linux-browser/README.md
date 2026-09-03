@@ -21,11 +21,11 @@ test/fixtures/dom/*.json  the synthetic DOM snapshots those tests read
 
 ## The rules this package exists to hold
 
-- **`not tested` and `unavailable` are different findings.** `not tested` comes
-  only from an empty attempt log — the probe never looked. `unavailable` means
-  the probe looked and the control genuinely was not there. Collapsing the two
-  is the failure this module exists to prevent, and `classifyCapability` is
-  written so nothing but an empty log can produce `not tested`.
+- **`not tested`, `unobservable`, and `unavailable` are different findings.**
+  `not tested` comes only from an empty attempt log. A missing DOM control is
+  `ui_unobserved` and therefore `unobservable`; `unavailable` requires a
+  capability-specific `verified_unavailable` outcome from the human-gated
+  driver.
 - **A control that was always reachable but never worked is `unreliable`, not
   `unavailable`.** It was never missing, and whoever reads the matrix next needs
   that distinction.

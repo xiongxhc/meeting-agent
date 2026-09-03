@@ -60,37 +60,66 @@ public enum BridgeRecord: Equatable, Sendable {
     case event(recordedAt: String, message: BridgeEventMessage)
 }
 
+/// The persisted command payload. Its cases deliberately cannot represent a
+/// `connect_media.sessionToken`.
+private enum EvidenceCommand: Equatable, Sendable {
+    case join(meetingOccurrenceId: String, meetingNo: String, leaseId: String)
+    case connectMedia(endpoint: String, format: String, expiresAt: String)
+    case postDisclosure(text: String)
+    case leave(reason: LeaveReason)
+    case releaseLease(leaseId: String)
+}
+
 /// The persisted command shape. `connect_media.sessionToken` remains in the
-/// live bridge command only; it is never available through evidence records or
-/// their JSONL encoding.
+/// live bridge command only; it is absent from both evidence memory and JSONL.
 public struct EvidenceCommandMessage: Equatable, Sendable, Encodable {
-    private let source: BridgeCommandMessage
+    private let sessionId: String
+    private let commandId: String
+    private let command: EvidenceCommand
 
     init(_ source: BridgeCommandMessage) {
-        self.source = source
+        sessionId = source.sessionId
+        commandId = source.commandId
+        switch source.command {
+        case .join(let meetingOccurrenceId, let meetingNo, let leaseId):
+            command = .join(
+                meetingOccurrenceId: meetingOccurrenceId, meetingNo: meetingNo, leaseId: leaseId)
+        case .connectMedia(let endpoint, _, let format, let expiresAt):
+            command = .connectMedia(endpoint: endpoint, format: format, expiresAt: expiresAt)
+        case .postDisclosure(let text):
+            command = .postDisclosure(text: text)
+        case .leave(let reason):
+            command = .leave(reason: reason)
+        case .releaseLease(let leaseId):
+            command = .releaseLease(leaseId: leaseId)
+        }
     }
 
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: BridgeCodingKey.self)
         try container.encode(bridgeSessionSchema, forKey: .schema)
-        try container.encode(source.sessionId, forKey: .sessionId)
-        try container.encode(source.commandId, forKey: .commandId)
-        try container.encode(source.command.typeName, forKey: .type)
+        try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(commandId, forKey: .commandId)
 
-        switch source.command {
+        switch command {
         case .join(let meetingOccurrenceId, let meetingNo, let leaseId):
+            try container.encode("join", forKey: .type)
             try container.encode(meetingOccurrenceId, forKey: .meetingOccurrenceId)
             try container.encode(meetingNo, forKey: .meetingNo)
             try container.encode(leaseId, forKey: .leaseId)
-        case .connectMedia(let endpoint, _, let format, let expiresAt):
+        case .connectMedia(let endpoint, let format, let expiresAt):
+            try container.encode("connect_media", forKey: .type)
             try container.encode(endpoint, forKey: .endpoint)
             try container.encode(format, forKey: .format)
             try container.encode(expiresAt, forKey: .expiresAt)
         case .postDisclosure(let text):
+            try container.encode("post_disclosure", forKey: .type)
             try container.encode(text, forKey: .text)
         case .leave(let reason):
+            try container.encode("leave", forKey: .type)
             try container.encode(reason.rawValue, forKey: .reason)
         case .releaseLease(let leaseId):
+            try container.encode("release_lease", forKey: .type)
             try container.encode(leaseId, forKey: .leaseId)
         }
     }

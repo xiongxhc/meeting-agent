@@ -129,6 +129,23 @@ final class BridgeRecorderTests: XCTestCase {
         XCTAssertTrue(jsonl.contains("udp://127.0.0.1:40001"))
     }
 
+    func testEvidenceRecordsDoNotRetainConnectMediaSessionTokenInMemory() {
+        let recorder = BridgeRecorder(
+            sessionId: "sess_mac_0000000000000001",
+            clock: SequentialClock(start: "2026-09-02T00:00:00.000Z"))
+        let token = "tok_must_not_reach_memory_evidence"
+
+        XCTAssertTrue(recorder.record(
+            command: BridgeCommandMessage(
+                sessionId: "sess_mac_0000000000000001",
+                commandId: "cmd_media",
+                command: .connectMedia(
+                    endpoint: "udp://127.0.0.1:40001", sessionToken: token,
+                    format: "pcm_s16le/48000/1/20ms", expiresAt: "2026-09-02T15:00:00Z"))))
+
+        XCTAssertFalse(String(reflecting: recorder.records).contains(token))
+    }
+
     func testRejectsDirectlyConstructedMessagesThatDoNotMeetTheContract() {
         let recorder = BridgeRecorder(
             sessionId: "sess_mac_0000000000000001",

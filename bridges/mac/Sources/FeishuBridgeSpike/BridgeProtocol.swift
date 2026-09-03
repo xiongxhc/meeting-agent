@@ -29,9 +29,9 @@ public let bridgeSessionSchema = "bridge-session/v1"
 ///   - `session_mismatch`, `sequence_duplicate`, `sequence_out_of_order` — the
 ///     stream rules, which live in `BridgeRecorder` and are reported by
 ///     returning `false` from `record`, not by throwing a contract error.
-///   - `unknown_command_id` — needs the set of commands a session issued, which
-///     the coordinator holds. This package never validates a `command_result`
-///     against it.
+///   - `unknown_command_id` — `BridgeRecorder` tracks accepted command IDs and
+///     rejects an unrecognised `command_result` by returning `false` rather
+///     than throwing a contract error.
 ///
 /// A Swift case is added here only when Swift code can actually produce it.
 public struct BridgeContractError: Error, Equatable, CustomStringConvertible {

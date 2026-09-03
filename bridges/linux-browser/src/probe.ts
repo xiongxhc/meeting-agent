@@ -62,7 +62,7 @@ export const ALL_CAPABILITIES: readonly CapabilityId[] = [
 ];
 
 /**
- * The four legal results, matching the vocabulary already used by
+ * The five legal results, matching the vocabulary already used by
  * `docs/feasibility/feishu-client-matrix.md`. `not tested` is the default
  * for a capability the probe never attempted -- it is never inferred from a
  * failure or an absence, only from an empty attempt log.
@@ -83,49 +83,44 @@ export type CapabilityResult =
 
 /**
  * One observed attempt to exercise a capability's control.
- *   - "control_absent": the probe looked, and the control genuinely was not
- *     present -- a legal, expected finding, never a cue to guess and never
- *     represented any other way.
- *   - "ui_observed" / "ui_error": the probe saw the control state. Neither
+ *   - "ui_observed" / "ui_error" / "ui_unobserved": the probe saw (or did
+ *     not see) a control state. None of these DOM observations
  *     proves the underlying capability worked or failed end to end.
- *   - "verified_succeeded" / "verified_failed": capability-specific outcome
- *     evidence from a real exercise, supplied by the human-gated driver.
+ *   - "verified_succeeded" / "verified_failed" / "verified_unavailable":
+ *     capability-specific outcome evidence from a real exercise, supplied by
+ *     the human-gated driver.
  */
 export type CapabilityAttempt =
-  | { readonly capability: CapabilityId; readonly outcome: "control_absent" }
   | { readonly capability: CapabilityId; readonly outcome: "ui_observed" }
   | { readonly capability: CapabilityId; readonly outcome: "ui_error" }
+  | { readonly capability: CapabilityId; readonly outcome: "ui_unobserved" }
   | { readonly capability: CapabilityId; readonly outcome: "verified_succeeded" }
-  | { readonly capability: CapabilityId; readonly outcome: "verified_failed" };
+  | { readonly capability: CapabilityId; readonly outcome: "verified_failed" }
+  | { readonly capability: CapabilityId; readonly outcome: "verified_unavailable" };
 
 /**
  * Folds every attempt recorded for one capability into exactly one of the
- * four result values.
+ * five result values.
  *
  *   - No attempts at all -> `not tested`. This is the only path to
  *     `not tested`; nothing below ever produces it from data.
- *   - Every attempt found the control genuinely absent, with no success and
- *     no failure recorded -> `unavailable`.
  *   - DOM-only observations -> `unobservable`: they establish UI reachability,
- *     not capability success. A visible microphone meter or Connected banner
- *     cannot stand in for audio flow or reconnect.
- *   - Every capability-specific outcome succeeded, with no absence or failure
- *     -> `proven`. A verified failure or mixed positive/negative evidence ->
- *     `unreliable`.
+ *     not capability success or availability. A visible microphone meter,
+ *     missing control, or Connected banner cannot stand in for audio flow or
+ *     reconnect.
+ *   - Only an all-`verified_unavailable` attempt log -> `unavailable`.
+ *   - Every capability-specific outcome succeeding -> `proven`. Every other
+ *     verified-outcome mix -> `unreliable`.
  */
 export function classifyCapability(attempts: readonly CapabilityAttempt[]): CapabilityResult {
   if (attempts.length === 0) return "not tested";
 
-  const everAbsent = attempts.some((a) => a.outcome === "control_absent");
-  const everUiObserved = attempts.some(
-    (a) => a.outcome === "ui_observed" || a.outcome === "ui_error",
-  );
-  const everSucceeded = attempts.some((a) => a.outcome === "verified_succeeded");
-  const everFailed = attempts.some((a) => a.outcome === "verified_failed");
-
-  if (everAbsent && !everUiObserved && !everSucceeded && !everFailed) return "unavailable";
-  if (!everSucceeded && !everFailed) return "unobservable";
-  if (everSucceeded && !everFailed && !everAbsent) return "proven";
+  const verified = attempts.filter((attempt) => attempt.outcome.startsWith("verified_"));
+  if (verified.length === 0) return "unobservable";
+  if (verified.every((attempt) => attempt.outcome === "verified_unavailable")) {
+    return "unavailable";
+  }
+  if (verified.every((attempt) => attempt.outcome === "verified_succeeded")) return "proven";
   return "unreliable";
 }
 
@@ -248,7 +243,7 @@ export function attemptCapabilityByControlPresence(
   const control = CONTROL_FOR_CAPABILITY[capability];
   const snapshot = port.findControl(control);
   if (snapshot === null || !snapshot.visible) {
-    return { capability, outcome: "control_absent" };
+    return { capability, outcome: "ui_unobserved" };
   }
   if (snapshot.state === "error") {
     return { capability, outcome: "ui_error" };

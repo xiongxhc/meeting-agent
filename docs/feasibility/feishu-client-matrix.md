@@ -79,7 +79,7 @@ measurement exists.
 | Echo and feedback, second participant on headphones | Whether the returned tone re-entered capture, and whether a loop built | | | | | | | | |
 | Echo and feedback, second participant on open speakers | Whether the returned tone re-entered capture, and whether a loop built | | | | | | | | |
 | Interruption (barge-in) stop time | Interrupt to last rendered frame, ten runs: min / median / max, against the 300 ms Gate | | | | | | | | |
-| One-hour two-participant run | Duration from the evidence file's own first and last record | | | | | | | | |
+| One-hour two-participant run | Continuous capture-checkpoint sidecar: 60-second maximum cadence and duration at least 3600 seconds | | | | | | | | |
 | Unexplained audio gaps in that run | Count of distinct gaps (keyed by `direction` + `startedAt`) that could not be tied to something observed; the Gate needs zero | | | | | | | | |
 | Provoked OS/client interruptions | Interruptions provoked versus distinct gaps observed; the two counts must match | | | | | | | | |
 | Gaps whose end was never observed | Count of distinct gaps for which no closing event exists, and what each one was | | | | | | | | |
@@ -121,17 +121,18 @@ Feishu web client login; the exact procedure is
 run actually performed.
 
 UI reachability is separate from capability outcome. The synthetic DOM probe
-returns `unobservable` for a visible or error-state control and `unknown` for a
-missing/hidden meeting container; neither is proof of a meeting state, audio
-flow, reconnect, or participant accuracy. A human-gated driver must supply a
-capability-specific verified outcome before `proven` or `unreliable` is valid.
-`not tested` means no attempt, and `unavailable` means a genuinely unreachable
-capability — never merely an absent DOM observation.
+returns `unobservable` for a visible, error-state, missing, or hidden control
+and `unknown` for a missing/hidden meeting container; neither is proof of a
+meeting state, audio flow, reconnect, or participant accuracy. A human-gated
+driver must supply a capability-specific verified outcome before `proven`,
+`unreliable`, or `unavailable` is valid. `not tested` means no attempt, and
+`unavailable` means a verified genuinely unreachable capability — never merely
+an absent DOM observation.
 
 **`proven` carries no run-count floor in this section, unlike the join-path
 rows above.** The Result vocabulary table's `proven` (and `unreliable`) are
 defined against a four-consecutive-clean-runs bar. The agent-box rows below
-use the same four words but not that bar: here `proven` means only "every
+use the same result words but not that bar: here `proven` means only "every
 attempt actually made succeeded," which a single lucky attempt satisfies.
 If consistency with the rest of this file is wanted, apply the same
 four-consecutive-clean-run bar before writing `proven` into a row below —

@@ -1,7 +1,8 @@
 # Evidence handling
 
-`evidence/` contains this schema only. JSONL, audio, and screenshots are
-ignored by git; keep every run artifact outside the checkout when possible.
+`evidence/` contains this schema only. Every artifact under this directory,
+including nested JSONL, audio, and screenshots, is ignored by git; keep every
+run artifact outside the checkout when possible.
 
 ## Safe JSONL projection
 
@@ -39,7 +40,8 @@ and on every watchdog transition:
 {"schema":"capture-checkpoint/v1","recordedAt":"2026-09-02T14:00:00.000Z","frameCount":123,"lastSequence":123,"frameHash":"<sha256-hex>"}
 ```
 
-The endpoint integration must reject a run with missing or non-increasing
-checkpoint sequence/count progress. Hash the redacted JSONL and checkpoint
-sidecar together only after both pass the credential scan in the human
-checklist.
+The endpoint integration must reject a run with missing checkpoints, a cadence
+gap, duration below 3600 seconds, inconsistent frame count/sequence, unchanged
+or invalid hash progression, or non-UTC/non-increasing timestamps. Hash the
+redacted JSONL and checkpoint sidecar together only after both pass the
+credential scan in the human checklist.
