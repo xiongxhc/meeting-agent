@@ -201,8 +201,9 @@ export function createObservationReducer(options: {
   function reduceMeetingEnded(
     observation: Extract<UiObservation, { kind: "meeting_ended" }>,
   ): BridgeEventMessage[] {
+    const events = [emit(observation.observedAt, { type: "left", reason: "ended" })];
     hasLeft = true;
-    return [emit(observation.observedAt, { type: "left", reason: "ended" })];
+    return events;
   }
 
   function reduceDisclosureAttempt(
