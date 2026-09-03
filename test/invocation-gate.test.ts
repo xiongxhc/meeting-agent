@@ -172,7 +172,7 @@ test("CJK alias at the start, full-width-comma-separated, with a request marker,
 });
 
 test("CJK alias at the end, full-width-comma-separated, authorizes", () => {
-  assertPositive(decide(segment("现在可以总结了吗，会议机器人", true), CJK_IDENTITY), "会议机器人");
+  assertPositive(decide(segment("可以总结了吗，会议机器人", true), CJK_IDENTITY), "会议机器人");
 });
 
 test("CJK alias alone as the entire segment authorizes", () => {
@@ -187,20 +187,26 @@ test("CJK alias with NO separator at all still authorizes via the '一下' reque
 });
 
 test("CJK third-person mention, no separator, no cue in the following clause, does not authorize", () => {
+  // The alias's text IS present (round 3: matchedAlias/reason for the
+  // negative fallback come from a plain, no-adjacency-guard substring
+  // check -- see module doc point 5), it just never opens the adjoining
+  // clause with a recognized cue ("今天" comes first, not a cue).
   const decision = decide(segment("会议机器人今天没来", true), CJK_IDENTITY);
-  assertNegative(decision, "no_alias_match");
-  assert.equal(decision.matchedAlias, null);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "会议机器人");
 });
 
 test("CJK third-person mention, embedded mid-sentence, does not authorize", () => {
-  // With no whitespace to delimit words, an alias embedded between two
-  // other CJK characters (说 before, 通 after) is adjacent to letters on
-  // BOTH sides -- same mechanism as the "Meiling" vs "Mei" case -- so it
-  // cannot even be confirmed as a genuine word occurrence, and resolves to
-  // "no_alias_match" rather than "incidental_mention".
+  // The alias's text is embedded between two other CJK characters (说
+  // before, 通 after) with no whitespace to delimit words -- structurally
+  // never a boundary candidate for authorize purposes -- but round 3's
+  // diagnostic fallback (a plain substring check with no adjacency guard)
+  // still surfaces that the text WAS present, matching this module's own
+  // stated goal ("an operator debugging 'why did it not answer me' needs
+  // to see that the name WAS heard, just not addressed").
   const decision = decide(segment("他说会议机器人通常负责记录", true), CJK_IDENTITY);
-  assertNegative(decision, "no_alias_match");
-  assert.equal(decision.matchedAlias, null);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "会议机器人");
 });
 
 // ---------------------------------------------------------------------------
@@ -254,18 +260,144 @@ test("a bare incidental mention mid-sentence does not authorize", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ROUND 3, Critical 1: the cue must be BOUNDED to the clause immediately
+// adjoining the alias, and must OPEN it -- not merely appear anywhere in
+// the (unbounded) rest of the segment. Every fixture below is a confirmed
+// round-2 false positive, reproduced directly against the round-2 source
+// before this fix, per the second review.
+// ---------------------------------------------------------------------------
+
+test("ROUND 3 Critical 1: a cue word deep in the sentence does not authorize (reported speech)", () => {
+  const decision = decide(segment("Meetbot said he can help with that."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Meetbot");
+});
+
+test("ROUND 3 Critical 1: a cue word deep in the sentence does not authorize (reported intent)", () => {
+  const decision = decide(segment("Meetbot mentioned he will join later."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 3 Critical 1: a cue word past the first clause boundary does not authorize", () => {
+  // The comma after "it" truncates the adjoining clause to "broke it" --
+  // "will" (in the second clause) is never reached.
+  const decision = decide(segment("Meetbot broke it, and honestly nobody will fix it."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 3 Critical 1: a leading cue word addressing a THIRD PARTY about the agent does not authorize", () => {
+  // "Please" opens the clause, but the alias is the OBJECT of "blame", not
+  // an addressee -- there is no separator before "Meetbot" at all, so the
+  // mandatory-trailing-separator rule (module doc point 3) rejects this
+  // before the cue check even runs.
+  const decision = decide(segment("Please don't blame Meetbot."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 3 Critical 1: an appositive with a non-copula verb past the first comma still does not authorize", () => {
+  // Same appositive shape as the pinned "Meetbot, the note taker, is
+  // broken again." fixture, with "is" swapped for "did" specifically to
+  // bypass the copula exclusion list -- the fix here is scope (the first
+  // comma truncates the clause to "the note taker", so "did" is never
+  // reached), not vocabulary.
+  const decision = decide(segment("Meetbot, the note taker, did leave early."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 3 Critical 1 (CJK): a cue word deep in the sentence does not authorize", () => {
+  const decision = decide(segment("会议机器人说他可以处理这个问题", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "会议机器人");
+});
+
+test("ROUND 3 Critical 1 (CJK): a cue word not at the very start of the clause does not authorize", () => {
+  // "什么" (a cue) appears in the clause, but "今天" opens it -- the Han
+  // check is a strict PREFIX test, not "contains anywhere".
+  const decision = decide(segment("会议机器人今天什么都没做", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 3, Critical 2: the apostrophe (straight and typographic) is now a
+// word-continuation character, so a possessive does not authorize -- same
+// mechanism as the hyphen fix, same false-positive class ("Mei" recurring
+// inside "Mei's", the brief's own headline scenario).
+// ---------------------------------------------------------------------------
+
+test("ROUND 3 Critical 2: a possessive using a short alias does not authorize", () => {
+  const decision = decide(segment("Mei's phone is ringing, can someone check?"), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Mei");
+});
+
+test("ROUND 3 Critical 2: a possessive using the primary alias does not authorize", () => {
+  const decision = decide(segment("Meetbot's log shows what happened."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Meetbot");
+});
+
+test("ROUND 3 Critical 2: a possessive with a typographic (curly) apostrophe does not authorize", () => {
+  const decision = decide(segment("Meetbot\u2019s log shows what happened."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 3 (found by adversarial probing, not the review): a wh-word
+// contraction ("what's", "who's", "where's", ...) is an extremely common
+// way to open a real question and must still count as the cue "what" /
+// "who" / "where" even though the apostrophe survives token-edge
+// stripping (it's internal to the token, not at either edge).
+// ---------------------------------------------------------------------------
+
+test("a wh-word contraction still counts as its cue", () => {
+  assertPositive(decide(segment("Meetbot: what's the plan?"), IDENTITY), "Meetbot");
+});
+
+test("a different wh-word contraction still counts as its cue", () => {
+  assertPositive(decide(segment("Meetbot, who's next?"), IDENTITY), "Meetbot");
+});
+
+test("a non-contracted misspelling ('whats', no apostrophe) does not get the contraction leniency", () => {
+  // Deliberately NOT extended to bare misspellings -- the contraction
+  // fix targets a specific, unambiguous apostrophe shape, not fuzzy
+  // matching.
+  const decision = decide(segment("Meetbot: whats the plan?"), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 3: a trailing mention needs a REAL separator, not just whitespace
+// ---------------------------------------------------------------------------
+
+test("ROUND 3: a trailing mention with only whitespace before it (no comma) does not authorize", () => {
+  // Contrast with the required positive "Can you take a note, Meetbot?",
+  // which has a comma. Word-adjacency alone is too weak a signal at the
+  // END of an utterance -- the name is at least as likely to be a
+  // grammatical object as an addressee.
+  const decision = decide(segment("I will ask Meetbot"), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
 // Similar human names: an alias must not fire inside a longer word
 // ---------------------------------------------------------------------------
 
 test("an alias that is a prefix of a participant's name does not authorize", () => {
+  // authorize is still false -- the START/END boundary checks reject this
+  // outright (the character after "Mei" is "l", a word-continuation
+  // character). Round 3 changed only the DIAGNOSTIC fallback: matchedAlias
+  // now surfaces "Mei" via the plain substring check (see module doc point
+  // 5), rather than staying null, because the text genuinely was present
+  // even though it could never have authorized.
   const decision = decide(segment("Meiling, can you send the notes?"), IDENTITY);
-  assertNegative(decision, "no_alias_match");
-  assert.equal(decision.matchedAlias, null);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Mei");
 });
 
-test("an alias that is a prefix of a participant's name is not even reported as an incidental mention", () => {
+test("an alias that is a prefix of a participant's name still never authorizes, regardless of surrounding cues", () => {
   const decision = decide(segment("Meiling usually takes the notes."), IDENTITY);
-  assertNegative(decision, "no_alias_match");
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Mei");
 });
 
 // ---------------------------------------------------------------------------
@@ -508,6 +640,27 @@ const REQUIRED_NEGATIVES: ReadonlyArray<{ readonly text: string; readonly note: 
   { text: "Mei-Ling usually takes the notes.", note: "alias is a substring of a hyphenated human name" },
   { text: "Meetbot-api is throwing 500s.", note: "alias is a substring of a hyphenated identifier" },
   { text: "Amelie-Rose, are you there?", note: "alias is a substring of a hyphenated human name" },
+  // ROUND 3, Critical 1 (reproduced as confirmed round-2 false positives
+  // by the second review): a cue word appearing anywhere in the unbounded
+  // rest of the segment is not enough -- it must open the clause
+  // immediately adjoining the alias.
+  { text: "Meetbot said he can help with that.", note: "cue 'can' is past the first clause boundary, reported speech" },
+  { text: "Meetbot mentioned he will join later.", note: "cue 'will' does not open the adjoining clause" },
+  {
+    text: "Meetbot broke it, and honestly nobody will fix it.",
+    note: "cue 'will' is beyond the first comma boundary",
+  },
+  {
+    text: "Please don't blame Meetbot.",
+    note: "cue 'please' opens the SENTENCE, but the alias is a trailing object with no separator before it",
+  },
+  {
+    text: "Meetbot, the note taker, did leave early.",
+    note: "same appositive shape as the pinned copula fixture, with 'did' beyond the first comma",
+  },
+  // ROUND 3, Critical 2: apostrophe is now a word-continuation character.
+  { text: "Mei's phone is ringing, can someone check?", note: "possessive using the short alias" },
+  { text: "Meetbot's log shows what happened.", note: "possessive using the primary alias" },
 ];
 
 for (const { text, note } of REQUIRED_NEGATIVES) {
@@ -762,8 +915,69 @@ function randomNonEmptyText(rng: () => number, minLength: number, maxLength: num
 }
 
 function randomJoiner(rng: () => number): string {
-  const joiners = ["-", " ", ", ", ": ", ""];
+  // Round 3: added the straight and typographic apostrophe -- the exact
+  // joiner class Critical 2 found missing from WORD_CONTINUATION.
+  const joiners = ["-", " ", ", ", ": ", "", "'", "\u2019"];
   return joiners[Math.floor(rng() * joiners.length)] ?? " ";
+}
+
+// Round 3: ordinary filler words a real appositive/reported-speech
+// sentence would use, deliberately disjoint from BURIED_CUE_POOL below.
+const WORD_POOL = [
+  "the",
+  "team",
+  "report",
+  "update",
+  "meeting",
+  "status",
+  "today",
+  "later",
+  "again",
+  "broke",
+  "said",
+  "mentioned",
+  "honestly",
+  "nobody",
+  "yesterday",
+  "costs",
+  "tool",
+  "our",
+  "transcription",
+  "notes",
+  "audio",
+  "call",
+  "topic",
+];
+
+// The same cue words decide() recognizes -- placed deliberately at a
+// NON-OPENING position by randomBuriedCuePhrase below, so this directly
+// targets round 2's Critical 1 defect class (a cue word anywhere in the
+// unbounded remainder used to be enough; now it must open the clause).
+const BURIED_CUE_POOL = ["can", "could", "would", "will", "do", "does", "did", "what", "who", "where", "when", "why", "how", "please"];
+
+function randomWord(rng: () => number, pool: readonly string[]): string {
+  return pool[Math.floor(rng() * pool.length)] ?? pool[0]!;
+}
+
+/** A multi-word phrase with a real cue word buried at position 1 or 2 --
+ * never position 0 -- so if the matcher incorrectly treats "a cue anywhere"
+ * as sufficient (round 2's Critical 1 bug), this phrase would wrongly
+ * authorize; if the matcher correctly requires the cue to OPEN the clause,
+ * it never does. */
+function randomBuriedCuePhrase(rng: () => number): string {
+  const leadWordCount = 1 + Math.floor(rng() * 2);
+  const words: string[] = [];
+  for (let i = 0; i < leadWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
+  words.push(randomWord(rng, BURIED_CUE_POOL));
+  const trailWordCount = Math.floor(rng() * 3);
+  for (let i = 0; i < trailWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
+  return words.join(" ");
+}
+
+function randomEmbeddingText(rng: () => number): string {
+  // Half character noise (catches generic/hyphen/apostrophe-class issues),
+  // half a buried-cue word phrase (catches the clause-scope class).
+  return rng() < 0.5 ? randomNonEmptyText(rng, 1, 25) : randomBuriedCuePhrase(rng);
 }
 
 test("property 2: an alias embedded in random filler on both sides (never at a segment edge) never authorizes", () => {
@@ -774,8 +988,8 @@ test("property 2: an alias embedded in random filler on both sides (never at a s
   const alias = "Meetbot";
 
   for (let i = 0; i < SAMPLES; i += 1) {
-    let prefix = randomNonEmptyText(rng, 1, 25);
-    let suffix = randomNonEmptyText(rng, 1, 25);
+    let prefix = randomEmbeddingText(rng);
+    let suffix = randomEmbeddingText(rng);
     let guard = 0;
     // Guard against: (a) the random prefix/suffix accidentally spelling out
     // another occurrence of a configured alias, which would make the
@@ -792,8 +1006,8 @@ test("property 2: an alias embedded in random filler on both sides (never at a s
       return foldedFillers.has(foldedPrefix);
     }
     while (isProblematic() && guard < 15) {
-      prefix = randomNonEmptyText(rng, 1, 25);
-      suffix = randomNonEmptyText(rng, 1, 25);
+      prefix = randomEmbeddingText(rng);
+      suffix = randomEmbeddingText(rng);
       guard += 1;
     }
     assert.ok(!isProblematic(), `seed=${SEED} sample=${i}: could not generate a clean embedding after ${guard} retries`);

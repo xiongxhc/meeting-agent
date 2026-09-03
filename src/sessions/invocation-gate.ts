@@ -10,57 +10,103 @@
 // FINALIZED segment. Getting the boundary right is the whole module:
 //   - A bare incidental mention ("I asked Meetbot about it yesterday") is
 //     negative -- somebody talking ABOUT the agent, not TO it.
-//   - Third-person discussion ("Meetbot usually handles the notes") is
-//     negative for the same reason.
+//   - Third-person discussion ("Meetbot usually handles the notes", "Meetbot
+//     said he can help with that") is negative for the same reason, EVEN
+//     WHEN a cue word appears somewhere later in the sentence -- the cue
+//     must OPEN the clause immediately adjoining the alias, not merely
+//     occur anywhere in it. See ROUND 3 below.
 //   - An appositive/agenda-style mention ("Meetbot, the note taker, is
 //     broken again.", "Agenda: Meetbot") is negative -- the alias sits at
 //     a segment edge with a separator, but the adjoining clause never
-//     actually addresses it.
+//     actually opens with an address to it.
 //   - A quoted mention (somebody reading a sentence aloud that happens to
 //     contain the name) is negative.
 //   - A short alias must never fire merely because it is a textual prefix
 //     or suffix of a longer, unrelated token -- a human name ("Mei" vs
-//     "Meiling") or a compound identifier ("Meetbot-api", "eng-meetbot").
+//     "Meiling"), a possessive ("Mei's"), or a compound identifier
+//     ("Meetbot-api", "eng-meetbot").
+//   - A trailing mention with no real separator before it ("Please don't
+//     blame Meetbot.") is negative -- word-adjacency alone (as opposed to
+//     comma/colon/semicolon) is too weak a signal at the END of an
+//     utterance, where the name is at least as likely to be a grammatical
+//     object as an addressee. See ROUND 3 below.
 //   - A partial transcript NEVER authorizes, whatever it contains. This is
 //     structural: finality is the first thing decide() checks, and nothing
 //     below that check can produce a positive outcome for a partial
 //     segment -- see decide() below.
 //
-// ROUND 2 (post-review) design: telling a genuine command/question
-// ("Meetbot, what did we decide?", "Meetbot what did we decide") apart
-// from a third-person or appositive mention that merely happens to sit at
-// a segment edge with a separator ("Meetbot, the note taker, is broken
-// again.") cannot be done from punctuation and position alone -- both
-// shapes are "alias at a segment edge, comma nearby, more clause
-// attached." The disambiguator is a small, closed, deployment-configured
-// ADDRESS CUE lexicon (question words, request modals, "please") checked
-// in the clause immediately adjoining the alias -- the same class of
-// configuration the aliases themselves already are, not NLP, not fuzzy
-// matching, not a scoring model. A short LEADING FILLER lexicon ("hey",
-// "so", "OK", "um", ...) similarly lets a filler word precede a leading
-// vocative ("Hey Meetbot, ...") without defeating the start-boundary
-// check. Both lexicons ship English and Chinese defaults and can be
-// extended (not replaced) by the caller's identity -- see
-// InvocationGateIdentity.
+// ROUND 3 (post-second-review) design, replacing round 2's "cue anywhere in
+// the unbounded remainder" check: two post-review passes each reproduced
+// real false positives round 1/round 2's fixture lists never contained.
+// The lesson taken: bound the scope of every check to exactly the clause
+// immediately touching the alias, never "the rest of the segment."
 //
-// Multilingual note, revised: a "word boundary" only exists as whitespace
-// in space-delimited languages, and Chinese has none at all -- there is no
-// character that reliably separates "the alias" from "the next word" the
-// way a Latin space does. Requiring an explicit non-letter character
-// immediately next to a CJK alias (as round 1 did) makes an unpunctuated
-// Chinese vocative ("会议机器人总结一下") permanently unreachable, because
-// in continuous CJK text the character after the alias is essentially
-// always another CJK letter. This module therefore treats a
-// Script=Han-only alias differently at exactly one point: the
-// "must-not-embed-in-a-longer-token" adjacency guard (see WORD_CONTINUATION
-// below) is skipped for it, and disambiguation is carried entirely by the
-// address-cue lexicon instead. For a Latin/other-script alias the
-// adjacency guard still applies, which is what keeps "Mei-Ling" or
-// "Meetbot-api" from ever being treated as an edge match at all. Coverage:
-// the shipped defaults distinguish address from mention in English and
-// Chinese; an operator deploying a third language passes
-// additionalAddressCues/additionalLeadingFillers with that language's
-// question words, request modals, and greeting fillers.
+//   1. The adjoining clause is truncated at the next clause-boundary
+//      character (comma/period/semicolon/colon/question/exclamation, or
+//      the CJK full-width equivalents) before any cue lookup runs -- see
+//      truncateAtNextClauseBoundary / truncateAtPreviousClauseBoundary.
+//      "Meetbot said he can help with that." truncates the adjoining
+//      clause to "said he" (English has no boundary character there, so
+//      the cue-position rule below is what actually rejects it); "Meetbot,
+//      the note taker, did leave early." truncates to "the note taker" at
+//      the first comma, so "did" (in the clause beyond it) is never
+//      reached at all.
+//   2. The cue must OPEN that bounded clause, not merely occur somewhere
+//      in it -- checked against the clause's first two whitespace tokens
+//      for a Latin/other-script alias (exact token match, so "can" at
+//      position 3 of "said he can help" does not count), or as a strict
+//      string PREFIX of the clause for a Han-script alias (Chinese has no
+//      whitespace to tokenize on, so "prefix" is the closest analogue --
+//      "会议机器人总结一下"'s adjoining clause "总结一下" opens with the
+//      cue "总结"; "会议机器人今天什么都没做"'s clause "今天什么都没做"
+//      does NOT open with "什么", even though it contains it, because
+//      "今天" comes first).
+//   3. For a TRAILING vocative specifically, an actual clause-separator
+//      character (comma/colon/semicolon, or their CJK full-width/
+//      ideographic equivalents) is now REQUIRED immediately before the
+//      alias -- plain whitespace is no longer sufficient. This is
+//      asymmetric with the LEADING position on purpose: a name that opens
+//      an utterance is, in ordinary speech, overwhelmingly likely to be a
+//      genuine address ("Meetbot what did we decide" needs no comma to be
+//      understood as a vocative); a name that merely trails the last word
+//      of a sentence with no separator at all is at least as likely to be
+//      a grammatical OBJECT ("Please don't blame Meetbot.") as an
+//      addressee, and every required trailing-position positive fixture
+//      already carries a comma. Because this requirement is itself a
+//      punctuation character, it is automatically also a stronger
+//      word-continuation guard than round 2's "next char is not a letter"
+//      check -- no hyphen, apostrophe, or letter can ever satisfy it.
+//   4. `WORD_CONTINUATION` (the guard that keeps a short alias from firing
+//      inside a longer token, e.g. "Mei" inside "Meiling" or
+//      "Meetbot-api") now also includes the apostrophe/typographic
+//      apostrophe, so a possessive ("Mei's phone") is treated the same way
+//      as a hyphenated compound: the alias is embedded in a longer token,
+//      not a standalone occurrence, and is never even considered as a
+//      boundary candidate.
+//   5. `matchedAlias` and the `incidental_mention`/`no_alias_match`
+//      distinction, for the FINAL fallback only (i.e. after the authorize
+//      decision has already been made and is negative), now come from a
+//      plain folded substring containment check with NO adjacency guard --
+//      the same class of check used to guard the property test's random
+//      generator. This changes no authorize decision (that guard remains
+//      solely on the authorize path, per points 1-4 above); it only makes
+//      the diagnostic reason more honest: an operator debugging "why did
+//      it not answer me" sees that the configured text WAS present in the
+//      segment even when it was embedded inside a longer word (a
+//      hyphenated identifier, a longer human name, a possessive) -- the
+//      same accuracy this module already gives for a clean mid-sentence
+//      mention like "I asked Meetbot about it yesterday."
+//
+// Multilingual note: a "word boundary" only exists as whitespace in
+// space-delimited languages, and Chinese has none at all. This module
+// therefore uses two different mechanisms for "does the cue open the
+// clause" depending on the alias's own script (Script=Han vs not), but
+// ONE mechanism (clause truncation at the next real punctuation boundary)
+// for bounding how much text is even eligible to be checked, applied
+// identically to both. Coverage: the shipped defaults distinguish address
+// from mention in English and Chinese; an operator deploying a third
+// language passes additionalAddressCues/additionalLeadingFillers with that
+// language's question words, request modals, and greeting fillers.
 
 /** A candidate transcript segment, exactly as decide() needs it. Deliberately
  * NOT the Conversation Runtime port's segment shape -- that port is Task 5's
@@ -119,13 +165,15 @@ export type InvocationDecision =
   | {
       readonly segmentId: string;
       readonly authorize: false;
-      /** Populated whenever a configured alias was textually found in the
+      /** Populated whenever a configured alias's text was found in the
        * segment -- including negative outcomes like "incidental_mention"
        * and "quoted_mention" -- because an operator debugging "why did it
        * not answer me" needs to see that the name WAS heard, just not
-       * addressed. Null when no configured alias appears in the text at
-       * all, or when the segment was not final and the text was never
-       * inspected. */
+       * addressed. This check has NO adjacency guard (see module doc,
+       * point 5): it also populates for a hyphenated/possessive/longer-word
+       * occurrence that never had a chance to authorize. Null only when no
+       * configured alias's text appears anywhere in the segment at all, or
+       * when the segment was not final and the text was never inspected. */
       readonly matchedAlias: string | null;
       readonly reason: Exclude<InvocationDecisionReason, "vocative_invocation">;
     };
@@ -138,17 +186,21 @@ export type InvocationDecision =
  *   1. Not final -> negative, "non_final_segment". Nothing below this
  *      point runs for a partial segment.
  *   2. The entire segment is wrapped in matching quotation marks and an
- *      alias appears inside -- someone reading text aloud -- -> negative,
- *      "quoted_mention".
+ *      alias's text appears inside -- someone reading text aloud --
+ *      -> negative, "quoted_mention".
  *   3. An alias sits at a genuine vocative boundary: the whole segment, or
- *      the segment's start/end (optionally preceded, at the start, by a
- *      single recognized leading filler word) where the adjoining clause
- *      either is empty or carries a recognized address cue -> positive,
- *      "vocative_invocation".
- *   4. An alias appears anywhere else as a real word -> negative,
+ *      the segment's start (optionally preceded by a single recognized
+ *      leading filler word) or end (requiring, at the end specifically, an
+ *      actual separator character immediately before it -- see module doc
+ *      point 3), where the clause immediately adjoining the alias, bounded
+ *      at the next real punctuation boundary, either is empty or OPENS
+ *      with a recognized address cue -> positive, "vocative_invocation".
+ *   4. An alias's text appears anywhere else in the segment -> negative,
  *      "incidental_mention" (covers third-person discussion, appositive/
- *      agenda mentions, and "I asked X about it yesterday").
- *   5. No alias anywhere -> negative, "no_alias_match".
+ *      agenda mentions, "I asked X about it yesterday", and any
+ *      hyphenated/possessive/longer-word occurrence that never had a
+ *      chance to authorize).
+ *   5. No alias's text anywhere -> negative, "no_alias_match".
  */
 export function decide(
   segment: InvocationCandidateSegment,
@@ -179,7 +231,7 @@ export function decide(
   const quotedInner = stripMatchingQuotes(trimmed);
   if (quotedInner !== null) {
     const foldedInner = fold(quotedInner);
-    const quotedAlias = aliases.find(({ folded }) => containsWord(foldedInner, folded));
+    const quotedAlias = aliases.find(({ folded }) => containsPlainSubstring(foldedInner, folded));
     if (quotedAlias) {
       return {
         segmentId,
@@ -204,7 +256,12 @@ export function decide(
     };
   }
 
-  const incidentalAlias = aliases.find(({ folded }) => containsWord(foldedText, folded));
+  // Diagnostic-only fallback: NO adjacency guard here (see module doc,
+  // point 5). The authorize decision above is already final and negative;
+  // this only decides which negative reason, and whether matchedAlias is
+  // populated, so an operator sees when the configured text was present
+  // even embedded inside a longer token.
+  const incidentalAlias = aliases.find(({ folded }) => containsPlainSubstring(foldedText, folded));
   if (incidentalAlias) {
     return {
       segmentId,
@@ -278,46 +335,36 @@ function fold(s: string): string {
 const HAN_CHAR = /\p{Script=Han}/u;
 
 /** True if `folded` contains any Han (Chinese) character. Used to decide,
- * per alias, whether the strict Latin word-continuation adjacency guard
- * applies (see module doc's multilingual note). */
+ * per alias, whether the cue must open the clause as a whitespace TOKEN
+ * (Latin/other scripts) or as a raw string PREFIX (Han, which has no
+ * whitespace to tokenize on) -- see the module doc's multilingual note. */
 function isHanText(folded: string): boolean {
   return HAN_CHAR.test(folded);
 }
 
-// Letters, digits, hyphen, and underscore all COUNT AS the same token: a
-// character immediately touching a candidate match that is one of these
-// means the match is embedded in a longer identifier, not a standalone
-// occurrence of the alias. Including hyphen/underscore here is what keeps
-// "Mei" out of "Mei-Ling", "Meetbot" out of "Meetbot-api", and "meetbot"
-// out of "eng-meetbot" -- the exact false-positive class round 1 missed by
-// treating a bare hyphen as a valid clause separator.
-const WORD_CONTINUATION = /[\p{L}\p{N}\-_]/u;
+// Letters, digits, hyphen, underscore, and the apostrophe (straight and
+// typographic) all COUNT AS the same token: a character immediately
+// touching a candidate match that is one of these means the match is
+// embedded in a longer identifier or a possessive, not a standalone
+// occurrence of the alias. This is what keeps "Mei" out of "Mei-Ling" and
+// "Mei's", "Meetbot" out of "Meetbot-api", and "meetbot" out of
+// "eng-meetbot".
+const WORD_CONTINUATION = /[\p{L}\p{N}\-_'’]/u;
 
 function isWordContinuation(ch: string | undefined): boolean {
   return ch !== undefined && ch !== "" && WORD_CONTINUATION.test(ch);
 }
 
-/** True if `needle` occurs anywhere in `haystack` as a real word -- neither
- * character immediately adjacent to the match continues the same token
- * (see WORD_CONTINUATION). This is what keeps a short alias like "Mei"
- * from firing inside a longer word like "Meiling", and now also keeps a
- * hyphenated compound like "Meetbot-api" or "eng-meetbot" from registering
- * as a mention of the bare alias at all. Both arguments must already be
- * folded. */
-function containsWord(haystack: string, needle: string): boolean {
+/** A plain, folded, NO-adjacency-guard substring containment check. Used
+ * ONLY on the negative/diagnostic path (see module doc, point 5) -- never
+ * to decide whether to authorize. Deliberately the loosest possible check:
+ * it finds "mei" inside "meiling" or "meetbot" inside "eng-meetbot", which
+ * is exactly the point -- the alias's TEXT was present, even though it
+ * never had a chance to be treated as a standalone word by the
+ * authorize-side adjacency guard. */
+function containsPlainSubstring(haystack: string, needle: string): boolean {
   if (needle === "") return false;
-  let from = 0;
-  for (;;) {
-    const idx = haystack.indexOf(needle, from);
-    if (idx === -1) return false;
-    const before = idx > 0 ? haystack[idx - 1] : undefined;
-    const afterIdx = idx + needle.length;
-    const after = afterIdx < haystack.length ? haystack[afterIdx] : undefined;
-    if (!isWordContinuation(before) && !isWordContinuation(after)) {
-      return true;
-    }
-    from = idx + 1;
-  }
+  return haystack.includes(needle);
 }
 
 // ---------------------------------------------------------------------------
@@ -327,11 +374,13 @@ function containsWord(haystack: string, needle: string): boolean {
 // that language's question words / request modals / greeting fillers.
 // ---------------------------------------------------------------------------
 
-/** Words that mark the clause adjoining the alias as an actual address --
- * a question or a request -- rather than a third-person or appositive
- * mention. Deliberately excludes generic copulas ("is"/"are"): including
- * them would turn appositive mentions like "Meetbot, the note taker, is
- * broken again." into false positives. */
+/** Words that mark the clause immediately adjoining the alias as an actual
+ * address -- a question or a request -- rather than a third-person or
+ * appositive mention. A cue only counts when it OPENS the (already
+ * boundary-truncated) clause; see clauseOpensWithCue. Deliberately
+ * excludes generic copulas ("is"/"are"): including them would turn
+ * appositive mentions like "Meetbot, the note taker, is broken again."
+ * into false positives even with clause truncation. */
 const DEFAULT_ADDRESS_CUES: readonly string[] = [
   // English: wh-question words, yes/no-question modals/auxiliaries, and
   // the one politeness marker that reliably signals a request.
@@ -349,12 +398,15 @@ const DEFAULT_ADDRESS_CUES: readonly string[] = [
   "does",
   "did",
   "please",
-  // Chinese: question particles/words and request markers. "一下" is the
-  // conventional softener that turns a bare verb into a polite request
-  // ("总结一下" = "summarize, would you" rather than a bare statement),
-  // which is what makes the unpunctuated CJK positive fixture resolvable
-  // without a dedicated NLP parser.
+  // Chinese: question particles/words, request markers, and "总结"
+  // (summarize) -- included specifically so an unpunctuated imperative
+  // ("会议机器人总结一下") is reachable via a clause-opening PREFIX match,
+  // the same discipline English gets from checking its first two tokens.
+  // "一下" is the conventional softener that turns a bare verb into a
+  // polite request ("总结一下" reads as "summarize, would you" rather
+  // than a bare statement).
   "请",
+  "总结",
   "一下",
   "可以",
   "能不能",
@@ -391,8 +443,8 @@ const DEFAULT_LEADING_FILLERS: readonly string[] = [
 // segment": whitespace, sentence-final punctuation, quote/bracket
 // characters (straight, curly, CJK corner/guillemet), and clause
 // separators (comma/colon/semicolon, plus their CJK full-width/
-// ideographic equivalents). Deliberately does NOT include hyphen/dash --
-// see WORD_CONTINUATION and the module doc's critical-fix note.
+// ideographic equivalents). Deliberately does NOT include hyphen/dash or
+// apostrophe -- see WORD_CONTINUATION and the module doc's fixes.
 const EDGE_STRIP =
   /^[\s.,!?…:;'"“”‘’「」『』«»()[\]、，。！？：；]+|[\s.,!?…:;'"“”‘’«»「」『』()[\]、，。！？：；]+$/gu;
 
@@ -408,40 +460,101 @@ const TRAILING_EDGE = /[\s.,!?…:;'"“”‘’«»「」『』()[\]、，。�
 const LEADING_CLAUSE_STRIP = /^[\s,:;、，：；.!?]+/u;
 const TRAILING_CLAUSE_STRIP = /[\s,:;、，：；.!?]+$/u;
 
-/** True if `clause` (already folded) either has no content at all -- the
- * alias plus an optional filler was essentially the whole utterance -- or
- * contains one of `cues` as a genuine address cue. Chinese cues are
- * matched as plain substrings (Chinese has no whitespace to make a
- * word-boundary check meaningful for a one- or two-character function
- * word); Latin-script cues are matched word-boundary-aware via
- * containsWord, so a cue like "do" cannot fire inside an unrelated longer
- * word. */
-function clauseAddressesTheAgent(clause: string, cues: readonly string[]): boolean {
+// A clause-boundary character: comma, period, semicolon, colon, question
+// mark, exclamation mark, or their CJK full-width equivalents. Used to
+// BOUND how much of the segment is even eligible for a cue lookup -- see
+// module doc point 1. This is what stops "Meetbot, the note taker, did
+// leave early." from ever considering "did" (in the clause beyond the
+// first comma) at all.
+const CLAUSE_BOUNDARY = /[,.;:?!，。；：？！]/u;
+
+/** Only the text up to (not including) the next clause-boundary character,
+ * or the whole string if none exists. Used for a LEADING vocative: the
+ * clause immediately after the alias. */
+function truncateAtNextClauseBoundary(s: string): string {
+  const idx = s.search(CLAUSE_BOUNDARY);
+  return idx === -1 ? s : s.slice(0, idx);
+}
+
+/** Only the text after the LAST clause-boundary character, or the whole
+ * string if none exists. Used for a TRAILING vocative: the clause
+ * immediately before the alias, even when an earlier sentence precedes it
+ * ("We talked yesterday, can you take a note, Meetbot?" -> "can you take a
+ * note", not the whole preceding sentence). */
+function truncateAtPreviousClauseBoundary(s: string): string {
+  let lastIdx = -1;
+  for (let i = 0; i < s.length; i += 1) {
+    if (CLAUSE_BOUNDARY.test(s.charAt(i))) lastIdx = i;
+  }
+  return lastIdx === -1 ? s : s.slice(lastIdx + 1);
+}
+
+// A REAL clause separator -- comma, colon, semicolon, or their CJK
+// full-width/ideographic equivalents. Deliberately narrower than "any
+// non-word-continuation character": plain whitespace does NOT count. Used
+// to gate the TRAILING vocative position specifically -- see module doc
+// point 3.
+const REQUIRED_TRAILING_SEPARATOR = /[,:;、，：；]/u;
+
+/** True if `clause` (already folded, already bounded to the adjoining
+ * clause via truncateAtNext/PreviousClauseBoundary, already trimmed)
+ * either has no content at all -- the alias plus an optional filler was
+ * essentially the whole utterance -- or OPENS with one of `cues`.
+ *
+ * "Opens with" means: for a Latin/other-script alias, one of the clause's
+ * first two whitespace-separated tokens exactly equals a cue word (not "a
+ * cue word appears somewhere in the clause" -- that was round 2's Critical
+ * 1 defect). For a Han-script alias, the clause's raw text starts with a
+ * Han cue as a literal prefix, since Chinese has no whitespace to
+ * tokenize on. */
+function clauseOpensWithCue(clause: string, cues: readonly string[], aliasIsHan: boolean): boolean {
   if (clause === "") return true;
-  return cues.some((cue) => {
-    if (cue === "") return false;
-    if (isHanText(cue)) return clause.includes(cue);
-    return containsWord(clause, cue);
+
+  if (aliasIsHan) {
+    return cues.some((cue) => cue !== "" && isHanText(cue) && clause.startsWith(cue));
+  }
+
+  const tokens = clause
+    .split(/\s+/u)
+    .map((token) => token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter((token) => token !== "");
+  const firstTwo = tokens.slice(0, 2);
+  return firstTwo.some((token) => {
+    if (cues.includes(token)) return true;
+    // A wh-word contraction ("what's", "who's", "where's", "when's",
+    // "why's", "how's" -- folded, so the apostrophe survives token
+    // stripping since it's internal, not at either edge) is an extremely
+    // common way to open a real question ("Meetbot, what'''s the plan?").
+    // Found by adversarial probing after round 3's fix landed; a token
+    // ending in an apostrophe-s that becomes a cue once the contraction is
+    // removed still counts.
+    const contracted = token.replace(/['’]s$/u, "");
+    return contracted !== token && cues.includes(contracted);
   });
 }
 
 /**
  * True when `foldedAlias` sits at a genuine vocative boundary of
  * `foldedText`: either the alias IS the entire segment (after stripping
- * edge whitespace/punctuation), or it sits at the segment's start/end --
- * optionally, at the start, preceded by a single recognized leading filler
- * word -- with the adjoining clause either empty or carrying a recognized
- * address cue.
+ * edge whitespace/punctuation), or it sits at the segment's start --
+ * optionally preceded by a single recognized leading filler word -- or end
+ * -- requiring, at the end specifically, a real separator character
+ * immediately before it (module doc point 3) -- with the clause
+ * immediately adjoining the alias, bounded at the next real clause
+ * boundary, either empty or opening with a recognized address cue.
  *
- * For a Latin/other-script alias, the character immediately touching the
- * alias at that edge must not continue the same token (see
- * WORD_CONTINUATION) -- this is what rejects "Meetbot-api" and
- * "eng-meetbot" before the cue check even runs. For a Han-script alias
- * that guard is skipped (see the module doc's multilingual note): CJK has
- * no whitespace, so "the next character is a letter" is true for almost
- * any real continuation and would make an unpunctuated CJK vocative
- * unreachable. Disambiguation for Han aliases is carried entirely by the
- * address-cue lexicon.
+ * For the START position, a Latin/other-script alias also requires that
+ * the character immediately after it not continue the same token (see
+ * WORD_CONTINUATION) -- this is what rejects "Meetbot-api" and "Mei's"
+ * before the cue check even runs. That guard is skipped for a Han-script
+ * alias at the START position (CJK has no whitespace, so "the next
+ * character is a letter" is true for almost any real continuation and
+ * would make an unpunctuated CJK vocative unreachable); disambiguation
+ * there is carried entirely by the clause-opening-cue check instead. At
+ * the END position, both scripts instead require an actual separator
+ * character (see REQUIRED_TRAILING_SEPARATOR) -- which is automatically
+ * also a stronger word-continuation guard than a bare adjacency check, so
+ * no script-specific carve-out is needed there.
  */
 function isVocativeBoundary(
   foldedText: string,
@@ -476,19 +589,30 @@ function isVocativeBoundary(
     const remainder = candidate.slice(foldedAlias.length);
     const nextChar = remainder.charAt(0);
     if (!aliasIsHan && nextChar !== "" && isWordContinuation(nextChar)) continue;
-    const clause = remainder.replace(LEADING_CLAUSE_STRIP, "").trim();
-    if (clauseAddressesTheAgent(clause, addressCues)) return true;
+    const stripped = remainder.replace(LEADING_CLAUSE_STRIP, "");
+    const clause = truncateAtNextClauseBoundary(stripped).trim();
+    if (clauseOpensWithCue(clause, addressCues, aliasIsHan)) return true;
   }
 
   // END: the segment's literal end (after stripping trailing terminal
-  // punctuation/quotes).
+  // punctuation/quotes), requiring an actual separator character (not
+  // just whitespace) immediately before the alias -- see module doc
+  // point 3 and REQUIRED_TRAILING_SEPARATOR.
   const textEnd = foldedText.replace(TRAILING_EDGE, "");
   if (textEnd.endsWith(foldedAlias)) {
-    const prefix = textEnd.slice(0, textEnd.length - foldedAlias.length);
-    const beforeChar = prefix.length > 0 ? prefix.charAt(prefix.length - 1) : "";
-    if (aliasIsHan || beforeChar === "" || !isWordContinuation(beforeChar)) {
-      const clause = prefix.replace(TRAILING_CLAUSE_STRIP, "").trim();
-      if (clauseAddressesTheAgent(clause, addressCues)) return true;
+    const prefixFull = textEnd.slice(0, textEnd.length - foldedAlias.length);
+    // The character that must be a real separator is the last NON-
+    // WHITESPACE character before the alias, not merely the last
+    // character -- "that, Meetbot" has a space between the comma and the
+    // alias, so checking only the literal last character would miss the
+    // comma entirely and wrongly reject every comma-separated trailing
+    // vocative that has the conventional space after its comma.
+    const trimmedPrefix = prefixFull.replace(/\s+$/u, "");
+    const beforeChar = trimmedPrefix.length > 0 ? trimmedPrefix.charAt(trimmedPrefix.length - 1) : "";
+    if (beforeChar !== "" && REQUIRED_TRAILING_SEPARATOR.test(beforeChar)) {
+      const stripped = prefixFull.replace(TRAILING_CLAUSE_STRIP, "");
+      const clause = truncateAtPreviousClauseBoundary(stripped).trim();
+      if (clauseOpensWithCue(clause, addressCues, aliasIsHan)) return true;
     }
   }
 
