@@ -56,9 +56,17 @@ Tests/FeishuBridgeSpikeTests/
   is left out rather than given a guessed id.
 - **Absence of evidence is not an ended meeting.** A tree with no locatable
   meeting window is `unobservable` — a backgrounded client and a partial read
-  both look like that. An end is claimed on the client's positive "meeting
-  ended" notice, or failing that only after three consecutive absent frames, and
-  `left` is emitted at most once per session.
+  both look like that. An end is claimed only on the client's positive "meeting
+  ended" notice, which is `left(reason: "ended")`. Three consecutive absent
+  frames instead give up and report `left(reason: "bridge_failure")`: what was
+  observed is that the bridge could not read the client, not that the meeting is
+  over.
+- **A session is terminal after any `left`.** The observer recovers from
+  absence — a meeting window that comes back resets its absence count — but the
+  reducer never un-leaves. After a `left` it emits nothing: no
+  `participant_joined`, no `active_speaker`, no second `left`. A bridge that
+  reported a departure and then reported activity in the same meeting would be
+  claiming both.
 - **The UI is re-read after every action.** `snapshot(waitingUpTo:)` carries a
   timing contract: keep re-reading until the tree changes or the deadline
   elapses. The adapter waits 60s after pressing join (a waiting-room join takes

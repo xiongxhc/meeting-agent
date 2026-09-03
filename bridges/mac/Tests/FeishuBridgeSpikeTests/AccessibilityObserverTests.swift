@@ -102,14 +102,51 @@ final class AccessibilityObserverTests: XCTestCase {
             "positive evidence needs no waiting")
     }
 
-    func testEnoughConsecutiveUnreadableFramesEventuallyReportTheMeetingEnded() {
+    func testEnoughConsecutiveUnreadableFramesReportABridgeFailureNotAnEndedMeeting() {
         let observer = observer()
         let absent = FakeTree.backgroundedClient()
         XCTAssertEqual(observer.observations(from: absent, at: at1), [.unobservable(observedAt: at1)])
         XCTAssertEqual(observer.observations(from: absent, at: at1), [.unobservable(observedAt: at1)])
         XCTAssertEqual(
-            observer.observations(from: absent, at: at2), [.meetingEnded(observedAt: at2)],
+            observer.observations(from: absent, at: at2), [.clientUnreadable(observedAt: at2)],
             "three consecutive absent frames is a departure, one is a hiccup")
+
+        XCTAssertEqual(
+            reducer().reduce(.clientUnreadable(observedAt: at2)).map(\.event),
+            [.left(reason: .bridgeFailure)],
+            "absence says the bridge could not read the client, never that the meeting ended")
+    }
+
+    /// The observer recovers from absence by design; the reducer does not
+    /// un-leave. Together that means a window coming back *after* the threshold
+    /// produces readable frames the reducer must stay silent about — otherwise
+    /// the bridge reports a roster and a speaker inside a meeting it already
+    /// said it had left.
+    func testNothingIsEmittedAfterALeaveEvenWhenTheClientComesBack() {
+        let observer = observer()
+        let reducer = reducer()
+        let absent = FakeTree.backgroundedClient()
+
+        var events: [BridgeEventMessage] = []
+        for _ in 0..<3 {
+            events += observer.observations(from: absent, at: at1).flatMap { reducer.reduce($0) }
+        }
+        XCTAssertEqual(events.map(\.event), [.left(reason: .bridgeFailure)])
+
+        let returned = FakeTree.inMeeting(
+            roster: [("row-1", "Test Participant One"), ("row-2", "Test Participant Two")],
+            tiles: [("tile-1", true)]
+        )
+        let afterReturn = observer.observations(from: returned, at: at2).flatMap {
+            reducer.reduce($0)
+        }
+        XCTAssertEqual(
+            afterReturn, [],
+            "a session is terminal after `left`: no participant_joined, no active_speaker, no second left")
+
+        XCTAssertEqual(
+            reducer.reduce(.meetingEnded(observedAt: at2)), [],
+            "not even a positive end notice reopens a session that already left")
     }
 
     func testAMeetingWindowComingBackResetsTheAbsenceCount() {

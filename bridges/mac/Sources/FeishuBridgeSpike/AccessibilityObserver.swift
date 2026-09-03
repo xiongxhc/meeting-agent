@@ -61,9 +61,13 @@ public struct RosterEntry: Equatable, Sendable {
 }
 
 /// A single instant of what the client UI showed. This mirrors `UiObservation`
-/// in `spikes/feishu/src/reducer.ts`, with one case the TypeScript reference does
-/// not have: `joined`, the counterpart of `meetingEnded`. Only the Mac bridge is
-/// in a position to observe entry into a meeting, so only it can report it.
+/// in `spikes/feishu/src/reducer.ts`, with three cases the TypeScript reference
+/// does not have, all of them things only a bridge watching a real client can
+/// see: `joined`, the counterpart of `meetingEnded`; `unobservable`, one frame
+/// the bridge could not read; and `clientUnreadable`, enough consecutive such
+/// frames that the bridge gives up. The TypeScript reducer is fed observations
+/// by whatever is watching the UI and never watches one itself, so it has no
+/// occasion to report any of the three.
 public enum UiObservation: Equatable, Sendable {
     case joined(observedAt: String, meetingOccurrenceId: String)
     /// The tree could not be read as a meeting: the client is backgrounded, the
@@ -71,6 +75,11 @@ public enum UiObservation: Equatable, Sendable {
     /// table knows. This says nothing about whether the meeting is still on, and
     /// the reducer emits nothing for it.
     case unobservable(observedAt: String)
+    /// The meeting window could not be located for `absentFramesBeforeEnded`
+    /// consecutive frames, so the bridge stops watching. What was observed is
+    /// that the bridge could not read the client — never that the meeting
+    /// ended, which is a claim only the client's own ended notice supports.
+    case clientUnreadable(observedAt: String)
     case rosterSnapshot(observedAt: String, participants: [RosterEntry])
     case speakerHighlight(observedAt: String, highlightedTileIds: [String])
     case meetingEnded(observedAt: String)
@@ -96,12 +105,13 @@ public protocol ChatControlPort {
 /// is left out rather than filled in, and a tree it cannot read is reported as
 /// unreadable rather than as an ended meeting.
 ///
-/// The end of a meeting is claimed on positive evidence — the client's
-/// meeting-ended notice — or, failing that, only after `absentFramesBeforeEnded`
-/// consecutive frames in which no meeting window could be located at all. One
-/// unreadable frame is `unobservable`. This is the same asymmetry the roster
-/// rule uses: a panel that is not on screen is unknown membership, not an empty
-/// meeting.
+/// The end of a meeting is claimed on positive evidence only — the client's
+/// meeting-ended notice. One unreadable frame is `unobservable`;
+/// `absentFramesBeforeEnded` consecutive unreadable frames is `clientUnreadable`,
+/// which the reducer reports as `left(reason: "bridge_failure")`, because a
+/// bridge that cannot read the client has observed its own blindness and not the
+/// end of a meeting. This is the same asymmetry the roster rule uses: a panel
+/// that is not on screen is unknown membership, not an empty meeting.
 ///
 /// Stateful, hence a class: the consecutive-absence count is what separates a
 /// backgrounded client from a meeting that is over.
@@ -131,7 +141,7 @@ public final class AccessibilityObserver {
         guard let window = tree.locate(labels.identifiers.meetingWindow, labels) else {
             consecutiveAbsentFrames += 1
             return consecutiveAbsentFrames >= absentFramesBeforeEnded
-                ? [.meetingEnded(observedAt: observedAt)]
+                ? [.clientUnreadable(observedAt: observedAt)]
                 : [.unobservable(observedAt: observedAt)]
         }
         consecutiveAbsentFrames = 0
@@ -197,12 +207,22 @@ extension AccessibilityNode {
 ///     tile has been lit
 ///   - a resolved state is re-emitted only when it changes, mirroring a UI whose
 ///     highlight persists across frames until a different tile lights up.
+///
+/// **A session is terminal after any `left`.** Once this reducer has reported a
+/// departure it emits nothing further — not a roster change, not a speaker, not
+/// a second `left`. The observer deliberately recovers: a meeting window that
+/// comes back resets its absence count, so the same session can go on producing
+/// readable frames after the bridge already gave up on it. Emitting from those
+/// frames would report activity inside a meeting this bridge said it had left,
+/// and the contract has no way to say "still here after all".
 public final class SessionObservationReducer {
     public let sessionId: String
     private let identity: any UiIdentityResolver
     private let chatControl: any ChatControlPort
     private var sequence = 0
     private var activeSpeaker: ActiveSpeaker?
+    /// Set by the first `left` this reducer emits, for either reason. It gates
+    /// every emission, not just a second `left`.
     private var hasLeft = false
     private var roster: [String: String] = [:]
 
@@ -215,6 +235,10 @@ public final class SessionObservationReducer {
     }
 
     public func reduce(_ observation: UiObservation) -> [BridgeEventMessage] {
+        // Terminal after a departure: a session that has reported `left` says
+        // nothing more, whatever the client goes on showing.
+        guard !hasLeft else { return [] }
+
         switch observation {
         case .joined(let observedAt, let meetingOccurrenceId):
             return [emit(observedAt, .joined(meetingOccurrenceId: meetingOccurrenceId))]
@@ -223,11 +247,17 @@ public final class SessionObservationReducer {
             return []
 
         case .meetingEnded(let observedAt):
-            // A meeting ends once. A repeated end observation is not a second
-            // departure, and the contract has no way to say "still gone".
-            guard !hasLeft else { return [] }
+            // `ended` is reserved for a positively observed end: the client's
+            // own meeting-ended notice, which is what produced this case.
             hasLeft = true
             return [emit(observedAt, .left(reason: .ended))]
+
+        case .clientUnreadable(let observedAt):
+            // What was observed is that the bridge could not read the client for
+            // long enough to give up. Calling that `ended` would claim knowledge
+            // of the meeting the bridge does not have.
+            hasLeft = true
+            return [emit(observedAt, .left(reason: .bridgeFailure))]
 
         case .disclosureAttempt(let observedAt, let text):
             return [emit(observedAt, .chatDisclosure(outcome: chatControl.postDisclosure(text: text)))]

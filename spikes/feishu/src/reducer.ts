@@ -20,6 +20,15 @@
  *   - a resolved speaker state is only re-emitted when it changes from the
  *     last one emitted, mirroring a UI whose highlight glow persists across
  *     frames until a different tile lights up.
+ *
+ * Terminal after a departure: once a `left` has been emitted this reducer emits
+ * nothing further — not a roster change, not a speaker, not a second `left`.
+ * The contract has no way to say "still here after all", so reporting activity
+ * inside a meeting the bridge already said it had left would be claiming both.
+ * The Swift second implementation
+ * (`bridges/mac/Sources/FeishuBridgeSpike/AccessibilityObserver.swift`) holds
+ * the same rule, and needs it harder: its observer recovers from an unreadable
+ * client, so readable frames really do arrive after it gave up.
  */
 
 import type { BridgeEvent, BridgeEventMessage } from "./protocol.ts";
@@ -117,6 +126,9 @@ export function createObservationReducer(options: {
   let sequence = 0;
   let activeSpeaker: ActiveSpeakerState | null = null;
   let roster = new Map<string, string>();
+  // Set by the first `left` emitted. It gates every emission, not just a
+  // second `left`.
+  let hasLeft = false;
 
   function emit(observedAt: string, payload: BridgeEvent): BridgeEventMessage {
     sequence += 1;
@@ -189,6 +201,7 @@ export function createObservationReducer(options: {
   function reduceMeetingEnded(
     observation: Extract<UiObservation, { kind: "meeting_ended" }>,
   ): BridgeEventMessage[] {
+    hasLeft = true;
     return [emit(observation.observedAt, { type: "left", reason: "ended" })];
   }
 
@@ -204,6 +217,7 @@ export function createObservationReducer(options: {
   return {
     sessionId,
     reduce(observation) {
+      if (hasLeft) return [];
       switch (observation.kind) {
         case "speaker_highlight":
           return reduceSpeakerHighlight(observation);

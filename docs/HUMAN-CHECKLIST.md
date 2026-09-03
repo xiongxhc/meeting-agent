@@ -95,9 +95,11 @@ cd bridges/mac && swift test
 controls exposed a stable `AXIdentifier` versus which are reachable only by
 localized title. A control reachable only by title is a standing fragility;
 note it. Also note whether the client shows a positive "meeting has ended"
-notice: the observer claims an end from that notice if it exists, and otherwise
-only after three consecutive frames in which no meeting window could be located
-at all. Do not paste a full tree dump into the repository — it will contain
+notice: it is the only evidence from which the bridge claims the meeting ended.
+Without it, three consecutive frames in which no meeting window could be located
+report `left(reason: "bridge_failure")` instead — the bridge gave up reading the
+client — so on a client with no such notice every session ends that way, and the
+coordinator has no observation that the meeting itself finished. Do not paste a full tree dump into the repository — it will contain
 real participant names.
 
 #### 3.0b Establish whether a participant identity is resolvable at all

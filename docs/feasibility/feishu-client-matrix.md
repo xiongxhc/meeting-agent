@@ -254,11 +254,17 @@ empty.
 degraded-path guarantees exist in the code and each has a passing unit test
 (see the Task 7 report's `npm test` / `swift test` output):
 - An accessibility read that cannot locate the meeting window does not claim
-  the meeting ended; it takes three consecutive unreadable frames before
-  `left(reason: .ended)` is emitted, and a window reappearing resets that
-  count (`AccessibilityObserverTests.testEnoughConsecutiveUnreadableFramesEventuallyReportTheMeetingEnded`,
+  the meeting ended. One such frame is reported as unobservable and emits
+  nothing; three consecutive ones emit `left(reason: "bridge_failure")`, which
+  says the bridge could not read the client, not that the meeting is over —
+  `left(reason: "ended")` is reserved for the client's own meeting-ended
+  notice. A window reappearing resets the absence count, and the session is
+  terminal after any `left`, so nothing is emitted from frames that arrive
+  after one
+  (`AccessibilityObserverTests.testEnoughConsecutiveUnreadableFramesReportABridgeFailureNotAnEndedMeeting`,
   `testABackgroundedClientIsNotReportedAsAnEndedMeeting`,
-  `testAMeetingWindowComingBackResetsTheAbsenceCount`).
+  `testAMeetingWindowComingBackResetsTheAbsenceCount`,
+  `testNothingIsEmittedAfterALeaveEvenWhenTheClientComesBack`).
 - An open `audio_gap` (`endedAt: null`) is never given an invented end: it
   stays open across a mute, a barge-in, or a media disconnect until an actual
   resumption is observed (`AudioBridgeTests.testAnOpenPlaybackGapStaysOpenWhenTheMediaSessionDisconnects`,

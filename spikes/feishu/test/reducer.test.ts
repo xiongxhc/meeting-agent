@@ -146,7 +146,7 @@ test("reducer: no highlighted tile emits nothing", () => {
   deepStrictEqual(events, []);
 });
 
-test("reducer: roster snapshot diff emits joins before leaves in id order", () => {
+test("reducer: roster snapshot diff emits leaves before joins, each in id order", () => {
   const reducer = newReducer({});
   const initial = reducer.reduce({
     kind: "roster_snapshot",
@@ -184,6 +184,36 @@ test("reducer: roster snapshot diff emits joins before leaves in id order", () =
   assertPassesStreamValidator([...initial, ...afterLeave]);
 });
 
+test("reducer: one frame that both loses and gains a participant emits the leave first", () => {
+  // The ordering claim is only exercised when a leave and a join fall in the
+  // same frame; two separate frames would pass whatever the order.
+  const reducer = newReducer({});
+  reducer.reduce({
+    kind: "roster_snapshot",
+    observedAt: "2026-09-02T00:00:00.000Z",
+    participants: [
+      { feishuUserId: "ou_0000000000000001", displayName: "Test Participant One" },
+      { feishuUserId: "ou_0000000000000002", displayName: "Test Participant Two" },
+    ],
+  });
+  const swapped = reducer.reduce({
+    kind: "roster_snapshot",
+    observedAt: "2026-09-02T00:00:10.000Z",
+    participants: [
+      { feishuUserId: "ou_0000000000000003", displayName: "Test Participant Three" },
+      { feishuUserId: "ou_0000000000000001", displayName: "Test Participant One" },
+    ],
+  });
+  deepStrictEqual(
+    swapped.map((e) => [e.type, (e as { feishuUserId: string }).feishuUserId]),
+    [
+      ["participant_left", "ou_0000000000000002"],
+      ["participant_joined", "ou_0000000000000003"],
+    ],
+  );
+  assertPassesStreamValidator(swapped);
+});
+
 test("reducer: an unchanged roster emits nothing", () => {
   const reducer = newReducer({});
   const roster = {
@@ -215,6 +245,42 @@ test("reducer: meeting_ended emits left with reason ended", () => {
     },
   ]);
   assertPassesStreamValidator(events);
+});
+
+test("reducer: a session is terminal after left — nothing follows it", () => {
+  // The Swift second implementation needs this rule hardest: its observer
+  // recovers from an unreadable client, so readable frames really do arrive
+  // after it gave up. Both implementations must state the same rule.
+  const reducer = newReducer({
+    speakerIdentity: stubSpeakerIdentity({ "tile-1": "ou_0000000000000001" }),
+  });
+  const left = reducer.reduce({
+    kind: "meeting_ended",
+    observedAt: "2026-09-02T00:30:00.000Z",
+  });
+  strictEqual(left.length, 1);
+
+  deepStrictEqual(
+    reducer.reduce({
+      kind: "roster_snapshot",
+      observedAt: "2026-09-02T00:30:01.000Z",
+      participants: [{ feishuUserId: "ou_0000000000000001", displayName: "Test Participant One" }],
+    }),
+    [],
+  );
+  deepStrictEqual(
+    reducer.reduce({
+      kind: "speaker_highlight",
+      observedAt: "2026-09-02T00:30:02.000Z",
+      highlightedTileIds: ["tile-1"],
+    }),
+    [],
+  );
+  deepStrictEqual(
+    reducer.reduce({ kind: "meeting_ended", observedAt: "2026-09-02T00:30:03.000Z" }),
+    [],
+    "a meeting ends once; a repeated observation is not a second departure",
+  );
 });
 
 test("reducer: disclosure attempt with chat control available reports sent", () => {
