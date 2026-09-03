@@ -124,12 +124,15 @@ test('runtimeProfile !== "online" is a config error in v1', () => {
   });
 });
 
-test("runtimeProfile defaults to online when unset", () => {
+test("absent runtime profile is a config error (v1 requires it explicitly, never defaults it)", () => {
   withTempDir((dir) => {
     const env = { ...validEnv(dir) };
     delete (env as Record<string, string | undefined>).MEETING_AGENT_RUNTIME_PROFILE;
-    const config = loadConfig({ env });
-    assert.equal(config.conversationRuntime.profile, "online");
+    assert.throws(() => loadConfig({ env }), (error: unknown) => {
+      assert.ok(error instanceof ConfigError);
+      assert.equal(error.field, "conversationRuntime.profile");
+      return true;
+    });
   });
 });
 

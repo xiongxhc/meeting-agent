@@ -184,10 +184,12 @@ function requireUrl(env: ConfigEnv, key: string, field: string): string {
 }
 
 function requirePinnedRuntimeProfile(env: ConfigEnv): RuntimeProfile {
-  const raw = env[ENV_KEYS.runtimeProfile]?.trim();
-  if (raw === undefined || raw === "") {
-    return PINNED_RUNTIME_PROFILE;
-  }
+  // Required, not defaulted: the spec says Meeting Agent v1 "explicitly
+  // selects online at session creation" and "there is no silent profile
+  // switching". Materializing "online" from an absent variable would itself
+  // be a silent selection, even though it can never resolve to a forbidden
+  // value -- so an absent variable is a config error like any other.
+  const raw = requireNonBlank(env, ENV_KEYS.runtimeProfile, "conversationRuntime.profile");
   if (raw !== PINNED_RUNTIME_PROFILE) {
     throw new ConfigError(
       "conversationRuntime.profile",
