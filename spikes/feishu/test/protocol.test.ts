@@ -16,6 +16,7 @@ import {
   BRIDGE_EVENT_TYPES,
   BRIDGE_SESSION_SCHEMA,
   createBridgeSessionValidator,
+  parseCommandShape,
 } from "../src/protocol.ts";
 import { createJsonlRecorder } from "../src/recorder.ts";
 
@@ -216,6 +217,65 @@ test("bridge schema rejects a connect_media format the media bridge cannot parse
     );
   }
   strictEqual(validateCommand(commandOfType("connect_media")), true);
+});
+
+test("the hand-written validator rejects the same connect_media formats as the schema", () => {
+  // The gap this closes: the schema was tightened with a four-part `pattern`
+  // and the frozen fixture re-cut to "pcm_s16le/48000/1/20ms", but the
+  // hand-written validator -- the one the recorder, the replay harness and
+  // (since this task) the product's meeting session actually run -- still
+  // declared `format` as a bare non-empty string, so it went on accepting the
+  // obsolete three-part "opus/48000/2". Ajv is a test-only dependency; nothing
+  // at runtime consults the schema, so a value only Ajv refuses is a value that
+  // reaches the bridge.
+  for (const unparseable of [
+    "opus/48000/2",
+    "pcm_s16le/48000/1/20",
+    "pcm_s16le/48000/0/20ms",
+    "pcm_s16le/48000/1/0ms",
+    "/48000/1/20ms",
+    "pcm_s16le/48000/1/20ms/extra",
+    "",
+  ]) {
+    const command = { ...commandOfType("connect_media"), format: unparseable };
+    const result = parseCommandShape(command);
+    strictEqual(
+      result.ok,
+      false,
+      `the validator must reject the format ${JSON.stringify(unparseable)}`,
+    );
+    if (result.ok) return;
+    strictEqual(result.rejection.code, "media_format");
+    strictEqual(result.rejection.path, "/format");
+  }
+
+  const accepted = parseCommandShape(commandOfType("connect_media"));
+  strictEqual(accepted.ok, true, JSON.stringify(accepted));
+});
+
+test("validator and schema agree on every connect_media format probed", () => {
+  // The two views must not merely both reject the known-bad value; they must
+  // return the same verdict on every probe, which is what stops one of them
+  // drifting again.
+  const probes = [
+    "pcm_s16le/48000/1/20ms",
+    "pcm_s16le/16000/2/10ms",
+    "opus/48000/2",
+    "pcm_s16le/48000/1/20",
+    "pcm_s16le/48000/0/20ms",
+    "pcm_s16le/00048/1/20ms",
+    "pcm_s16le/48000/1/20MS",
+    " pcm_s16le/48000/1/20ms",
+    "",
+  ];
+  for (const format of probes) {
+    const command = { ...commandOfType("connect_media"), format };
+    strictEqual(
+      parseCommandShape(structuredClone(command)).ok,
+      validateCommand(structuredClone(command)) === true,
+      `validator and schema disagree on ${JSON.stringify(format)}`,
+    );
+  }
 });
 
 test("bridge fixture replays clean through the session validator", () => {

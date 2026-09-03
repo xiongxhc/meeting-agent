@@ -69,6 +69,7 @@ export type BridgeRejectionCode =
   | "field_type"
   | "enum_value"
   | "timestamp_format"
+  | "media_format"
   | "speaker_identity_required"
   | "speaker_identity_forbidden"
   | "session_mismatch"
@@ -93,6 +94,7 @@ type FieldSpec =
   | "utc_timestamp"
   | "nullable_utc_timestamp"
   | "positive_int"
+  | "media_format"
   | readonly string[];
 
 /**
@@ -119,7 +121,7 @@ const COMMAND_PAYLOADS = {
   connect_media: {
     endpoint: "string",
     sessionToken: "string",
-    format: "string",
+    format: "media_format",
     expiresAt: "utc_timestamp",
   },
   post_disclosure: { text: "string" },
@@ -171,6 +173,18 @@ export const BRIDGE_EVENT_TYPES: readonly string[] = Object.keys(EVENT_PAYLOADS)
 const UTC_TIMESTAMP =
   /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3})?Z$/;
 
+// The four-part PCM stream shape <encoding>/<sampleRate>/<channels>/<frameMs>ms,
+// character for character the `mediaFormat` pattern in
+// protocols/bridge-session-v1.schema.json. It lives here because this validator,
+// not the schema, is what runs: Ajv is a test-only dependency, so a format only
+// the schema refuses is a format that still reaches the bridge — and
+// AudioFormat.parse in bridges/mac/Sources/FeishuBridgeSpike/AudioBridge.swift
+// refuses anything outside this grammar rather than substituting a default,
+// so the coordinator would be opening a session the bridge can only reject.
+// The obsolete three-part form "opus/48000/2" is the concrete value this
+// rejects; it was in the frozen bytes before the fixture was re-cut.
+const MEDIA_FORMAT = /^[^/]+\/[1-9][0-9]*\/[1-9][0-9]*\/[1-9][0-9]*ms$/;
+
 function reject(
   code: BridgeRejectionCode,
   path: string,
@@ -214,6 +228,19 @@ function checkField(
         code: "timestamp_format",
         path,
         detail: "expected a Z-suffixed UTC timestamp",
+      };
+    }
+    return null;
+  }
+  if (spec === "media_format") {
+    if (typeof value !== "string") {
+      return { code: "field_type", path, detail: "expected a string" };
+    }
+    if (!MEDIA_FORMAT.test(value)) {
+      return {
+        code: "media_format",
+        path,
+        detail: "expected <encoding>/<sampleRate>/<channels>/<frameMs>ms",
       };
     }
     return null;
