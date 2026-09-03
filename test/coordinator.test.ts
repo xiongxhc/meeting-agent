@@ -20,7 +20,7 @@
 // Nothing here touches a live TeamMem installation.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -172,13 +172,14 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 5);
+      assert.equal(store.schemaVersion, 6);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
         { version: 3, name: "003_bridge_capacity.sql", appliedAtMs: BASE_MS },
         { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
         { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
+        { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -223,7 +224,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 5);
+      assert.equal(second.schemaVersion, 6);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -232,6 +233,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 3, name: "003_bridge_capacity.sql", appliedAtMs: BASE_MS },
         { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
         { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
+        { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -240,6 +242,35 @@ test("reopening an existing database does not re-apply the migrations", () => {
   } finally {
     h.cleanup();
   }
+});
+
+test("migration 004 represents pre-runtime recording metadata as unavailable, never fabricated", () => {
+  const h = harness();
+  try {
+    const id = identity(91);
+    const raw = new Database(h.dbPath);
+    try {
+      const migrationsDir = path.resolve(import.meta.dirname, "..", "migrations");
+      raw.exec(readFileSync(path.join(migrationsDir, "001_orchestration.sql"), "utf8"));
+      raw.exec(readFileSync(path.join(migrationsDir, "002_recordings.sql"), "utf8"));
+      raw.prepare("INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)").run(1, "001_orchestration.sql", BASE_MS);
+      raw.prepare("INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)").run(2, "002_recordings.sql", BASE_MS);
+      raw.prepare(`INSERT INTO sessions (occurrence_id, occurrence_segment, provider_meeting_id, occurrence_started_at, state, terminal_reason, created_at_ms, updated_at_ms)
+                   VALUES (?, ?, ?, ?, 'finalizing', NULL, ?, ?)`)
+        .run(id.occurrenceId, occurrencePathSegment(id.occurrenceId), id.providerMeetingId, id.occurrenceStartedAt, BASE_MS, BASE_MS);
+      raw.prepare("INSERT INTO recordings (occurrence_id, handle, sha256, duration_ms, finalized_at_ms) VALUES (?, ?, ?, ?, ?)")
+        .run(id.occurrenceId, "legacyrecording1", "0".repeat(64), 1, BASE_MS);
+    } finally { raw.close(); }
+    const store = h.open();
+    try {
+      assert.equal(store.schemaVersion, 6);
+      const legacy = store.getRecording(id.occurrenceId);
+      assert.equal(legacy?.encryptedPath, null);
+      assert.equal(legacy?.format, null);
+      assert.equal(legacy?.keyId, null);
+      assert.deepEqual(store.foreignKeyCheck(), []);
+    } finally { store.close(); }
+  } finally { h.cleanup(); }
 });
 
 test("the control database is structurally incapable of holding transcript text or audio", () => {
@@ -928,7 +959,7 @@ test("bridge failure recovery is durable, bounded, and keeps the occurrence reus
     coordinator.advance(id.occurrenceId, "listening");
     const firstFailure = coordinator.recordBridgeFailure(id.occurrenceId, 1, [
       { direction: "capture", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" },
-    ]);
+    ], null);
     assert.deepEqual(firstFailure, { attempt: 1, retryAllowed: true });
     first.close();
 
@@ -936,7 +967,7 @@ test("bridge failure recovery is durable, bounded, and keeps the occurrence reus
     try {
       const resumedCoordinator = coordinatorFor(resumed, clock);
       assert.equal(resumedCoordinator.get(id.occurrenceId)?.state, "listening");
-      assert.deepEqual(resumedCoordinator.recordBridgeFailure(id.occurrenceId, 1, []), {
+      assert.deepEqual(resumedCoordinator.recordBridgeFailure(id.occurrenceId, 1, [], null), {
         attempt: 2,
         retryAllowed: false,
       });

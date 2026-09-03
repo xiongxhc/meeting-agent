@@ -144,6 +144,17 @@ test("refuses untracked Markdown instead of indexing it under an unrelated HEAD"
   });
 });
 
+test("never indexes ignored untracked Markdown; committed tree bytes remain the only provenance", () => {
+  withTempGitVault((dir) => {
+    writeFileSync(path.join(dir, ".gitignore"), "ignored.md\n");
+    writeFileSync(path.join(dir, "roadmap.md"), "Published October decision.\n");
+    commitAll(dir, "publish roadmap");
+    writeFileSync(path.join(dir, "ignored.md"), "Unpublished secret December decision.\n");
+    const result = createTeamVaultIndex({ teamVaultDir: dir }).search("secret December");
+    assert.deepEqual(result.hits, []);
+  });
+});
+
 test("refuses a Markdown symlink that escapes the published checkout", () => {
   const outside = mkdtempSync(path.join(os.tmpdir(), "team-vault-outside-"));
   try {

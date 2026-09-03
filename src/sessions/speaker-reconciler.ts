@@ -176,6 +176,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
 
 export type ReconcileSpeakersInput = Omit<ReconcileTranscriptInput, "reconciliation"> & {
   readonly occurrenceId: string;
+  readonly sessionId: bigint;
   /** Where the finalized recording's handle is PERSISTED -- the coordinator
    * (SessionCoordinator.recording) or the store behind it. The handle is
    * read from here, never assumed to still be in memory: after a restart the
@@ -202,7 +203,7 @@ export type SpeakerReconciliationResult = ReconciledTranscript & {
  * `reconciliation_unavailable` like any other failure.
  */
 export async function reconcileSpeakers(input: ReconcileSpeakersInput): Promise<SpeakerReconciliationResult> {
-  const { occurrenceId, recordings, runtime, ...rest } = input;
+  const { occurrenceId, sessionId, recordings, runtime, ...rest } = input;
   const row = recordings.recording(occurrenceId);
   if (row === null) {
     return {
@@ -216,7 +217,7 @@ export async function reconcileSpeakers(input: ReconcileSpeakersInput): Promise<
 
   let reconciliation: ReconcileTranscriptInput["reconciliation"];
   try {
-    reconciliation = await runtime.reconcileRecording({ recordingHandle: row.handle });
+    reconciliation = await runtime.reconcileRecording({ sessionId, recordingHandle: row.handle });
   } catch (error) {
     reconciliation = { unavailable: error instanceof Error ? error.message : String(error) };
   }
@@ -228,6 +229,8 @@ export async function reconcileSpeakers(input: ReconcileSpeakersInput): Promise<
 // ---------------------------------------------------------------------------
 
 type Interval = { readonly start: number; readonly end: number };
+
+type DiarizedInterval = DiarizedSegment & Interval;
 
 type LiveInterval = Interval & { readonly segmentId: string; readonly text: string };
 
@@ -262,6 +265,16 @@ function parseInstant(value: string, what: string): number {
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) throw new Error(`${what} is not a timestamp: ${JSON.stringify(value)}`);
   return ms;
+}
+
+/** Domain transcript intervals are numbers; do not silently truncate an SDK
+ * bigint outside that exact range. The caller turns this into the existing
+ * typed reconciliation-unavailable result rather than guessing a timeline. */
+function exactTimelineNumber(value: bigint, what: string): number {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new RangeError(`${what} exceeds JavaScript's exact numeric timeline range`);
+  }
+  return Number(value);
 }
 
 function overlap(a: Interval, b: Interval): number {
@@ -308,9 +321,13 @@ function buildUnits(
 
   for (const detail of reconciliation.warnings) warnings.push({ code: "runtime_warning", detail });
 
-  const diarized: DiarizedSegment[] = [...reconciliation.segments].sort(
-    (a, b) => (a.startedAtMs !== b.startedAtMs ? a.startedAtMs - b.startedAtMs : a.segmentId.localeCompare(b.segmentId)),
-  );
+  const diarized: DiarizedInterval[] = reconciliation.segments
+    .map((segment) => ({
+      ...segment,
+      start: exactTimelineNumber(segment.startedAtMs, `diarized ${segment.segmentId} startedAtMs`),
+      end: exactTimelineNumber(segment.endedAtMs, `diarized ${segment.segmentId} endedAtMs`),
+    }))
+    .sort((a, b) => (a.start !== b.start ? a.start - b.start : a.segmentId.localeCompare(b.segmentId)));
   if (diarized.length === 0 && live.length > 0) warnings.push({ code: "reconciliation_empty" });
 
   const worded = diarized.filter((segment) => segment.text.trim() !== "");
@@ -319,7 +336,7 @@ function buildUnits(
   }
 
   const units: Unit[] = worded.map((segment) => {
-    const interval = { start: segment.startedAtMs, end: segment.endedAtMs };
+    const interval = { start: segment.start, end: segment.end };
     return {
       ...interval,
       segmentId: segment.segmentId,
@@ -335,7 +352,7 @@ function buildUnits(
   const multiVoice: string[] = [];
   for (const segment of live) {
     // A live segment the reconciled wording covers is superseded by it.
-    const consumedMs = worded.reduce((sum, d) => sum + overlap(segment, { start: d.startedAtMs, end: d.endedAtMs }), 0);
+    const consumedMs = worded.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
     if (worded.length > 0 && duration(segment) > 0 && consumedMs >= MIN_ALIGNED_COVERAGE * duration(segment)) continue;
 
     const { cluster, straddles } = clusterFor(segment, diarized);
@@ -368,12 +385,12 @@ function liveUnit(segment: LiveInterval, cluster: string | null, multiVoice: boo
  * overlapping speech the STT ran together -- `straddles`. */
 function clusterFor(
   segment: LiveInterval,
-  diarized: readonly DiarizedSegment[],
+  diarized: readonly DiarizedInterval[],
 ): { cluster: string | null; straddles: boolean } {
   const byCluster = new Map<string, number>();
   for (const d of diarized) {
     if (d.speakerCluster === null) continue;
-    const ms = overlap(segment, { start: d.startedAtMs, end: d.endedAtMs });
+    const ms = overlap(segment, { start: d.start, end: d.end });
     if (ms > 0) byCluster.set(d.speakerCluster, (byCluster.get(d.speakerCluster) ?? 0) + ms);
   }
   const ranked = [...byCluster.entries()].sort((a, b) => b[1] - a[1]);

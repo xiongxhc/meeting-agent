@@ -20,6 +20,7 @@ import {
   type RecordingInput,
   type RecordingRow,
   type BridgeRecoveryResult,
+  type BridgeFailureRecordingRow,
   type TransitionInput,
   type LeaseRow,
   type LeaseReleaseReason,
@@ -43,6 +44,7 @@ export type {
   RecordingInput,
   RecordingRow,
   BridgeRecoveryResult,
+  BridgeFailureRecordingRow,
   SessionRow,
   SessionState,
   SessionStore,
@@ -172,7 +174,9 @@ export type SessionCoordinator = {
     occurrenceId: string,
     maxRetries: number,
     gaps: RecordingInput["gaps"],
+    recording: RecordingInput | null,
   ): BridgeRecoveryResult;
+  bridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
 
   /** The full, append-only audit trail in order, including the synthetic
    * creation transition (`fromState: null`). */
@@ -327,11 +331,16 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
       occurrenceId: string,
       maxRetries: number,
       gaps: RecordingInput["gaps"],
+      recording: RecordingInput | null,
     ): BridgeRecoveryResult {
       if (!Number.isInteger(maxRetries) || maxRetries < 0) {
         throw new OrchestrationError("invalid_configuration", "max bridge retries must be a non-negative integer");
       }
-      return store.recordBridgeFailure({ occurrenceId, nowMs: clock.now(), maxRetries, gaps });
+      return store.recordBridgeFailure({ occurrenceId, nowMs: clock.now(), maxRetries, gaps, recording });
+    },
+
+    bridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null {
+      return store.getBridgeFailureRecording(occurrenceId, attempt);
     },
 
     history(occurrenceId: string): TransitionRow[] {

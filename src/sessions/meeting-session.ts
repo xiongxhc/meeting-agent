@@ -70,13 +70,12 @@ import {
 } from "../ports/bridge.ts";
 import type {
   ConversationRuntimePort,
-  RecordingGap,
-  RecordingHandle,
+  RecordingSummary,
   RuntimeEvent,
   TranscriptSegment,
 } from "../ports/conversation-runtime.ts";
 import type { TeamVaultIndexPort, TeamVaultSearchResult } from "../ports/knowledge.ts";
-import type { Clock, SessionCoordinator, TerminalOutcome } from "./coordinator.ts";
+import type { Clock, RecordingInput, SessionCoordinator, TerminalOutcome } from "./coordinator.ts";
 import {
   createInvocationDispatcher,
   decide,
@@ -179,22 +178,21 @@ export type RoutingFailure = {
   readonly error: unknown;
 };
 
-/** Whether the finalized recording's own gap accounting matched what the
- * bridge observed. `unreconciled` is the case that must never pass silently:
- * the runtime was asked to reconcile and still disagreed. */
-export type GapReconciliation = "not_needed" | "reconciled" | "unreconciled";
+/** Runtime gaps are its own media timeline; bridge observations are retained
+ * independently and are never rewritten through an invented SDK method. */
+export type GapReconciliation = "not_needed";
 
 export type MeetingSessionState = {
   readonly phase: MeetingSessionPhase;
   readonly speaking: SpeakingState;
   readonly speakingAbortReason: string | null;
-  readonly runtimeSessionId: string | null;
+  readonly runtimeSessionId: bigint | null;
   readonly bridgeConnected: boolean;
   readonly mediaConnected: boolean;
   readonly reconnectAttempts: number;
   readonly disclosure: "pending" | DisclosureOutcome;
   readonly observedGaps: readonly ObservedAudioGap[];
-  readonly recording: RecordingHandle | null;
+  readonly recording: RecordingSummary | null;
   /** Why there is no recording, when there is none. `recording === null` alone
    * cannot distinguish "the session never finalized" from "finalization was
    * attempted and threw", and those need different operator responses. */
@@ -247,9 +245,10 @@ export type MeetingSession = {
   /** Resolves once the event queue is drained. Every test awaits this rather
    * than a timer; nothing in this module sleeps. */
   settled(): Promise<void>;
-  /** Per-session cancellation: unsubscribes both planes and discards anything
-   * still queued. Idempotent, and safe before join. */
-  dispose(): void;
+  /** Per-session cancellation. Resolves only after the ordered best-effort
+   * leave/finalize/close/release/unsubscribe cleanup is complete; idempotent
+   * and safe before join. */
+  dispose(): Promise<void>;
 };
 
 export type CreateMeetingSessionOptions = {
@@ -321,23 +320,24 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let phase: MeetingSessionPhase = "created";
   let speaking: SpeakingState = "enabled";
   let speakingAbortReason: string | null = null;
-  let runtimeSessionId: string | null = null;
+  let runtimeSessionId: bigint | null = null;
   let bridgeConnected = true;
   let mediaConnected = false;
   let reconnectAttempts = 0;
   let disclosure: "pending" | DisclosureOutcome = "pending";
-  let recording: RecordingHandle | null = null;
+  let recording: RecordingSummary | null = null;
   let finalizationError: unknown = null;
-  let gapReconciliation: GapReconciliation = "not_needed";
+  const gapReconciliation: GapReconciliation = "not_needed";
   let terminalReason: string | null = null;
   let ignoredAfterTerminal = 0;
   let leaseId: string | null = null;
   let finalized = false;
   let disposed = false;
   let cancellationGeneration = 0;
-  let runtimeStarted = false;
+  let runtimeStartAttempted = false;
   let runtimeClosed = false;
   let joinCommandSent = false;
+  let disposePromise: Promise<void> | null = null;
 
   const observedGaps: ObservedAudioGap[] = [];
   const commandResults: BridgeCommandResult[] = [];
@@ -363,6 +363,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // missing or broken checkout degrades retrieval instead of failing the
   // session (see createTeamVaultIndexOrDegraded and UNCONFIGURED_VAULT
   // above).
+  const runtimeContextSink = {
+    get sessionId(): bigint {
+      if (runtimeSessionId === null) {
+        throw new Error("runtime session ID is unavailable before the local start handle resolves");
+      }
+      return runtimeSessionId;
+    },
+    seedConversationContext: runtime.seedConversationContext.bind(runtime),
+    authorizeVoiceResponse: runtime.authorizeVoiceResponse.bind(runtime),
+  };
+
   const retrievalRouter: RetrievalRouter =
     options.retrieval ??
     createRetrievalRouter({
@@ -370,7 +381,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         options.teamVaultDir === undefined
           ? UNCONFIGURED_VAULT
           : createTeamVaultIndexOrDegraded({ teamVaultDir: options.teamVaultDir }),
-      sink: runtime,
+      sink: runtimeContextSink,
     });
 
   // A transcript_final segment's text, captured just long enough for the
@@ -399,7 +410,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   const sink: InvocationSink = {
     skipVoiceResponse(segmentId: string, reason): void {
       pendingQueryText.delete(segmentId);
-      runtime.skipVoiceResponse(segmentId, reason).catch((error: unknown) => {
+      runtime.skipVoiceResponse({ sessionId: requireRuntimeSessionId(), segmentId, reason }).catch((error: unknown) => {
         runtimeErrors.push({ segmentId, error });
       });
     },
@@ -483,9 +494,16 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     cancellationGeneration += 1;
   }
 
+  function requireRuntimeSessionId(): bigint {
+    if (runtimeSessionId === null) {
+      throw new Error("runtime session ID is unavailable for a session-bound control request");
+    }
+    return runtimeSessionId;
+  }
+
   function failClosedTurn(segmentId: string, reason: string): void {
     if (!settledTurns.has(segmentId)) settle(segmentId, "failed", reason);
-    runtime.skipVoiceResponse(segmentId, reason).catch((error: unknown) => {
+    runtime.skipVoiceResponse({ sessionId: requireRuntimeSessionId(), segmentId, reason }).catch((error: unknown) => {
       runtimeErrors.push({ segmentId, error });
     });
   }
@@ -754,7 +772,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           // of one -- but no branch here can authorize. Meeting knowledge
           // still accrues: capture is not gated on the ability to speak.
           retrievalRouter.prepare(meetingSegment);
-          await runtime.skipVoiceResponse(segmentId, "speaking_aborted").catch((error: unknown) => {
+          await runtime.skipVoiceResponse({
+            sessionId: requireRuntimeSessionId(),
+            segmentId,
+            reason: "speaking_aborted",
+          }).catch((error: unknown) => {
             runtimeErrors.push({ segmentId, error });
           });
           settle(segmentId, "skipped", "speaking_aborted");
@@ -826,24 +848,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         settle(segmentId, "failed", "session_ended");
       }
 
-      if (leaseId !== null) {
-        coordinator.releaseBridgeLease(
-          identity.occurrenceId,
-          leaseId,
-          reason === "bridge_failure" ? "bridge_failure" : "left",
-        );
-        leaseId = null;
-      }
-
       // Finalization runs BEFORE the terminal transition, deliberately: the
       // recording handle does not exist until the runtime returns it, and the
       // two have to be written together. See applyTerminalTransition.
       await finalizeRecording();
       if (reason === "bridge_failure") {
+        const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps);
         const recovery = coordinator.recordBridgeFailure(
           identity.occurrenceId,
           bridgeFailureRetryLimit,
           observedGaps.map((gap) => ({ ...gap })),
+          persistedRecording,
         );
         if (!recovery.retryAllowed) coordinator.fail(identity.occurrenceId, "bridge_failure_exhausted");
       } else {
@@ -857,6 +872,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // "structurally deaf after a left" false in exactly the branch where it
       // matters most.
       await closeRuntime();
+      releaseLease(reason === "bridge_failure" ? "bridge_failure" : "left");
       unsubscribe();
     }
   }
@@ -885,7 +901,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           : { kind: "fail", terminalReason: reason };
 
     if (recording !== null) {
-      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recording);
+      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps));
       return;
     }
     if (outcome.kind === "fail") {
@@ -900,42 +916,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * `finalizationError` instead, so terminate() can always go on to apply the
    * session's terminal transition.
    *
-   * The guard is the WHOLE body, not one await. Round 1 wrapped
-   * finalizeRecording() and stopped one line short of the reconcileRecordingGaps()
-   * beneath it, whose throw escaped this function entirely and took
-   * applyTerminalTransition() with it -- leaving the row at "listening" with a
-   * NULL finalizationError, which reads as a clean pending session. Guarding
-   * the body means an await added here later is covered by construction rather
-   * than by whoever adds it remembering.
+   * The bridge's exact observed gaps stay in `observedGaps`; the SDK has no
+   * gap-rewrite method, so its own bigint media-timeline gaps are retained in
+   * the returned RecordingSummary without being compared or mutated.
    */
   async function finalizeRecording(): Promise<void> {
     if (finalized) return;
     finalized = true;
 
-    const observed: RecordingGap[] = observedGaps.map((gap) => ({ ...gap }));
+    if (runtimeSessionId === null) return;
     try {
-      const finalizedHandle = await runtime.finalizeRecording({ observedGaps: observed });
-
-      // "Exact gap recording": the stored gaps must be the gaps the bridge
-      // actually observed. If the runtime's own accounting disagrees, the
-      // bridge is authoritative -- it is the thing that watched the media
-      // socket -- so the runtime is asked to reconcile against it rather than
-      // the difference being averaged away or silently preferred.
-      if (gapsEqual(finalizedHandle.gaps, observed)) {
-        recording = finalizedHandle;
-        return;
-      }
-
-      // The handle is secured BEFORE the reconcile await, and the pessimistic
-      // verdict recorded with it. It is the only reference to the encrypted
-      // audio; losing the recording because the gap BOOKKEEPING could not be
-      // reconciled would be the wrong thing to protect.
-      recording = finalizedHandle;
-      gapReconciliation = "unreconciled";
-
-      const reconciled = await runtime.reconcileRecordingGaps({ gaps: observed });
-      recording = reconciled;
-      gapReconciliation = gapsEqual(reconciled.gaps, observed) ? "reconciled" : "unreconciled";
+      recording = await runtime.finalizeRecording({ sessionId: runtimeSessionId });
     } catch (error) {
       // Recorded as its own typed fact rather than a generic routing error:
       // "there is no recording" and "finalization was attempted and failed"
@@ -955,10 +946,24 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * terminal for `reason`. Terminal, not merely "already joined": a retry
    * means a NEW session against a NEW lease, exactly as after a `left`. */
   async function closeRuntime(): Promise<void> {
-    if (!runtimeStarted || runtimeClosed) return;
+    if (!runtimeStartAttempted || runtimeClosed) return;
     runtimeClosed = true;
     try {
       await runtime.close();
+    } catch (error) {
+      routingErrors.push({ source: "join_cleanup", error });
+    }
+  }
+
+  /** Cleanup must never replace the operation failure that triggered it. The
+   * coordinator's lease release is synchronous, so isolate its possible store
+   * error here just as closeRuntime isolates the remote close failure. */
+  function releaseLease(reason: "left" | "bridge_failure"): void {
+    if (leaseId === null) return;
+    const activeLeaseId = leaseId;
+    leaseId = null;
+    try {
+      coordinator.releaseBridgeLease(identity.occurrenceId, activeLeaseId, reason);
     } catch (error) {
       routingErrors.push({ source: "join_cleanup", error });
     }
@@ -977,11 +982,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           routingErrors.push({ source: "join_cleanup", error });
         }
       }
+      if (runtimeStartAttempted) await finalizeRecording();
       await closeRuntime();
-      if (leaseId !== null) {
-        coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
-        leaseId = null;
-      }
+      releaseLease("bridge_failure");
       const state = coordinator.get(identity.occurrenceId)?.state ?? null;
       if (state !== null && state !== "notified" && state !== "failed") {
         coordinator.fail(identity.occurrenceId, reason);
@@ -1061,14 +1064,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // Exactly one runtime session, with both values pinned explicitly. The
         // runtime's own default profile stays "offline"; nothing here switches
         // it silently, and nothing accepts a substitute.
+        runtimeStartAttempted = true;
         const handle = await runtime.startVoiceSession({
-          occurrenceId: identity.occurrenceId,
           profile: PINNED_PROFILE,
           responseMode: PINNED_RESPONSE_MODE,
         });
-        runtimeSessionId = handle.runtimeSessionId;
-        runtimeStarted = true;
-
+        runtimeSessionId = handle.sessionId;
         if (handle.profile !== PINNED_PROFILE) {
           abortSpeaking("profile_mismatch");
         } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
@@ -1139,29 +1140,49 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       return whenIdle();
     },
 
-    dispose(): void {
-      if (disposed) return;
+    dispose(): Promise<void> {
+      if (disposePromise !== null) return disposePromise;
+      if (disposed) return Promise.resolve();
       disposed = true;
       cancellationGeneration += 1;
       queue.length = 0;
-      void closeRuntime();
-      unsubscribe();
+      disposePromise = (async () => {
+        try {
+          if (terminalReason === null && phase !== "created") {
+            if (joinCommandSent) {
+              try { await issue({ type: "leave", reason: "coordinator_stop" }); }
+              catch (error) { routingErrors.push({ source: "join_cleanup", error }); }
+            }
+            await terminate("removed");
+          } else {
+            await closeRuntime();
+            unsubscribe();
+          }
+        } catch (error) {
+          routingErrors.push({ source: "join_cleanup", error });
+        }
+      })();
+      return disposePromise;
     },
   };
 }
 
-/** Field-for-field, order-sensitive gap comparison. Deliberately not a set or
- * a subset test: "exact" means the same gaps in the same order, and two gaps
- * that merged into one are a different recording. */
-function gapsEqual(a: readonly RecordingGap[], b: readonly RecordingGap[]): boolean {
-  if (a.length !== b.length) return false;
-  return a.every((gap, index) => {
-    const other = b[index];
-    return (
-      other !== undefined &&
-      gap.direction === other.direction &&
-      gap.startedAt === other.startedAt &&
-      gap.endedAt === other.endedAt
-    );
-  });
+/** The orchestration schema currently stores a SQLite number. Refuse a value
+ * outside JavaScript's exact integer range rather than silently truncating an
+ * SDK bigint; the complete bigint remains in MeetingSessionState regardless. */
+function recordingInput(summary: RecordingSummary, bridgeGaps: readonly ObservedAudioGap[]): RecordingInput {
+  if (summary.durationMs > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError("runtime recording duration exceeds SQLite's exact numeric representation");
+  }
+  return {
+    handle: summary.recordingHandle,
+    encryptedPath: summary.encryptedPath,
+    sha256: summary.sha256,
+    durationMs: Number(summary.durationMs),
+    format: summary.format,
+    keyId: summary.keyId,
+    // These are bridge-observed control-plane gaps, deliberately independent
+    // from RecordingSummary.gaps' runtime media timeline and reason tokens.
+    gaps: bridgeGaps.map((gap) => ({ ...gap })),
+  };
 }

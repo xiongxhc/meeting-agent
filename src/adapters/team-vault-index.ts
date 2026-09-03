@@ -14,8 +14,6 @@
 // all, not by working around the scanner's heuristic.
 
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
-import path from "node:path";
 
 import {
   termCoverageScore,
@@ -25,7 +23,6 @@ import {
 } from "../ports/knowledge.ts";
 
 const MARKDOWN_EXTENSION = ".md";
-const GIT_DIR_NAME = ".git";
 
 type IndexedFile = {
   readonly relativePath: string;
@@ -57,7 +54,7 @@ export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): Team
   // checkout advancing during construction cannot create a mixed snapshot.
   assertCleanWorkingTree(teamVaultDir);
   const indexedRevision = readGitRevision(teamVaultDir);
-  const files = readMarkdownFiles(teamVaultDir);
+  const files = readMarkdownFiles(teamVaultDir, indexedRevision);
   assertCleanWorkingTree(teamVaultDir);
   if (readGitRevision(teamVaultDir) !== indexedRevision) {
     throw new Error("Team Vault checkout advanced while its index was being built");
@@ -104,31 +101,28 @@ function bestParagraph(
   return best;
 }
 
-function readMarkdownFiles(rootDir: string): readonly IndexedFile[] {
+function readMarkdownFiles(rootDir: string, revision: string): readonly IndexedFile[] {
+  const listing = execFileSync("git", ["-C", rootDir, "ls-tree", "-r", "-z", "--full-tree", revision], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   const files: IndexedFile[] = [];
-  walk(rootDir, rootDir, files);
-  return files;
-}
-
-function walk(rootDir: string, currentDir: string, out: IndexedFile[]): void {
-  for (const entry of readdirSync(currentDir)) {
-    const full = path.join(currentDir, entry);
-    if (lstatSync(full).isSymbolicLink()) {
-      throw new Error(`Team Vault index refuses symlink entry "${full}"`);
-    }
-    const info = statSync(full);
-    if (info.isDirectory()) {
-      if (entry === GIT_DIR_NAME) continue;
-      walk(rootDir, full, out);
-      continue;
-    }
-    if (!info.isFile() || !entry.toLowerCase().endsWith(MARKDOWN_EXTENSION)) continue;
-    const content = readFileSync(full, "utf8");
-    out.push({
-      relativePath: path.relative(rootDir, full).split(path.sep).join("/"),
-      paragraphs: splitParagraphs(content),
+  for (const row of listing.split("\0")) {
+    if (row === "") continue;
+    const match = /^(\d+) \w+ [0-9a-f]+\t(.+)$/u.exec(row);
+    if (match === null) throw new Error("Team Vault git tree entry is malformed");
+    const mode = match[1];
+    const relativePath = match[2];
+    if (mode === undefined || relativePath === undefined) throw new Error("Team Vault git tree entry is malformed");
+    if (!relativePath.toLowerCase().endsWith(MARKDOWN_EXTENSION)) continue;
+    if (mode === "120000") throw new Error(`Team Vault index refuses symlink entry "${relativePath}"`);
+    const content = execFileSync("git", ["-C", rootDir, "show", `${revision}:${relativePath}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
     });
+    files.push({ relativePath, paragraphs: splitParagraphs(content) });
   }
+  return files;
 }
 
 function splitParagraphs(content: string): readonly string[] {

@@ -96,7 +96,7 @@ function diarized(
   speakerCluster: string | null,
   text = "",
 ): DiarizedSegment {
-  return { segmentId, startedAtMs, endedAtMs, text, speakerCluster };
+  return { segmentId, startedAtMs: BigInt(startedAtMs), endedAtMs: BigInt(endedAtMs), text, speakerCluster };
 }
 
 function input(overrides: Partial<ReconcileTranscriptInput>): ReconcileTranscriptInput {
@@ -631,6 +631,7 @@ test("reconcileSpeakers reads the PERSISTED handle and hands exactly that to rec
   const runtime = fakeRuntime({ reconciliation: ONLINE });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
     recordings: recordings(RECORDING_ROW),
     runtime,
     attendance: ATTENDANCE,
@@ -640,7 +641,7 @@ test("reconcileSpeakers reads the PERSISTED handle and hands exactly that to rec
     endedAt: ENDED_AT,
   });
   assert.deepEqual(runtime.callsOf("reconcileRecording"), [
-    { method: "reconcileRecording", recordingHandle: RECORDING_ROW.handle },
+    { method: "reconcileRecording", input: { sessionId: 17n, recordingHandle: RECORDING_ROW.handle } },
   ]);
   assert.equal(result.recordingHandle, RECORDING_ROW.handle);
   assert.equal(result.transcriptComplete, true);
@@ -651,6 +652,7 @@ test("reconcileSpeakers with the fake's local-backend option produces a worded, 
   const runtime = fakeRuntime({ reconciliation: ONLINE, diarizationBackend: "local" });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
     recordings: recordings(RECORDING_ROW),
     runtime,
     attendance: ATTENDANCE,
@@ -669,6 +671,7 @@ test("no persisted recording: the runtime is never called, the transcript is liv
   const runtime = fakeRuntime({ reconciliation: ONLINE });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
     recordings: recordings(null),
     runtime,
     attendance: ATTENDANCE,
@@ -689,6 +692,7 @@ test("a reconcileRecording failure is a typed warning, not a thrown error, and t
   const runtime = fakeRuntime({ reconcileRecordingError: new Error("synthetic diarization outage") });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
     recordings: recordings(RECORDING_ROW),
     runtime,
     attendance: ATTENDANCE,
@@ -708,13 +712,14 @@ test("a reconcileRecording failure is a typed warning, not a thrown error, and t
 
 test("reconcileRecording is refused by the fake while the voice session is live, and the refusal surfaces as unavailable", async () => {
   // The runtime refuses processText and reconcileRecording while a voice
-  // session is live (interim handoff, behavioural constraints). The fake
+  // session is live (runtime-sdk-ready.md, behavioural constraints). The fake
   // enforces it; a reconciler that ran before the meeting ended would see
   // exactly this.
   const runtime = fakeRuntime({ reconciliation: ONLINE });
-  await runtime.startVoiceSession({ occurrenceId: "x", profile: "online", responseMode: "external_gate" });
+  await runtime.startVoiceSession({ profile: "online", responseMode: "external_gate" });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
     recordings: recordings(RECORDING_ROW),
     runtime,
     attendance: ATTENDANCE,

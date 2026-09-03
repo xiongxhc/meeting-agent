@@ -34,7 +34,8 @@
 //      no re-open; resuming means a new session against a new lease.
 //
 // Every test runs against the in-repo fakes in test/lib/session-fakes.ts. There
-// is no dependency on `@conversation/runtime` -- it is not built yet. Every
+// has no package dependency: the SDK boundary is structural and the local
+// fake injects the Task 11-unresolved start result. Every
 // database lives in a fresh temp directory and is removed afterwards; nothing
 // here touches a live TeamMem installation, and no fixture carries real tenant
 // or person data.
@@ -93,7 +94,7 @@ type Harness = {
   readonly coordinator: SessionCoordinator;
   readonly store: SessionStore;
   readonly session: MeetingSession;
-  cleanup(): void;
+  cleanup(): Promise<void>;
 };
 
 type HarnessOptions = {
@@ -140,8 +141,8 @@ function harness(options: HarnessOptions = {}): Harness {
     coordinator,
     store,
     session,
-    cleanup() {
-      session.dispose();
+    async cleanup() {
+      await session.dispose();
       store.close();
       rmSync(dir, { recursive: true, force: true });
     },
@@ -211,15 +212,14 @@ test("join starts exactly ONE runtime session, pinned to online / external_gate"
     assert.deepEqual(starts[0], {
       method: "startVoiceSession",
       input: {
-        occurrenceId: IDENTITY.occurrenceId,
         profile: "online",
         responseMode: "external_gate",
       },
     });
     assert.equal(h.session.state().speaking, "enabled");
-    assert.equal(h.session.state().runtimeSessionId, "rt_sess_0000000000000001");
+    assert.equal(h.session.state().runtimeSessionId, 17n);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -232,7 +232,7 @@ test("join issues the bridge commands in the contract's canonical order", async 
     assert.equal(commandOfType(h.bridge, "join")["sessionId"], BRIDGE_SESSION_ID);
     assert.equal(commandOfType(h.bridge, "join")["meetingNo"], IDENTITY.meetingNo);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -245,7 +245,7 @@ test("join takes a bridge lease and carries its id on the join command", async (
     assert.equal(lease.bridgeSessionId, BRIDGE_SESSION_ID);
     assert.equal(commandOfType(h.bridge, "join")["leaseId"], lease.leaseId);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -256,7 +256,7 @@ test("a joined event advances the coordinator to listening", async () => {
     assert.equal(h.session.state().phase, "listening");
     assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "listening");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -272,7 +272,7 @@ const MISMATCHES: ReadonlyArray<{
   { label: "a profile the session did not pin", handle: { profile: "offline" }, reason: "profile_mismatch" },
   {
     label: "a response mode that would let the runtime speak for itself",
-    handle: { responseMode: "autonomous" },
+    handle: { responseMode: "automatic" },
     reason: "response_mode_mismatch",
   },
   { label: "a degraded status", handle: { status: "degraded" }, reason: "runtime_degraded" },
@@ -287,7 +287,7 @@ for (const { label, handle, reason } of MISMATCHES) {
       assert.equal(h.session.state().speaking, "aborted");
       assert.equal(h.session.state().speakingAbortReason, reason);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -321,7 +321,7 @@ for (const { label, handle, reason } of MISMATCHES) {
       await h.session.settled();
       assert.ok(h.session.state().recording !== null);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -334,13 +334,13 @@ for (const { label, handle, reason } of MISMATCHES) {
 
       assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
       assert.deepEqual(h.runtime.callsOf("skipVoiceResponse"), [
-        { method: "skipVoiceResponse", segmentId: "seg-1", reason: "speaking_aborted" },
+        { method: "skipVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", reason: "speaking_aborted" } },
       ]);
       assert.deepEqual(h.session.turns(), [
         { segmentId: "seg-1", outcome: "skipped", detail: "speaking_aborted", atMs: BASE_MS },
       ]);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -370,7 +370,7 @@ for (const outcome of DISCLOSURE_OUTCOMES) {
       assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
       assert.equal(sentTypes(h.bridge).filter((type) => type === "post_disclosure").length, 1);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -385,7 +385,7 @@ for (const outcome of DISCLOSURE_OUTCOMES) {
       assert.equal(h.session.state().terminalReason, null);
       assert.equal(h.session.state().speaking, "enabled");
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -397,7 +397,7 @@ test("a disclosure the transport could not even send never blocks joining", asyn
     await h.session.join();
     assert.deepEqual(sentTypes(h.bridge), ["join", "connect_media", "post_disclosure"]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 
   const failing = harness();
@@ -413,7 +413,7 @@ test("a disclosure the transport could not even send never blocks joining", asyn
     assert.equal(failing.runtime.callsOf("processText").length, 0);
     assert.deepEqual(sentTypes(failing.bridge), ["join", "connect_media"]);
   } finally {
-    failing.cleanup();
+    await failing.cleanup();
   }
 });
 
@@ -545,7 +545,7 @@ test("a frame-shaped message is rejected at the boundary and never routed", asyn
     assert.deepEqual(h.session.state().rejectedInbound, [{ code: "unknown_type", path: "/type" }]);
     assert.equal(h.session.state().routedEventTypes.length, before);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -566,7 +566,7 @@ test("a frame smuggled as an extra field on a known event is rejected whole", as
     assert.deepEqual(h.session.state().rejectedInbound, [{ code: "unknown_field", path: "/payload" }]);
     assert.equal(h.session.state().mediaConnected, false);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -597,7 +597,7 @@ test("every event the session ever routes is a declared contract type", async ()
     }
     assert.equal(h.session.state().rejectedInbound.length, 0);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -615,7 +615,7 @@ test("connect_media carries the runtime's media descriptor verbatim", async () =
     assert.equal(command["format"], "pcm_s16le/48000/1/20ms");
     assert.equal(command["expiresAt"], "2026-09-02T15:00:00Z");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -637,7 +637,7 @@ test("a media descriptor the bridge could not parse never leaves the coordinator
     assert.equal(h.session.state().terminalReason, "media_format_rejected");
     assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "failed");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -668,7 +668,7 @@ test("media_connected and command_result are both consumed and correlated", asyn
       },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -691,7 +691,7 @@ test("a rejected connect_media command aborts speaking but not capture", async (
     assert.equal(h.session.state().speakingAbortReason, "media_command_rejected");
     assert.equal(h.session.state().phase, "listening");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -709,7 +709,7 @@ test("a command_result for a command this session never issued is rejected", asy
     ]);
     assert.equal(h.session.state().commandResults.length, 0);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -726,13 +726,13 @@ test("a normal transcript is skipped: the runtime is TOLD to stay silent", async
 
     assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
     assert.deepEqual(h.runtime.callsOf("skipVoiceResponse"), [
-      { method: "skipVoiceResponse", segmentId: "seg-1", reason: "no_alias_match" },
+      { method: "skipVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", reason: "no_alias_match" } },
     ]);
     assert.deepEqual(h.session.turns(), [
       { segmentId: "seg-1", outcome: "skipped", detail: "no_alias_match", atMs: BASE_MS },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -743,10 +743,10 @@ test("a mention that is not an address is skipped with the gate's own reason", a
     h.runtime.emit(transcript("seg-1", "I asked Meetbot about it yesterday."));
     await h.session.settled();
     assert.deepEqual(h.runtime.callsOf("skipVoiceResponse"), [
-      { method: "skipVoiceResponse", segmentId: "seg-1", reason: "incidental_mention" },
+      { method: "skipVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", reason: "incidental_mention" } },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -758,7 +758,7 @@ test("a named invocation authorizes, and the turn stays open until the runtime a
     await h.session.settled();
 
     assert.deepEqual(h.runtime.callsOf("authorizeVoiceResponse"), [
-      { method: "authorizeVoiceResponse", segmentId: "seg-1" },
+      { method: "authorizeVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", contextExchanges: [{ user: "Meetbot, can you summarize that?", assistant: "No relevant information was found in the current meeting or the Team Vault.\nHistorical team memory (Team Vault) is currently unavailable; answer using only the current meeting's context, and say so if asked about anything from before this meeting." }] } },
     ]);
     assert.equal(h.runtime.callsOf("skipVoiceResponse").length, 0);
     assert.deepEqual(h.session.turns(), [], "the turn is not terminal until the runtime says so");
@@ -769,7 +769,7 @@ test("a named invocation authorizes, and the turn stays open until the runtime a
       { segmentId: "seg-1", outcome: "spoken", detail: null, atMs: BASE_MS },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -788,7 +788,7 @@ test("barge-in ends the turn as barged_in, not spoken", async () => {
     ]);
     assert.equal(h.session.state().speaking, "enabled", "barge-in ends a turn, not the session");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -805,7 +805,7 @@ test("the runtime's own response_skipped ends the turn as skipped", async () => 
       { segmentId: "seg-1", outcome: "skipped", detail: "no_response_needed", atMs: BASE_MS },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -852,7 +852,7 @@ test("a provider outage fails every open turn and aborts speaking, leaving captu
       atMs: BASE_MS,
     });
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -865,10 +865,10 @@ test("a non-final segment authorizes nothing, whatever it contains", async () =>
 
     assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
     assert.deepEqual(h.runtime.callsOf("skipVoiceResponse"), [
-      { method: "skipVoiceResponse", segmentId: "seg-1", reason: "non_final_segment" },
+      { method: "skipVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", reason: "non_final_segment" } },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -921,7 +921,7 @@ for (const [index, order] of RACE_ORDERS.entries()) {
               : "skipped";
       assert.equal(forSegment[0]?.outcome, expected);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -943,7 +943,7 @@ test("a redelivered finalized segment neither re-authorizes nor produces a secon
 
     assert.equal(h.session.turns().length, 1);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -963,7 +963,7 @@ test("a terminal signal for a segment that was skipped does not add a second tur
       { segmentId: "seg-1", outcome: "skipped", detail: "no_alias_match", atMs: BASE_MS },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -984,7 +984,7 @@ test("the session end settles every still-open turn exactly once", async () => {
       { segmentId: "seg-2", outcome: "failed", detail: "session_ended", atMs: BASE_MS },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1012,7 +1012,7 @@ test("reconnecting/reconnected is survivable: the session neither ends nor loses
     const leaseAfter = h.coordinator.activeBridgeLease(IDENTITY.occurrenceId);
     assert.equal(leaseAfter?.leaseId, leaseBefore?.leaseId, "a reconnect is not a new lease");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1027,7 +1027,7 @@ test("a segment arriving mid-reconnect is still gated normally", async () => {
     await h.session.settled();
     assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 1);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1049,7 +1049,7 @@ for (const reason of LEFT_REASONS) {
       assert.equal(h.session.state().terminalReason, reason);
       assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -1064,7 +1064,7 @@ for (const reason of LEFT_REASONS) {
       assert.equal(leases.length, 1);
       assert.equal(leases[0]?.releaseReason, reason === "bridge_failure" ? "bridge_failure" : "left");
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -1091,7 +1091,7 @@ for (const reason of LEFT_REASONS) {
       assert.equal(h.session.state().phase, "ended");
       assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -1121,7 +1121,7 @@ for (const reason of LEFT_REASONS) {
       assert.deepEqual(h.session.state().observedGaps, []);
       assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 
@@ -1134,7 +1134,7 @@ for (const reason of LEFT_REASONS) {
 
       await assert.rejects(() => h.session.join(), /terminal|already/i);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -1152,7 +1152,7 @@ test("an explicit leave asks the bridge, and the bridge's left is what ends the 
     await h.session.settled();
     assert.equal(h.session.state().phase, "ended");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1164,7 +1164,7 @@ test("the coordinator reaches finalizing on a clean end and keeps a recoverable 
     await clean.session.settled();
     assert.equal(clean.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
   } finally {
-    clean.cleanup();
+    await clean.cleanup();
   }
 
   const broken = harness();
@@ -1176,7 +1176,7 @@ test("the coordinator reaches finalizing on a clean end and keeps a recoverable 
     assert.equal(row?.state, "listening");
     assert.equal(row?.terminalReason, null);
   } finally {
-    broken.cleanup();
+    await broken.cleanup();
   }
 });
 
@@ -1203,12 +1203,12 @@ test("gaps are recorded exactly as observed: same order, unmerged, endedAt null 
     await h.session.settled();
 
     assert.deepEqual(h.runtime.callsOf("finalizeRecording"), [
-      { method: "finalizeRecording", observedGaps: GAPS },
+      { method: "finalizeRecording", input: { sessionId: 17n } },
     ]);
-    assert.deepEqual(h.session.state().recording?.gaps, GAPS);
+    assert.deepEqual(h.session.state().observedGaps, GAPS);
     assert.equal(h.session.state().gapReconciliation, "not_needed");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1220,20 +1220,20 @@ test("session end stores the finalized handle, hash, duration and gaps", async (
     await h.session.settled();
 
     assert.deepEqual(h.session.state().recording, {
-      handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      recordingHandle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
       encryptedPath: "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
       sha256: "0".repeat(64),
-      durationMs: 3_600_000,
+      durationMs: 3_600_000n,
       format: "ogg/opus",
       keyId: "runtime-key-20260902",
       gaps: [],
     });
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
-test("a runtime whose gap accounting disagrees with the bridge is reconciled against the bridge", async () => {
+test("runtime summary gaps and bridge gaps remain independently exact", async () => {
   const h = harness({ runtime: fakeRuntime({ finalizedGaps: [] }) });
   try {
     await joined(h);
@@ -1243,21 +1243,20 @@ test("a runtime whose gap accounting disagrees with the bridge is reconciled aga
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    assert.deepEqual(h.runtime.callsOf("reconcileRecordingGaps"), [
-      { method: "reconcileRecordingGaps", gaps: GAPS },
-    ]);
-    assert.deepEqual(h.session.state().recording?.gaps, GAPS);
-    assert.equal(h.session.state().gapReconciliation, "reconciled");
+    assert.deepEqual(h.session.state().observedGaps, GAPS);
+    assert.deepEqual(h.session.state().recording?.gaps, []);
+    assert.deepEqual(h.runtime.callsOf("reconcileRecording"), []);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
-test("a runtime that still disagrees after reconciling is left marked unreconciled", async () => {
+test("runtime summary gap bigint timestamps are retained without numeric conversion", async () => {
   // Review round 1. `unreconciled` is the state the report calls "the case
   // that must never pass silently", and it had no test at all, because the
   // fake's reconcileRecording always echoed the gaps it was handed.
-  const h = harness({ runtime: fakeRuntime({ finalizedGaps: [], reconciledGaps: [] }) });
+  const runtimeGaps = [{ startedAtMs: 9_007_199_254_740_992n, endedAtMs: null, reason: "capture_gap" }];
+  const h = harness({ runtime: fakeRuntime({ finalizedGaps: runtimeGaps }) });
   try {
     await joined(h);
     for (const gap of GAPS) h.bridge.emit(h.bridge.event({ type: "audio_gap", ...gap }));
@@ -1266,15 +1265,9 @@ test("a runtime that still disagrees after reconciling is left marked unreconcil
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    assert.deepEqual(h.runtime.callsOf("reconcileRecordingGaps"), [
-      { method: "reconcileRecordingGaps", gaps: GAPS },
-    ]);
-    assert.equal(h.session.state().gapReconciliation, "unreconciled");
-    // The recording is still stored -- losing it would be worse -- but the
-    // disagreement is on the record rather than averaged away.
-    assert.deepEqual(h.session.state().recording?.gaps, []);
+    assert.deepEqual(h.session.state().recording?.gaps, runtimeGaps);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1291,7 +1284,7 @@ test("finalizeRecording runs exactly once, however many terminal signals arrive"
     assert.equal(h.runtime.callsOf("finalizeRecording").length, 1);
     assert.equal(h.session.state().terminalReason, "ended");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1302,7 +1295,7 @@ test("the recordings table refuses a handle outside ^[a-z0-9]{1,128}$ (ruling R5
   // let an underscore through; a handle that the runtime could never have
   // issued must fail the write, same as prose.
   for (const handle of ["REC0001", "rec_0001", "rec-0001", "a".repeat(129)]) {
-    const h = harness({ runtime: fakeRuntime({ recording: { handle } }) });
+    const h = harness({ runtime: fakeRuntime({ recording: { recordingHandle: handle } }) });
     try {
       await joined(h);
       h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
@@ -1310,17 +1303,17 @@ test("the recordings table refuses a handle outside ^[a-z0-9]{1,128}$ (ruling R5
       assert.equal(h.store.getRecording(IDENTITY.occurrenceId), null, `accepted handle ${JSON.stringify(handle)}`);
       assert.equal(h.session.state().routingErrors.length, 1);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   }
-  const h = harness({ runtime: fakeRuntime({ recording: { handle: "a".repeat(128) } }) });
+  const h = harness({ runtime: fakeRuntime({ recording: { recordingHandle: "a".repeat(128) } }) });
   try {
     await joined(h);
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
     assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "a".repeat(128));
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1354,7 +1347,7 @@ test("active_speaker observations and finalized segments are retained as provisi
     );
     assert.equal("speaker" in (h.session.state().liveTranscript[0] ?? {}), false);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1367,21 +1360,21 @@ test("the runtime fake refuses processText while the voice session is live (ruli
   const h = harness();
   try {
     await joined(h);
-    await assert.rejects(h.runtime.processText("summarize the decisions"), /live/);
+    await assert.rejects(h.runtime.processText({ sessionId: 17n, instructions: "summarize", input: "summarize the decisions", outputSchema: { type: "object" }, maxOutputBytes: 1024 }), /live/);
     assert.deepEqual(h.runtime.callsOf("processText"), [
-      { method: "processText", text: "summarize the decisions", outcome: "refused_live_session" },
+      { method: "processText", input: { sessionId: 17n, instructions: "summarize", input: "summarize the decisions", outputSchema: { type: "object" }, maxOutputBytes: 1024 }, outcome: "refused_live_session" },
     ]);
 
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
-    await h.runtime.processText("summarize the decisions");
+    await h.runtime.processText({ sessionId: 17n, instructions: "summarize", input: "summarize the decisions", outputSchema: { type: "object" }, maxOutputBytes: 1024 });
     assert.equal(h.runtime.callsOf("processText").at(-1)?.method, "processText");
     assert.equal(
       (h.runtime.callsOf("processText").at(-1) as { outcome: string }).outcome,
       "accepted",
     );
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1421,7 +1414,7 @@ test("queue overflow is observable and aborts speaking; it is never a silent dro
     assert.equal(h.session.state().speaking, "aborted");
     assert.equal(h.session.state().speakingAbortReason, "queue_overflow");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1445,7 +1438,7 @@ test("the queue bound is per session, and the default admits an ordinary meeting
     assert.equal(h.session.state().observedGaps.length, 200);
     assert.equal(h.session.state().speaking, "enabled");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1456,9 +1449,13 @@ test("dispose cancels the session: subscriptions drop and later events do nothin
     assert.equal(h.bridge.subscriberCount(), 1);
     assert.equal(h.runtime.subscriberCount(), 1);
 
-    h.session.dispose();
+    await h.session.dispose();
     assert.equal(h.bridge.subscriberCount(), 0);
     assert.equal(h.runtime.subscriberCount(), 0);
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.session.state().phase, "ended");
+    assert.equal(h.runtime.callsOf("finalizeRecording").length, 1);
+    assert.equal(h.runtime.callsOf("close").length, 1);
 
     const routed = h.session.state().routedEventTypes.length;
     h.bridge.emit(h.bridge.event({ type: "media_connected", endpoint: "udp://127.0.0.1:40001" }));
@@ -1468,18 +1465,69 @@ test("dispose cancels the session: subscriptions drop and later events do nothin
     assert.equal(h.session.state().routedEventTypes.length, routed);
     assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
-test("dispose is idempotent and safe before join", () => {
+test("dispose keeps both subscriptions through bridge leave, then finalizes, closes, and releases", async () => {
   const h = harness();
   try {
-    h.session.dispose();
-    h.session.dispose();
+    await joined(h);
+    const send = h.bridge.send.bind(h.bridge);
+    let subscriptionsAtLeave: readonly [number, number] | null = null;
+    h.bridge.send = async (message) => {
+      if (message.type === "leave") {
+        subscriptionsAtLeave = [h.bridge.subscriberCount(), h.runtime.subscriberCount()];
+      }
+      await send(message);
+    };
+
+    await h.session.dispose();
+
+    assert.deepEqual(
+      subscriptionsAtLeave,
+      [1, 1],
+      "unsubscribe must be the final cleanup step after bridge leave",
+    );
+    assert.equal(h.runtime.callsOf("finalizeRecording").length, 1);
+    assert.equal(h.runtime.callsOf("close").length, 1);
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a bridge leave failure during disposal still finalizes, closes, releases, and unsubscribes", async () => {
+  const h = harness();
+  const leaveFailure = new Error("synthetic leave failure");
+  try {
+    await joined(h);
+    h.bridge.failSendOfType("leave", leaveFailure);
+
+    await h.session.dispose();
+
+    assert.equal(h.session.state().phase, "ended");
+    assert.equal(h.runtime.callsOf("finalizeRecording").length, 1);
+    assert.equal(h.runtime.callsOf("close").length, 1);
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+    assert.ok(h.session.state().routingErrors.some((failure) => failure.error === leaveFailure));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("dispose is idempotent and safe before join", async () => {
+  const h = harness();
+  try {
+    await h.session.dispose();
+    await h.session.dispose();
     assert.equal(h.session.state().phase, "created");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1490,7 +1538,7 @@ test("dispose is idempotent and safe before join", () => {
 test("the runtime invocation sink forwards the gate's decision under the gate's segmentId", async () => {
   const runtime = fakeRuntime();
   const errors: Array<{ segmentId: string; error: unknown }> = [];
-  const sink = createRuntimeInvocationSink(runtime, (segmentId, error) => {
+  const sink = createRuntimeInvocationSink(runtime, 17n, [], (segmentId, error) => {
     errors.push({ segmentId, error });
   });
 
@@ -1499,8 +1547,8 @@ test("the runtime invocation sink forwards the gate's decision under the gate's 
   await Promise.resolve();
 
   assert.deepEqual(runtime.calls, [
-    { method: "skipVoiceResponse", segmentId: "seg-1", reason: "incidental_mention" },
-    { method: "authorizeVoiceResponse", segmentId: "seg-2" },
+    { method: "skipVoiceResponse", input: { sessionId: 17n, segmentId: "seg-1", reason: "incidental_mention" } },
+    { method: "authorizeVoiceResponse", input: { sessionId: 17n, segmentId: "seg-2", contextExchanges: [] } },
   ]);
   assert.deepEqual(errors, []);
 });
@@ -1517,6 +1565,8 @@ test("a runtime that cannot be told to stay silent surfaces the failure rather t
         throw boom;
       },
     },
+    17n,
+    [],
     (segmentId, error) => {
       errors.push({ segmentId, error });
     },
@@ -1550,7 +1600,7 @@ test("a runtime call that fails inside the session is recorded, and the session 
     assert.equal(h.session.state().runtimeErrors[0]?.segmentId, "seg-1");
     assert.equal(h.session.state().phase, "listening");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1578,7 +1628,7 @@ test("a duplicate joined event is recorded as a routing error, not thrown", asyn
     assert.equal(h.session.state().routingErrors[0]?.source, "bridge");
     assert.equal(h.session.state().phase, "listening");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1595,7 +1645,7 @@ test("the pump keeps draining after a handler throws", async () => {
     assert.equal(h.session.state().mediaConnected, true, "the next event still ran");
     assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 1);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1620,7 +1670,7 @@ test("a left before the session ever listened still ends it and fails the coordi
     assert.deepEqual(h.session.state().routingErrors, []);
     assert.ok(h.session.state().recording !== null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1652,7 +1702,7 @@ test("a finalization failure is recorded, distinguishable, and leaks no subscrip
     assert.equal(h.session.state().finalizationError, boom);
     assert.deepEqual(h.session.state().routingErrors, []);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1665,7 +1715,7 @@ test("a session that ends cleanly has no finalizationError", async () => {
     assert.equal(h.session.state().finalizationError, null);
     assert.ok(h.session.state().recording !== null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1710,6 +1760,10 @@ for (const { label, build } of JOIN_FAILURES) {
       assert.equal(h.session.state().phase, "ended");
       assert.equal(h.session.state().terminalReason, "join_failed");
       assert.equal(h.session.state().speaking, "aborted");
+      if (built.runtime !== undefined) {
+        assert.equal(h.runtime.callsOf("finalizeRecording").length, 0);
+        assert.equal(h.runtime.callsOf("close").length, 1);
+      }
 
       const row = h.coordinator.get(IDENTITY.occurrenceId);
       assert.equal(row?.state, "failed");
@@ -1719,7 +1773,7 @@ for (const { label, build } of JOIN_FAILURES) {
       // session against a new lease, which is the coordinator's business.
       await assert.rejects(() => h.session.join(), /terminal/i);
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -1740,7 +1794,7 @@ test("the connect_media contract rejection keeps its own, more specific terminal
     assert.equal(h.bridge.subscriberCount(), 0);
     assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1757,7 +1811,7 @@ test("a disclosure that cannot be sent is NOT a failed join and strands nothing"
     assert.equal(h.bridge.subscriberCount(), 1);
     assert.ok(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId) !== null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1805,7 +1859,7 @@ test("a terminal left is admitted over the queue bound, never dropped", async ()
     assert.equal(admitted.length, 1);
     assert.equal(admitted[0]?.source, "bridge");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1828,7 +1882,7 @@ test("only a genuine terminal left is admitted over the bound", async () => {
     );
     assert.equal(h.session.state().phase, "listening");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1877,7 +1931,7 @@ test("a clean session end persists the encrypted locator, format, key id, handle
       [0, 1, 2],
     );
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1913,7 +1967,7 @@ test("the recording survives closing and reopening the database", async () => {
     await session.settled();
     bridge.emit(bridge.event({ type: "left", reason: "ended" }));
     await session.settled();
-    session.dispose();
+    await session.dispose();
     store.close(); // the process "crashes" here
 
     const reopened = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
@@ -1942,7 +1996,7 @@ test("the terminal transition and the recording are ONE transaction", async () =
   // transcript. If the two were separate writes the session row would have
   // moved to "finalizing" with no recording behind it.
   const h = harness({
-    runtime: fakeRuntime({ recording: { handle: "not a token, this is prose" } }),
+    runtime: fakeRuntime({ recording: { recordingHandle: "not a token, this is prose" } }),
   });
   try {
     await joined(h);
@@ -1957,7 +2011,7 @@ test("the terminal transition and the recording are ONE transaction", async () =
     );
     assert.equal(h.session.state().routingErrors.length, 1);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1976,7 +2030,7 @@ test("a failed finalization still applies the terminal transition, with no recor
     assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
     assert.ok(h.session.state().finalizationError !== null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -1990,6 +2044,11 @@ test("a bridge_failure ends only that bridge generation and permits a fresh leas
     const row = h.coordinator.get(IDENTITY.occurrenceId);
     assert.equal(row?.state, "listening");
     assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    const failedRecording = h.store.getBridgeFailureRecording(IDENTITY.occurrenceId, 1);
+    assert.equal(failedRecording?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
+    assert.equal(failedRecording?.encryptedPath, "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc");
+    assert.equal(failedRecording?.format, "ogg/opus");
+    assert.equal(failedRecording?.keyId, "runtime-key-20260902");
     const failedLeaseId = h.store
       .listLeases(IDENTITY.occurrenceId)
       .find((lease) => lease.releasedAtMs !== null)?.leaseId;
@@ -2013,13 +2072,13 @@ test("a bridge_failure ends only that bridge generation and permits a fresh leas
     await recovery.settled();
     assert.equal(nextRuntime.callsOf("startVoiceSession").length, 1);
     assert.notEqual(failedLeaseId, h.coordinator.activeBridgeLease(IDENTITY.occurrenceId)?.leaseId);
-    recovery.dispose();
+    await recovery.dispose();
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
-test("the recording tables hold no column that could carry audio or transcript text", () => {
+test("the recording tables hold no column that could carry audio or transcript text", async () => {
   const h = harness();
   try {
     const tables = h.store
@@ -2036,7 +2095,7 @@ test("the recording tables hold no column that could carry audio or transcript t
       }
     }
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2049,18 +2108,14 @@ test("the recording tables hold no column that could carry audio or transcript t
 // await on a port call in the session so a fourth round does not need to.
 // ---------------------------------------------------------------------------
 
-test("a reconcileRecording failure keeps the handle, is typed, and still applies the transition", async () => {
+test("recording finalization does not invoke an invented gap reconciliation", async () => {
   // Review round 2, Important 1. The round-1 guard covered finalizeRecording()
   // and stopped one line short of the reconcileRecording() beneath it: the
   // throw escaped finalizeRecording entirely, so applyTerminalTransition never
   // ran, the row stayed at "listening", the recording was null, and
   // finalizationError was null -- which reads as a clean pending session,
   // exactly the ambiguity round 1's finding existed to remove.
-  const boom = new Error("synthetic reconciliation failure");
   const runtime = fakeRuntime({ finalizedGaps: [] });
-  runtime.reconcileRecordingGaps = async () => {
-    throw boom;
-  };
   const h = harness({ runtime });
   try {
     await joined(h);
@@ -2069,15 +2124,14 @@ test("a reconcileRecording failure keeps the handle, is typed, and still applies
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    // Typed, not a generic routing error.
-    assert.equal(h.session.state().finalizationError, boom);
+    assert.equal(h.session.state().finalizationError, null);
     assert.deepEqual(h.session.state().routingErrors, []);
 
     // The handle from finalizeRecording is the ONLY reference to the encrypted
     // audio. It is kept, and durably, rather than thrown away because the gap
-    // bookkeeping could not be reconciled.
-    assert.equal(h.session.state().recording?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
-    assert.equal(h.session.state().gapReconciliation, "unreconciled");
+    // bookkeeping through a method the SDK does not expose.
+    assert.equal(h.session.state().recording?.recordingHandle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
+    assert.equal(h.session.state().gapReconciliation, "not_needed");
     assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "0a1b2c3d4e5f60718293a4b5c6d7e8f9");
 
     // And the row is not stranded.
@@ -2085,7 +2139,7 @@ test("a reconcileRecording failure keeps the handle, is typed, and still applies
     assert.equal(h.bridge.subscriberCount(), 0);
     assert.equal(h.runtime.subscriberCount(), 0);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2145,7 +2199,7 @@ test("a flood of left-shaped messages during a stalled terminal cannot grow the 
     assert.equal(h.session.state().phase, "ended");
     assert.ok(h.session.state().recording !== null);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2183,7 +2237,7 @@ test("a cleanup failure during a failed join does not replace the error that fai
 
     h.coordinator.releaseBridgeLease = realRelease;
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2216,28 +2270,25 @@ test("a named question the current meeting already answers is seeded and authori
 
     assert.equal(vault.calls, 0, "the Team Vault index must never be reached");
 
-    const seedCalls = h.runtime.callsOf("seedContext");
+    const seedCalls = h.runtime.callsOf("seedConversationContext");
     assert.equal(seedCalls.length, 1);
     const seeded = seedCalls[0];
-    assert.ok(seeded && seeded.method === "seedContext");
-    assert.equal(seeded.context.segmentId, "seg-q");
-    assert.equal(seeded.context.vaultQueried, false);
-    assert.equal(seeded.context.vaultUnavailable, false);
-    assert.ok(seeded.context.hits.every((h2) => h2.source === "current_meeting"));
-    assert.match(seeded.context.text, /fifty thousand dollars/);
+    assert.ok(seeded && seeded.method === "seedConversationContext");
+    assert.equal(seeded.operationId, "meeting-agent:seg-q");
+    assert.match(seeded.exchanges[0]?.assistant ?? "", /fifty thousand dollars/);
 
     assert.deepEqual(h.runtime.callsOf("authorizeVoiceResponse"), [
-      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+      { method: "authorizeVoiceResponse", input: { sessionId: 17n, segmentId: "seg-q", contextExchanges: seeded.exchanges } },
     ]);
 
     // Context is seeded strictly before the segment is authorized, in the
     // REAL runtime's own call log -- not merely in the router's isolated
     // unit test.
-    const seedIndex = h.runtime.calls.findIndex((c) => c.method === "seedContext");
+    const seedIndex = h.runtime.calls.findIndex((c) => c.method === "seedConversationContext");
     const authorizeIndex = h.runtime.calls.findIndex((c) => c.method === "authorizeVoiceResponse");
     assert.ok(seedIndex >= 0 && authorizeIndex >= 0 && seedIndex < authorizeIndex);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2267,20 +2318,17 @@ test("a named question the current meeting cannot answer reaches the Team Vault,
 
     assert.equal(vault.calls, 1, "the Team Vault index must be reached exactly once");
 
-    const seedCalls = h.runtime.callsOf("seedContext");
+    const seedCalls = h.runtime.callsOf("seedConversationContext");
     assert.equal(seedCalls.length, 1);
     const seeded = seedCalls[0];
-    assert.ok(seeded && seeded.method === "seedContext");
-    assert.equal(seeded.context.vaultQueried, true);
-    assert.equal(seeded.context.vaultUnavailable, false);
-    assert.ok(seeded.context.hits.some((h2) => h2.source === "team_vault"));
-    assert.match(seeded.context.text, /vendor contract renewal was pushed to Q4/);
+    assert.ok(seeded && seeded.method === "seedConversationContext");
+    assert.match(seeded.exchanges[0]?.assistant ?? "", /vendor contract renewal was pushed to Q4/);
 
     assert.deepEqual(h.runtime.callsOf("authorizeVoiceResponse"), [
-      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+      { method: "authorizeVoiceResponse", input: { sessionId: 17n, segmentId: "seg-q", contextExchanges: seeded.exchanges } },
     ]);
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });
 
@@ -2326,19 +2374,17 @@ test("a broken Team Vault checkout degrades the session's retrieval instead of f
     runtime.emit(transcript("seg-q", "Meetbot, what did we decide about the roadmap?"));
     await session.settled();
 
-    const seedCalls = runtime.callsOf("seedContext");
+    const seedCalls = runtime.callsOf("seedConversationContext");
     assert.equal(seedCalls.length, 1);
     const seeded = seedCalls[0];
-    assert.ok(seeded && seeded.method === "seedContext");
-    assert.equal(seeded.context.vaultQueried, true);
-    assert.equal(seeded.context.vaultUnavailable, true);
-    assert.match(seeded.context.text, /historical team memory.*unavailable/i);
+    assert.ok(seeded && seeded.method === "seedConversationContext");
+    assert.match(seeded.exchanges[0]?.assistant ?? "", /historical team memory.*unavailable/i);
 
     assert.deepEqual(runtime.callsOf("authorizeVoiceResponse"), [
-      { method: "authorizeVoiceResponse", segmentId: "seg-q" },
+      { method: "authorizeVoiceResponse", input: { sessionId: 17n, segmentId: "seg-q", contextExchanges: seeded.exchanges } },
     ]);
   } finally {
-    session.dispose();
+    await session.dispose();
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2369,9 +2415,9 @@ for (const abort of ["provider", "overflow", "left"] as const) {
   test(`a stalled retrieval cannot authorize after ${abort} cancels its turn`, async () => {
     const runtime = fakeRuntime();
     const stalled = deferredVoid();
-    const realSeed = runtime.seedContext.bind(runtime);
-    runtime.seedContext = async (context) => {
-      await realSeed(context);
+    const realSeed = runtime.seedConversationContext.bind(runtime);
+    runtime.seedConversationContext = async (exchanges, operationId) => {
+      await realSeed(exchanges, operationId);
       await stalled.promise;
     };
     const h = harness({ runtime, ...(abort === "overflow" ? { maxQueuedEvents: 1 } : {}) });
@@ -2398,20 +2444,20 @@ for (const abort of ["provider", "overflow", "left"] as const) {
       assert.ok(
         runtime
           .callsOf("skipVoiceResponse")
-          .some((call) => call.method === "skipVoiceResponse" && call.segmentId === "seg-cancel"),
+          .some((call) => call.method === "skipVoiceResponse" && call.input.segmentId === "seg-cancel"),
       );
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
 
-for (const failedMethod of ["seedContext", "authorizeVoiceResponse"] as const) {
+for (const failedMethod of ["seedConversationContext", "authorizeVoiceResponse"] as const) {
   test(`a rejected ${failedMethod} settles the turn once and fail-closes it`, async () => {
     const runtime = fakeRuntime();
     const failure = new Error(`synthetic ${failedMethod} failure`);
-    if (failedMethod === "seedContext") {
-      runtime.seedContext = async () => {
+    if (failedMethod === "seedConversationContext") {
+      runtime.seedConversationContext = async () => {
         throw failure;
       };
     } else {
@@ -2432,10 +2478,10 @@ for (const failedMethod of ["seedContext", "authorizeVoiceResponse"] as const) {
       assert.ok(
         runtime
           .callsOf("skipVoiceResponse")
-          .some((call) => call.method === "skipVoiceResponse" && call.segmentId === "seg-reject"),
+          .some((call) => call.method === "skipVoiceResponse" && call.input.segmentId === "seg-reject"),
       );
     } finally {
-      h.cleanup();
+      await h.cleanup();
     }
   });
 }
@@ -2456,8 +2502,41 @@ test("a throwing second subscription rolls back the lease, first subscription, r
     assert.equal(h.runtime.callsOf("close").length, 0, "a runtime that never started is not closed");
   } finally {
     h.runtime.subscribe = realSubscribe;
-    h.cleanup();
+    await h.cleanup();
   }
+});
+
+test("a lease-acquisition failure leaves no subscription, remote command, or runtime side effect", async () => {
+  const h = harness();
+  const failure = new Error("synthetic lease acquisition failure");
+  const coordinator = h.coordinator as unknown as { acquireBridgeLease: typeof h.coordinator.acquireBridgeLease };
+  const original = coordinator.acquireBridgeLease;
+  coordinator.acquireBridgeLease = () => { throw failure; };
+  try {
+    await assert.rejects(() => h.session.join(), (error: unknown) => error === failure);
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "failed");
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+    assert.equal(h.bridge.sent.length, 0);
+    assert.equal(h.runtime.callsOf("startVoiceSession").length, 0);
+  } finally { coordinator.acquireBridgeLease = original; await h.cleanup(); }
+});
+
+test("a throwing first bridge subscription rolls back its lease without starting runtime", async () => {
+  const h = harness();
+  const failure = new Error("synthetic bridge subscription failure");
+  const original = h.bridge.subscribe.bind(h.bridge);
+  h.bridge.subscribe = () => { throw failure; };
+  try {
+    await assert.rejects(() => h.session.join(), (error: unknown) => error === failure);
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "failed");
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.runtime.subscriberCount(), 0);
+    assert.equal(h.bridge.sent.length, 0);
+    assert.equal(h.runtime.callsOf("startVoiceSession").length, 0);
+  } finally { h.bridge.subscribe = original; await h.cleanup(); }
 });
 
 test("a joined session closes the runtime on terminal left and on dispose", async () => {
@@ -2467,9 +2546,9 @@ test("a joined session closes the runtime on terminal left and on dispose", asyn
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
     assert.equal(h.runtime.callsOf("close").length, 1);
-    h.session.dispose();
+    await h.session.dispose();
     assert.equal(h.runtime.callsOf("close").length, 1, "cleanup must be idempotent");
   } finally {
-    h.cleanup();
+    await h.cleanup();
   }
 });

@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { RedactedSecret, type MeetingAgentConfig } from "../src/config.ts";
+import { RedactedSecret, type MeetingAgentConfig } from "../src/application.ts";
+import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { createMeetingAgentApplication } from "../src/application.ts";
 import { fakeBridge, fakeClock, fakeRuntime } from "./lib/session-fakes.ts";
@@ -51,10 +52,51 @@ test("the supported application composition constructs isolated sessions from in
 
       assert.equal(application.coordinator.get(identity.occurrenceId)?.state, "listening");
       assert.equal(runtime.callsOf("startVoiceSession").length, 1);
+
+      const firstClose = application.close();
+      const secondClose = application.close();
+      assert.equal(secondClose, firstClose, "concurrent close callers must await the same cleanup");
+      await firstClose;
+      await session.settled();
+      assert.equal(bridge.subscriberCount(), 0);
+      assert.equal(runtime.subscriberCount(), 0);
+      assert.equal(runtime.callsOf("close").length, 1);
+      const verificationStore = openSessionStore({
+        filename: path.join(config.dataPaths.outboxDir, "orchestration.db"),
+      });
+      try {
+        assert.equal(verificationStore.getActiveLease(identity.occurrenceId), null);
+      } finally {
+        verificationStore.close();
+      }
     } finally {
-      application.close();
+      await application.close();
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the public composition retains configuration exports and closes owned sessions before its store", async () => {
+  assert.equal(typeof RedactedSecret, "function");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-application-close-"));
+  try {
+    const config: MeetingAgentConfig = {
+      feishu: { appId: "synthetic-app", appSecret: new RedactedSecret("synthetic-secret") },
+      conversationRuntime: { endpoint: "https://runtime.example.invalid/", profile: "online" },
+      agentIdentity: { aliases: ["Meetbot"] },
+      dataPaths: { recordingsDir: path.join(dir, "recordings"), outboxDir: path.join(dir, "outbox"), receiptsDir: path.join(dir, "receipts"), teamVaultDir: path.join(dir, "vault") },
+    };
+    const bridge = fakeBridge("application-close-bridge");
+    const runtime = fakeRuntime();
+    const app = createMeetingAgentApplication({ config, adapters: { bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-close-bridge" }), runtimeFor: () => runtime } });
+    const session = app.createSession(buildMeetingIdentity({ providerMeetingId: "close", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "close", organizer: null }));
+    await session.join();
+    await app.close();
+    await session.settled();
+    assert.equal(bridge.subscriberCount(), 0);
+    assert.equal(runtime.subscriberCount(), 0);
+    assert.equal(runtime.callsOf("close").length, 1);
+    assert.throws(() => app.createSession(buildMeetingIdentity({ providerMeetingId: "later", meetingNo: "2", occurrenceStartedAt: "2026-09-02T14:01:00Z", title: "later", organizer: null })), /closed/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

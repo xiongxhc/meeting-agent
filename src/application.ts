@@ -14,6 +14,11 @@ import type { SessionStore } from "./ports/session-store.ts";
 import { createCoordinator, type Clock, type SessionCoordinator } from "./sessions/coordinator.ts";
 import { createMeetingSession, type MeetingSession } from "./sessions/meeting-session.ts";
 
+// Keep the original public configuration surface available from the package
+// root while adding composition. Existing deployment overlays import these
+// names from `meeting-agent`, not from an implementation file.
+export { ConfigError, RedactedSecret, describeConfig, loadConfig, type MeetingAgentConfig } from "./config.ts";
+
 export type MeetingAgentCompositionAdapters = {
   bridgeFor(identity: MeetingIdentity): {
     readonly bridge: BridgeTransport;
@@ -29,13 +34,14 @@ export type CreateMeetingAgentApplicationOptions = {
   readonly clock?: Clock;
   readonly bridgeLeaseTtlMs?: number;
   readonly maxConcurrentSessions?: number;
+  readonly bridgeFailureRetryLimit?: number;
   readonly store?: SessionStore;
 };
 
 export type MeetingAgentApplication = {
   readonly coordinator: SessionCoordinator;
   createSession(identity: MeetingIdentity): MeetingSession;
-  close(): void;
+  close(): Promise<void>;
 };
 
 export function createMeetingAgentApplication(
@@ -53,13 +59,17 @@ export function createMeetingAgentApplication(
     bridgeLeaseTtlMs: options.bridgeLeaseTtlMs ?? 30_000,
     maxConcurrentSessions: options.maxConcurrentSessions ?? 1,
   });
+  const sessions = new Set<MeetingSession>();
+  let closed = false;
+  let closePromise: Promise<void> | null = null;
 
   return {
     coordinator,
     createSession(identity: MeetingIdentity): MeetingSession {
+      if (closed) throw new Error("meeting-agent application is closed");
       if (coordinator.get(identity.occurrenceId) === null) coordinator.discover(identity);
       const bridge = options.adapters.bridgeFor(identity);
-      return createMeetingSession({
+      const sessionOptions = {
         identity,
         bridge: bridge.bridge,
         runtime: options.adapters.runtimeFor(identity),
@@ -70,10 +80,23 @@ export function createMeetingAgentApplication(
         bridgeSessionId: bridge.bridgeSessionId,
         disclosureText: "A meeting agent is listening and will create meeting notes.",
         teamVaultDir: options.config.dataPaths.teamVaultDir,
-      });
+      };
+      const session = createMeetingSession(options.bridgeFailureRetryLimit === undefined
+        ? sessionOptions
+        : { ...sessionOptions, bridgeFailureRetryLimit: options.bridgeFailureRetryLimit });
+      sessions.add(session);
+      return session;
     },
-    close(): void {
-      if (ownsStore) store.close();
+    close(): Promise<void> {
+      if (closePromise !== null) return closePromise;
+      if (closed) return Promise.resolve();
+      closed = true;
+      closePromise = (async () => {
+        await Promise.all([...sessions].map((session) => session.dispose()));
+        sessions.clear();
+        if (ownsStore) store.close();
+      })();
+      return closePromise;
     },
   };
 }

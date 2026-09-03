@@ -1,125 +1,90 @@
-// A thin structural mapping from the `@conversation/runtime` client onto
-// src/ports/conversation-runtime.ts.
+// Structural adapter for the current Conversation Runtime SDK.
 //
-// STRUCTURE ONLY -- NO WIRE CODEC. The SDK owns the transport, the framing and
-// the JSON. Nothing here encodes, decodes, retries, buffers or reorders
-// anything: duplicating the SDK's codec is precisely what the plan forbids,
-// because two codecs is two truths about the same bytes. What this file does is
-// name-level: the SDK's method and event spellings on one side, the port's on
-// the other, plus one narrowing of the event union.
-//
-// The SDK is NOT imported. It is not built yet (the lane handoff file
-// runtime-sdk-ready.md does not exist), so `ConversationRuntimeSdk` below is a
-// structural description of the surface that repository announced. A
-// structural type needs no import to be satisfied: when the real client lands,
-// it either satisfies this shape and `createConversationRuntimeClient` accepts
-// it unchanged, or it does not and Task 11's compile-check against the built
-// SDK says so in one place instead of throughout the session. Every test in
-// this task runs against the in-repo fake, never against the SDK.
+// There is deliberately no SDK import and no wire codec here. The SDK owns
+// transport framing. Task 11 alone owns the still-missing startVoiceSession
+// construction: the current SDK VoiceSession has neither the bigint session
+// ID nor authenticated media descriptor Meeting Agent needs to join its
+// bridge, so this adapter fails closed instead of inventing either value.
 
 import type {
+  ConversationContextExchange,
   ConversationRuntimePort,
-  RecordingGap,
-  RecordingHandle,
+  ProcessTextRequest,
+  ProcessedText,
   RecordingReconciliation,
+  RecordingSummary,
   RuntimeEvent,
-  StartVoiceSessionInput,
-  VoiceSessionHandle,
+  RuntimeProfile,
+  RuntimeResponseMode,
 } from "../ports/conversation-runtime.ts";
-import type { SeededContext } from "../ports/knowledge.ts";
 import type { InvocationDecisionReason, InvocationSink } from "../sessions/invocation-gate.ts";
 
-/** The surface `@conversation/runtime`'s client announces. Structural, so the
- * real client satisfies it without this module importing the package.
- * `seedContext` is a Task 6 addition to the port (src/ports/conversation-
- * runtime.ts) -- the real SDK's actual method for this is unknown until
- * runtime-sdk-ready.md exists; Task 11's compile-check against the built
- * SDK needs to confirm this name and shape, or adjust the forward below. */
+/** The currently-built SDK's public client surface, structurally described so
+ * a real `RuntimeClient<3>` satisfies it without a dependency or adapter-side
+ * protocol types. `startVoiceSession` remains `unknown` because its present
+ * VoiceSession result is intentionally opaque until Task 11 can construct a
+ * Meeting Agent bridge session from real SDK material. */
 export type ConversationRuntimeSdk = {
-  startVoiceSession(input: StartVoiceSessionInput): Promise<VoiceSessionHandle>;
-  seedContext(context: SeededContext): Promise<void>;
-  authorizeVoiceResponse(segmentId: string): Promise<void>;
-  skipVoiceResponse(segmentId: string, reason: string): Promise<void>;
-  processText(text: string): Promise<void>;
-  finalizeRecording(input: { readonly observedGaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
-  /** No counterpart in the interim handoff (runtime-sdk-ready.md); Task 11's
-   * compile-check settles whether the SDK has one or the port drops it. */
-  reconcileRecordingGaps(input: { readonly gaps: readonly RecordingGap[] }): Promise<RecordingHandle>;
-  /** The SDK takes `{ sessionId, recordingHandle }` and returns bigint
-   * milliseconds; the sessionId is the adapter's to supply and the bigints
-   * its to convert. Structural here, until Task 11 binds the real client. */
-  reconcileRecording(input: { readonly recordingHandle: string }): Promise<RecordingReconciliation>;
-  on(listener: (event: RuntimeEvent) => void): () => void;
+  startVoiceSession(options?: {
+    profile?: RuntimeProfile;
+    responseMode?: RuntimeResponseMode;
+  }): Promise<unknown>;
+  seedConversationContext(exchanges: readonly ConversationContextExchange[], operationId: string): Promise<void>;
+  authorizeVoiceResponse(input: {
+    sessionId: bigint;
+    segmentId: string;
+    contextExchanges: ConversationContextExchange[];
+  }): Promise<bigint>;
+  skipVoiceResponse(input: { sessionId: bigint; segmentId: string; reason: string }): Promise<void>;
+  finalizeRecording(input: { sessionId: bigint }): Promise<RecordingSummary>;
+  reconcileRecording(input: { sessionId: bigint; recordingHandle: string }): Promise<RecordingReconciliation>;
+  processText(input: ProcessTextRequest): Promise<ProcessedText>;
   close(): Promise<void>;
 };
 
-/**
- * Wraps an SDK client as a ConversationRuntimePort.
- *
- * The one behavioural line in the whole file is the event filter: the SDK's
- * stream may carry members this product has no use for, and forwarding an
- * event the session cannot name would put an un-routable value into its
- * bounded queue. Unknown members are dropped HERE, at the port boundary, where
- * the closed union is defined -- not deep inside the session's router, where a
- * default branch would quietly absorb them.
- */
-export function createConversationRuntimeClient(
-  sdk: ConversationRuntimeSdk,
-): ConversationRuntimePort {
+export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): ConversationRuntimePort {
   return {
-    startVoiceSession: (input) => sdk.startVoiceSession(input),
-    seedContext: (context) => sdk.seedContext(context),
-    authorizeVoiceResponse: (segmentId) => sdk.authorizeVoiceResponse(segmentId),
-    skipVoiceResponse: (segmentId, reason) => sdk.skipVoiceResponse(segmentId, reason),
-    processText: (text) => sdk.processText(text),
+    async startVoiceSession() {
+      // Do not even call the SDK: accepting a VoiceSession that lacks both
+      // required fields would force this package to fabricate a session ID or
+      // media descriptor. Runtime Tasks 6-8 and Meeting Agent Task 11 close
+      // this one explicit construction gap.
+      throw new Error("Conversation Runtime startVoiceSession cannot construct a Meeting Agent session before Task 11");
+    },
+    seedConversationContext: (exchanges, operationId) =>
+      sdk.seedConversationContext(exchanges, operationId),
+    authorizeVoiceResponse: (input) => sdk.authorizeVoiceResponse(input),
+    skipVoiceResponse: (input) => sdk.skipVoiceResponse(input),
+    processText: (input) => sdk.processText(input),
     finalizeRecording: (input) => sdk.finalizeRecording(input),
-    reconcileRecordingGaps: (input) => sdk.reconcileRecordingGaps(input),
     reconcileRecording: (input) => sdk.reconcileRecording(input),
-    subscribe: (listener) =>
-      sdk.on((event) => {
-        if (isKnownRuntimeEvent(event)) listener(event);
-      }),
+    // No SDK VoiceSession event stream is available because start is
+    // fail-closed above. This inert subscription is safe only in that state;
+    // Task 11 replaces it with a real event bridge once it has actual session
+    // construction material.
+    subscribe: (listener: (event: RuntimeEvent) => void) => {
+      void listener;
+      return () => {};
+    },
     close: () => sdk.close(),
   };
 }
 
-const KNOWN_RUNTIME_EVENT_TYPES: readonly string[] = [
-  "transcript_final",
-  "response_authorized",
-  "response_skipped",
-  "barge_in",
-  "provider_unavailable",
-];
-
-function isKnownRuntimeEvent(event: RuntimeEvent): boolean {
-  return KNOWN_RUNTIME_EVENT_TYPES.includes(event.type);
-}
-
-/**
- * Adapts the runtime port to the invocation gate's two-method sink.
- *
- * The gate (Task 4) already decided; this re-decides NOTHING. It forwards the
- * decision under the same segmentId the gate carried on it, and the gate's
- * dispatcher -- not this adapter -- is what guarantees one call per segment.
- *
- * Both port methods are async and both sink methods return void, so a rejected
- * promise here has nowhere to go. It is routed to `onError` rather than left as
- * an unhandled rejection: a runtime that cannot be told to stay silent is a
- * fact the session must see, and swallowing it would leave the loudest failure
- * mode of this product invisible.
- */
+/** Adapts a session-aware port to the invocation gate's two-method sink. */
 export function createRuntimeInvocationSink(
   runtime: Pick<ConversationRuntimePort, "authorizeVoiceResponse" | "skipVoiceResponse">,
+  sessionId: bigint,
+  contextExchanges: ConversationContextExchange[],
   onError: (segmentId: string, error: unknown) => void,
 ): InvocationSink {
   return {
     skipVoiceResponse(segmentId: string, reason: InvocationDecisionReason): void {
-      runtime.skipVoiceResponse(segmentId, reason).catch((error: unknown) => {
+      runtime.skipVoiceResponse({ sessionId, segmentId, reason }).catch((error: unknown) => {
         onError(segmentId, error);
       });
     },
     authorizeVoiceResponse(segmentId: string): void {
-      runtime.authorizeVoiceResponse(segmentId).catch((error: unknown) => {
+      runtime.authorizeVoiceResponse({ sessionId, segmentId, contextExchanges }).catch((error: unknown) => {
         onError(segmentId, error);
       });
     },

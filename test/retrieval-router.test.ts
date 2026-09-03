@@ -19,9 +19,9 @@ import { test } from "node:test";
 
 import type {
   KnowledgeHit,
-  SeededContext,
   TeamVaultSearchResult,
 } from "../src/ports/knowledge.ts";
+import type { ConversationContextExchange } from "../src/ports/conversation-runtime.ts";
 import {
   createCurrentMeetingMemory,
   createRetrievalRouter,
@@ -63,18 +63,25 @@ function throwingVault(error: Error): { search(query: string): TeamVaultSearchRe
 }
 
 type SinkCall =
-  | { readonly method: "seedContext"; readonly context: SeededContext }
-  | { readonly method: "authorizeVoiceResponse"; readonly segmentId: string };
+  | { readonly method: "seedConversationContext"; readonly exchanges: ConversationContextExchange[]; readonly operationId: string }
+  | { readonly method: "authorizeVoiceResponse"; readonly input: { sessionId: bigint; segmentId: string; contextExchanges: ConversationContextExchange[] } };
 
-function fakeSink(): { seedContext(c: SeededContext): Promise<void>; authorizeVoiceResponse(id: string): Promise<void>; calls: SinkCall[] } {
+function fakeSink(): {
+  readonly sessionId: bigint;
+  seedConversationContext(exchanges: ConversationContextExchange[], operationId: string): Promise<void>;
+  authorizeVoiceResponse(input: { sessionId: bigint; segmentId: string; contextExchanges: ConversationContextExchange[] }): Promise<bigint>;
+  calls: SinkCall[];
+} {
   const calls: SinkCall[] = [];
   return {
+    sessionId: 17n,
     calls,
-    async seedContext(context: SeededContext): Promise<void> {
-      calls.push({ method: "seedContext", context });
+    async seedConversationContext(exchanges: ConversationContextExchange[], operationId: string): Promise<void> {
+      calls.push({ method: "seedConversationContext", exchanges, operationId });
     },
-    async authorizeVoiceResponse(segmentId: string): Promise<void> {
-      calls.push({ method: "authorizeVoiceResponse", segmentId });
+    async authorizeVoiceResponse(input): Promise<bigint> {
+      calls.push({ method: "authorizeVoiceResponse", input });
+      return 99n;
     },
   };
 }
@@ -248,9 +255,9 @@ test("vault unavailable is a field on SeededContext, observable without reading 
 
   const context = await router.answer(invocation, "anything");
 
-  const seeded = sink.calls.find((c) => c.method === "seedContext");
-  assert.ok(seeded && seeded.method === "seedContext");
-  assert.equal(seeded.context.vaultUnavailable, true);
+  const seeded = sink.calls.find((c) => c.method === "seedConversationContext");
+  assert.ok(seeded && seeded.method === "seedConversationContext");
+  assert.match(seeded.exchanges[0]?.assistant ?? "", /historical team memory.*unavailable/i);
   assert.equal(context.vaultUnavailable, true);
 });
 
@@ -387,7 +394,7 @@ test("prepare() on a final segment makes it searchable but still never touches t
 // Context is always seeded before the segment is authorized
 // ---------------------------------------------------------------------------
 
-test("seedContext is called before authorizeVoiceResponse, every time", async () => {
+test("seedConversationContext is called before authorizeVoiceResponse, every time", async () => {
   const memory = createCurrentMeetingMemory();
   memory.record({ segmentId: "seg_a", text: "the launch date is October", final: true });
   const vault = fakeVault(() => ({ hits: [], indexedRevision: null, stale: false }));
@@ -397,9 +404,12 @@ test("seedContext is called before authorizeVoiceResponse, every time", async ()
   await router.answer(invocation, "launch date");
 
   assert.equal(sink.calls.length, 2);
-  assert.equal(sink.calls[0]?.method, "seedContext");
+  assert.equal(sink.calls[0]?.method, "seedConversationContext");
   assert.equal(sink.calls[1]?.method, "authorizeVoiceResponse");
-  assert.equal((sink.calls[1] as { segmentId: string }).segmentId, invocation.segmentId);
+  const authorization = (sink.calls[1] as { input: { sessionId: bigint; segmentId: string; contextExchanges: unknown[] } }).input;
+  assert.equal(authorization.sessionId, 17n);
+  assert.equal(authorization.segmentId, invocation.segmentId);
+  assert.equal(authorization.contextExchanges.length, 1);
 });
 
 // ---------------------------------------------------------------------------

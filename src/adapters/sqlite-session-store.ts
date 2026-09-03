@@ -34,6 +34,7 @@ import {
   type RecordingGapRow,
   type RecordingRow,
   type BridgeRecoveryResult,
+  type BridgeFailureRecordingRow,
   type MigrationRow,
   type SessionRow,
   type SessionState,
@@ -91,6 +92,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     finalizeSession: (input) => finalizeSession(db, input),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
+    getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
 
     acquireLease: (input) => acquireLease(db, input),
     releaseLease: (occurrenceId, leaseId, reason, nowMs) =>
@@ -420,11 +422,11 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
     | {
         occurrence_id: string;
         handle: string;
-        encrypted_path: string;
+        encrypted_path: string | null;
         sha256: string;
         duration_ms: number;
-        format: string;
-        key_id: string;
+        format: string | null;
+        key_id: string | null;
         finalized_at_ms: number;
       }
     | undefined;
@@ -469,6 +471,7 @@ function recordBridgeFailure(
     readonly nowMs: number;
     readonly maxRetries: number;
     readonly gaps: FinalizeSessionInput["recording"]["gaps"];
+    readonly recording: FinalizeSessionInput["recording"] | null;
   },
 ): BridgeRecoveryResult {
   const run = db.transaction(() => {
@@ -491,9 +494,34 @@ function recordBridgeFailure(
     input.gaps.forEach((gap, ordinal) => {
       insertGap.run(input.occurrenceId, attempt, ordinal, gap.direction, gap.startedAt, gap.endedAt);
     });
+    if (input.recording !== null) {
+      db.prepare(
+        `INSERT INTO bridge_failure_recordings
+          (occurrence_id, attempt, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(input.occurrenceId, attempt, input.recording.handle, input.recording.encryptedPath,
+        input.recording.sha256, input.recording.durationMs, input.recording.format, input.recording.keyId, input.nowMs);
+    }
     return { attempt, retryAllowed: attempt <= input.maxRetries };
   });
   return run();
+}
+
+function getBridgeFailureRecording(
+  db: Database.Database, occurrenceId: string, attempt: number,
+): BridgeFailureRecordingRow | null {
+  const row = db.prepare(
+    `SELECT handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms
+       FROM bridge_failure_recordings WHERE occurrence_id = ? AND attempt = ?`,
+  ).get(occurrenceId, attempt) as { handle: string; encrypted_path: string; sha256: string; duration_ms: number; format: string; key_id: string; finalized_at_ms: number } | undefined;
+  if (row === undefined) return null;
+  const gaps = db.prepare(
+    `SELECT ordinal, direction, started_at, ended_at FROM bridge_recovery_gaps
+       WHERE occurrence_id = ? AND attempt = ? ORDER BY ordinal`,
+  ).all(occurrenceId, attempt) as Array<{ ordinal: number; direction: string; started_at: string; ended_at: string | null }>;
+  return { occurrenceId, attempt, handle: row.handle, encryptedPath: row.encrypted_path, sha256: row.sha256,
+    durationMs: row.duration_ms, format: row.format, keyId: row.key_id, finalizedAtMs: row.finalized_at_ms,
+    gaps: gaps.map((gap) => ({ ordinal: gap.ordinal, direction: gap.direction as RecordingGapRow["direction"], startedAt: gap.started_at, endedAt: gap.ended_at })) };
 }
 
 function toTransitionRow(raw: {

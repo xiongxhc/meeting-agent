@@ -46,6 +46,20 @@ export type WriteLikeCall = {
   readonly file: string;
   readonly calleeText: string;
   readonly argumentsText: string;
+  readonly method: string;
+};
+
+export type CapabilityUse = {
+  readonly file: string;
+  readonly capability: string;
+  readonly snippet: string;
+};
+
+export type EnvironmentAccess = {
+  readonly file: string;
+  /** The statically-known variable name, or null for an opaque computed key. */
+  readonly key: string | null;
+  readonly text: string;
 };
 
 export type ScanResult = {
@@ -53,8 +67,11 @@ export type ScanResult = {
   readonly callArgumentLiterals: CallArgumentLiteral[];
   readonly opaqueConstructs: OpaqueConstruct[];
   readonly writeLikeCalls: WriteLikeCall[];
-  readonly runtimeBoundaryCalls: WriteLikeCall[];
-  readonly environmentAccesses: Array<{ readonly file: string; readonly text: string }>;
+  /** Every direct network capability use, independent of its endpoint text. */
+  readonly runtimeBoundaryCalls: CapabilityUse[];
+  /** fs write-capability imports; namespace/default imports are broad capability. */
+  readonly fsWriteCapabilityImports: CapabilityUse[];
+  readonly environmentAccesses: EnvironmentAccess[];
 };
 
 const SKIP_DIRS = new Set(["node_modules", "dist", ".build"]);
@@ -73,7 +90,22 @@ const WRITE_LIKE_METHOD_NAMES = new Set([
   "unlink",
   "unlinkSync",
   "createWriteStream",
+  "mkdir",
+  "mkdirSync",
 ]);
+
+const NETWORK_MODULES = new Set([
+  "node:http",
+  "node:https",
+  "http",
+  "https",
+  "undici",
+  "axios",
+  "got",
+  "node-fetch",
+]);
+const NETWORK_METHOD_NAMES = new Set(["fetch", "request", "get", "post", "put", "delete", "patch"]);
+const FS_MODULES = new Set(["node:fs", "node:fs/promises", "fs", "fs/promises"]);
 
 const MAX_SNIPPET_LENGTH = 240;
 
@@ -90,6 +122,7 @@ export function scanProductionTree(rootDir: string): ScanResult {
     opaqueConstructs: [],
     writeLikeCalls: [],
     runtimeBoundaryCalls: [],
+    fsWriteCapabilityImports: [],
     environmentAccesses: [],
   };
   for (const file of walkTsFiles(rootDir)) {
@@ -101,7 +134,7 @@ export function scanProductionTree(rootDir: string): ScanResult {
       /* setParentNodes */ true,
       ts.ScriptKind.TS,
     );
-    visit(sourceFile, sourceFile, file, result);
+    visit(sourceFile, sourceFile, file, result, createFileContext());
   }
   return result;
 }
@@ -138,7 +171,10 @@ function visit(
   sourceFile: ts.SourceFile,
   file: string,
   result: ScanResult,
+  context: FileScanContext,
 ): void {
+  recordImportCapabilities(node, sourceFile, file, result, context);
+  recordStaticBindings(node, sourceFile, file, result, context);
   if (
     (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
     node.moduleSpecifier &&
@@ -171,11 +207,7 @@ function visit(
       });
     }
 
-    for (const arg of node.arguments) {
-      if (ts.isStringLiteralLike(arg)) {
-        result.callArgumentLiterals.push({ file, value: arg.text });
-      }
-    }
+    for (const arg of node.arguments) recordStaticCallArgument(arg, file, result, context);
 
     const calleeName = lastCalleeSegment(node.expression);
     if (calleeName !== null && WRITE_LIKE_METHOD_NAMES.has(calleeName)) {
@@ -183,20 +215,214 @@ function visit(
         file,
         calleeText: node.expression.getText(sourceFile),
         argumentsText: node.arguments.map((a) => a.getText(sourceFile)).join(", "),
+        method: calleeName,
       });
     }
-    if (calleeName === "fetch" || calleeName === "request" || calleeName === "get") {
+    if (isNetworkCall(node.expression, context)) {
       result.runtimeBoundaryCalls.push({
         file,
-        calleeText: node.expression.getText(sourceFile),
-        argumentsText: node.arguments.map((a) => a.getText(sourceFile)).join(", "),
+        capability: node.expression.getText(sourceFile),
+        snippet: snippetOf(node, sourceFile),
       });
     }
-  } else if (ts.isPropertyAccessExpression(node) && node.getText(sourceFile).startsWith("process.env.")) {
-    result.environmentAccesses.push({ file, text: node.getText(sourceFile) });
   }
 
-  ts.forEachChild(node, (child) => visit(child, sourceFile, file, result));
+  recordEnvironmentAccess(node, sourceFile, file, result, context);
+
+  ts.forEachChild(node, (child) => visit(child, sourceFile, file, result, context));
+}
+
+type FileScanContext = {
+  readonly networkAliases: Set<string>;
+  readonly networkNamespaces: Set<string>;
+  readonly environmentAliases: Map<string, string | null>;
+  readonly staticStrings: Map<string, string>;
+};
+
+function createFileContext(): FileScanContext {
+  return {
+    networkAliases: new Set(["fetch"]),
+    networkNamespaces: new Set(),
+    environmentAliases: new Map(),
+    staticStrings: new Map(),
+  };
+}
+
+function recordImportCapabilities(
+  node: ts.Node,
+  sourceFile: ts.SourceFile,
+  file: string,
+  result: ScanResult,
+  context: FileScanContext,
+): void {
+  if (!ts.isImportDeclaration(node) || !ts.isStringLiteralLike(node.moduleSpecifier)) return;
+  const specifier = node.moduleSpecifier.text;
+  const clause = node.importClause;
+  if (!clause) return;
+  if (NETWORK_MODULES.has(specifier)) {
+    if (clause.name) context.networkNamespaces.add(clause.name.text);
+    const bindings = clause.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) context.networkNamespaces.add(bindings.name.text);
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const item of bindings.elements) {
+        if (NETWORK_METHOD_NAMES.has(item.propertyName?.text ?? item.name.text)) {
+          context.networkAliases.add(item.name.text);
+        }
+      }
+    }
+    result.runtimeBoundaryCalls.push({
+      file,
+      capability: `import:${specifier}`,
+      snippet: snippetOf(node, sourceFile),
+    });
+  }
+  // A named `fetch`/`request` import is direct network capability even when a
+  // future HTTP client is not in the small module-name catalogue above.
+  // Generic names such as `get` are deliberately excluded: they occur in
+  // ordinary local APIs and are not capability evidence on their own.
+  if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+    for (const item of clause.namedBindings.elements) {
+      const imported = item.propertyName?.text ?? item.name.text;
+      if (imported === "fetch" || imported === "request") context.networkAliases.add(item.name.text);
+    }
+  }
+  if (!FS_MODULES.has(specifier)) return;
+  if (clause.name) {
+    result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
+  }
+  const bindings = clause.namedBindings;
+  if (bindings && ts.isNamespaceImport(bindings)) {
+    result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
+  }
+  if (bindings && ts.isNamedImports(bindings)) {
+    for (const item of bindings.elements) {
+      const imported = item.propertyName?.text ?? item.name.text;
+      if (WRITE_LIKE_METHOD_NAMES.has(imported)) {
+        result.fsWriteCapabilityImports.push({ file, capability: imported, snippet: snippetOf(node, sourceFile) });
+      }
+    }
+  }
+}
+
+function recordStaticBindings(
+  node: ts.Node,
+  sourceFile: ts.SourceFile,
+  file: string,
+  result: ScanResult,
+  context: FileScanContext,
+): void {
+  if (!ts.isVariableDeclaration(node) || !node.initializer) return;
+  if (ts.isIdentifier(node.name)) {
+    const value = staticString(node.initializer, context);
+    if (value !== null) context.staticStrings.set(node.name.text, value);
+    if (isProcessEnvironment(node.initializer, context)) context.environmentAliases.set(node.name.text, null);
+    if (isNetworkExpression(node.initializer, context)) context.networkAliases.add(node.name.text);
+    return;
+  }
+  if (!ts.isObjectBindingPattern(node.name) || !isProcessEnvironment(node.initializer, context)) return;
+  for (const element of node.name.elements) {
+    if (ts.isIdentifier(element.name)) {
+      const key = bindingPropertyName(element, context);
+      context.environmentAliases.set(element.name.text, key);
+      result.environmentAccesses.push({ file, key, text: element.getText(sourceFile) });
+    }
+  }
+}
+
+function isNetworkCall(expression: ts.Expression, context: FileScanContext): boolean {
+  if (ts.isIdentifier(expression)) return context.networkAliases.has(expression.text);
+  if (!ts.isPropertyAccessExpression(expression) && !ts.isElementAccessExpression(expression)) return false;
+  const method = ts.isPropertyAccessExpression(expression)
+    ? expression.name.text
+    : staticString(expression.argumentExpression, context);
+  if (method === null || !NETWORK_METHOD_NAMES.has(method)) return false;
+  return (ts.isIdentifier(expression.expression) && context.networkNamespaces.has(expression.expression.text)) ||
+    (method === "fetch" && ts.isIdentifier(expression.expression) && expression.expression.text === "globalThis");
+}
+
+function isNetworkExpression(expression: ts.Expression, context: FileScanContext): boolean {
+  if (ts.isIdentifier(expression)) return context.networkAliases.has(expression.text);
+  if (!ts.isPropertyAccessExpression(expression) && !ts.isElementAccessExpression(expression)) return false;
+  const method = ts.isPropertyAccessExpression(expression)
+    ? expression.name.text
+    : staticString(expression.argumentExpression, context);
+  if (method === null || !NETWORK_METHOD_NAMES.has(method)) return false;
+  if (ts.isIdentifier(expression.expression) && context.networkNamespaces.has(expression.expression.text)) return true;
+  if (method === "fetch" && ts.isIdentifier(expression.expression) && expression.expression.text === "globalThis") return true;
+  return false;
+}
+
+function recordEnvironmentAccess(
+  node: ts.Node,
+  sourceFile: ts.SourceFile,
+  file: string,
+  result: ScanResult,
+  context: FileScanContext,
+): void {
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return;
+  if (!isProcessEnvironment(node.expression, context)) return;
+  const key = ts.isPropertyAccessExpression(node)
+    ? node.name.text
+    : staticString(node.argumentExpression, context);
+  // `process.env` itself is an environment object, not a secret lookup.
+  result.environmentAccesses.push({ file, key, text: node.getText(sourceFile) });
+}
+
+function isProcessEnvironment(expression: ts.Expression, context: FileScanContext): boolean {
+  if (ts.isIdentifier(expression)) return context.environmentAliases.has(expression.text);
+  if (ts.isParenthesizedExpression(expression)) return isProcessEnvironment(expression.expression, context);
+  if (ts.isBinaryExpression(expression) &&
+    (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || expression.operatorToken.kind === ts.SyntaxKind.BarBarToken)) {
+    return isProcessEnvironment(expression.left, context) || isProcessEnvironment(expression.right, context);
+  }
+  if (ts.isPropertyAccessExpression(expression)) {
+    return ts.isIdentifier(expression.expression) && expression.expression.text === "process" && expression.name.text === "env";
+  }
+  if (ts.isElementAccessExpression(expression)) {
+    return ts.isIdentifier(expression.expression) && expression.expression.text === "process" &&
+      staticString(expression.argumentExpression, context) === "env";
+  }
+  return false;
+}
+
+function bindingPropertyName(element: ts.BindingElement, context: FileScanContext): string | null {
+  if (!element.propertyName) return ts.isIdentifier(element.name) ? element.name.text : null;
+  if (ts.isIdentifier(element.propertyName) || ts.isStringLiteralLike(element.propertyName)) return element.propertyName.text;
+  if (ts.isComputedPropertyName(element.propertyName)) return staticString(element.propertyName.expression, context);
+  return null;
+}
+
+function staticString(expression: ts.Expression | undefined, context: FileScanContext): string | null {
+  if (!expression) return null;
+  if (ts.isStringLiteralLike(expression)) return expression.text;
+  if (ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
+  if (ts.isIdentifier(expression)) return context.staticStrings.get(expression.text) ?? null;
+  if (ts.isParenthesizedExpression(expression)) return staticString(expression.expression, context);
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticString(expression.left, context);
+    const right = staticString(expression.right, context);
+    return left === null || right === null ? null : left + right;
+  }
+  if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression) && expression.expression.name.text === "join") {
+    const receiver = expression.expression.expression;
+    if (!ts.isArrayLiteralExpression(receiver)) return null;
+    const pieces = receiver.elements.map((element) =>
+      ts.isExpression(element) ? staticString(element, context) : null,
+    );
+    const separator = staticString(expression.arguments[0], context);
+    return separator === null || pieces.some((piece) => piece === null) ? null : pieces.join(separator);
+  }
+  return null;
+}
+
+function recordStaticCallArgument(
+  argument: ts.Expression,
+  file: string,
+  result: ScanResult,
+  context: FileScanContext,
+): void {
+  const value = staticString(argument, context);
+  if (value !== null) result.callArgumentLiterals.push({ file, value });
 }
 
 function lastCalleeSegment(expression: ts.Expression): string | null {
@@ -270,8 +496,8 @@ export function findViolations(
  * data directories, wherever a string literal carrying one appears as a call
  * argument -- not only as an import specifier. Narrower than the
  * import-specifier "TeamMem Python/module path" rule on purpose: this layer
- * scans every call-argument string literal in the tree, a much bigger
- * surface than import specifiers, so the patterns stay tied to actual path
+ * scans every statically resolvable call argument in the tree, including
+ * constant aliases and string construction, while staying tied to actual path
  * shapes rather than the bare word "teammem" (which could appear in ordinary
  * domain vocabulary, e.g. a "TeamMember" type, without ever naming a path).
  */
@@ -313,52 +539,79 @@ export function findOpaqueConstructs(
   return constructs;
 }
 
-/**
- * The Team Vault field name this scan treats as forbidden to reach a write.
- * Meeting Agent's config surface (src/config.ts) names this field
- * `dataPaths.teamVaultDir`; Task 6 builds a read-only index over it and nothes
- * else may hold a path derived from it in a write-shaped call.
- *
- * This is a name-based heuristic (it checks whether the call's argument
- * source text contains this identifier), not full data-flow analysis: it
- * catches `fs.writeFileSync(config.dataPaths.teamVaultDir + "/x.md", ...)`
- * and `fs.writeFileSync(teamVaultDir, ...)` alike, because both mention the
- * field/variable by name in the call's argument text, but it would not catch
- * the value being renamed to something unrelated before reaching a write.
- * That's an accepted, documented limit -- the convention is to always carry
- * the name through, exactly as `config.dataPaths.teamVaultDir` already does.
- */
-export const TEAM_VAULT_DIR_FIELD_NAME = "teamVaultDir";
+/** Explicit owners of filesystem writes. The application may create its own
+ * outbox directory; the future outbox adapter owns durable publication. No
+ * Team Vault module appears here, so its read-only git index cannot gain an
+ * fs write capability by renaming a path variable. */
+export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "src/application.ts": new Set(["mkdir", "mkdirSync"]),
+  "src/adapters/filesystem-outbox.ts": new Set([
+    "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "writeFile", "writeFileSync",
+  ]),
+};
 
-export function findTeamVaultWriteAttempts(
-  calls: readonly WriteLikeCall[],
-  marker: RegExp = /(?:teamVaultDir|(?:team|published)?Vault(?:Dir|Root|Path)?)/i,
-): Violation[] {
-  return calls
-    .filter((call) => marker.test(call.argumentsText))
-    .map((call) => ({
-      file: call.file,
-      specifier: call.calleeText,
-      rule: "writable fs call reachable from the Team Vault directory",
-    }));
-}
+/** Direct HTTP is an adapter capability, never an endpoint-text exception. */
+export const NETWORK_CAPABILITY_OWNERS = new Set([
+  "src/adapters/conversation-runtime-client.ts",
+  "src/adapters/feishu-api.ts",
+]);
 
-/** Direct provider HTTP and provider/recording-key environment access belong
- * only to the runtime adapter. The Meeting Agent control plane may use Feishu
- * HTTPS in its dedicated adapter, but must never make model-provider calls. */
-export function findForbiddenRuntimeBoundaryAccess(result: ScanResult): Violation[] {
+export function findForbiddenFilesystemWriteCapabilities(result: ScanResult, repoRoot?: string): Violation[] {
   const violations: Violation[] = [];
-  for (const call of result.runtimeBoundaryCalls) {
-    if (/openai|provider/i.test(call.argumentsText)) {
-      violations.push({ file: call.file, specifier: call.calleeText, rule: "direct provider HTTP outside runtime" });
+  for (const use of result.fsWriteCapabilityImports) {
+    if (!allowsWriteCapability(use.file, use.capability, repoRoot)) {
+      violations.push({ file: use.file, specifier: use.capability, rule: "filesystem write capability outside approved owner" });
     }
   }
-  for (const access of result.environmentAccesses) {
-    if (/(OPENAI|PROVIDER|RECORDING.*KEY|KEY.*RECORDING)/i.test(access.text)) {
-      violations.push({ file: access.file, specifier: access.text, rule: "provider or recording-key environment access" });
+  for (const call of result.writeLikeCalls) {
+    if (!allowsWriteCapability(call.file, call.method, repoRoot)) {
+      violations.push({ file: call.file, specifier: call.calleeText, rule: "filesystem write capability outside approved owner" });
     }
   }
   return violations;
+}
+
+/** Direct network capability and secret-bearing environment access are
+ * ownership checks. A URL's spelling can never grant a production module a
+ * capability it does not own. Runtime endpoint configuration is narrowly
+ * allowed in config/runtime adapter; recording keys are never allowed. */
+export function findForbiddenRuntimeBoundaryAccess(result: ScanResult, repoRoot?: string): Violation[] {
+  const violations: Violation[] = [];
+  for (const call of result.runtimeBoundaryCalls) {
+    if (!allowsNetworkCapability(call.file, repoRoot)) {
+      violations.push({ file: call.file, specifier: call.capability, rule: "direct network capability outside designated adapter" });
+    }
+  }
+  for (const access of result.environmentAccesses) {
+    if (access.key !== null && /(?:RECORDING.*KEY|KEY.*RECORDING)/i.test(access.key)) {
+      violations.push({ file: access.file, specifier: access.text, rule: "recording-key environment access is forbidden" });
+    } else if (access.key !== null && /(?:OPENAI|PROVIDER).*(?:KEY|TOKEN|SECRET)?|(?:KEY|TOKEN|SECRET).*(?:OPENAI|PROVIDER)/i.test(access.key)) {
+      violations.push({ file: access.file, specifier: access.text, rule: "provider credential environment access is forbidden" });
+    } else if (access.key !== null && /(?:RUNTIME|PROVIDER).*(?:ENDPOINT|URL)|(?:ENDPOINT|URL).*(?:RUNTIME|PROVIDER)/i.test(access.key)) {
+      if (!allowsRuntimeConfiguration(access.file, repoRoot)) {
+        violations.push({ file: access.file, specifier: access.text, rule: "runtime/provider endpoint environment access outside config/runtime adapter" });
+      }
+    } else if (access.key === null && !allowsRuntimeConfiguration(access.file, repoRoot)) {
+      violations.push({ file: access.file, specifier: access.text, rule: "opaque environment key access outside config/runtime adapter" });
+    }
+  }
+  return violations;
+}
+
+function allowsWriteCapability(file: string, capability: string, repoRoot?: string): boolean {
+  if (!repoRoot) return false;
+  const allowed = WRITE_CAPABILITY_OWNERS[normalizeRelative(path.relative(repoRoot, file))];
+  return allowed?.has(capability) ?? false;
+}
+
+function allowsNetworkCapability(file: string, repoRoot?: string): boolean {
+  return repoRoot !== undefined && NETWORK_CAPABILITY_OWNERS.has(normalizeRelative(path.relative(repoRoot, file)));
+}
+
+function allowsRuntimeConfiguration(file: string, repoRoot?: string): boolean {
+  if (!repoRoot) return false;
+  const relative = normalizeRelative(path.relative(repoRoot, file));
+  return relative === "src/config.ts" || relative === "src/adapters/conversation-runtime-client.ts";
 }
 
 /**

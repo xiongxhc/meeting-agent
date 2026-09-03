@@ -97,11 +97,11 @@ export type RecordingGapRow = {
 export type RecordingRow = {
   readonly occurrenceId: string;
   readonly handle: string;
-  readonly encryptedPath: string;
+  readonly encryptedPath: string | null;
   readonly sha256: string;
   readonly durationMs: number;
-  readonly format: string;
-  readonly keyId: string;
+  readonly format: string | null;
+  readonly keyId: string | null;
   readonly finalizedAtMs: number;
   readonly gaps: readonly RecordingGapRow[];
 };
@@ -138,6 +138,7 @@ export type BridgeRecoveryResult = {
   readonly attempt: number;
   readonly retryAllowed: boolean;
 };
+export type BridgeFailureRecordingRow = RecordingRow & { readonly attempt: number };
 
 export type MigrationRow = {
   readonly version: number;
@@ -240,7 +241,9 @@ export type SessionStore = {
     readonly nowMs: number;
     readonly maxRetries: number;
     readonly gaps: RecordingInput["gaps"];
+    readonly recording: RecordingInput | null;
   }): BridgeRecoveryResult;
+  getBridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
 
   acquireLease(input: AcquireLeaseInput): LeaseRow;
   releaseLease(

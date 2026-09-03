@@ -15,8 +15,8 @@
 //   2. call-argument string-literal rules (findForbiddenPathLiterals) -- sees
 //      a TeamMem ledger/data path handed straight to a driver or path-join
 //      call, not only an import.
-//   3. writable-fs-call rule (findTeamVaultWriteAttempts) -- sees a write-shaped
-//      call whose argument text carries the Team Vault directory field.
+//   3. fs write-capability ownership -- permits only the application outbox
+//      mkdir and the explicitly reserved filesystem-outbox adapter.
 //   4. dependency-level SQLite gate (findForbiddenSqliteDependencies /
 //      findUnconfinedSqliteImports) -- a rule a renamed variable cannot evade.
 // Plus a catch-all: any require()/computed dynamic import() is itself flagged
@@ -32,10 +32,10 @@ import { test } from "node:test";
 import {
   collectImports,
   findForbiddenRuntimeBoundaryAccess,
+  findForbiddenFilesystemWriteCapabilities,
   findForbiddenPathLiterals,
   findForbiddenSqliteDependencies,
   findOpaqueConstructs,
-  findTeamVaultWriteAttempts,
   findUnconfinedSqliteImports,
   findViolations,
   scanProductionTree,
@@ -223,7 +223,7 @@ test("negative control: flags a bare readFileSync call against the TeamMem ledge
     writeFileSync(
       path.join(dir, "bad-read.ts"),
       [
-        'import { readFileSync } from "node:fs";',
+        'import fs from "node:fs";',
         "",
         "export function peek() {",
         '  return readFileSync("/Users/x/.local/share/teammem/ledger.db");',
@@ -253,18 +253,17 @@ test("an ordinary domain-vocabulary literal (e.g. a TeamMember-shaped string) is
 });
 
 // ---------------------------------------------------------------------------
-// Layer 3: a writable fs call reachable from the Team Vault directory.
-// Meeting Agent may only read rendered Markdown from teamVaultDir, never
-// write into it.
+// Layer 3: filesystem write-capability ownership. The read-only Team Vault
+// index is not an owner, so renaming its directory cannot make writes legal.
 // ---------------------------------------------------------------------------
 
-test("src/ has no writable fs call reachable from the Team Vault directory", () => {
-  const { writeLikeCalls } = scanProductionTree(SRC_ROOT);
-  const violations = findTeamVaultWriteAttempts(writeLikeCalls);
+test("src/ grants no filesystem write capability outside explicit owners", () => {
+  const result = scanProductionTree(SRC_ROOT);
+  const violations = findForbiddenFilesystemWriteCapabilities(result, REPO_ROOT);
   assert.deepEqual(
     violations,
     [],
-    `forbidden Team Vault writes found:\n${violations
+    `forbidden filesystem write capabilities found:\n${violations
       .map((v) => `  ${v.file}: ${v.specifier} (${v.rule})`)
       .join("\n")}`,
   );
@@ -283,9 +282,9 @@ test("negative control: flags fs.writeFileSync reachable from config.dataPaths.t
         "",
       ].join("\n"),
     );
-    const violations = findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls);
-    assert.equal(violations.length, 1);
-    assert.match(violations[0]?.rule ?? "", /Team Vault/);
+    const violations = findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir));
+    assert.equal(violations.length, 2);
+    assert.match(violations[0]?.rule ?? "", /filesystem write capability/);
   });
 });
 
@@ -302,8 +301,8 @@ test("negative control: flags a destructured teamVaultDir reaching createWriteSt
         "",
       ].join("\n"),
     );
-    const violations = findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls);
-    assert.equal(violations.length, 1);
+    const violations = findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir));
+    assert.equal(violations.length, 2);
   });
 });
 
@@ -312,15 +311,15 @@ test("reading from the Team Vault directory is never flagged (only write-shaped 
     writeFileSync(
       path.join(dir, "ok-vault-read.ts"),
       [
-        'import fs from "node:fs";',
+        'import { readFileSync } from "node:fs";',
         "",
         "export function readNote(config: { dataPaths: { teamVaultDir: string } }) {",
-        '  return fs.readFileSync(config.dataPaths.teamVaultDir + "/note.md", "utf8");',
+        '  return readFileSync(config.dataPaths.teamVaultDir + "/note.md", "utf8");',
         "}",
         "",
       ].join("\n"),
     );
-    const violations = findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls);
+    const violations = findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir));
     assert.deepEqual(violations, []);
   });
 });
@@ -338,7 +337,7 @@ test("negative control: flags a renamed Team Vault capability reaching a write",
         "",
       ].join("\n"),
     );
-    assert.equal(findTeamVaultWriteAttempts(scanProductionTree(dir).writeLikeCalls).length, 1);
+    assert.equal(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir)).length, 2);
   });
 });
 
@@ -346,8 +345,8 @@ test("negative control: flags a renamed Team Vault capability reaching a write",
 // Layer 3b: provider and recording-key access may not bypass the runtime.
 // ---------------------------------------------------------------------------
 
-test("src/ makes no provider HTTP call or reads a provider/recording-key environment variable", () => {
-  assert.deepEqual(findForbiddenRuntimeBoundaryAccess(scanProductionTree(SRC_ROOT)), []);
+test("src/ makes no unowned network call or reads a provider/recording-key environment variable", () => {
+  assert.deepEqual(findForbiddenRuntimeBoundaryAccess(scanProductionTree(SRC_ROOT), REPO_ROOT), []);
 });
 
 test("negative control: flags direct provider HTTP and recording-key environment access", () => {
@@ -363,10 +362,137 @@ test("negative control: flags direct provider HTTP and recording-key environment
       ].join("\n"),
     );
     const violations = findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir));
-    assert.deepEqual(violations.map((violation) => violation.rule).sort(), [
-      "direct provider HTTP outside runtime",
-      "provider or recording-key environment access",
-    ]);
+    assert.equal(violations.length, 2);
+  });
+});
+
+test("negative control: endpoint spelling cannot exempt aliased fetch or an aliased HTTPS request capability", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-network-capability.ts"),
+      [
+        'import { request as issueRequest } from "node:https";',
+        'const send = fetch;',
+        'const endpoint = "https://" + "model" + ".example.test/v1";',
+        'export async function bypass() {',
+        '  await send(endpoint);',
+        '  return issueRequest(endpoint);',
+        '}',
+        '',
+      ].join("\n"),
+    );
+    const violations = findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir));
+    assert.equal(violations.length, 3);
+  });
+});
+
+test("negative control: globalThis.fetch is direct network capability outside an adapter", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-global-fetch.ts"),
+      'export const bypass = () => globalThis.fetch("https://anything.example.test");\n',
+    );
+    assert.equal(findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir)).length, 1);
+  });
+});
+
+test("negative control: bracket, alias, and destructured provider/recording env access cannot evade the boundary", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-env-capability.ts"),
+      [
+        'const environment = process.env;',
+        'const recording = environment["MEETING_RECORDING_KEY"];',
+        'const { OPENAI_API_KEY: providerKey } = process.env;',
+        'export { recording, providerKey };',
+        '',
+      ].join("\n"),
+    );
+    const violations = findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir));
+    assert.equal(violations.length, 2);
+  });
+});
+
+test("negative control: a renamed Team Vault path cannot receive an fs write capability", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-renamed-vault-capability.ts"),
+      [
+        'import fs from "node:fs";',
+        'export function write(config: { dataPaths: { teamVaultDir: string } }) {',
+        '  const immutablePublishedKnowledge = config.dataPaths.teamVaultDir;',
+        '  fs.writeFileSync(immutablePublishedKnowledge + "/note.md", "no");',
+        '}',
+        '',
+      ].join("\n"),
+    );
+    assert.equal(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir)).length, 2);
+  });
+});
+
+test("negative control: statically computed TeamMem paths are recognized before a filesystem call", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-computed-teammem-path.ts"),
+      [
+        'import { readFileSync } from "node:fs";',
+        'const root = [".local", "share", "team" + "mem"].join("/");',
+        'const ledger = ["led", "ger", ".db"].join("");',
+        'export function bypass() { return readFileSync(root + "/" + ledger); }',
+        '',
+      ].join("\n"),
+    );
+    const violations = findForbiddenPathLiterals(scanProductionTree(dir).callArgumentLiterals);
+    assert.equal(violations.length, 1);
+  });
+});
+
+test("designated Runtime and Feishu adapters own direct network capability, and config alone may read a runtime endpoint", () => {
+  withTempDir((dir) => {
+    const adapters = path.join(dir, "src", "adapters");
+    mkdirSync(adapters, { recursive: true });
+    writeFileSync(
+      path.join(adapters, "conversation-runtime-client.ts"),
+      [
+        'const send = globalThis.fetch;',
+        'const endpoint = process.env["RUNTIME_ENDPOINT"];',
+        'export async function call() { return send(endpoint ?? "https://runtime.example.test"); }',
+        '',
+      ].join("\n"),
+    );
+    writeFileSync(
+      path.join(adapters, "feishu-api.ts"),
+      [
+        'import { request } from "node:https";',
+        'export function call() { return request("https://open.feishu.example.test"); }',
+        '',
+      ].join("\n"),
+    );
+    writeFileSync(
+      path.join(dir, "src", "config.ts"),
+      'export const endpoint = process.env["RUNTIME_ENDPOINT"];\n',
+    );
+    assert.deepEqual(findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir), dir), []);
+  });
+});
+
+test("application mkdir and filesystem outbox are explicit write owners, while the Vault index remains read-only", () => {
+  withTempDir((dir) => {
+    const adapters = path.join(dir, "src", "adapters");
+    mkdirSync(adapters, { recursive: true });
+    writeFileSync(
+      path.join(dir, "src", "application.ts"),
+      'import { mkdirSync } from "node:fs"; export const prepare = (dir: string) => mkdirSync(dir, { recursive: true });\n',
+    );
+    writeFileSync(
+      path.join(adapters, "filesystem-outbox.ts"),
+      'import { writeFileSync } from "node:fs"; export const publish = (file: string) => writeFileSync(file, "ok");\n',
+    );
+    writeFileSync(
+      path.join(adapters, "team-vault-index.ts"),
+      'import { readFileSync } from "node:fs"; export const read = (file: string) => readFileSync(file, "utf8");\n',
+    );
+    assert.deepEqual(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir), []);
   });
 });
 

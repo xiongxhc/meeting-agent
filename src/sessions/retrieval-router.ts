@@ -208,11 +208,16 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
         text,
       };
 
-      await sink.seedContext(context);
+      const contextExchanges = [{ user: queryText, assistant: context.text }];
+      await sink.seedConversationContext(contextExchanges, `meeting-agent:${invocation.segmentId}`);
       if (answerOptions.mayAuthorize !== undefined && !answerOptions.mayAuthorize()) {
         throw new RetrievalAuthorizationCancelled();
       }
-      await sink.authorizeVoiceResponse(invocation.segmentId);
+      await sink.authorizeVoiceResponse({
+        sessionId: sink.sessionId,
+        segmentId: invocation.segmentId,
+        contextExchanges,
+      });
 
       return context;
     },

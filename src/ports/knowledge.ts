@@ -7,7 +7,8 @@
 //
 // RuntimeContextSink is a narrow, EXPLICITLY-DERIVED slice of
 // ConversationRuntimePort (src/ports/conversation-runtime.ts) --
-// `Pick<ConversationRuntimePort, "seedContext" | "authorizeVoiceResponse">`,
+// `Pick<ConversationRuntimePort, "seedConversationContext" |
+// "authorizeVoiceResponse">`,
 // not a separately-declared type that merely happens to line up. The two
 // files import each other's types (this file's SeededContext; that file's
 // ConversationRuntimePort) -- both are type-only imports, erased at compile
@@ -139,5 +140,10 @@ export type SeededContext = {
  * independently-declared shape. */
 export type RuntimeContextSink = Pick<
   ConversationRuntimePort,
-  "seedContext" | "authorizeVoiceResponse"
->;
+  "seedConversationContext" | "authorizeVoiceResponse"
+> & {
+  /** The live SDK voice-session binding. Retrieval is created before join, so
+   * the session supplies this through a getter that fails closed until its
+   * injected test/local start handle is available. */
+  readonly sessionId: bigint;
+};
