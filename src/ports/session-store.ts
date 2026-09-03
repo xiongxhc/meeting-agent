@@ -114,9 +114,13 @@ export class OrchestrationError extends Error {
   }
 }
 
+/** occurrenceSegment is deliberately NOT a field here: the adapter derives it
+ * from occurrenceId itself (via occurrencePathSegment), so there is no way
+ * for a caller to persist a segment that doesn't correspond to its
+ * occurrence id -- removing the mismatch is strictly better than adding a
+ * test that catches it after the fact. */
 export type CreateSessionInput = {
   readonly occurrenceId: string;
-  readonly occurrenceSegment: string;
   readonly providerMeetingId: string;
   readonly occurrenceStartedAt: string;
   readonly nowMs: number;

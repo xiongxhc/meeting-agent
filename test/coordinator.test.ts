@@ -25,17 +25,25 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+// Raw better-sqlite3, used ONLY in the dedicated FK-enforcement test below to
+// open a second, low-level connection against the same database file and
+// prove the schema's FOREIGN KEY constraints themselves reject an orphan
+// row -- independent of any check the store's own API performs first. This
+// is a *.test.ts file, so test/lib/import-scanner.ts's SQLite gate (which
+// scans production code only) does not apply to it.
+import Database from "better-sqlite3";
+
 import { buildMeetingIdentity, type MeetingIdentity } from "../src/domain/meeting.ts";
 import { occurrencePathSegment } from "../src/domain/occurrence-id.ts";
 import {
   OrchestrationError,
-  openSessionStore,
   type LeaseRow,
   type SessionRow,
   type SessionState,
   type SessionStore,
   type TransitionRow,
-} from "../src/adapters/sqlite-session-store.ts";
+} from "../src/ports/session-store.ts";
+import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import {
   ALLOWED_TRANSITIONS,
   HAPPY_PATH_STATES,
@@ -54,6 +62,7 @@ const LEASE_TTL_MS = 30_000;
 // ---------------------------------------------------------------------------
 
 type Harness = {
+  readonly dbPath: string;
   open(nowMs?: number): SessionStore;
   cleanup(): void;
 };
@@ -62,6 +71,7 @@ function harness(): Harness {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-orchestration-"));
   const dbPath = path.join(dir, "orchestration.db");
   return {
+    dbPath,
     open(nowMs = BASE_MS) {
       return openSessionStore({ filename: dbPath, nowMs });
     },
@@ -100,6 +110,17 @@ function identity(seq: number, startedAt = "2026-09-02T14:00:00Z"): MeetingIdent
 
 function isOrchestrationError(code: string): (error: unknown) => boolean {
   return (error: unknown) => error instanceof OrchestrationError && error.code === code;
+}
+
+/** Composes the shape coordinator.activeBridgeLease() actually returns (the
+ * lease row plus a live-computed isExpired flag) from a plain LeaseRow
+ * returned by acquireBridgeLease/releaseBridgeLease, so assertions can stay
+ * readable instead of spelling out `{ ...lease, isExpired: ... }` everywhere. */
+function withExpiry<T extends { readonly expiresAtMs: number }>(
+  lease: T,
+  isExpired: boolean,
+): T & { isExpired: boolean } {
+  return { ...lease, isExpired };
 }
 
 /** Every durable row that belongs to one occurrence, in a comparable shape. */
@@ -165,6 +186,24 @@ test("the migration applies, reports schema version 1, and passes foreign_key_ch
   }
 });
 
+test("a missing migrations directory raises a clean invalid_configuration error, not a bare ENOENT stack trace", () => {
+  // This is exactly the failure mode DEFAULT_MIGRATIONS_DIR would hit if it
+  // ever resolved to a directory that doesn't exist (e.g. a built dist/
+  // tree with no migrations/ copied alongside it, before `npm run build`
+  // learned to copy that directory) -- see the "dist/ finds its migrations"
+  // demonstration in the task report for the positive case.
+  const h = harness();
+  try {
+    const missingDir = path.join(os.tmpdir(), "meeting-agent-no-such-migrations-dir-" + Date.now());
+    assert.throws(
+      () => openSessionStore({ filename: h.dbPath, migrationsDir: missingDir, nowMs: BASE_MS }),
+      isOrchestrationError("invalid_configuration"),
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("reopening an existing database does not re-apply the migration", () => {
   const h = harness();
   try {
@@ -172,7 +211,6 @@ test("reopening an existing database does not re-apply the migration", () => {
     const first = h.open(BASE_MS);
     const created = first.createSession({
       occurrenceId: id.occurrenceId,
-      occurrenceSegment: occurrencePathSegment(id.occurrenceId),
       providerMeetingId: id.providerMeetingId,
       occurrenceStartedAt: id.occurrenceStartedAt,
       nowMs: BASE_MS,
@@ -222,7 +260,6 @@ test("the control database is structurally incapable of holding transcript text 
       const id = identity(1);
       store.createSession({
         occurrenceId: id.occurrenceId,
-        occurrenceSegment: occurrencePathSegment(id.occurrenceId),
         providerMeetingId: id.providerMeetingId,
         occurrenceStartedAt: id.occurrenceStartedAt,
         nowMs: BASE_MS,
@@ -247,7 +284,16 @@ test("the control database is structurally incapable of holding transcript text 
   }
 });
 
-test("foreign keys are enforced, not decorative: a lease for an unknown occurrence is rejected", () => {
+// NOTE on the two tests below: the first proves the STORE's own existence
+// check (acquireLease looks up the session before ever preparing an INSERT)
+// -- it never reaches the schema's FOREIGN KEY constraint at all, and would
+// stay green even if every `REFERENCES sessions(occurrence_id)` clause were
+// deleted from migrations/001_orchestration.sql. The second is the actual
+// FK-enforcement proof: it opens a second, low-level connection to the same
+// file and inserts an orphan row directly, bypassing the store's API
+// entirely, so only the schema itself can catch it.
+
+test("acquireLease's own existence check rejects an unknown occurrence before any write is attempted", () => {
   const h = harness();
   try {
     const store = h.open();
@@ -266,6 +312,55 @@ test("foreign keys are enforced, not decorative: a lease for an unknown occurren
       assert.deepEqual(store.foreignKeyCheck(), []);
     } finally {
       store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the FOREIGN KEY constraints are actually enforced by SQLite -- an orphan row inserted directly, bypassing the store, is rejected", () => {
+  const h = harness();
+  try {
+    const store = h.open(); // applies the migration
+    store.close();
+
+    // A second, independent connection to the same file -- never goes
+    // through src/adapters/sqlite-session-store.ts's own checks at all.
+    const raw = new Database(h.dbPath);
+    raw.pragma("foreign_keys = ON");
+    try {
+      const isForeignKeyViolation = (error: unknown): boolean =>
+        error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_FOREIGNKEY";
+
+      // Every other column is filled with a schema-valid value on purpose,
+      // so the ONLY thing that can fail is the FK -- proving specifically
+      // that constraint fires, not some other CHECK.
+      assert.throws(
+        () =>
+          raw
+            .prepare(
+              `INSERT INTO transitions (occurrence_id, from_state, to_state, reason, terminal_reason, occurred_at_ms)
+               VALUES ('does-not-exist', NULL, 'discovered', NULL, NULL, 1)`,
+            )
+            .run(),
+        isForeignKeyViolation,
+        "an orphan transitions row must be rejected by the FOREIGN KEY constraint",
+      );
+
+      assert.throws(
+        () =>
+          raw
+            .prepare(
+              `INSERT INTO bridge_leases
+                 (lease_id, occurrence_id, bridge_id, bridge_session_id, acquired_at_ms, expires_at_ms)
+               VALUES ('orphan-lease', 'does-not-exist', 'fake-bridge', 'fake-bridge-session', 1, 2)`,
+            )
+            .run(),
+        isForeignKeyViolation,
+        "an orphan bridge_leases row must be rejected by the FOREIGN KEY constraint",
+      );
+    } finally {
+      raw.close();
     }
   } finally {
     h.cleanup();
@@ -395,54 +490,61 @@ test("every edge declared legal is actually accepted by the coordinator", () => 
   assert.ok(exercised >= 12, `expected the state machine to declare real edges, got ${exercised}`);
 });
 
-test("invalid transitions are rejected, and reject without touching state or the audit trail", () => {
-  const illegal: ReadonlyArray<readonly [SessionState, SessionState]> = [
-    ["discovered", "listening"],
-    ["discovered", "notified"],
-    ["joining", "discovered"],
-    ["listening", "joining"],
-    ["listening", "published"],
-    ["finalizing", "listening"],
-    ["awaiting_teammem", "finalizing"],
-    ["published", "listening"],
-    ["notified", "published"],
-    ["notified", "failed"],
-    ["failed", "joining"],
-    ["failed", "notified"],
-  ];
+test("every (from, to) pair NOT declared in ALLOWED_TRANSITIONS is rejected, leaving state and audit trail untouched", () => {
+  // Exhaustive, not hand-picked: every one of the 8x8 = 64 (from, to) pairs
+  // is exercised, skipping only the ~12 pairs the "every edge declared
+  // legal" test above already proves are ACCEPTED. This also fully covers
+  // TERMINAL_STATES behaviorally (every "to" is illegal from a terminal
+  // "from", since ALLOWED_TRANSITIONS[terminal] is empty) and every
+  // self-transition (e.g. "listening" -> "listening"), neither of which the
+  // previous hand-picked 12-pair list happened to include.
+  let exercised = 0;
+  for (const from of SESSION_STATES) {
+    for (const to of SESSION_STATES) {
+      if (ALLOWED_TRANSITIONS[from].includes(to)) continue; // legal edge, covered elsewhere
 
-  for (const [from, to] of illegal) {
-    const h = harness();
-    try {
-      const store = h.open();
-      const coordinator = coordinatorFor(store, fakeClock());
+      const h = harness();
       try {
-        const id = identity(1);
-        coordinator.discover(id);
-        if (from === "failed") {
-          coordinator.fail(id.occurrenceId, "bridge_failure");
-        } else {
-          driveTo(coordinator, id.occurrenceId, from);
+        const store = h.open();
+        const coordinator = coordinatorFor(store, fakeClock());
+        try {
+          const id = identity(1);
+          coordinator.discover(id);
+          if (from === "failed") {
+            coordinator.fail(id.occurrenceId, "bridge_failure");
+          } else {
+            driveTo(coordinator, id.occurrenceId, from);
+          }
+          const before = snapshot(store, id.occurrenceId);
+
+          assert.throws(
+            () => (to === "failed" ? coordinator.fail(id.occurrenceId, "bridge_failure") : coordinator.advance(id.occurrenceId, to)),
+            isOrchestrationError("illegal_transition"),
+            `${from} -> ${to} must be rejected`,
+          );
+
+          assert.deepEqual(snapshot(store, id.occurrenceId), before, `${from} -> ${to} must leave every row untouched`);
+          exercised += 1;
+        } finally {
+          store.close();
         }
-        const before = snapshot(store, id.occurrenceId);
-
-        assert.throws(
-          () => (to === "failed" ? coordinator.fail(id.occurrenceId, "bridge_failure") : coordinator.advance(id.occurrenceId, to)),
-          isOrchestrationError("illegal_transition"),
-          `${from} -> ${to} must be rejected`,
-        );
-
-        assert.deepEqual(snapshot(store, id.occurrenceId), before, `${from} -> ${to} must leave every row untouched`);
       } finally {
-        store.close();
+        h.cleanup();
       }
-    } finally {
-      h.cleanup();
     }
   }
+  // 64 total pairs minus the ~12 legal edges (exact count depends on
+  // ALLOWED_TRANSITIONS' own shape, asserted elsewhere) leaves roughly 52
+  // illegal pairs; this is a sanity floor, not a hand-picked list.
+  assert.ok(exercised >= 50, `expected roughly 52 illegal pairs to be exercised, got ${exercised}`);
 });
 
-test("terminal states accept no further transition at all", () => {
+test("TERMINAL_STATES agrees with ALLOWED_TRANSITIONS: both declare notified/failed as dead ends", () => {
+  // A fast, narrow data-consistency check between the module's own two
+  // constants. The actual RUNTIME behavior for every terminal-state
+  // transition attempt (not just a shape assertion over the constant) is
+  // proven by the exhaustive pairwise test above, which exercises every
+  // illegal (from, to) pair including every terminal "from".
   for (const terminal of TERMINAL_STATES) {
     assert.deepEqual(ALLOWED_TRANSITIONS[terminal], [], `${terminal} must be terminal in the declared table`);
   }
@@ -640,7 +742,7 @@ test("a bridge lease is unique per occurrence while it is live", () => {
       });
       assert.equal(lease.expiresAtMs, clock.now() + LEASE_TTL_MS);
       assert.equal(lease.releasedAtMs, null);
-      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), lease);
+      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), withExpiry(lease, false));
 
       clock.advance(LEASE_TTL_MS - 1);
       assert.throws(
@@ -651,7 +753,8 @@ test("a bridge lease is unique per occurrence while it is live", () => {
           }),
         isOrchestrationError("lease_held"),
       );
-      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), lease);
+      // Not yet expired (one ms of TTL remains): still reported live.
+      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), withExpiry(lease, false));
       assert.equal(store.listLeases(id.occurrenceId).length, 1);
     } finally {
       store.close();
@@ -684,7 +787,7 @@ test("a stale lease is recoverable once its bounded timeout has passed, using an
 
       assert.notEqual(recovered.leaseId, abandoned.leaseId);
       assert.equal(recovered.bridgeId, "fake-bridge-b");
-      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), recovered);
+      assert.deepEqual(coordinator.activeBridgeLease(id.occurrenceId), withExpiry(recovered, false));
 
       const all = store.listLeases(id.occurrenceId);
       assert.equal(all.length, 2);
@@ -783,7 +886,7 @@ test("leases survive a restart: an unexpired lease is still held, an expired one
     const after = h.open();
     const resumed = coordinatorFor(after, clock);
     try {
-      assert.deepEqual(resumed.activeBridgeLease(id.occurrenceId), lease);
+      assert.deepEqual(resumed.activeBridgeLease(id.occurrenceId), withExpiry(lease, false));
       assert.throws(
         () =>
           resumed.acquireBridgeLease(id.occurrenceId, {
@@ -871,9 +974,15 @@ test("occurrence A's entire lifecycle never reads or mutates occurrence B's rows
       assert.notDeepEqual(snapshot(store, a.occurrenceId), aBefore);
       assert.deepEqual(snapshot(store, b.occurrenceId), bBefore, "occurrence B's rows must be byte-identical after all of A's activity");
 
-      // B's lease is untouched even though A's clock has passed B's TTL: no
-      // cross-occurrence sweep exists.
-      assert.deepEqual(coordinator.activeBridgeLease(b.occurrenceId), bLease);
+      // B's ROW is untouched (isolation) -- but the shared clock genuinely
+      // has advanced past B's lease TTL while servicing all of A's activity,
+      // and activeBridgeLease() computes isExpired live against that clock
+      // rather than reading a stored value, so it correctly now reports
+      // isExpired: true. No cross-occurrence sweep exists: nothing released
+      // or mutated B's lease ROW -- store.listLeases(b.occurrenceId) below
+      // still shows the same single, unreleased row it always did.
+      assert.deepEqual(coordinator.activeBridgeLease(b.occurrenceId), withExpiry(bLease, true));
+      assert.deepEqual(store.listLeases(b.occurrenceId), bBefore.leases);
 
       // A's lease token is meaningless against B, and vice versa.
       const aActive = coordinator.activeBridgeLease(a.occurrenceId)!;

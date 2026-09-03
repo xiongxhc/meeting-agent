@@ -14,7 +14,6 @@
 // deterministic under test.
 
 import type { MeetingIdentity } from "../domain/meeting.ts";
-import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import {
   OrchestrationError,
   SESSION_STATE_VALUES,
@@ -102,6 +101,17 @@ export type BridgeLeaseRequest = {
   readonly bridgeSessionId: string;
 };
 
+/** A live (unreleased) lease row, plus whether it is CURRENTLY past its
+ * bounded timeout, computed from the coordinator's own injected clock. The
+ * stored row has no such column (expiry is a live judgement, not persisted
+ * state) -- exposing only `expiresAtMs` and leaving the caller to remember
+ * to compare it against "now" produced two different truths about liveness
+ * from one API: acquireBridgeLease() already treats an unreleased-but-past-
+ * TTL lease as recoverable, while activeBridgeLease() reported it as
+ * unqualified "active", which a caller answering "is a bridge attached?"
+ * would misread as true for a dead bridge. */
+export type ActiveBridgeLease = LeaseRow & { readonly isExpired: boolean };
+
 export type SessionCoordinator = {
   readonly maxConcurrentSessions: number;
 
@@ -143,11 +153,14 @@ export type SessionCoordinator = {
     reason: Exclude<LeaseReleaseReason, "stale_recovered">,
   ): LeaseRow;
 
-  /** The occurrence's current live (unreleased) lease, if any -- regardless
-   * of whether it has technically passed its TTL: a lease is only actually
-   * recovered by a subsequent acquireBridgeLease call, never swept in the
-   * background. */
-  activeBridgeLease(occurrenceId: string): LeaseRow | null;
+  /** The occurrence's current live (unreleased) lease, if any, WITH an
+   * `isExpired` flag computed against the coordinator's own clock right now.
+   * A lease is only actually recovered (released and replaced) by a
+   * subsequent acquireBridgeLease call, never swept in the background --
+   * `isExpired: true` here means "nobody has recovered it yet", not "it was
+   * released". Callers that need to know "is a bridge genuinely attached
+   * right now" must check `isExpired`, not merely non-null. */
+  activeBridgeLease(occurrenceId: string): ActiveBridgeLease | null;
 
   /** Runs `fn` while holding one of `maxConcurrentSessions` global slots,
    * queueing FIFO when none are free. The slot is released whether `fn`
@@ -188,9 +201,11 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     maxConcurrentSessions,
 
     discover(identity: MeetingIdentity): SessionRow {
+      // occurrenceSegment is not passed here: the store derives it from
+      // occurrenceId itself, so segment and occurrence id can never
+      // disagree (see CreateSessionInput's doc comment in the port).
       return store.createSession({
         occurrenceId: identity.occurrenceId,
-        occurrenceSegment: occurrencePathSegment(identity.occurrenceId),
         providerMeetingId: identity.providerMeetingId,
         occurrenceStartedAt: identity.occurrenceStartedAt,
         nowMs: clock.now(),
@@ -265,8 +280,10 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
       return store.releaseLease(occurrenceId, leaseId, reason, clock.now());
     },
 
-    activeBridgeLease(occurrenceId: string): LeaseRow | null {
-      return store.getActiveLease(occurrenceId);
+    activeBridgeLease(occurrenceId: string): ActiveBridgeLease | null {
+      const lease = store.getActiveLease(occurrenceId);
+      if (lease === null) return null;
+      return { ...lease, isExpired: lease.expiresAtMs <= clock.now() };
     },
 
     async withSession<T>(occurrenceId: string, fn: () => Promise<T>): Promise<T> {

@@ -16,7 +16,7 @@
     "test": "node --test \"spikes/**/*.test.ts\" \"bridges/**/*.test.ts\" \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').cpSync('migrations','dist/migrations',{recursive:true})\"",
     "start": "node dist/src/main.js"
   },
   "devDependencies": {

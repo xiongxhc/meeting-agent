@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
+import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
 import {
   OrchestrationError,
   type AcquireLeaseInput,
@@ -37,7 +38,13 @@ import {
   type TransitionRow,
 } from "../ports/session-store.ts";
 
-export * from "../ports/session-store.ts";
+// Deliberately NOT `export * from "../ports/session-store.ts"`: the port is
+// the canonical, sqlite-free surface every consumer (including tests) should
+// depend on. Re-exporting it here would let callers keep depending on this
+// adapter by name for types that have nothing to do with SQLite -- the exact
+// coupling the port split exists to remove. Import row/error types straight
+// from "../ports/session-store.ts"; import only `openSessionStore` and
+// `OpenSessionStoreOptions` (the adapter's own additions) from here.
 
 export type OpenSessionStoreOptions = {
   readonly filename: string;
@@ -115,7 +122,20 @@ function currentSchemaVersion(db: Database.Database): number {
 type MigrationFile = { readonly version: number; readonly name: string; readonly sql: string };
 
 function discoverMigrationFiles(migrationsDir: string): MigrationFile[] {
-  const entries = readdirSync(migrationsDir).filter((name) => name.endsWith(".sql"));
+  let entries: string[];
+  try {
+    entries = readdirSync(migrationsDir).filter((name) => name.endsWith(".sql"));
+  } catch (error) {
+    // A missing/unreadable migrations directory is a configuration error,
+    // not a bare fs stack trace -- the same failure mode as the
+    // badly-named-file case below, and the one a mis-resolved
+    // DEFAULT_MIGRATIONS_DIR (e.g. running from a built dist/ tree with no
+    // migrations/ copied alongside it) actually hits in practice.
+    throw new OrchestrationError(
+      "invalid_configuration",
+      `could not read migrations directory "${migrationsDir}": ${(error as Error).message}`,
+    );
+  }
   const files: MigrationFile[] = [];
   for (const name of entries) {
     const match = /^(\d+)_/.exec(name);
@@ -225,7 +245,27 @@ function getSession(db: Database.Database, occurrenceId: string): SessionRow | n
   return raw ? toSessionRow(raw) : null;
 }
 
+/** Derives the occurrence_segment column from occurrenceId itself, using the
+ * same occurrencePathSegment every other layer in the system uses, so
+ * segment and occurrence id can never disagree. Wraps
+ * occurrencePathSegment's own validation error (a malformed occurrenceId is
+ * not the kind of thing that should ever reach here, since
+ * buildMeetingIdentity validates it first, but the store's contract should
+ * not simply trust its caller) as OrchestrationError rather than letting a
+ * generic Error escape this module. */
+function deriveOccurrenceSegment(occurrenceId: string): string {
+  try {
+    return occurrencePathSegment(occurrenceId as OccurrenceId);
+  } catch (error) {
+    throw new OrchestrationError(
+      "invalid_configuration",
+      `occurrenceId "${occurrenceId}" is not a valid occurrence id: ${(error as Error).message}`,
+    );
+  }
+}
+
 function createSession(db: Database.Database, input: CreateSessionInput): SessionRow {
+  const occurrenceSegment = deriveOccurrenceSegment(input.occurrenceId);
   const run = db.transaction(() => {
     if (selectSessionRaw(db, input.occurrenceId) !== undefined) {
       throw new OrchestrationError(
@@ -241,7 +281,7 @@ function createSession(db: Database.Database, input: CreateSessionInput): Sessio
          VALUES (?, ?, ?, ?, 'discovered', NULL, ?, ?)`,
       ).run(
         input.occurrenceId,
-        input.occurrenceSegment,
+        occurrenceSegment,
         input.providerMeetingId,
         input.occurrenceStartedAt,
         input.nowMs,
@@ -407,9 +447,11 @@ function acquireLease(db: Database.Database, input: AcquireLeaseInput): LeaseRow
       }
       // Stale: unreleased but past its bounded timeout. Recover it rather
       // than leaving it dangling forever.
-      db.prepare(
-        `UPDATE bridge_leases SET released_at_ms = ?, release_reason = 'stale_recovered' WHERE lease_id = ?`,
-      ).run(input.nowMs, active.lease_id);
+      withConstraintTranslation(() => {
+        db.prepare(
+          `UPDATE bridge_leases SET released_at_ms = ?, release_reason = 'stale_recovered' WHERE lease_id = ?`,
+        ).run(input.nowMs, active.lease_id);
+      });
     }
 
     const leaseId = randomUUID();
