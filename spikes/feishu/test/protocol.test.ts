@@ -202,6 +202,22 @@ test("bridge every fixture message validates against the normative schema", () =
   }
 });
 
+test("bridge schema rejects a connect_media format the media bridge cannot parse", () => {
+  // The frozen bytes once carried "opus/48000/2", a three-part value
+  // `AudioFormat.parse` in bridges/mac/Sources/FeishuBridgeSpike/AudioBridge.swift
+  // refuses outright. The schema now encodes the four-part grammar, so the two
+  // cannot drift apart again without this test failing.
+  for (const unparseable of ["opus/48000/2", "pcm_s16le/48000/1/20", "pcm_s16le/48000/0/20ms", ""]) {
+    const command = { ...commandOfType("connect_media"), format: unparseable };
+    strictEqual(
+      validateCommand(command),
+      false,
+      `the schema must reject the format "${unparseable}"`,
+    );
+  }
+  strictEqual(validateCommand(commandOfType("connect_media")), true);
+});
+
 test("bridge fixture replays clean through the session validator", () => {
   const validator = createBridgeSessionValidator(fixture.sessionId);
   for (const command of fixture.commands) {

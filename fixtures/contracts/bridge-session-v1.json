@@ -18,7 +18,7 @@
       "type": "connect_media",
       "endpoint": "udp://127.0.0.1:40001",
       "sessionToken": "synthetic-media-token-not-a-secret",
-      "format": "opus/48000/2",
+      "format": "pcm_s16le/48000/1/20ms",
       "expiresAt": "2026-09-02T15:00:00Z"
     },
     {

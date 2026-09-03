@@ -13,25 +13,51 @@ final class BridgeContractTests: XCTestCase {
 
     /// The repo root, derived from this file's own path. Five levels up from
     /// `bridges/mac/Tests/FeishuBridgeSpikeTests/BridgeContractTests.swift`.
-    private static let repoRoot: URL = URL(fileURLWithPath: #filePath)
+    static let repoRoot: URL = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()  // FeishuBridgeSpikeTests
         .deletingLastPathComponent()  // Tests
         .deletingLastPathComponent()  // mac
         .deletingLastPathComponent()  // bridges
         .deletingLastPathComponent()  // repo root
 
-    private static let contractURL: URL =
+    static let contractURL: URL =
         repoRoot
         .appendingPathComponent("fixtures")
         .appendingPathComponent("contracts")
         .appendingPathComponent("bridge-session-v1.json")
 
+    static let schemaURL: URL =
+        repoRoot
+        .appendingPathComponent("protocols")
+        .appendingPathComponent("bridge-session-v1.schema.json")
+
     private func frozenBytes() throws -> Data {
         try Data(contentsOf: Self.contractURL)
     }
 
+    static func decodedTranscript() throws -> BridgeSessionTranscript {
+        try JSONDecoder().decode(
+            BridgeSessionTranscript.self, from: try Data(contentsOf: contractURL))
+    }
+
     private func decodedTranscript() throws -> BridgeSessionTranscript {
-        try JSONDecoder().decode(BridgeSessionTranscript.self, from: frozenBytes())
+        try Self.decodedTranscript()
+    }
+
+    /// The `format` value the frozen `connect_media` command actually carries.
+    /// Read from disk, never retyped here: a literal copy in a test is what let
+    /// the fixture and `AudioFormat.parse` disagree unnoticed in the first place.
+    static func frozenMediaFormat() throws -> String {
+        let formats = try decodedTranscript().commands.compactMap { message -> String? in
+            guard case .connectMedia(_, _, let format, _) = message.command else { return nil }
+            return format
+        }
+        guard formats.count == 1, let format = formats.first else {
+            throw BridgeContractError(
+                code: .missingField, path: "/commands",
+                detail: "expected exactly one connect_media command in the frozen fixture")
+        }
+        return format
     }
 
     func testFrozenContractFixtureExistsOnDisk() throws {
@@ -49,14 +75,18 @@ final class BridgeContractTests: XCTestCase {
             ["join", "connect_media", "post_disclosure", "leave", "release_lease"]
         )
         XCTAssertEqual(
-            Set(transcript.commands.map { $0.command.typeName }),
-            Set(BridgeCommand.allTypeNames),
-            "the fixture must exercise every declared command type"
+            transcript.commands.map { $0.command.typeName },
+            BridgeCommand.allTypeNames,
+            "the fixture must exercise every declared command type, in the canonical order"
         )
     }
 
     func testDecodesEveryEventTypeInTheContract() throws {
         let transcript = try decodedTranscript()
+        // Compared as sets on purpose: the fixture is ordered as a session
+        // actually unfolds and repeats `active_speaker` and `audio_gap`, so it
+        // is a coverage check. Canonical order is asserted against the schema
+        // file below, where it is an ordered claim.
         XCTAssertEqual(
             Set(transcript.events.map { $0.event.typeName }),
             Set(BridgeEvent.allTypeNames),
@@ -66,6 +96,45 @@ final class BridgeContractTests: XCTestCase {
             transcript.events.map(\.sequence),
             Array(1...14),
             "sequence numbers decode in order"
+        )
+    }
+
+    /// `BridgeCommand.allTypeNames` and `BridgeEvent.allTypeNames` both say
+    /// "declaration order is the contract's canonical order". That is a claim
+    /// about the normative schema, so it is checked against the schema's own
+    /// `oneOf` order, as an ordered comparison — a set comparison would let a
+    /// reorder through, which is exactly what the claim forbids.
+    func testDeclarationOrderMatchesTheNormativeSchemasOneOfOrder() throws {
+        func typeConsts(_ definition: String) throws -> [String] {
+            let root = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: try Data(contentsOf: Self.schemaURL))
+                    as? [String: Any])
+            let defs = try XCTUnwrap(root["$defs"] as? [String: Any])
+            let variants = try XCTUnwrap(
+                (defs[definition] as? [String: Any])?["oneOf"] as? [[String: Any]])
+            return try variants.map { variant in
+                let properties = try XCTUnwrap(variant["properties"] as? [String: Any])
+                let type = try XCTUnwrap(properties["type"] as? [String: Any])
+                return try XCTUnwrap(type["const"] as? String)
+            }
+        }
+
+        XCTAssertEqual(try typeConsts("command"), BridgeCommand.allTypeNames)
+        XCTAssertEqual(try typeConsts("event"), BridgeEvent.allTypeNames)
+    }
+
+    /// The frozen bytes must carry a media format the bridge can actually
+    /// negotiate. They once carried `opus/48000/2`, which `AudioFormat.parse`
+    /// refuses: feeding the canonical bytes to `AudioBridge.connect` returned
+    /// `media_format_unparseable`, and no test noticed because every media test
+    /// used its own literal. This one reads the fixture's own value.
+    func testTheFrozenMediaFormatIsOneTheBridgeCanParse() throws {
+        let wireValue = try Self.frozenMediaFormat()
+        XCTAssertEqual(
+            AudioFormat.parse(wireValue),
+            AudioFormat(
+                encoding: "pcm_s16le", sampleRate: 48000, channels: 1, frameMilliseconds: 20),
+            "the frozen connect_media format must parse: a contract value no code can read is not a contract"
         )
     }
 

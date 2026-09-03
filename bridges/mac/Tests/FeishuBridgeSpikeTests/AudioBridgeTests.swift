@@ -124,6 +124,19 @@ final class AudioBridgeTests: XCTestCase {
         XCTAssertTrue(harness.controlPlane.events.isEmpty)
     }
 
+    /// The format literal every other test in this file uses is a literal. This
+    /// one comes off disk, from the frozen contract's own `connect_media`
+    /// command, so the canonical bytes are proven to open a media session rather
+    /// than merely proven to decode.
+    func testTheFrozenContractsOwnFormatOpensTheMediaSession() throws {
+        let harness = makeHarness()
+
+        let outcome = connect(harness, format: try BridgeContractTests.frozenMediaFormat())
+
+        XCTAssertEqual(outcome, .connected(AudioBridgeTests.format))
+        XCTAssertEqual(harness.endpoint.openedFormat, AudioBridgeTests.format)
+    }
+
     func testAnExpiredSessionTokenIsRejectedBeforeTheEndpointIsOpened() {
         let harness = makeHarness()
 

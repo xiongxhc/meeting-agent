@@ -37,6 +37,11 @@
       "type": "integer",
       "minimum": 1
     },
+    "mediaFormat": {
+      "type": "string",
+      "description": "A PCM stream shape, in the four-part wire form <encoding>/<sampleRate>/<channels>/<frameMs>ms, e.g. pcm_s16le/48000/1/20ms. The pattern is here because the bridge parses this string: AudioFormat.parse in bridges/mac/Sources/FeishuBridgeSpike/AudioBridge.swift accepts exactly this grammar and refuses anything else rather than substituting a default, so a format the schema admits but the bridge cannot parse would be a session the coordinator could open and the bridge could only reject.",
+      "pattern": "^[^/]+/[1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*ms$"
+    },
     "command": {
       "description": "One coordinator-to-bridge command.",
       "oneOf": [
@@ -82,7 +87,7 @@
             "type": { "const": "connect_media" },
             "endpoint": { "$ref": "#/$defs/nonEmptyString" },
             "sessionToken": { "$ref": "#/$defs/nonEmptyString" },
-            "format": { "$ref": "#/$defs/nonEmptyString" },
+            "format": { "$ref": "#/$defs/mediaFormat" },
             "expiresAt": { "$ref": "#/$defs/utcTimestamp" }
           }
         },
