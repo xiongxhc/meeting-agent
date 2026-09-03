@@ -83,6 +83,21 @@
 // explicit request marker. See clauseIsRequest for the evidence and the
 // false negative it costs.
 //
+// R47 (round 7) narrows the interrogative branch once more. Round 6 already
+// required the clause to carry EVIDENCE OF ADDRESS before a question mark
+// could mean "request" -- a wh-word, a second-person pronoun or a request
+// marker, anywhere in it. A bare wh-word is not that evidence: English opens
+// a rhetorical or exclamatory fragment ABOUT something with the same words
+// ("what garbage", "how awful", "why bother", "who cares"), and a
+// transcriber who punctuates one of those with a question mark had the agent
+// speaking into a conversation it was not part of. A wh-word now counts only
+// when an AUXILIARY OR MODAL immediately follows it -- the subject-auxiliary
+// inversion (or copula) that makes a genuine wh-question and that a
+// rhetorical fragment has nowhere to put. Closed grammatical class, not
+// another idiom list. See AUXILIARIES / AUXILIARY_CLITICS, and the false
+// negative it costs ("who broke it?", "what happened?" -- subject
+// wh-questions carry no auxiliary at all).
+//
 // The separator requirement (R41) and the anti-cue list stay as OUTER
 // guards around the request test, and both still carry weight:
 //   - The separator is what rejects "Please don't blame Meetbot." -- a
@@ -424,7 +439,10 @@ const DEFAULT_REQUEST_MARKERS: readonly string[] = [
  * lexicon R43 deleted: the cue list asked which word OPENS the clause (an
  * exclamative opens the same way a question does), while this asks whether
  * the clause contains, anywhere, a word that can only be doing deictic or
- * interrogative work. */
+ * interrogative work.
+ *
+ * R47 (round 7) narrows the wh half only: a wh-word evidences address ONLY
+ * when an auxiliary or modal immediately follows it. See AUXILIARIES. */
 const WH_WORDS: readonly string[] = [
   "what",
   "when",
@@ -441,6 +459,56 @@ const WH_WORDS: readonly string[] = [
  * addresses somebody. "yourselves" is the one entry beyond the four the
  * ruling named -- same closed class, same job. */
 const SECOND_PERSON: readonly string[] = ["you", "your", "yours", "yourself", "yourselves"];
+
+/** R47 (round 7): the closed set of auxiliaries and modals that must
+ * IMMEDIATELY follow a wh-word before it counts as evidence of address.
+ *
+ * Round 6 accepted a wh-word anywhere in an interrogative clause. It is not
+ * evidence on its own: English uses the same wh-words to open a rhetorical
+ * or exclamatory fragment ABOUT something -- "what garbage", "how awful",
+ * "why bother", "who cares" -- and a transcriber who punctuates one of
+ * those with a question mark had the agent speaking into a conversation it
+ * was not part of. Every one of those authorized before this rule.
+ *
+ * The discriminator is grammar, not another idiom list: a genuine wh-
+ * question inverts the subject and the auxiliary ("what DID we decide") or
+ * uses the copula ("what IS it"), so an auxiliary sits immediately after
+ * the wh-word. A rhetorical fragment is wh + noun or wh + bare verb and has
+ * nowhere for one to go. This list is exactly the ruling's, unextended. */
+const AUXILIARIES: readonly string[] = [
+  "do",
+  "does",
+  "did",
+  "is",
+  "are",
+  "was",
+  "were",
+  "am",
+  "can",
+  "could",
+  "will",
+  "would",
+  "shall",
+  "should",
+  "have",
+  "has",
+  "had",
+  "may",
+  "might",
+  "must",
+];
+
+/** The contracted forms of the same auxiliaries, as they survive the
+ * apostrophe split: "what's" -> what + s (is/has), "who're" -> who + re
+ * (are), "what'll" -> what + ll (will), "what'd" -> what + d (had/would),
+ * "what've" -> what + ve (have).
+ *
+ * These are not an extension of the ruling's list, they ARE that list: the
+ * clitic is the auxiliary, merely written joined. Without them "Meetbot:
+ * what's the plan?" and "Meetbot, who's next?" -- two genuine questions the
+ * suite already pinned -- would have become collateral of R47. As closed a
+ * class as the auxiliaries themselves. */
+const AUXILIARY_CLITICS: readonly string[] = ["s", "re", "ll", "d", "ve"];
 
 /** Short address/greeting fillers that may precede a leading vocative
  * ("Hey Meetbot, ...") without defeating the start-boundary check. Only
@@ -565,26 +633,61 @@ function clauseStartsWithPhrase(clause: string, phrase: string): boolean {
   return clause === phrase || clause.startsWith(`${phrase} `);
 }
 
-/** Every whitespace-delimited token of `clause`, stripped of leading and
- * trailing non-alphanumerics, and split at any internal apostrophe so a
- * contraction contributes its stem ("what's" -> "what", "you're" -> "you").
- * Empty pieces are dropped. */
-function clauseTokens(clause: string): string[] {
+/** The whitespace-delimited WORDS of `clause`, each split at any internal
+ * apostrophe into its pieces and stripped of leading and trailing non-
+ * alphanumerics: "what's" -> ["what", "s"], "plan?" -> ["plan"]. Empty
+ * pieces and empty words are dropped.
+ *
+ * Word structure is preserved (rather than flattened straight to a token
+ * list) because R47 asks what immediately FOLLOWS a wh-word, and because a
+ * contraction's second piece is a clitic auxiliary attached to the first
+ * piece, not a free-standing word of its own. */
+function clauseWords(clause: string): string[][] {
   return clause
     .split(/\s+/u)
-    .flatMap((token) => token.split(/['\u2019]/u))
-    .map((piece) => piece.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
-    .filter((piece) => piece !== "");
+    .map((token) =>
+      token
+        .split(/['\u2019]/u)
+        .map((piece) => piece.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+        .filter((piece) => piece !== ""),
+    )
+    .filter((word) => word.length > 0);
 }
 
-/** True when `clause` contains, anywhere, a wh-word, a second-person
- * pronoun, or a request marker -- the conjunct the interrogative branch of
- * the request test requires. See WH_WORDS / SECOND_PERSON. */
+/** True when `clause` carries evidence that somebody was addressed -- the
+ * conjunct the interrogative branch of the request test requires:
+ *
+ *   - a second-person pronoun or a request marker, anywhere (unchanged);
+ *   - a wh-word IMMEDIATELY followed by an auxiliary or modal, either as
+ *     the next word or as its own contracted clitic (R47).
+ *
+ * See WH_WORDS / SECOND_PERSON / AUXILIARIES / AUXILIARY_CLITICS. */
 function clauseCarriesAddressEvidence(clause: string, requestMarkers: readonly string[]): boolean {
-  return clauseTokens(clause).some(
-    (token) =>
-      WH_WORDS.includes(token) || SECOND_PERSON.includes(token) || requestMarkers.includes(token),
-  );
+  const words = clauseWords(clause);
+
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    if (word === undefined) continue;
+
+    for (const piece of word) {
+      if (SECOND_PERSON.includes(piece) || requestMarkers.includes(piece)) return true;
+    }
+
+    const stem = word[0];
+    if (stem === undefined || !WH_WORDS.includes(stem)) continue;
+
+    // "what's" / "who're" / "what'll": the auxiliary is the clitic itself.
+    const clitic = word[1];
+    if (clitic !== undefined && AUXILIARY_CLITICS.includes(clitic)) return true;
+
+    // "what did" / "how should": the auxiliary is the very next word. Not a
+    // later one -- "who cares, is anyone reading these" must not have
+    // "cares" rescued by an "is" in a different clause.
+    const nextStem = words[i + 1]?.[0];
+    if (nextStem !== undefined && AUXILIARIES.includes(nextStem)) return true;
+  }
+
+  return false;
 }
 
 /** The first whitespace-delimited token of `clause`, stripped of leading and

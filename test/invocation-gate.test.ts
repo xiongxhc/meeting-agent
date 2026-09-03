@@ -15,6 +15,13 @@
 // counter-examples. The separator requirement (R41) and the anti-cue list
 // survive as outer guards -- see the tests named for each.
 //
+// ROUND 7 (R47) narrows the interrogative branch's evidence conjunct: a
+// wh-word counts only when an auxiliary or modal immediately follows it, so
+// "Meetbot, what garbage?" and "Meetbot, who cares?" no longer authorize.
+// Second-person pronouns and request markers are untouched. R48 -- a Chinese
+// request marker used as an ordinary character prefix -- is PARKED, and its
+// known instances are pinned below as the gap, not as required behaviour.
+//
 // Rounds 2-4 (still pinned below): the matcher must not fire inside
 // hyphenated names/identifiers ("Mei-Ling", "Meetbot-api", "eng-meetbot")
 // or possessives ("Mei's"), must not treat an appositive or agenda label
@@ -412,7 +419,7 @@ test("a different wh-word contraction opens a question and authorizes", () => {
 });
 
 test("KNOWN LIMITATION (R43 conjunct): an ASR misspelling that destroys the wh-word does not authorize", () => {
-  // "what's" contributes the stem "what" (clauseTokens splits at the
+  // "what's" contributes the stem "what" (clauseWords splits at the
   // apostrophe), but "whats" is a token of its own and matches no wh-word,
   // so the clause carries no evidence of address and the question mark
   // alone is not enough. Documented false negative -- the same
@@ -524,8 +531,18 @@ test("ROUND 4: the anti-cue phrase must be a whole phrase, not a bare string pre
   // "what another day" is NOT the anti-cue idiom "what a" -- "another" is
   // a different, real word. clauseStartsWithPhrase requires a word
   // boundary after the phrase, not merely a character-level prefix match.
-  // ("what" is still a recognized cue, so this authorizes.)
-  assertPositive(decide(segment("Meetbot, what another day looks like?"), IDENTITY), "Meetbot");
+  //
+  // R47 changed the carrier sentence, not the property. Round 4's fixture
+  // ("Meetbot, what another day looks like?") authorized on the bare
+  // wh-word, which R47 no longer accepts, so it would now pass for the
+  // wrong reason. This phrasing carries "you" instead. The anti-cue check
+  // runs BEFORE any evidence test and returns negative unconditionally when
+  // it matches, so a positive here still proves "what a" did not match
+  // "what another" -- which is the whole point of the test.
+  assertPositive(
+    decide(segment("Meetbot, what another day looks like to you?"), IDENTITY),
+    "Meetbot",
+  );
 });
 
 test("additionalAntiCues extends (not replaces) the default anti-cue lexicon", () => {
@@ -712,7 +729,11 @@ test("ROUND 6 conjunct: the one-word difference that decides the pair", () => {
 });
 
 test("ROUND 6 conjunct: a wh-word anywhere in the clause is enough, not only at its start", () => {
-  assertPositive(decide(segment("Meetbot, remind me what we decided?"), IDENTITY), "Meetbot");
+  // R47 changed the carrier sentence, not the property: the wh-word still
+  // counts wherever it sits in the clause, it just has to be followed by an
+  // auxiliary now. Round 6's fixture was "remind me what we decided?", where
+  // "we" follows the wh-word.
+  assertPositive(decide(segment("Meetbot, remind me what was decided?"), IDENTITY), "Meetbot");
 });
 
 test("ROUND 6 conjunct: a second-person pronoun anywhere in the clause is enough", () => {
@@ -762,11 +783,122 @@ test("KNOWN LIMITATION (R43 conjunct): a bare-adjective question does not author
   assertNegative(decide(segment("Meetbot, anything?"), IDENTITY), "incidental_mention");
 });
 
-test("ROUND 6 conjunct: the residual ambiguity the ruling explicitly accepts", () => {
-  // Both authorize on their wh-word and both are plausibly addressed to
-  // the agent. Pinned so a later round does not "fix" them by accident.
-  assertPositive(decide(segment("Meetbot, what is it?"), IDENTITY), "Meetbot");
-  assertPositive(decide(segment("Meetbot, who broke it?"), IDENTITY), "Meetbot");
+// ---------------------------------------------------------------------------
+// ROUND 7 (R47): a wh-word evidences address only when an AUXILIARY or MODAL
+// immediately follows it.
+//
+// Round 6 accepted a wh-word anywhere in an interrogative clause as evidence
+// that somebody was addressed. It is not: English uses the same wh-words to
+// open a rhetorical or exclamatory fragment ABOUT something -- "what
+// garbage", "how awful", "why bother", "who cares" -- and a transcriber who
+// writes any of those with a question mark had the agent speaking into a
+// conversation it was not part of. The discriminator is not another idiom
+// list: a genuine wh-question inverts the subject and the auxiliary, or uses
+// the copula, so the wh-word is immediately followed by one of a closed set
+// of auxiliaries and modals. A rhetorical fragment is wh + noun or wh + bare
+// verb, and has nowhere for an auxiliary to sit.
+//
+// A contracted auxiliary counts, because it IS the auxiliary: "what's" is
+// "what is" and "who's" is "who is". The clitic set ('s 're 'll 'd 've) is as
+// closed as the auxiliary list itself.
+//
+// Second-person pronouns and request markers are untouched -- they are
+// evidence of address on their own, wherever they sit.
+// ---------------------------------------------------------------------------
+
+const R47_FALSE_POSITIVES: readonly string[] = [
+  "Meetbot, what garbage?",
+  "Meetbot, how awful?",
+  "Meetbot, why bother?",
+  "Meetbot, who cares?",
+  "What garbage, Meetbot?",
+  "Meetbot, what nonsense?",
+  "How typical, Meetbot?",
+  "Meetbot, why me?",
+];
+
+for (const text of R47_FALSE_POSITIVES) {
+  test(`R47: "${text}" does not authorize -- a wh-word with no auxiliary after it is not an address`, () => {
+    assertNegative(decide(segment(text), IDENTITY), "incidental_mention");
+  });
+}
+
+test("R47: the auxiliary must IMMEDIATELY follow the wh-word, not merely appear later", () => {
+  // "who cares" carries "cares", not an auxiliary; the later "is" belongs to
+  // a different clause and must not rescue it.
+  assertNegative(decide(segment("Meetbot, who cares, is anyone even reading these?"), IDENTITY), "incidental_mention");
+});
+
+test("R47: a genuine wh-question, with the auxiliary in place, still authorizes", () => {
+  for (const text of [
+    "Meetbot, what did we decide?",
+    "Meetbot, what is it?",
+    "Meetbot, when does the review start?",
+    "Meetbot, where was that recorded?",
+    "Meetbot, how should we split this?",
+    "Meetbot, why are we blocked?",
+    "Meetbot, which is the latest draft?",
+  ]) {
+    assertPositive(decide(segment(text), IDENTITY), "Meetbot");
+  }
+});
+
+test("R47: a contracted auxiliary counts, because it IS the auxiliary", () => {
+  // "what's" -> "what is"; "who's" -> "who is". Without the clitic set these
+  // two genuine questions would become collateral of R47.
+  assertPositive(decide(segment("Meetbot: what's the plan?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, who's next?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, what'll it take?"), IDENTITY), "Meetbot");
+});
+
+test("R47: the second-person and request-marker branches are untouched", () => {
+  // No wh-word at all in the first two; a wh-word with no auxiliary in the
+  // third, rescued by "you" rather than by the wh branch.
+  assertPositive(decide(segment("Meetbot, are you broken?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, please close the ticket."), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, what garbage is in your queue?"), IDENTITY), "Meetbot");
+});
+
+test("KNOWN LIMITATION (R47): a wh-question with no auxiliary does not authorize", () => {
+  // The price of the closed-class rule. "who broke it?" is a genuine
+  // question a person might put to the agent, and English subject
+  // wh-questions carry no auxiliary at all ("who broke it", "what happened")
+  // -- structurally identical to "who cares?" and "what garbage?", which
+  // must stay negative. Round 6 pinned "Meetbot, who broke it?" as a
+  // POSITIVE and as "residual ambiguity the ruling explicitly accepts"; R47
+  // resolves that ambiguity in the direction the standing ruling requires,
+  // so this test now pins the correction rather than the earlier claim.
+  // Documented false negative: a person repeating themselves is the correct
+  // way to fail, and a deployment recovers either phrasing with
+  // additionalRequestMarkers.
+  assertNegative(decide(segment("Meetbot, who broke it?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, what happened?"), IDENTITY), "incidental_mention");
+});
+
+test("KNOWN LIMITATION (R47): an exclamative written with a question mark is now negative twice over", () => {
+  // "what a nightmare?" was already caught by the anti-cue phrase "what a".
+  // Under R47 it is independently negative -- "a" is not an auxiliary -- so
+  // the anti-cue list is no longer the only thing standing between an
+  // over-eager ASR punctuator and unprompted speech.
+  assertNegative(decide(segment("Meetbot, what a nightmare?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, what a mess?"), IDENTITY), "incidental_mention");
+});
+
+test("KNOWN LIMITATION (R48, parked): a Chinese request marker used as an ordinary prefix still authorizes", () => {
+  // The Chinese path requires a request marker as a RAW STRING PREFIX,
+  // because Chinese has no whitespace to tokenize on. That makes a clause
+  // whose first characters merely coincide with a marker indistinguishable
+  // from one that opens with it: "请假条" ("leave-of-absence form") begins
+  // with "请" ("please"), and "帮我们省了不少事" ("saved us a lot of trouble")
+  // begins with "帮我" ("help me"). Both are remarks, not requests, and both
+  // authorize today.
+  //
+  // Parked as R48, not fixed: separating them needs word segmentation, which
+  // this plan forbids. Pinned as the gap's known instances so the next round
+  // that touches the Han carve-out sees exactly what it has to beat, and so
+  // a later "fix" that quietly changes this behaviour has to say so.
+  assertPositive(decide(segment("会议机器人，请假条怎么写", true), CJK_IDENTITY), "会议机器人");
+  assertPositive(decide(segment("会议机器人，帮我们省了不少事", true), CJK_IDENTITY), "会议机器人");
 });
 
 test("KNOWN LIMITATION (R43): an imperative with no question mark and no request marker does not authorize", () => {
