@@ -54,6 +54,7 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { createRuntimeInvocationSink } from "../src/adapters/conversation-runtime-client.ts";
 import { buildMeetingIdentity, type MeetingIdentity } from "../src/domain/meeting.ts";
 import { createCoordinator, type SessionCoordinator } from "../src/sessions/coordinator.ts";
+import { collectImports } from "./lib/import-scanner.ts";
 import type { SessionStore } from "../src/ports/session-store.ts";
 import { createMeetingSession, type MeetingSession } from "../src/sessions/meeting-session.ts";
 import { fakeBridge, fakeClock, fakeRuntime, type FakeBridge, type FakeRuntime } from "./lib/session-fakes.ts";
@@ -386,17 +387,81 @@ test("a disclosure the transport could not even send never blocks joining", asyn
   }
 });
 
-test("the disclosure publisher's module cannot reach the runtime at all", () => {
+/** Every module reachable from `entry` by following relative import
+ * specifiers, plus every non-relative specifier any of them names. Built from
+ * the AST-based scanner test/boundaries.test.ts already uses, so it sees
+ * import/export-from/import=/literal dynamic import alike.
+ *
+ * Review round 1: the earlier version of the test below text-scanned
+ * src/ports/bridge.ts alone, so an INDIRECT import of the runtime port would
+ * have passed it. */
+function reachableFrom(entry: string): { files: Set<string>; external: Set<string> } {
+  const bySource = new Map<string, string[]>();
+  for (const { file, specifier } of collectImports(path.join(import.meta.dirname, "..", "src"))) {
+    const list = bySource.get(file) ?? [];
+    list.push(specifier);
+    bySource.set(file, list);
+  }
+
+  const files = new Set<string>();
+  const external = new Set<string>();
+  const stack = [entry];
+  while (stack.length > 0) {
+    const file = stack.pop();
+    if (file === undefined || files.has(file)) continue;
+    files.add(file);
+    for (const specifier of bySource.get(file) ?? []) {
+      if (specifier.startsWith(".")) {
+        stack.push(path.resolve(path.dirname(file), specifier));
+      } else {
+        external.add(specifier);
+      }
+    }
+  }
+  return { files, external };
+}
+
+test("the disclosure publisher's module cannot reach the runtime, even indirectly", () => {
   // Structural, not stylistic: createDisclosurePublisher is handed ONE
-  // capability (issue a BridgeCommand), and src/ports/bridge.ts imports
-  // nothing from the runtime port, so there is no branch of the disclosure
-  // path from which a spoken disclosure could be synthesized.
-  const source = readFileSync(
-    path.join(import.meta.dirname, "..", "src", "ports", "bridge.ts"),
-    "utf8",
+  // capability (issue a BridgeCommand), and the runtime is not in scope for
+  // any branch of the disclosure path to call.
+  //
+  // Asserted over the TRANSITIVE import set, not one file's text, so adding
+  // the runtime port two hops away fails this too.
+  const entry = path.join(import.meta.dirname, "..", "src", "ports", "bridge.ts");
+  const { files, external } = reachableFrom(entry);
+
+  assert.ok(files.size >= 2, "the entry must actually resolve its own imports");
+  for (const file of files) {
+    assert.equal(
+      file.includes("conversation-runtime"),
+      false,
+      `${file} is reachable from src/ports/bridge.ts`,
+    );
+    const source = readFileSync(file, "utf8");
+    assert.equal(
+      /\bprocessText\b|\bauthorizeVoiceResponse\b/.test(source),
+      false,
+      `${file} names a runtime speech method and is reachable from the disclosure path`,
+    );
+  }
+  for (const specifier of external) {
+    assert.equal(specifier.includes("conversation"), false, `external import ${specifier}`);
+  }
+});
+
+test("the transitive reachability check has teeth", () => {
+  // Negative control for the test above: the same walk from the meeting
+  // session -- which legitimately DOES depend on the runtime port -- must find
+  // it. Without this, `reachableFrom` returning an empty set would make the
+  // real assertion vacuous.
+  const { files } = reachableFrom(
+    path.join(import.meta.dirname, "..", "src", "sessions", "meeting-session.ts"),
   );
-  assert.equal(source.includes("conversation-runtime"), false);
-  assert.equal(/\bprocessText\b|\bauthorizeVoiceResponse\b/.test(source), false);
+  assert.ok(
+    [...files].some((file) => file.includes("conversation-runtime")),
+    "the walk must actually follow imports",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1220,31 @@ test("a runtime whose gap accounting disagrees with the bridge is reconciled aga
   }
 });
 
+test("a runtime that still disagrees after reconciling is left marked unreconciled", async () => {
+  // Review round 1. `unreconciled` is the state the report calls "the case
+  // that must never pass silently", and it had no test at all, because the
+  // fake's reconcileRecording always echoed the gaps it was handed.
+  const h = harness({ runtime: fakeRuntime({ finalizedGaps: [], reconciledGaps: [] }) });
+  try {
+    await joined(h);
+    for (const gap of GAPS) h.bridge.emit(h.bridge.event({ type: "audio_gap", ...gap }));
+    await h.session.settled();
+
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    assert.deepEqual(h.runtime.callsOf("reconcileRecording"), [
+      { method: "reconcileRecording", gaps: GAPS },
+    ]);
+    assert.equal(h.session.state().gapReconciliation, "unreconciled");
+    // The recording is still stored -- losing it would be worse -- but the
+    // disagreement is on the record rather than averaged away.
+    assert.deepEqual(h.session.state().recording?.gaps, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("finalizeRecording runs exactly once, however many terminal signals arrive", async () => {
   const h = harness();
   try {
@@ -1411,7 +1501,335 @@ test("a left before the session ever listened still ends it and fails the coordi
   }
 });
 
-test("a finalization failure is recorded and never escapes the pump", async () => {
+test("a finalization failure is recorded, distinguishable, and leaks no subscription", async () => {
+  // Review round 1, Important 1. The original code put unsubscribe() after
+  // `await finalizeRecording()`, so a throw skipped it: both planes stayed
+  // subscribed to a session that had already declared itself terminal, and
+  // the only trace was one generic routing error. The earlier version of this
+  // test asserted phase, recording and routing errors and never the
+  // subscriber counts, which is exactly why it passed.
+  const runtime = fakeRuntime();
+  const boom = new Error("synthetic finalization failure");
+  runtime.finalizeRecording = async () => {
+    throw boom;
+  };
+  const h = harness({ runtime });
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    assert.equal(h.session.state().phase, "ended");
+    assert.equal(h.bridge.subscriberCount(), 0, "a failed finalization must not leak the bridge subscription");
+    assert.equal(h.runtime.subscriberCount(), 0, "a failed finalization must not leak the runtime subscription");
+
+    // "no recording" and "finalization failed" are different facts and must
+    // not be told apart only by a generic routing error.
+    assert.equal(h.session.state().recording, null);
+    assert.equal(h.session.state().finalizationError, boom);
+    assert.deepEqual(h.session.state().routingErrors, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a session that ends cleanly has no finalizationError", async () => {
+  const h = harness();
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+    assert.equal(h.session.state().finalizationError, null);
+    assert.ok(h.session.state().recording !== null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. A failed join leaves nothing stranded
+//
+// Review round 1, Important 2. Only the connect_media contract rejection had
+// cleanup. Everything else that can throw after the lease is taken -- the
+// runtime refusing to start, either bridge send failing -- left the lease
+// live, both planes subscribed, and the coordinator row in "joining" with no
+// terminal reason. Nothing sweeps that: the coordinator recovers a stale
+// lease only inside a subsequent acquireBridgeLease for the SAME occurrence,
+// which for a join that failed will never come. The occurrence is stranded
+// permanently.
+// ---------------------------------------------------------------------------
+
+const JOIN_FAILURES: ReadonlyArray<{
+  readonly label: string;
+  readonly build: () => { runtime?: FakeRuntime; failSend?: string };
+}> = [
+  {
+    label: "the runtime refuses to start a voice session",
+    build: () => ({ runtime: fakeRuntime({ startVoiceSessionError: new Error("synthetic runtime outage") }) }),
+  },
+  { label: "the join command cannot be sent", build: () => ({ failSend: "join" }) },
+  { label: "the connect_media command cannot be sent", build: () => ({ failSend: "connect_media" }) },
+];
+
+for (const { label, build } of JOIN_FAILURES) {
+  test(`a failed join (${label}) strands neither the lease, the subscriptions nor the coordinator`, async () => {
+    const built = build();
+    const h = harness(built.runtime === undefined ? {} : { runtime: built.runtime });
+    try {
+      if (built.failSend !== undefined) {
+        h.bridge.failSendOfType(built.failSend, new Error("synthetic transport failure"));
+      }
+      await assert.rejects(() => h.session.join());
+
+      assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null, "the lease must be released");
+      assert.equal(h.bridge.subscriberCount(), 0);
+      assert.equal(h.runtime.subscriberCount(), 0);
+      assert.equal(h.session.state().phase, "ended");
+      assert.equal(h.session.state().terminalReason, "join_failed");
+      assert.equal(h.session.state().speaking, "aborted");
+
+      const row = h.coordinator.get(IDENTITY.occurrenceId);
+      assert.equal(row?.state, "failed");
+      assert.equal(row?.terminalReason, "join_failed");
+
+      // And it is terminal, not merely "already joined": a retry means a new
+      // session against a new lease, which is the coordinator's business.
+      await assert.rejects(() => h.session.join(), /terminal/i);
+    } finally {
+      h.cleanup();
+    }
+  });
+}
+
+test("the connect_media contract rejection keeps its own, more specific terminal reason", async () => {
+  const h = harness({
+    runtime: fakeRuntime({ handle: { media: {
+      endpoint: "udp://127.0.0.1:40001",
+      sessionToken: "synthetic-media-token-not-a-secret",
+      format: "opus/48000/2",
+      expiresAt: "2026-09-02T15:00:00Z",
+    } } }),
+  });
+  try {
+    await assert.rejects(() => h.session.join(), /media_format/);
+    assert.equal(h.session.state().terminalReason, "media_format_rejected");
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.terminalReason, "media_format_rejected");
+    assert.equal(h.bridge.subscriberCount(), 0);
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a disclosure that cannot be sent is NOT a failed join and strands nothing", async () => {
+  // The one post-lease failure that must not trigger the cleanup: failing to
+  // disclose never blocks joining.
+  const h = harness();
+  try {
+    h.bridge.failSendOfType("post_disclosure", new Error("synthetic transport failure"));
+    await h.session.join();
+
+    assert.equal(h.session.state().disclosure, "failed");
+    assert.equal(h.session.state().terminalReason, null);
+    assert.equal(h.bridge.subscriberCount(), 1);
+    assert.ok(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId) !== null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 14. Overflow must never drop the terminal `left`
+//
+// Review round 1, Important 3. Dropping the newest arrival costs one event for
+// every other type. For `left` it costs the session: no finalizeRecording, no
+// lease release, and the coordinator row stuck in "listening" forever.
+// ---------------------------------------------------------------------------
+
+test("a terminal left is admitted over the queue bound, never dropped", async () => {
+  const h = harness({ maxQueuedEvents: 4 });
+  try {
+    await joined(h);
+
+    // Fill past the bound so ordinary events are being dropped, THEN deliver
+    // the `left` into a full queue.
+    for (let i = 0; i < 8; i += 1) {
+      h.bridge.emit(
+        h.bridge.event({
+          type: "audio_gap",
+          direction: "capture",
+          startedAt: "2026-09-02T14:10:00Z",
+          endedAt: null,
+        }),
+      );
+    }
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    assert.ok(
+      h.session.state().overflows.some((o) => o.disposition === "dropped"),
+      "the ordinary events really were over the bound",
+    );
+    assert.equal(h.session.state().phase, "ended");
+    assert.equal(h.session.state().terminalReason, "ended");
+    assert.ok(h.session.state().recording !== null, "the recording must still be finalized");
+    assert.equal(h.coordinator.activeBridgeLease(IDENTITY.occurrenceId), null);
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
+
+    // The admission is still recorded -- the queue WAS over its bound, and a
+    // reader must be able to see that.
+    const admitted = h.session.state().overflows.filter((o) => o.disposition === "admitted");
+    assert.equal(admitted.length, 1);
+    assert.equal(admitted[0]?.source, "bridge");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("only a genuine terminal left is admitted over the bound", async () => {
+  const h = harness({ maxQueuedEvents: 4 });
+  try {
+    await joined(h);
+    for (let i = 0; i < 8; i += 1) {
+      h.bridge.emit(h.bridge.event({ type: "media_connected", endpoint: "udp://127.0.0.1:40001" }));
+    }
+    // A `left` for a DIFFERENT session, and a non-left, both over the bound.
+    h.bridge.emit({ ...h.bridge.event({ type: "left", reason: "ended" }), sessionId: "sess_other" });
+    h.bridge.emit(h.bridge.event({ type: "media_disconnected", reason: "peer_reset" }));
+    await h.session.settled();
+
+    assert.deepEqual(
+      h.session.state().overflows.filter((o) => o.disposition === "admitted"),
+      [],
+      "nothing but this session's own left may bypass the bound",
+    );
+    assert.equal(h.session.state().phase, "listening");
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15. The finalized recording is DURABLE
+//
+// Review round 1, Important 4. Task 5 originally held handle/sha256/duration/
+// gaps in session memory only and scoped persistence to "whichever task owns
+// the artifact store". That reasoning does not survive contact with the later
+// briefs: Tasks 7, 8, 9 and 9a all CONSUME the handle and none owns a
+// migration or a store method. And it is not recoverable after the fact --
+// the runtime port exposes no lookup, and after a crash the runtime session
+// is gone, so the encrypted audio would be referenced by a string that lived
+// only in a dead process's heap.
+// ---------------------------------------------------------------------------
+
+test("a clean session end persists the handle, hash, duration and gaps", async () => {
+  const h = harness();
+  try {
+    await joined(h);
+    for (const gap of GAPS) h.bridge.emit(h.bridge.event({ type: "audio_gap", ...gap }));
+    await h.session.settled();
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    const stored = h.store.getRecording(IDENTITY.occurrenceId);
+    assert.ok(stored !== null, "the recording must survive the process");
+    assert.equal(stored.handle, "rec_synthetic_0001");
+    assert.equal(stored.sha256, "0".repeat(64));
+    assert.equal(stored.durationMs, 3_600_000);
+    assert.equal(stored.finalizedAtMs, BASE_MS);
+    assert.deepEqual(
+      stored.gaps.map((gap) => ({
+        direction: gap.direction,
+        startedAt: gap.startedAt,
+        endedAt: gap.endedAt,
+      })),
+      GAPS,
+      "gaps are ordered child rows, in observation order, endedAt null preserved",
+    );
+    assert.deepEqual(
+      stored.gaps.map((gap) => gap.ordinal),
+      [0, 1, 2],
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the recording survives closing and reopening the database", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-session-reopen-"));
+  const dbPath = path.join(dir, "orchestration.db");
+  try {
+    const store = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
+    const clock = fakeClock(BASE_MS);
+    const coordinator = createCoordinator({
+      store,
+      clock,
+      bridgeLeaseTtlMs: LEASE_TTL_MS,
+      maxConcurrentSessions: 2,
+    });
+    coordinator.discover(IDENTITY);
+    const bridge = fakeBridge(BRIDGE_SESSION_ID);
+    const runtime = fakeRuntime();
+    const session = createMeetingSession({
+      identity: IDENTITY,
+      bridge,
+      runtime,
+      coordinator,
+      clock,
+      agentIdentity: { aliases: ["Meetbot"] },
+      bridgeId: "bridge-mac-synthetic",
+      bridgeSessionId: BRIDGE_SESSION_ID,
+      disclosureText: DISCLOSURE_TEXT,
+    });
+
+    await session.join();
+    bridge.emit(bridge.event({ type: "joined", meetingOccurrenceId: IDENTITY.occurrenceId }));
+    await session.settled();
+    bridge.emit(bridge.event({ type: "left", reason: "ended" }));
+    await session.settled();
+    session.dispose();
+    store.close(); // the process "crashes" here
+
+    const reopened = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
+    try {
+      assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+      assert.equal(reopened.getSession(IDENTITY.occurrenceId)?.state, "finalizing");
+      assert.deepEqual(reopened.foreignKeyCheck(), []);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the terminal transition and the recording are ONE transaction", async () => {
+  // Proved by making the recording write fail on a schema CHECK -- a handle
+  // with whitespace in it, which the column rejects because a handle is an
+  // opaque token and a column that accepts prose is a column that can hold a
+  // transcript. If the two were separate writes the session row would have
+  // moved to "finalizing" with no recording behind it.
+  const h = harness({
+    runtime: fakeRuntime({ recording: { handle: "not a token, this is prose" } }),
+  });
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
+    await h.session.settled();
+
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId), null);
+    assert.equal(
+      h.coordinator.get(IDENTITY.occurrenceId)?.state,
+      "listening",
+      "neither half may land without the other",
+    );
+    assert.equal(h.session.state().routingErrors.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a failed finalization still applies the terminal transition, with no recording row", async () => {
   const runtime = fakeRuntime();
   runtime.finalizeRecording = async () => {
     throw new Error("synthetic finalization failure");
@@ -1422,9 +1840,46 @@ test("a finalization failure is recorded and never escapes the pump", async () =
     h.bridge.emit(h.bridge.event({ type: "left", reason: "ended" }));
     await h.session.settled();
 
-    assert.equal(h.session.state().phase, "ended");
-    assert.equal(h.session.state().recording, null);
-    assert.equal(h.session.state().routingErrors.length, 1);
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId), null);
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "finalizing");
+    assert.ok(h.session.state().finalizationError !== null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a bridge_failure end persists the recording alongside the failed transition", async () => {
+  const h = harness();
+  try {
+    await joined(h);
+    h.bridge.emit(h.bridge.event({ type: "left", reason: "bridge_failure" }));
+    await h.session.settled();
+
+    const row = h.coordinator.get(IDENTITY.occurrenceId);
+    assert.equal(row?.state, "failed");
+    assert.equal(row?.terminalReason, "bridge_failure");
+    assert.equal(h.store.getRecording(IDENTITY.occurrenceId)?.handle, "rec_synthetic_0001");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the recording tables hold no column that could carry audio or transcript text", () => {
+  const h = harness();
+  try {
+    const tables = h.store
+      .describeSchema()
+      .filter((table) => table.name === "recordings" || table.name === "recording_gaps");
+    assert.equal(tables.length, 2);
+    for (const table of tables) {
+      assert.match(table.sql, /\bSTRICT\b/);
+      for (const column of table.columns) {
+        assert.ok(
+          ["TEXT", "INTEGER", "INT"].includes(column.type.toUpperCase()),
+          `${table.name}.${column.name} is ${column.type}`,
+        );
+      }
+    }
   } finally {
     h.cleanup();
   }

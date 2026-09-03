@@ -167,14 +167,15 @@ function driveTo(coordinator: SessionCoordinator, occurrenceId: string, target: 
 // Migration and schema
 // ---------------------------------------------------------------------------
 
-test("the migration applies, reports schema version 1, and passes foreign_key_check", () => {
+test("the migrations apply in order, report the latest schema version, and pass foreign_key_check", () => {
   const h = harness();
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 1);
+      assert.equal(store.schemaVersion, 2);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
+        { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -204,7 +205,7 @@ test("a missing migrations directory raises a clean invalid_configuration error,
   }
 });
 
-test("reopening an existing database does not re-apply the migration", () => {
+test("reopening an existing database does not re-apply the migrations", () => {
   const h = harness();
   try {
     const id = identity(1);
@@ -219,11 +220,12 @@ test("reopening an existing database does not re-apply the migration", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 1);
-      // applied_at is the FIRST application's stamp, proving the migration
+      assert.equal(second.schemaVersion, 2);
+      // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
+        { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {

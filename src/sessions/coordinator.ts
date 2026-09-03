@@ -17,6 +17,9 @@ import type { MeetingIdentity } from "../domain/meeting.ts";
 import {
   OrchestrationError,
   SESSION_STATE_VALUES,
+  type RecordingInput,
+  type RecordingRow,
+  type TransitionInput,
   type LeaseRow,
   type LeaseReleaseReason,
   type SessionRow,
@@ -35,6 +38,9 @@ export type {
   LeaseRow,
   LeaseReleaseReason,
   OrchestrationErrorCode,
+  RecordingGapRow,
+  RecordingInput,
+  RecordingRow,
   SessionRow,
   SessionState,
   SessionStore,
@@ -96,6 +102,14 @@ export type CreateCoordinatorOptions = {
   readonly maxConcurrentSessions: number;
 };
 
+/** Which terminal edge a session-ending caller wants applied. A discriminated
+ * union rather than two methods, because it is passed straight through to
+ * finalizeWithRecording, where the recording write and the transition have to
+ * be one call to be one transaction. */
+export type TerminalOutcome =
+  | { readonly kind: "advance"; readonly toState: SessionState }
+  | { readonly kind: "fail"; readonly terminalReason: string };
+
 export type BridgeLeaseRequest = {
   readonly bridgeId: string;
   readonly bridgeSessionId: string;
@@ -133,6 +147,25 @@ export type SessionCoordinator = {
    * `terminalReason` (a short lowercase_snake token; the store's CHECK
    * constraints reject anything else). */
   fail(occurrenceId: string, terminalReason: string): SessionRow;
+
+  /** Applies a terminal transition AND persists the finalized recording in ONE
+   * store transaction. The edge is validated exactly as advance()/fail()
+   * validate theirs.
+   *
+   * This exists as one call rather than two because the recording handle is
+   * the only reference to the encrypted audio and cannot be re-derived after a
+   * crash: a transition that committed without its recording would leave audio
+   * nothing points at, and a recording without its transition would claim a
+   * session finalized when it had not. */
+  finalizeWithRecording(
+    occurrenceId: string,
+    outcome: TerminalOutcome,
+    recording: RecordingInput,
+  ): SessionRow;
+
+  /** The persisted recording for an occurrence, or null if it never finalized
+   * (or finalization failed). */
+  recording(occurrenceId: string): RecordingRow | null;
 
   /** The full, append-only audit trail in order, including the synthetic
    * creation transition (`fromState: null`). */
@@ -189,6 +222,50 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
   const { store, clock, bridgeLeaseTtlMs, maxConcurrentSessions } = options;
   const semaphore = createSemaphore(maxConcurrentSessions);
 
+  /** Validates one terminal/forward edge against ALLOWED_TRANSITIONS for the
+   * session's CURRENT persisted state and builds the store input for it. The
+   * single place the transition graph is enforced, so advance(), fail() and
+   * finalizeWithRecording() cannot drift apart on which edges are legal. */
+  function transitionFor(occurrenceId: string, outcome: TerminalOutcome): TransitionInput {
+    const current = requireSession(occurrenceId);
+    if (outcome.kind === "fail") {
+      if (!ALLOWED_TRANSITIONS[current.state].includes("failed")) {
+        throw new OrchestrationError(
+          "illegal_transition",
+          `occurrence "${occurrenceId}" cannot fail from terminal state "${current.state}"`,
+        );
+      }
+      return {
+        occurrenceId,
+        fromState: current.state,
+        toState: "failed",
+        reason: FAIL_REASON,
+        terminalReason: outcome.terminalReason,
+        nowMs: clock.now(),
+      };
+    }
+    if (outcome.toState === "failed") {
+      throw new OrchestrationError(
+        "illegal_transition",
+        `advance() never targets "failed"; call fail() with a terminal reason instead`,
+      );
+    }
+    if (!ALLOWED_TRANSITIONS[current.state].includes(outcome.toState)) {
+      throw new OrchestrationError(
+        "illegal_transition",
+        `"${current.state}" -> "${outcome.toState}" is not a legal transition for occurrence "${occurrenceId}"`,
+      );
+    }
+    return {
+      occurrenceId,
+      fromState: current.state,
+      toState: outcome.toState,
+      reason: ADVANCE_REASON,
+      terminalReason: null,
+      nowMs: clock.now(),
+    };
+  }
+
   function requireSession(occurrenceId: string): SessionRow {
     const row = store.getSession(occurrenceId);
     if (row === null) {
@@ -217,45 +294,26 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     },
 
     advance(occurrenceId: string, toState: SessionState): SessionRow {
-      const current = requireSession(occurrenceId);
-      if (toState === "failed") {
-        throw new OrchestrationError(
-          "illegal_transition",
-          `advance() never targets "failed"; call fail() with a terminal reason instead`,
-        );
-      }
-      if (!ALLOWED_TRANSITIONS[current.state].includes(toState)) {
-        throw new OrchestrationError(
-          "illegal_transition",
-          `"${current.state}" -> "${toState}" is not a legal transition for occurrence "${occurrenceId}"`,
-        );
-      }
-      return store.transition({
-        occurrenceId,
-        fromState: current.state,
-        toState,
-        reason: ADVANCE_REASON,
-        terminalReason: null,
-        nowMs: clock.now(),
-      });
+      return store.transition(transitionFor(occurrenceId, { kind: "advance", toState }));
     },
 
     fail(occurrenceId: string, terminalReason: string): SessionRow {
-      const current = requireSession(occurrenceId);
-      if (!ALLOWED_TRANSITIONS[current.state].includes("failed")) {
-        throw new OrchestrationError(
-          "illegal_transition",
-          `occurrence "${occurrenceId}" cannot fail from terminal state "${current.state}"`,
-        );
-      }
-      return store.transition({
-        occurrenceId,
-        fromState: current.state,
-        toState: "failed",
-        reason: FAIL_REASON,
-        terminalReason,
-        nowMs: clock.now(),
-      });
+      return store.transition(transitionFor(occurrenceId, { kind: "fail", terminalReason }));
+    },
+
+    finalizeWithRecording(
+      occurrenceId: string,
+      outcome: TerminalOutcome,
+      recording: RecordingInput,
+    ): SessionRow {
+      return store.finalizeSession({
+        transition: transitionFor(occurrenceId, outcome),
+        recording,
+      }).session;
+    },
+
+    recording(occurrenceId: string): RecordingRow | null {
+      return store.getRecording(occurrenceId);
     },
 
     history(occurrenceId: string): TransitionRow[] {

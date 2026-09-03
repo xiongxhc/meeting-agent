@@ -27,8 +27,12 @@ import {
   OrchestrationError,
   type AcquireLeaseInput,
   type CreateSessionInput,
+  type FinalizeSessionInput,
+  type FinalizeSessionResult,
   type LeaseReleaseReason,
   type LeaseRow,
+  type RecordingGapRow,
+  type RecordingRow,
   type MigrationRow,
   type SessionRow,
   type SessionState,
@@ -82,6 +86,9 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     getSession: (occurrenceId) => getSession(db, occurrenceId),
     transition: (input) => transition(db, input),
     listTransitions: (occurrenceId) => listTransitions(db, occurrenceId),
+
+    finalizeSession: (input) => finalizeSession(db, input),
+    getRecording: (occurrenceId) => getRecording(db, occurrenceId),
 
     acquireLease: (input) => acquireLease(db, input),
     releaseLease: (occurrenceId, leaseId, reason, nowMs) =>
@@ -345,6 +352,102 @@ function transition(db: Database.Database, input: TransitionInput): SessionRow {
   });
   run();
   return getSession(db, input.occurrenceId)!;
+}
+
+// ---------------------------------------------------------------------------
+// Recordings
+// ---------------------------------------------------------------------------
+
+/**
+ * The terminal transition and the finalized recording, in ONE transaction.
+ *
+ * `transition` is the existing per-transition function, which opens a
+ * transaction of its own -- better-sqlite3 nests those as savepoints, so the
+ * whole thing still commits or rolls back as a unit. A crash, or a CHECK
+ * violation on the recording, therefore cannot leave a session marked
+ * finalized with no recording behind it, nor a recording attached to a
+ * session that never transitioned.
+ *
+ * `finalized_at_ms` and `occurrence_id` are taken from the TRANSITION, never
+ * from the recording input, so the two halves cannot disagree about which
+ * occurrence finalized or when.
+ */
+function finalizeSession(
+  db: Database.Database,
+  input: FinalizeSessionInput,
+): FinalizeSessionResult {
+  const { occurrenceId, nowMs } = input.transition;
+  const run = db.transaction(() => {
+    const session = transition(db, input.transition);
+    withConstraintTranslation(() => {
+      db.prepare(
+        `INSERT INTO recordings (occurrence_id, handle, sha256, duration_ms, finalized_at_ms)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        occurrenceId,
+        input.recording.handle,
+        input.recording.sha256,
+        input.recording.durationMs,
+        nowMs,
+      );
+      const insertGap = db.prepare(
+        `INSERT INTO recording_gaps (occurrence_id, ordinal, direction, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      input.recording.gaps.forEach((gap, ordinal) => {
+        insertGap.run(occurrenceId, ordinal, gap.direction, gap.startedAt, gap.endedAt);
+      });
+    });
+    return session;
+  });
+  const session = run();
+  return { session, recording: getRecording(db, occurrenceId)! };
+}
+
+function getRecording(db: Database.Database, occurrenceId: string): RecordingRow | null {
+  const raw = db
+    .prepare(
+      `SELECT occurrence_id, handle, sha256, duration_ms, finalized_at_ms
+         FROM recordings WHERE occurrence_id = ?`,
+    )
+    .get(occurrenceId) as
+    | {
+        occurrence_id: string;
+        handle: string;
+        sha256: string;
+        duration_ms: number;
+        finalized_at_ms: number;
+      }
+    | undefined;
+  if (raw === undefined) return null;
+
+  const gaps = db
+    .prepare(
+      `SELECT ordinal, direction, started_at, ended_at
+         FROM recording_gaps WHERE occurrence_id = ? ORDER BY ordinal`,
+    )
+    .all(occurrenceId) as Array<{
+    ordinal: number;
+    direction: string;
+    started_at: string;
+    ended_at: string | null;
+  }>;
+
+  return {
+    occurrenceId: raw.occurrence_id,
+    handle: raw.handle,
+    sha256: raw.sha256,
+    durationMs: raw.duration_ms,
+    finalizedAtMs: raw.finalized_at_ms,
+    gaps: gaps.map(
+      (gap): RecordingGapRow => ({
+        ordinal: gap.ordinal,
+        direction: gap.direction as RecordingGapRow["direction"],
+        startedAt: gap.started_at,
+        endedAt: gap.ended_at,
+      }),
+    ),
+  };
 }
 
 function toTransitionRow(raw: {

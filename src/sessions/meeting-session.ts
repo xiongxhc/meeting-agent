@@ -73,7 +73,7 @@ import type {
   RecordingHandle,
   RuntimeEvent,
 } from "../ports/conversation-runtime.ts";
-import type { Clock, SessionCoordinator } from "./coordinator.ts";
+import type { Clock, SessionCoordinator, TerminalOutcome } from "./coordinator.ts";
 import {
   createInvocationDispatcher,
   decide,
@@ -129,6 +129,11 @@ export type QueueOverflow = {
   readonly source: "bridge" | "runtime";
   readonly queueDepth: number;
   readonly atMs: number;
+  /** `dropped` for every ordinary event. `admitted` only for this session's
+   * own terminal `left`, which is let through over the bound rather than
+   * dropped -- see enqueue. Either way the arrival over the bound is on the
+   * record; the disposition says what happened to it. */
+  readonly disposition: "dropped" | "admitted";
 };
 
 export type InboundRejection = {
@@ -166,6 +171,10 @@ export type MeetingSessionState = {
   readonly disclosure: "pending" | DisclosureOutcome;
   readonly observedGaps: readonly ObservedAudioGap[];
   readonly recording: RecordingHandle | null;
+  /** Why there is no recording, when there is none. `recording === null` alone
+   * cannot distinguish "the session never finalized" from "finalization was
+   * attempted and threw", and those need different operator responses. */
+  readonly finalizationError: unknown;
   readonly gapReconciliation: GapReconciliation;
   readonly terminalReason: string | null;
   readonly commandResults: readonly BridgeCommandResult[];
@@ -258,6 +267,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let reconnectAttempts = 0;
   let disclosure: "pending" | DisclosureOutcome = "pending";
   let recording: RecordingHandle | null = null;
+  let finalizationError: unknown = null;
   let gapReconciliation: GapReconciliation = "not_needed";
   let terminalReason: string | null = null;
   let ignoredAfterTerminal = 0;
@@ -338,13 +348,55 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   function enqueue(item: QueueItem): void {
     if (disposed) return;
+
     if (queue.length >= maxQueuedEvents) {
-      overflows.push({ source: item.source, queueDepth: queue.length, atMs: clock.now() });
+      // Dropping the newest arrival costs one event for every ordinary type.
+      // For this session's own terminal `left` it would cost the SESSION:
+      // no finalizeRecording, no lease release, and the coordinator row stuck
+      // in "listening" forever, with nothing that ever sweeps it. So a
+      // terminal `left` is admitted over the bound. The admission is recorded
+      // like any other over-bound arrival, and it does not abort speaking --
+      // nothing was lost, and the session is ending anyway.
+      if (item.source === "bridge" && looksLikeTerminalLeft(item.raw)) {
+        overflows.push({
+          source: item.source,
+          queueDepth: queue.length,
+          atMs: clock.now(),
+          disposition: "admitted",
+        });
+        queue.push(item);
+        void pump();
+        return;
+      }
+
+      overflows.push({
+        source: item.source,
+        queueDepth: queue.length,
+        atMs: clock.now(),
+        disposition: "dropped",
+      });
       abortSpeaking("queue_overflow");
       return;
     }
+
     queue.push(item);
     void pump();
+  }
+
+  /** A deliberately cheap PRE-FILTER, not a second validator: is this raw
+   * message plausibly this session's own terminal `left`? It decides only
+   * whether one message may occupy a queue slot over the bound. Whatever it
+   * admits still passes through `acceptEvent` when it is handled, so a forged
+   * or malformed message is rejected there exactly as before -- the worst a
+   * lie can buy is one queue slot. */
+  function looksLikeTerminalLeft(raw: unknown): boolean {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
+    const record = raw as Record<string, unknown>;
+    return (
+      record["schema"] === BRIDGE_SESSION_SCHEMA &&
+      record["type"] === "left" &&
+      record["sessionId"] === bridgeSessionId
+    );
   }
 
   async function pump(): Promise<void> {
@@ -532,35 +584,68 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     terminalReason = reason;
     phase = "ended";
 
-    for (const segmentId of [...openTurns]) {
-      settle(segmentId, "failed", "session_ended");
-    }
+    try {
+      for (const segmentId of [...openTurns]) {
+        settle(segmentId, "failed", "session_ended");
+      }
 
-    if (leaseId !== null) {
-      coordinator.releaseBridgeLease(
-        identity.occurrenceId,
-        leaseId,
-        reason === "bridge_failure" ? "bridge_failure" : "left",
-      );
-      leaseId = null;
-    }
+      if (leaseId !== null) {
+        coordinator.releaseBridgeLease(
+          identity.occurrenceId,
+          leaseId,
+          reason === "bridge_failure" ? "bridge_failure" : "left",
+        );
+        leaseId = null;
+      }
 
-    // "listening" -> "finalizing" is the only forward edge a `left` can take.
-    // A session that never reached "listening" (a bridge that left mid-join)
-    // has no such edge, and leaving the row stranded in "joining" forever is
-    // worse than recording the truth: it failed, for the reason the bridge
-    // gave.
+      // Finalization runs BEFORE the terminal transition, deliberately: the
+      // recording handle does not exist until the runtime returns it, and the
+      // two have to be written together. See applyTerminalTransition.
+      await finalizeRecording();
+      applyTerminalTransition(reason);
+    } finally {
+      // In a `finally`, because a finalization that throws must not leave the
+      // session subscribed to two planes it has already declared itself
+      // terminal for. The failure itself is on `state().finalizationError`;
+      // losing the subscriptions on top of it would make the session
+      // "structurally deaf after a left" false in exactly the branch where it
+      // matters most.
+      unsubscribe();
+    }
+  }
+
+  /** Applies the session's terminal edge, WITH the finalized recording in the
+   * same store transaction when there is one.
+   *
+   * "listening" -> "finalizing" is the only forward edge a `left` can take. A
+   * session that never reached "listening" (a bridge that left mid-join) has
+   * no such edge, and leaving the row stranded in "joining" forever is worse
+   * than recording the truth: it failed, for the reason the bridge gave.
+   *
+   * When finalization failed there is no handle to write, so the transition
+   * goes in alone -- the session really did end, and refusing to record that
+   * because the recording was lost would strand the occurrence on top of
+   * losing the audio. */
+  function applyTerminalTransition(reason: "ended" | "removed" | "bridge_failure"): void {
     const state = coordinator.get(identity.occurrenceId)?.state ?? null;
-    if (reason === "bridge_failure") {
-      coordinator.fail(identity.occurrenceId, "bridge_failure");
-    } else if (state === "listening") {
-      coordinator.advance(identity.occurrenceId, "finalizing");
-    } else if (state !== null && state !== "notified" && state !== "failed") {
-      coordinator.fail(identity.occurrenceId, reason);
-    }
+    if (state === null || state === "notified" || state === "failed") return;
 
-    await finalizeRecording();
-    unsubscribe();
+    const outcome: TerminalOutcome =
+      reason === "bridge_failure"
+        ? { kind: "fail", terminalReason: "bridge_failure" }
+        : state === "listening"
+          ? { kind: "advance", toState: "finalizing" }
+          : { kind: "fail", terminalReason: reason };
+
+    if (recording !== null) {
+      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recording);
+      return;
+    }
+    if (outcome.kind === "fail") {
+      coordinator.fail(identity.occurrenceId, outcome.terminalReason);
+    } else {
+      coordinator.advance(identity.occurrenceId, outcome.toState);
+    }
   }
 
   async function finalizeRecording(): Promise<void> {
@@ -568,7 +653,19 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     finalized = true;
 
     const observed: RecordingGap[] = observedGaps.map((gap) => ({ ...gap }));
-    let handle = await runtime.finalizeRecording({ observedGaps: observed });
+    let handle: RecordingHandle;
+    try {
+      handle = await runtime.finalizeRecording({ observedGaps: observed });
+    } catch (error) {
+      // Recorded as its own typed fact rather than a generic routing error:
+      // "there is no recording" and "finalization was attempted and failed"
+      // need different operator responses, and `recording === null` alone
+      // cannot tell them apart. There is no retry -- runtime finalization is
+      // not known to be idempotent, and re-running it is not this session's
+      // call to make.
+      finalizationError = error;
+      return;
+    }
 
     // "Exact gap recording": the stored gaps must be the gaps the bridge
     // actually observed. If the runtime's own accounting disagrees, the bridge
@@ -580,6 +677,25 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       gapReconciliation = gapsEqual(handle.gaps, observed) ? "reconciled" : "unreconciled";
     }
     recording = handle;
+  }
+
+  /** Releases everything join() had already taken, and makes the session
+   * terminal for `reason`. Terminal, not merely "already joined": a retry
+   * means a NEW session against a NEW lease, exactly as after a `left`. */
+  function failJoin(reason: string): void {
+    if (terminalReason !== null) return;
+    terminalReason = reason;
+    phase = "ended";
+    abortSpeaking(reason);
+    if (leaseId !== null) {
+      coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
+      leaseId = null;
+    }
+    const state = coordinator.get(identity.occurrenceId)?.state ?? null;
+    if (state !== null && state !== "notified" && state !== "failed") {
+      coordinator.fail(identity.occurrenceId, reason);
+    }
+    unsubscribe();
   }
 
   function unsubscribe(): void {
@@ -620,53 +736,53 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         enqueue({ source: "runtime", event });
       });
 
-      await issue({
-        type: "join",
-        meetingOccurrenceId: identity.occurrenceId,
-        meetingNo: identity.meetingNo,
-        leaseId: lease.leaseId,
-      });
-
-      // Exactly one runtime session, with both values pinned explicitly. The
-      // runtime's own default profile stays "offline"; nothing here switches
-      // it silently, and nothing accepts a substitute.
-      const handle = await runtime.startVoiceSession({
-        occurrenceId: identity.occurrenceId,
-        profile: PINNED_PROFILE,
-        responseMode: PINNED_RESPONSE_MODE,
-      });
-      runtimeSessionId = handle.runtimeSessionId;
-
-      if (handle.profile !== PINNED_PROFILE) {
-        abortSpeaking("profile_mismatch");
-      } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
-        abortSpeaking("response_mode_mismatch");
-      } else if (handle.status !== "ready") {
-        abortSpeaking(`runtime_${handle.status}`);
-      }
-
+      // ONE cleanup for every way the rest of join can fail. The lease is
+      // already taken by this point, and nothing sweeps an abandoned one: the
+      // coordinator recovers a stale lease only inside a subsequent
+      // acquireBridgeLease for the SAME occurrence, which for a join that
+      // failed will never come. A runtime outage or a transport failure here
+      // would otherwise strand the occurrence permanently -- lease live, both
+      // planes subscribed, the row sitting in "joining" with no terminal
+      // reason and no way to retry.
       try {
+        await issue({
+          type: "join",
+          meetingOccurrenceId: identity.occurrenceId,
+          meetingNo: identity.meetingNo,
+          leaseId: lease.leaseId,
+        });
+
+        // Exactly one runtime session, with both values pinned explicitly. The
+        // runtime's own default profile stays "offline"; nothing here switches
+        // it silently, and nothing accepts a substitute.
+        const handle = await runtime.startVoiceSession({
+          occurrenceId: identity.occurrenceId,
+          profile: PINNED_PROFILE,
+          responseMode: PINNED_RESPONSE_MODE,
+        });
+        runtimeSessionId = handle.runtimeSessionId;
+
+        if (handle.profile !== PINNED_PROFILE) {
+          abortSpeaking("profile_mismatch");
+        } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
+          abortSpeaking("response_mode_mismatch");
+        } else if (handle.status !== "ready") {
+          abortSpeaking(`runtime_${handle.status}`);
+        }
+
         await issue({ type: "connect_media", ...handle.media });
       } catch (error) {
         // A descriptor the contract refuses is one the bridge would refuse
-        // too, so there is no capture to keep alive here: the session fails
-        // closed instead of opening a media socket nobody can use.
-        if (error instanceof BridgeContractError) {
-          terminalReason = "media_format_rejected";
-          phase = "ended";
-          abortSpeaking("media_format_rejected");
-          if (leaseId !== null) {
-            coordinator.releaseBridgeLease(identity.occurrenceId, leaseId, "bridge_failure");
-            leaseId = null;
-          }
-          coordinator.fail(identity.occurrenceId, "media_format_rejected");
-          unsubscribe();
-        }
+        // too, and it keeps its own, more specific reason so an operator can
+        // tell a bad media format from a runtime outage at a glance. Everything
+        // else is a plain failed join.
+        failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
         throw error;
       }
 
       // Disclosure is meeting-chat TEXT, attempted by the bridge alone, and
-      // failing to disclose never blocks joining.
+      // failing to disclose never blocks joining -- which is why it sits
+      // OUTSIDE the cleanup above and can never trigger it.
       try {
         await disclosurePublisher.publish(disclosureText);
       } catch {
@@ -691,6 +807,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         disclosure,
         observedGaps: [...observedGaps],
         recording,
+        finalizationError,
         gapReconciliation,
         terminalReason,
         commandResults: [...commandResults],

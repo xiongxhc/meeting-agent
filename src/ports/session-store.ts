@@ -78,6 +78,56 @@ export type LeaseRow = {
   readonly releaseReason: LeaseReleaseReason | null;
 };
 
+/** One gap in the finalized recording, as a persisted child row. `ordinal` is
+ * the zero-based position in the order the bridge observed them -- "exact gap
+ * recording" means the same gaps in the same order, so the order is stored,
+ * not re-derived. */
+export type RecordingGapRow = {
+  readonly ordinal: number;
+  readonly direction: "capture" | "playback";
+  readonly startedAt: string;
+  /** null when the gap was still open at finalization. Never collapsed to the
+   * finalization instant. */
+  readonly endedAt: string | null;
+};
+
+/** The finalized recording's METADATA. Never audio bytes: `handle` is an
+ * opaque reference to the ENCRYPTED recording, and Meeting Agent never holds
+ * the recording key. */
+export type RecordingRow = {
+  readonly occurrenceId: string;
+  readonly handle: string;
+  readonly sha256: string;
+  readonly durationMs: number;
+  readonly finalizedAtMs: number;
+  readonly gaps: readonly RecordingGapRow[];
+};
+
+/** What a caller supplies to persist a recording. `occurrenceId` and
+ * `finalizedAtMs` are not fields here: both come from the transition the
+ * recording is written with, so the two halves cannot disagree about which
+ * occurrence finalized, or when. */
+export type RecordingInput = {
+  readonly handle: string;
+  readonly sha256: string;
+  readonly durationMs: number;
+  readonly gaps: ReadonlyArray<{
+    readonly direction: "capture" | "playback";
+    readonly startedAt: string;
+    readonly endedAt: string | null;
+  }>;
+};
+
+export type FinalizeSessionInput = {
+  readonly transition: TransitionInput;
+  readonly recording: RecordingInput;
+};
+
+export type FinalizeSessionResult = {
+  readonly session: SessionRow;
+  readonly recording: RecordingRow;
+};
+
 export type MigrationRow = {
   readonly version: number;
   readonly name: string;
@@ -165,6 +215,15 @@ export type SessionStore = {
   getSession(occurrenceId: string): SessionRow | null;
   transition(input: TransitionInput): SessionRow;
   listTransitions(occurrenceId: string): TransitionRow[];
+
+  /** Applies the session's terminal transition AND writes the finalized
+   * recording in ONE transaction. The handle is the only reference to the
+   * encrypted audio and cannot be re-derived after a crash -- the runtime
+   * exposes no lookup and its session is gone -- so a transition that landed
+   * without its recording would leave audio nothing points at. Neither half
+   * may land alone. */
+  finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
+  getRecording(occurrenceId: string): RecordingRow | null;
 
   acquireLease(input: AcquireLeaseInput): LeaseRow;
   releaseLease(

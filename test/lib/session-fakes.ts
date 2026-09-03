@@ -120,6 +120,10 @@ export type FakeRuntimeOptions = {
   /** When set, finalizeRecording resolves with these gaps regardless of what
    * it was handed -- the "the runtime disagrees with the bridge" case. */
   readonly finalizedGaps?: readonly RecordingGap[];
+  /** When set, reconcileRecording resolves with these gaps instead of echoing
+   * what it was handed -- the "the runtime STILL disagrees after being asked
+   * to reconcile" case, which is the only way to reach `unreconciled`. */
+  readonly reconciledGaps?: readonly RecordingGap[];
   readonly startVoiceSessionError?: Error;
 };
 
@@ -187,7 +191,7 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
       readonly gaps: readonly RecordingGap[];
     }): Promise<RecordingHandle> {
       calls.push({ method: "reconcileRecording", gaps: input.gaps });
-      return recordingFor(input.gaps);
+      return recordingFor(options.reconciledGaps ?? input.gaps);
     },
     subscribe(listener: (event: RuntimeEvent) => void): () => void {
       listeners.add(listener);
