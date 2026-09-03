@@ -218,6 +218,77 @@ public struct BridgeEventMessage: Equatable, Sendable {
     }
 }
 
+private func contractNonEmpty(_ value: String, _ path: String) -> BridgeContractError? {
+    value.isEmpty
+        ? BridgeContractError(code: .fieldType, path: path, detail: "expected a non-empty string")
+        : nil
+}
+
+private func contractUtcTimestamp(_ value: String, _ path: String) -> BridgeContractError? {
+    if let failure = contractNonEmpty(value, path) { return failure }
+    return value.range(of: utcTimestampPattern, options: .regularExpression) == nil
+        ? BridgeContractError(
+            code: .timestampFormat, path: path, detail: "expected a Z-suffixed UTC timestamp")
+        : nil
+}
+
+private func contractPositiveInt(_ value: Int, _ path: String) -> BridgeContractError? {
+    value >= 1
+        ? nil
+        : BridgeContractError(code: .fieldType, path: path, detail: "expected an integer >= 1")
+}
+
+extension BridgeEventMessage {
+    /// The contract's shape rules, applied to a message about to be built rather
+    /// than one being decoded — the counterpart of the `parseEventShape`
+    /// self-check `spikes/feishu/src/reducer.ts` runs before it returns an event.
+    ///
+    /// The types alone are not enough. They do make one rejected combination
+    /// unrepresentable — `ui_exact` beside a nil identity — but every initialiser
+    /// above takes a bare `String`/`Int`, so a non-empty string, a Z-suffixed UTC
+    /// timestamp and a sequence of at least 1 are all still checkable claims. A
+    /// producer that fills an identity with `""` would otherwise write a
+    /// transcript this package's own decoder rejects.
+    ///
+    /// - Returns: nil when the message would decode, otherwise the rejection it
+    ///   would decode into, with the same code and path the decoder uses.
+    public static func contractViolation(
+        sessionId: String, sequence: Int, observedAt: String, event: BridgeEvent
+    ) -> BridgeContractError? {
+        if let failure = contractNonEmpty(sessionId, "/sessionId") { return failure }
+        if let failure = contractPositiveInt(sequence, "/sequence") { return failure }
+        if let failure = contractUtcTimestamp(observedAt, "/observedAt") { return failure }
+
+        switch event {
+        case .joined(let meetingOccurrenceId):
+            return contractNonEmpty(meetingOccurrenceId, "/meetingOccurrenceId")
+        case .left, .chatDisclosure:
+            // Both payloads are enums: no case of either can be malformed.
+            return nil
+        case .participantJoined(let feishuUserId, let displayName):
+            return contractNonEmpty(feishuUserId, "/feishuUserId")
+                ?? contractNonEmpty(displayName, "/displayName")
+        case .participantLeft(let feishuUserId):
+            return contractNonEmpty(feishuUserId, "/feishuUserId")
+        case .activeSpeaker(let speaker):
+            guard case .uiExact(let feishuUserId) = speaker else { return nil }
+            return contractNonEmpty(feishuUserId, "/feishuUserId")
+        case .audioGap(_, let startedAt, let endedAt):
+            return contractUtcTimestamp(startedAt, "/startedAt")
+                ?? endedAt.flatMap { contractUtcTimestamp($0, "/endedAt") }
+        case .mediaConnected(let endpoint):
+            return contractNonEmpty(endpoint, "/endpoint")
+        case .mediaDisconnected(let reason):
+            return contractNonEmpty(reason, "/reason")
+        case .commandResult(let commandId, _, let detail):
+            return contractNonEmpty(commandId, "/commandId")
+                ?? detail.flatMap { contractNonEmpty($0, "/detail") }
+        case .reconnecting(let attempt), .reconnected(let attempt):
+            return contractPositiveInt(attempt, "/attempt")
+        }
+    }
+}
+
 /// One whole recorded session: exactly the shape of
 /// `fixtures/contracts/bridge-session-v1.json`.
 public struct BridgeSessionTranscript: Equatable, Sendable {

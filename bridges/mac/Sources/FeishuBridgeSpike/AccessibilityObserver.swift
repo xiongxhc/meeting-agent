@@ -226,6 +226,12 @@ public final class SessionObservationReducer {
     private var hasLeft = false
     private var roster: [String: String] = [:]
 
+    /// Every event this reducer refused to build because it would have failed
+    /// the contract it claims to speak — see `emit`. Readable rather than
+    /// silent: a refusal means an upstream port handed the reducer something
+    /// unusable, and that is a defect to find, not to swallow.
+    public private(set) var refusedEvents: [BridgeContractError] = []
+
     public init(
         sessionId: String, identity: any UiIdentityResolver, chatControl: any ChatControlPort
     ) {
@@ -241,7 +247,7 @@ public final class SessionObservationReducer {
 
         switch observation {
         case .joined(let observedAt, let meetingOccurrenceId):
-            return [emit(observedAt, .joined(meetingOccurrenceId: meetingOccurrenceId))]
+            return emit(observedAt, .joined(meetingOccurrenceId: meetingOccurrenceId))
 
         case .unobservable:
             return []
@@ -249,18 +255,20 @@ public final class SessionObservationReducer {
         case .meetingEnded(let observedAt):
             // `ended` is reserved for a positively observed end: the client's
             // own meeting-ended notice, which is what produced this case.
-            hasLeft = true
-            return [emit(observedAt, .left(reason: .ended))]
+            let events = emit(observedAt, .left(reason: .ended))
+            hasLeft = !events.isEmpty
+            return events
 
         case .clientUnreadable(let observedAt):
             // What was observed is that the bridge could not read the client for
             // long enough to give up. Calling that `ended` would claim knowledge
             // of the meeting the bridge does not have.
-            hasLeft = true
-            return [emit(observedAt, .left(reason: .bridgeFailure))]
+            let events = emit(observedAt, .left(reason: .bridgeFailure))
+            hasLeft = !events.isEmpty
+            return events
 
         case .disclosureAttempt(let observedAt, let text):
-            return [emit(observedAt, .chatDisclosure(outcome: chatControl.postDisclosure(text: text)))]
+            return emit(observedAt, .chatDisclosure(outcome: chatControl.postDisclosure(text: text)))
 
         case .rosterSnapshot(let observedAt, let participants):
             return reduceRoster(observedAt: observedAt, participants: participants)
@@ -270,10 +278,25 @@ public final class SessionObservationReducer {
         }
     }
 
-    private func emit(_ observedAt: String, _ event: BridgeEvent) -> BridgeEventMessage {
+    /// Zero or one event: the message is checked against the contract before a
+    /// sequence number is spent on it, so this reducer cannot put an event on
+    /// the wire that the decoder in `BridgeProtocol.swift` would reject. A
+    /// `UiIdentityResolver` returning `""` is the case this exists for — the
+    /// recorder would write it and nothing could read it back. The refusal is
+    /// recorded in `refusedEvents` rather than thrown, so one unusable
+    /// observation does not take the session down with it.
+    private func emit(_ observedAt: String, _ event: BridgeEvent) -> [BridgeEventMessage] {
+        if let violation = BridgeEventMessage.contractViolation(
+            sessionId: sessionId, sequence: sequence + 1, observedAt: observedAt, event: event)
+        {
+            refusedEvents.append(violation)
+            return []
+        }
         sequence += 1
-        return BridgeEventMessage(
-            sessionId: sessionId, sequence: sequence, observedAt: observedAt, event: event)
+        return [
+            BridgeEventMessage(
+                sessionId: sessionId, sequence: sequence, observedAt: observedAt, event: event)
+        ]
     }
 
     private func reduceRoster(observedAt: String, participants: [RosterEntry])
@@ -286,12 +309,13 @@ public final class SessionObservationReducer {
         var events: [BridgeEventMessage] = []
 
         for userId in roster.keys.filter({ next[$0] == nil }).sorted() {
-            events.append(emit(observedAt, .participantLeft(feishuUserId: userId)))
+            events.append(contentsOf: emit(observedAt, .participantLeft(feishuUserId: userId)))
         }
         for userId in next.keys.filter({ roster[$0] == nil }).sorted() {
             guard let displayName = next[userId] else { continue }
             events.append(
-                emit(observedAt, .participantJoined(feishuUserId: userId, displayName: displayName)))
+                contentsOf: emit(
+                    observedAt, .participantJoined(feishuUserId: userId, displayName: displayName)))
         }
 
         roster = next
@@ -312,7 +336,11 @@ public final class SessionObservationReducer {
         }
 
         guard let next, next != activeSpeaker else { return [] }
-        activeSpeaker = next
-        return [emit(observedAt, .activeSpeaker(next))]
+        let events = emit(observedAt, .activeSpeaker(next))
+        // The remembered state is what suppresses a repeat, so it is committed
+        // only when an event actually went out; a refused speaker must not
+        // silence the next observation of the same one.
+        if !events.isEmpty { activeSpeaker = next }
+        return events
     }
 }

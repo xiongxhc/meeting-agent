@@ -191,6 +191,49 @@ final class AccessibilityObserverTests: XCTestCase {
         XCTAssertEqual(participants.map(\.feishuUserId), ["ou_00000000000000000000000000000a"])
     }
 
+    // MARK: - the reducer's own contract check
+
+    /// The port for `spikes/feishu/test/reducer.test.ts`'s "reducer refuses to
+    /// construct an event that would fail its own contract". A resolver
+    /// returning an empty string is a port lying about a resolved identity: the
+    /// types happily build `.uiExact(feishuUserId: "")`, `BridgeRecorder` would
+    /// write it, and `BridgeContractTests.testRejectsAnEmptyRequiredString`
+    /// proves the decoder then refuses to read it back.
+    func testTheReducerRefusesToBuildAnEventThatWouldFailItsOwnContract() {
+        let reducer = SessionObservationReducer(
+            sessionId: "sess_mac_0000000000000001",
+            identity: FakeIdentityResolver(table: ["tile-1": ""]),
+            chatControl: FakeChatControl(outcome: .sent)
+        )
+
+        let events = reducer.reduce(
+            .speakerHighlight(observedAt: at1, highlightedTileIds: ["tile-1"]))
+
+        XCTAssertEqual(events, [], "an event the decoder would reject never reaches the wire")
+        XCTAssertEqual(reducer.refusedEvents.map(\.code), [.fieldType])
+        XCTAssertEqual(reducer.refusedEvents.map(\.path), ["/feishuUserId"])
+    }
+
+    func testARefusedEventSpendsNoSequenceNumberAndDoesNotSilenceTheNextOne() {
+        let reducer = SessionObservationReducer(
+            sessionId: "sess_mac_0000000000000001",
+            identity: FakeIdentityResolver(table: [
+                "tile-empty": "", "tile-1": "ou_00000000000000000000000000000a",
+            ]),
+            chatControl: FakeChatControl(outcome: .sent)
+        )
+
+        XCTAssertEqual(
+            reducer.reduce(.speakerHighlight(observedAt: at1, highlightedTileIds: ["tile-empty"])),
+            [])
+        let good = reducer.reduce(.speakerHighlight(observedAt: at2, highlightedTileIds: ["tile-1"]))
+        XCTAssertEqual(
+            good.map(\.sequence), [1], "a refused event must not consume a sequence number")
+        XCTAssertEqual(
+            good.map(\.event),
+            [.activeSpeaker(.uiExact(feishuUserId: "ou_00000000000000000000000000000a"))])
+    }
+
     // MARK: - membership
 
     func testActualParticipantMembershipComesFromTheRosterPanel() {

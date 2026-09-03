@@ -67,11 +67,19 @@ public enum BridgeRecord: Equatable, Sendable {
 /// Two differences from the TypeScript recorder, both deliberate. Keys are
 /// written sorted, because Swift's encoder does not promise insertion order and
 /// deterministic bytes matter more than matching JavaScript's key order. And the
-/// per-message shape checks the TypeScript validator performs are already
-/// discharged by the type system here — a `BridgeEventMessage` cannot hold an
-/// invalid payload — so only the stream rules that types cannot express are
-/// re-checked below: the session must match, and `sequence` must strictly
-/// increase (gaps allowed, repeats and regressions rejected).
+/// per-message shape checks happen before a message gets here rather than in
+/// this file: the types rule out one combination on their own — `ActiveSpeaker`
+/// cannot hold a user id beside an ambiguous confidence — but they do not make a
+/// non-empty string, a Z-suffixed UTC timestamp or a `sequence` of at least 1
+/// unrepresentable, since every initialiser takes a bare `String`/`Int`. Those
+/// are checked by `BridgeEventMessage.contractViolation`, which
+/// `SessionObservationReducer.emit` runs before it builds an event. A message
+/// built by some other means is recorded as it was given, so a producer that
+/// skips that check can still put an unreadable line in the evidence.
+///
+/// What this file checks is the stream rules, which no type expresses: the
+/// session must match, and `sequence` must strictly increase (gaps allowed,
+/// repeats and regressions rejected).
 public final class BridgeRecorder {
     public let sessionId: String
     public private(set) var records: [BridgeRecord] = []
