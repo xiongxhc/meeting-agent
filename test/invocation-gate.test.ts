@@ -85,10 +85,19 @@ test("a short configured alias at a boundary, with an address cue, authorizes", 
   assertPositive(decide(segment("Mei, can you take a note?"), IDENTITY), "Mei");
 });
 
-test("alias with no punctuation at all but a leading question-word cue authorizes", () => {
-  // No comma anywhere in this segment -- the boundary is whitespace, and
-  // the disambiguator is the cue word "what", not punctuation.
-  assertPositive(decide(segment("Meetbot what did we decide"), IDENTITY), "Meetbot");
+test("KNOWN LIMITATION (R41): no separator at all, even with a leading cue word, does not authorize", () => {
+  // Round 2/3 treated this as a required positive (whitespace as the
+  // boundary, the cue word "what" as the sole disambiguator). Round 4's
+  // R41 ruling removed that path entirely: two rounds of false positives
+  // both traced back to "alias directly touching more text with only a
+  // cue-lexicon check standing between that and authorize" -- exactly
+  // this shape. A real separator (comma/colon) is now mandatory before a
+  // cue lookup is even attempted, so this segment -- structurally
+  // identical in shape to the pinned negative "Meetbot usually handles
+  // the notes." -- is deliberately, structurally negative now too.
+  const decision = decide(segment("Meetbot what did we decide"), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -179,11 +188,20 @@ test("CJK alias alone as the entire segment authorizes", () => {
   assertPositive(decide(segment("会议机器人", true), CJK_IDENTITY), "会议机器人");
 });
 
-test("CJK alias with NO separator at all still authorizes via the '一下' request-softener cue", () => {
-  // Chinese has no whitespace, so there is no punctuation-free "boundary"
-  // the way English has one; the disambiguator here is the address-cue
-  // lexicon (一下), not adjacency to a non-letter character.
-  assertPositive(decide(segment("会议机器人总结一下", true), CJK_IDENTITY), "会议机器人");
+test("KNOWN LIMITATION (R41, CJK): no separator at all does not authorize, even with a would-be cue prefix", () => {
+  // Round 3 special-cased this authorize via the cue "总结" (since
+  // removed from the default lexicon -- it existed only for this case).
+  // R41 removes the whole no-separator path uniformly for both scripts:
+  // Chinese has no whitespace to mark a boundary the way English does, so
+  // "the next character is a letter" was never a meaningful signal here
+  // in the first place -- exactly why round 4 requires a real separator
+  // instead. This single change is also what makes an entire class of
+  // Chinese false positives (ordinary declarative sentences with the
+  // alias as subject and no comma after it) structurally unreachable --
+  // see the CJK declarative fixtures in the acceptance matrix below.
+  const decision = decide(segment("会议机器人总结一下", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+  assert.equal(decision.matchedAlias, "会议机器人");
 });
 
 test("CJK third-person mention, no separator, no cue in the following clause, does not authorize", () => {
@@ -375,6 +393,155 @@ test("ROUND 3: a trailing mention with only whitespace before it (no comma) does
   // END of an utterance -- the name is at least as likely to be a
   // grammatical object as an addressee.
   const decision = decide(segment("I will ask Meetbot"), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 4, Critical: exclamatory idioms open with an ordinary cue word but
+// are never a genuine address -- checked via a closed anti-cue list,
+// BEFORE the cue list, in both leading and trailing positions. Every
+// fixture below is a confirmed round-3 false positive, reproduced
+// directly against the round-3 source by the third review.
+// ---------------------------------------------------------------------------
+
+test("ROUND 4: an exclamatory 'what a' idiom does not authorize (leading)", () => {
+  const decision = decide(segment("Meetbot, what a mess."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'what a' idiom does not authorize (a different noun)", () => {
+  const decision = decide(segment("Meetbot, what a day."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'how about' idiom does not authorize", () => {
+  const decision = decide(segment("Meetbot, how about that game last night."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'how dare' idiom does not authorize", () => {
+  const decision = decide(segment("Meetbot, how dare you."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'why me' idiom does not authorize", () => {
+  const decision = decide(segment("Meetbot, why me."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'do tell' idiom does not authorize (checked before the 'do' cue)", () => {
+  // "do" alone is a recognized cue -- the anti-cue check must run FIRST,
+  // or this would incorrectly authorize.
+  const decision = decide(segment("Meetbot, do tell."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'what a' idiom does not authorize (trailing position)", () => {
+  const decision = decide(segment("What a mess, Meetbot."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4: an exclamatory 'would you look at that' idiom does not authorize (checked before the 'would' cue)", () => {
+  const decision = decide(segment("Meetbot, would you look at that."), IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 adversarial finding (fixed): a genuine 'would you look into X' request still authorizes", () => {
+  // Found during this round's own adversarial pass: the reviewer's named
+  // anti-cue was the bare phrase "would you look", which also swallowed a
+  // real request. Narrowed to the full idiom "would you look at that" --
+  // this is what proves the narrowing actually fixed the collateral
+  // damage rather than just moving it.
+  assertPositive(decide(segment("Meetbot, would you look into this bug?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, would you look over the report?"), IDENTITY), "Meetbot");
+});
+
+test("ROUND 4 adversarial finding (fixed, CJK): exclamatory slang starting with the '什么' cue does not authorize", () => {
+  // Found during this round's own adversarial pass, not named by the
+  // review: the same anti-cue bug class as "what a mess", but in Chinese.
+  // Neither "什么鬼" nor "什么玩意" has a literal-question reading in
+  // ordinary usage -- both are unambiguous exclamatory slang.
+  assertNegative(decide(segment("会议机器人，什么鬼", true), CJK_IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("会议机器人，什么玩意", true), CJK_IDENTITY), "incidental_mention");
+});
+
+test("ROUND 4 adversarial finding: a genuine '什么' question elsewhere still authorizes", () => {
+  // Confirms the new Chinese anti-cues are scoped to the exact idioms, not
+  // to "什么" generally.
+  assertPositive(decide(segment("会议机器人，什么都行", true), CJK_IDENTITY), "会议机器人");
+});
+
+test("ROUND 4: the anti-cue phrase must be a whole phrase, not a bare string prefix", () => {
+  // "what another day" is NOT the anti-cue idiom "what a" -- "another" is
+  // a different, real word. clauseStartsWithPhrase requires a word
+  // boundary after the phrase, not merely a character-level prefix match.
+  // ("what" is still a recognized cue, so this authorizes.)
+  assertPositive(decide(segment("Meetbot, what another day looks like?"), IDENTITY), "Meetbot");
+});
+
+test("additionalAntiCues extends (not replaces) the default anti-cue lexicon", () => {
+  const baseline = decide(segment("Meetbot, seriously though."), IDENTITY);
+  // "seriously though" has no cue at all, so it's already negative for an
+  // unrelated reason -- use a phrase that WOULD authorize under the
+  // default lexicon (opens with a real cue) to prove the anti-cue
+  // extension actually suppresses it.
+  const wouldAuthorizeByDefault = decide(segment("Meetbot, what a strange thing to ask about the budget."), IDENTITY);
+  assertNegative(wouldAuthorizeByDefault, "incidental_mention"); // already caught by the default "what a"
+
+  const extended: InvocationGateIdentity = {
+    ...IDENTITY,
+    additionalAntiCues: ["can we not"],
+  };
+  const baselineWithoutExtension = decide(segment("Meetbot, can we not do this today."), IDENTITY);
+  assertPositive(baselineWithoutExtension, "Meetbot"); // "can" opens the clause -- authorizes by default
+
+  const withExtension = decide(segment("Meetbot, can we not do this today."), extended);
+  assertNegative(withExtension, "incidental_mention"); // now suppressed by the operator's own anti-cue
+
+  // The built-in anti-cues still work under the extended identity too.
+  const stillBuiltIn = decide(segment("Meetbot, what a mess.", true), extended);
+  assertNegative(stillBuiltIn, "incidental_mention");
+  void baseline;
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 4 (R41): Chinese declarative sentences -- the alias as subject with
+// no separator after it -- are structurally unreachable now, regardless of
+// what cue-shaped words appear later in the sentence. Every fixture below
+// is a confirmed round-3 false positive.
+// ---------------------------------------------------------------------------
+
+test("ROUND 4 (R41, CJK): a declarative sentence with the alias as subject does not authorize", () => {
+  const decision = decide(segment("会议机器人可以处理很多任务", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 (R41, CJK): a declarative sentence using the (now removed) '一下' cue does not authorize", () => {
+  const decision = decide(segment("会议机器人一下就修好了", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 (R41, CJK): the idiom '总结起来' (in summary) does not authorize -- '总结' cue was removed", () => {
+  const decision = decide(segment("会议机器人总结起来都是问题", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 (R41, CJK): a rhetorical '怎么' question about the agent does not authorize", () => {
+  const decision = decide(segment("会议机器人怎么老是这样", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 (R41, CJK): a '为什么' question about the agent, not to it, does not authorize", () => {
+  const decision = decide(segment("会议机器人为什么大家都在讨论它", true), CJK_IDENTITY);
+  assertNegative(decision, "incidental_mention");
+});
+
+test("ROUND 4 (R41, CJK): even WITH a comma, the idiom '总结起来' does not authorize -- '总结' cue removal verified directly", () => {
+  // This is the fixture the second review named specifically: with the
+  // separator present, only the removal of "总结" from the default cue
+  // list prevents this from authorizing (R41's separator requirement
+  // alone would not have caught it, since a real comma IS present here).
+  const decision = decide(segment("会议机器人，总结起来都是问题", true), CJK_IDENTITY);
   assertNegative(decision, "incidental_mention");
 });
 
@@ -661,6 +828,16 @@ const REQUIRED_NEGATIVES: ReadonlyArray<{ readonly text: string; readonly note: 
   // ROUND 3, Critical 2: apostrophe is now a word-continuation character.
   { text: "Mei's phone is ringing, can someone check?", note: "possessive using the short alias" },
   { text: "Meetbot's log shows what happened.", note: "possessive using the primary alias" },
+  // ROUND 4, Critical: exclamatory idioms that open with an ordinary cue
+  // word but are never a genuine address (reproduced as confirmed round-3
+  // false positives by the third review).
+  { text: "Meetbot, what a mess.", note: "exclamatory 'what a' idiom, not a question" },
+  { text: "Meetbot, what a day.", note: "exclamatory 'what a' idiom, not a question" },
+  { text: "Meetbot, how about that game last night.", note: "exclamatory 'how about' idiom" },
+  { text: "Meetbot, how dare you.", note: "exclamatory 'how dare' idiom" },
+  { text: "Meetbot, why me.", note: "exclamatory 'why me' idiom" },
+  { text: "Meetbot, do tell.", note: "exclamatory idiom; 'do' is a cue word but the anti-cue wins" },
+  { text: "What a mess, Meetbot.", note: "same exclamatory idiom, trailing position" },
 ];
 
 for (const { text, note } of REQUIRED_NEGATIVES) {
@@ -681,13 +858,13 @@ test("acceptance matrix (negative): any non-final segment does not authorize, wh
   }
   // Also the required positive texts, made partial -- the hardest version
   // of "whatever its text": a perfectly-shaped vocative that is not final.
-  for (const text of [
-    "Meetbot",
-    "Meetbot, what did we decide?",
-    "Hey Meetbot, can you summarize?",
-    "会议机器人总结一下",
-  ]) {
-    const decision = decide(segment(text, false), IDENTITY.aliases.includes("会议机器人") ? IDENTITY : CJK_IDENTITY);
+  for (const text of ["Meetbot", "Meetbot, what did we decide?", "Hey Meetbot, can you summarize?"]) {
+    const decision = decide(segment(text, false), IDENTITY);
+    assertNegative(decision, "non_final_segment");
+  }
+  // And the CJK required positive, separately (different identity).
+  {
+    const decision = decide(segment("会议机器人，请总结一下", false), CJK_IDENTITY);
     assertNegative(decision, "non_final_segment");
   }
 });
@@ -708,12 +885,6 @@ const REQUIRED_POSITIVES: ReadonlyArray<{
     identity: IDENTITY,
     matchedAlias: "Meetbot",
     note: "comma + wh-word cue",
-  },
-  {
-    text: "Meetbot what did we decide",
-    identity: IDENTITY,
-    matchedAlias: "Meetbot",
-    note: "no punctuation, wh-word cue alone disambiguates",
   },
   {
     text: "Hey Meetbot, can you summarize?",
@@ -750,12 +921,6 @@ const REQUIRED_POSITIVES: ReadonlyArray<{
     identity: CJK_IDENTITY,
     matchedAlias: "会议机器人",
     note: "CJK, full-width comma + request marker",
-  },
-  {
-    text: "会议机器人总结一下",
-    identity: CJK_IDENTITY,
-    matchedAlias: "会议机器人",
-    note: "CJK, no separator at all, '一下' softener is the sole cue",
   },
 ];
 
@@ -921,8 +1086,8 @@ function randomJoiner(rng: () => number): string {
   return joiners[Math.floor(rng() * joiners.length)] ?? " ";
 }
 
-// Round 3: ordinary filler words a real appositive/reported-speech
-// sentence would use, deliberately disjoint from BURIED_CUE_POOL below.
+// Ordinary filler words a real appositive/reported-speech sentence would
+// use, deliberately disjoint from BURIED_CUE_POOL below.
 const WORD_POOL = [
   "the",
   "team",
@@ -949,21 +1114,25 @@ const WORD_POOL = [
   "topic",
 ];
 
-// The same cue words decide() recognizes -- placed deliberately at a
-// NON-OPENING position by randomBuriedCuePhrase below, so this directly
-// targets round 2's Critical 1 defect class (a cue word anywhere in the
-// unbounded remainder used to be enough; now it must open the clause).
+// The same cue words decide() recognizes.
 const BURIED_CUE_POOL = ["can", "could", "would", "will", "do", "does", "did", "what", "who", "where", "when", "why", "how", "please"];
 
 function randomWord(rng: () => number, pool: readonly string[]): string {
   return pool[Math.floor(rng() * pool.length)] ?? pool[0]!;
 }
 
-/** A multi-word phrase with a real cue word buried at position 1 or 2 --
- * never position 0 -- so if the matcher incorrectly treats "a cue anywhere"
- * as sufficient (round 2's Critical 1 bug), this phrase would wrongly
- * authorize; if the matcher correctly requires the cue to OPEN the clause,
- * it never does. */
+/** A multi-word phrase with a cue word placed somewhere in it (position 1
+ * or 2, i.e. NOT the opening word). Used as filler CONTENT for the fully-
+ * embedded mode below, where the alias never reaches a segment edge at
+ * all -- so this phrase is never actually passed to clauseIsAddress, and
+ * only adds word-shaped (rather than character-noise) realism to that
+ * mode's coverage of the adjacency guard. It is NOT what makes property 2
+ * exercise clauseIsAddress's position-sensitivity -- see
+ * randomDeeplyBuriedCuePhrase and the boundary-position modes below, which
+ * is what round 4 added specifically because this generator's cue can
+ * land at index 1, still inside the "first two tokens" window
+ * clauseIsAddress legitimately allows, so even a directly-checked clause
+ * built from it would not reliably prove anything either way. */
 function randomBuriedCuePhrase(rng: () => number): string {
   const leadWordCount = 1 + Math.floor(rng() * 2);
   const words: string[] = [];
@@ -974,50 +1143,108 @@ function randomBuriedCuePhrase(rng: () => number): string {
   return words.join(" ");
 }
 
+/** A multi-word phrase with a cue word placed strictly at index 2 or
+ * later -- OUTSIDE clauseIsAddress's "first two tokens" window, so this
+ * phrase genuinely could not authorize via the cue, no matter where in
+ * the sentence it sits. This is the one used in the BOUNDARY-position
+ * modes below (where the phrase actually IS the clause clauseIsAddress
+ * evaluates), because it is designed to fail if -- and only if -- the
+ * matcher regresses to "a cue word anywhere in the clause is enough"
+ * (round 2's Critical 1 defect class). */
+function randomDeeplyBuriedCuePhrase(rng: () => number): string {
+  const leadWordCount = 2 + Math.floor(rng() * 2);
+  const words: string[] = [];
+  for (let i = 0; i < leadWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
+  words.push(randomWord(rng, BURIED_CUE_POOL));
+  const trailWordCount = Math.floor(rng() * 3);
+  for (let i = 0; i < trailWordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
+  return words.join(" ");
+}
+
 function randomEmbeddingText(rng: () => number): string {
   // Half character noise (catches generic/hyphen/apostrophe-class issues),
-  // half a buried-cue word phrase (catches the clause-scope class).
+  // half a word-shaped phrase (more realistic filler content). NEITHER
+  // half reaches clauseIsAddress in this (embedded, non-edge) mode -- see
+  // the "embedded" case in the main loop below.
   return rng() < 0.5 ? randomNonEmptyText(rng, 1, 25) : randomBuriedCuePhrase(rng);
 }
 
-test("property 2: an alias embedded in random filler on both sides (never at a segment edge) never authorizes", () => {
+const BOUNDARY_SEPARATORS = [",", ":"];
+
+function randomBoundarySeparator(rng: () => number): string {
+  return BOUNDARY_SEPARATORS[Math.floor(rng() * BOUNDARY_SEPARATORS.length)] ?? ",";
+}
+
+test("property 2: an alias with a cue buried outside the checked window never authorizes, at a real edge or embedded", () => {
   const SEED = 0x656d_6265; // "embe", arbitrary fixed constant -- deterministic across runs
   const rng = mulberry32(SEED);
   const SAMPLES = 300;
   const identity = IDENTITY;
   const alias = "Meetbot";
+  const foldedFillers = new Set(["hey", "hi", "hello", "so", "ok", "okay", "um", "uh"]);
 
   for (let i = 0; i < SAMPLES; i += 1) {
-    let prefix = randomEmbeddingText(rng);
-    let suffix = randomEmbeddingText(rng);
-    let guard = 0;
-    // Guard against: (a) the random prefix/suffix accidentally spelling out
-    // another occurrence of a configured alias, which would make the
-    // "no alias elsewhere" premise false, and (b) the prefix folding down
-    // to exactly a recognized leading filler word, which would legitimately
-    // make this a real (non-embedded) vocative and defeat the point of the
-    // test.
-    const foldedFillers = new Set(["hey", "hi", "hello", "so", "ok", "okay", "um", "uh"]);
-    function isProblematic(): boolean {
-      if (containsAnyAliasSubstring(prefix, identity) || containsAnyAliasSubstring(suffix, identity)) {
-        return true;
+    // Three generation modes, round-robin by sample index:
+    //   0. EMBEDDED (round 3's original mode): the alias sits between a
+    //      non-empty prefix AND a non-empty suffix, so it never reaches a
+    //      segment edge -- clauseIsAddress is never invoked at all. This
+    //      still exercises the adjacency/hyphen/apostrophe guard.
+    //   1. LEADING BOUNDARY (round 4 addition -- Finding D): the alias
+    //      genuinely opens the segment, followed by a real separator and
+    //      a clause whose cue word is deliberately placed OUTSIDE the
+    //      first-two-tokens window clauseIsAddress checks. THIS mode
+    //      would fail if the matcher ever regressed to "a cue anywhere in
+    //      the clause is enough" (round 2's Critical 1 defect class).
+    //   2. TRAILING BOUNDARY (round 4 addition): the mirror image, alias
+    //      at the genuine end of the segment.
+    const mode = i % 3;
+
+    if (mode === 0) {
+      let prefix = randomEmbeddingText(rng);
+      let suffix = randomEmbeddingText(rng);
+      let guard = 0;
+      function isProblematic(): boolean {
+        if (containsAnyAliasSubstring(prefix, identity) || containsAnyAliasSubstring(suffix, identity)) {
+          return true;
+        }
+        const foldedPrefix = foldForContainmentCheck(prefix).trim().replace(/[,.\-!?:;]+$/u, "");
+        return foldedFillers.has(foldedPrefix);
       }
-      const foldedPrefix = foldForContainmentCheck(prefix).trim().replace(/[,.\-!?:;]+$/u, "");
-      return foldedFillers.has(foldedPrefix);
+      while (isProblematic() && guard < 15) {
+        prefix = randomEmbeddingText(rng);
+        suffix = randomEmbeddingText(rng);
+        guard += 1;
+      }
+      assert.ok(!isProblematic(), `seed=${SEED} sample=${i} (embedded): could not generate a clean case after ${guard} retries`);
+
+      const text = `${prefix}${randomJoiner(rng)}${alias}${randomJoiner(rng)}${suffix}`;
+      const decision = decide({ segmentId: `embed-${i}`, text, final: true }, identity);
+      assert.equal(
+        decision.authorize,
+        false,
+        `seed=${SEED} sample=${i} (embedded) text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
+      );
+      continue;
     }
-    while (isProblematic() && guard < 15) {
-      prefix = randomEmbeddingText(rng);
-      suffix = randomEmbeddingText(rng);
+
+    let clause = randomDeeplyBuriedCuePhrase(rng);
+    let guard = 0;
+    while (containsAnyAliasSubstring(clause, identity) && guard < 15) {
+      clause = randomDeeplyBuriedCuePhrase(rng);
       guard += 1;
     }
-    assert.ok(!isProblematic(), `seed=${SEED} sample=${i}: could not generate a clean embedding after ${guard} retries`);
+    assert.ok(
+      !containsAnyAliasSubstring(clause, identity),
+      `seed=${SEED} sample=${i} (boundary): could not generate a clean clause after ${guard} retries`,
+    );
 
-    const text = `${prefix}${randomJoiner(rng)}${alias}${randomJoiner(rng)}${suffix}`;
-    const decision = decide({ segmentId: `embed-${i}`, text, final: true }, identity);
+    const sep = randomBoundarySeparator(rng);
+    const text = mode === 1 ? `${alias}${sep} ${clause}` : `${clause}${sep} ${alias}`;
+    const decision = decide({ segmentId: `boundary-${i}`, text, final: true }, identity);
     assert.equal(
       decision.authorize,
       false,
-      `seed=${SEED} sample=${i} text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
+      `seed=${SEED} sample=${i} (boundary, mode=${mode}) text=${JSON.stringify(text)}: expected authorize=false but got ${JSON.stringify(decision)}`,
     );
   }
 });
