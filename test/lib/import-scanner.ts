@@ -255,51 +255,78 @@ function recordImportCapabilities(
   result: ScanResult,
   context: FileScanContext,
 ): void {
-  if (!ts.isImportDeclaration(node) || !ts.isStringLiteralLike(node.moduleSpecifier)) return;
-  const specifier = node.moduleSpecifier.text;
-  const clause = node.importClause;
-  if (!clause) return;
-  if (NETWORK_MODULES.has(specifier)) {
-    if (clause.name) context.networkNamespaces.add(clause.name.text);
+  if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+    const specifier = node.moduleSpecifier.text;
+    const clause = node.importClause;
+    if (!clause || clause.isTypeOnly) return;
     const bindings = clause.namedBindings;
-    if (bindings && ts.isNamespaceImport(bindings)) context.networkNamespaces.add(bindings.name.text);
-    if (bindings && ts.isNamedImports(bindings)) {
-      for (const item of bindings.elements) {
+    const valueImports = bindings && ts.isNamedImports(bindings)
+      ? bindings.elements.filter((item) => !item.isTypeOnly)
+      : [];
+    const hasRuntimeBinding = clause.name !== undefined ||
+      (bindings !== undefined && ts.isNamespaceImport(bindings)) || valueImports.length > 0;
+
+    if (NETWORK_MODULES.has(specifier) && hasRuntimeBinding) {
+      if (clause.name) context.networkNamespaces.add(clause.name.text);
+      if (bindings && ts.isNamespaceImport(bindings)) context.networkNamespaces.add(bindings.name.text);
+      for (const item of valueImports) {
         if (NETWORK_METHOD_NAMES.has(item.propertyName?.text ?? item.name.text)) {
           context.networkAliases.add(item.name.text);
         }
       }
+      result.runtimeBoundaryCalls.push({ file, capability: `import:${specifier}`, snippet: snippetOf(node, sourceFile) });
     }
-    result.runtimeBoundaryCalls.push({
-      file,
-      capability: `import:${specifier}`,
-      snippet: snippetOf(node, sourceFile),
-    });
-  }
-  // A named `fetch`/`request` import is direct network capability even when a
-  // future HTTP client is not in the small module-name catalogue above.
-  // Generic names such as `get` are deliberately excluded: they occur in
-  // ordinary local APIs and are not capability evidence on their own.
-  if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-    for (const item of clause.namedBindings.elements) {
+    for (const item of valueImports) {
       const imported = item.propertyName?.text ?? item.name.text;
       if (imported === "fetch" || imported === "request") context.networkAliases.add(item.name.text);
     }
-  }
-  if (!FS_MODULES.has(specifier)) return;
-  if (clause.name) {
-    result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
-  }
-  const bindings = clause.namedBindings;
-  if (bindings && ts.isNamespaceImport(bindings)) {
-    result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
-  }
-  if (bindings && ts.isNamedImports(bindings)) {
-    for (const item of bindings.elements) {
+    if (!FS_MODULES.has(specifier)) return;
+    if (clause.name || (bindings && ts.isNamespaceImport(bindings))) {
+      result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
+    }
+    for (const item of valueImports) {
       const imported = item.propertyName?.text ?? item.name.text;
       if (WRITE_LIKE_METHOD_NAMES.has(imported)) {
         result.fsWriteCapabilityImports.push({ file, capability: imported, snippet: snippetOf(node, sourceFile) });
       }
+    }
+    return;
+  }
+
+  if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+    if (node.isTypeOnly) return;
+    const specifier = node.moduleSpecifier.text;
+    const clause = node.exportClause;
+    const valueExports = clause && ts.isNamedExports(clause)
+      ? clause.elements.filter((item) => !item.isTypeOnly)
+      : [];
+    const exportsRuntimeValue = clause === undefined || ts.isNamespaceExport(clause) || valueExports.length > 0;
+    if (NETWORK_MODULES.has(specifier) && exportsRuntimeValue) {
+      result.runtimeBoundaryCalls.push({ file, capability: `export:${specifier}`, snippet: snippetOf(node, sourceFile) });
+    }
+    if (!FS_MODULES.has(specifier)) return;
+    if (clause === undefined || ts.isNamespaceExport(clause)) {
+      result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
+      return;
+    }
+    for (const item of valueExports) {
+      const exported = item.propertyName?.text ?? item.name.text;
+      if (WRITE_LIKE_METHOD_NAMES.has(exported)) {
+        result.fsWriteCapabilityImports.push({ file, capability: exported, snippet: snippetOf(node, sourceFile) });
+      }
+    }
+    return;
+  }
+
+  if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) &&
+    ts.isStringLiteralLike(node.moduleReference.expression)) {
+    const specifier = node.moduleReference.expression.text;
+    if (NETWORK_MODULES.has(specifier)) {
+      context.networkNamespaces.add(node.name.text);
+      result.runtimeBoundaryCalls.push({ file, capability: `import-equals:${specifier}`, snippet: snippetOf(node, sourceFile) });
+    }
+    if (FS_MODULES.has(specifier)) {
+      result.fsWriteCapabilityImports.push({ file, capability: "*", snippet: snippetOf(node, sourceFile) });
     }
   }
 }

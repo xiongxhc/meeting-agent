@@ -1949,7 +1949,11 @@ test("the recording survives closing and reopening the database", async () => {
     });
     coordinator.discover(IDENTITY);
     const bridge = fakeBridge(BRIDGE_SESSION_ID);
-    const runtime = fakeRuntime();
+    const runtimeGaps = [
+      { startedAtMs: 9_007_199_254_740_993n, endedAtMs: null, reason: "capture_gap" },
+      { startedAtMs: 9_007_199_254_740_995n, endedAtMs: 9_007_199_254_740_999n, reason: "provider_pause" },
+    ] as const;
+    const runtime = fakeRuntime({ finalizedGaps: runtimeGaps });
     const session = createMeetingSession({
       identity: IDENTITY,
       bridge,
@@ -1979,6 +1983,10 @@ test("the recording survives closing and reopening the database", async () => {
       );
       assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.format, "ogg/opus");
       assert.equal(reopened.getRecording(IDENTITY.occurrenceId)?.keyId, "runtime-key-20260902");
+      assert.deepEqual(reopened.getRecording(IDENTITY.occurrenceId)?.runtimeGaps, [
+        { ordinal: 0, ...runtimeGaps[0] },
+        { ordinal: 1, ...runtimeGaps[1] },
+      ]);
       assert.equal(reopened.getSession(IDENTITY.occurrenceId)?.state, "finalizing");
       assert.deepEqual(reopened.foreignKeyCheck(), []);
     } finally {
@@ -2075,6 +2083,117 @@ test("a bridge_failure ends only that bridge generation and permits a fresh leas
     await recovery.dispose();
   } finally {
     await h.cleanup();
+  }
+});
+
+test("maxRetries zero persists terminal bridge failure evidence and refuses every new generation after reopen", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-exhausted-reopen-"));
+  const dbPath = path.join(dir, "orchestration.db");
+  const runtimeGaps = [{
+    startedAtMs: 9_007_199_254_740_993n,
+    endedAtMs: null,
+    reason: "capture_gap",
+  }] as const;
+  try {
+    const store = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
+    const coordinator = createCoordinator({
+      store,
+      clock: fakeClock(BASE_MS),
+      bridgeLeaseTtlMs: LEASE_TTL_MS,
+      maxConcurrentSessions: 2,
+    });
+    coordinator.discover(IDENTITY);
+    const bridge = fakeBridge(BRIDGE_SESSION_ID);
+    const runtime = fakeRuntime({ finalizedGaps: runtimeGaps });
+    const session = createMeetingSession({
+      identity: IDENTITY,
+      bridge,
+      runtime,
+      coordinator,
+      clock: fakeClock(BASE_MS),
+      agentIdentity: { aliases: ["Meetbot"] },
+      bridgeId: "bridge-mac-synthetic",
+      bridgeSessionId: BRIDGE_SESSION_ID,
+      disclosureText: DISCLOSURE_TEXT,
+      bridgeFailureRetryLimit: 0,
+    });
+    await session.join();
+    bridge.emit(bridge.event({ type: "joined", meetingOccurrenceId: IDENTITY.occurrenceId }));
+    bridge.emit(bridge.event({
+      type: "audio_gap",
+      direction: "capture",
+      startedAt: "2026-09-02T14:10:00Z",
+      endedAt: "2026-09-02T14:10:02Z",
+    }));
+    bridge.emit(bridge.event({ type: "left", reason: "bridge_failure" }));
+    await session.settled();
+    store.close();
+
+    const reopened = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
+    try {
+      const resumed = createCoordinator({
+        store: reopened,
+        clock: fakeClock(BASE_MS),
+        bridgeLeaseTtlMs: LEASE_TTL_MS,
+        maxConcurrentSessions: 2,
+      });
+      assert.equal(resumed.get(IDENTITY.occurrenceId)?.state, "failed");
+      assert.equal(resumed.get(IDENTITY.occurrenceId)?.terminalReason, "bridge_failure_exhausted");
+      assert.deepEqual(
+        resumed.history(IDENTITY.occurrenceId).at(-1),
+        {
+          id: resumed.history(IDENTITY.occurrenceId).at(-1)?.id,
+          occurrenceId: IDENTITY.occurrenceId,
+          fromState: "listening",
+          toState: "failed",
+          reason: "fail",
+          terminalReason: "bridge_failure_exhausted",
+          occurredAtMs: BASE_MS,
+        },
+      );
+      assert.deepEqual(resumed.bridgeFailureRecording(IDENTITY.occurrenceId, 1), {
+        occurrenceId: IDENTITY.occurrenceId,
+        attempt: 1,
+        handle: "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        encryptedPath: "/synthetic-runtime/recordings/0a1b2c3d4e5f60718293a4b5c6d7e8f9.enc",
+        sha256: "0".repeat(64),
+        durationMs: 3_600_000,
+        format: "ogg/opus",
+        keyId: "runtime-key-20260902",
+        finalizedAtMs: BASE_MS,
+        gaps: [{
+          ordinal: 0,
+          direction: "capture",
+          startedAt: "2026-09-02T14:10:00Z",
+          endedAt: "2026-09-02T14:10:02Z",
+        }],
+        runtimeGaps: [{ ordinal: 0, ...runtimeGaps[0] }],
+      });
+
+      const nextBridge = fakeBridge("sess_0000000000000002");
+      const nextRuntime = fakeRuntime();
+      const next = createMeetingSession({
+        identity: IDENTITY,
+        bridge: nextBridge,
+        runtime: nextRuntime,
+        coordinator: resumed,
+        clock: fakeClock(BASE_MS),
+        agentIdentity: { aliases: ["Meetbot"] },
+        bridgeId: "bridge-mac-synthetic",
+        bridgeSessionId: "sess_0000000000000002",
+        disclosureText: DISCLOSURE_TEXT,
+        bridgeFailureRetryLimit: 0,
+      });
+      await assert.rejects(() => next.join(), /state "failed"/);
+      assert.equal(nextRuntime.callsOf("startVoiceSession").length, 0);
+      assert.deepEqual(nextBridge.sent, []);
+      assert.equal(resumed.activeBridgeLease(IDENTITY.occurrenceId), null);
+      await next.dispose();
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -2240,6 +2359,44 @@ test("a cleanup failure during a failed join does not replace the error that fai
     await h.cleanup();
   }
 });
+
+for (const throwingCallback of ["bridge", "runtime"] as const) {
+  test(`a throwing ${throwingCallback} unsubscribe preserves the join failure and still runs the other unsubscribe`, async () => {
+    const joinFailure = new Error("synthetic runtime outage");
+    const unsubscribeFailure = new Error(`synthetic ${throwingCallback} unsubscribe failure`);
+    const h = harness({ runtime: fakeRuntime({ startVoiceSessionError: joinFailure }) });
+    const originalBridgeSubscribe = h.bridge.subscribe.bind(h.bridge);
+    const originalRuntimeSubscribe = h.runtime.subscribe.bind(h.runtime);
+    let bridgeUnsubscribed = 0;
+    let runtimeUnsubscribed = 0;
+    h.bridge.subscribe = (listener) => {
+      const unsubscribe = originalBridgeSubscribe(listener);
+      return () => {
+        bridgeUnsubscribed += 1;
+        unsubscribe();
+        if (throwingCallback === "bridge") throw unsubscribeFailure;
+      };
+    };
+    h.runtime.subscribe = (listener) => {
+      const unsubscribe = originalRuntimeSubscribe(listener);
+      return () => {
+        runtimeUnsubscribed += 1;
+        unsubscribe();
+        if (throwingCallback === "runtime") throw unsubscribeFailure;
+      };
+    };
+    try {
+      await assert.rejects(() => h.session.join(), (error: unknown) => error === joinFailure);
+      assert.equal(bridgeUnsubscribed, 1);
+      assert.equal(runtimeUnsubscribed, 1);
+      assert.equal(h.bridge.subscriberCount(), 0);
+      assert.equal(h.runtime.subscriberCount(), 0);
+      assert.ok(h.session.state().routingErrors.some((failure) => failure.error === unsubscribeFailure));
+    } finally {
+      await h.cleanup();
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Retrieval wiring: the router (src/sessions/retrieval-router.ts) actually

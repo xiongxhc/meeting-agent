@@ -617,6 +617,7 @@ const RECORDING_ROW: RecordingRow = {
   keyId: "runtime-key-20260902",
   finalizedAtMs: Date.parse(ENDED_AT),
   gaps: [],
+  runtimeGaps: [],
 };
 
 function recordings(row: RecordingRow | null): { recording(occurrenceId: string): RecordingRow | null } {

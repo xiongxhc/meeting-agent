@@ -41,6 +41,7 @@ export type CreateMeetingAgentApplicationOptions = {
 export type MeetingAgentApplication = {
   readonly coordinator: SessionCoordinator;
   createSession(identity: MeetingIdentity): MeetingSession;
+  liveSessionCount(): number;
   close(): Promise<void>;
 };
 
@@ -81,11 +82,22 @@ export function createMeetingAgentApplication(
         disclosureText: "A meeting agent is listening and will create meeting notes.",
         teamVaultDir: options.config.dataPaths.teamVaultDir,
       };
+      const tracked: { session?: MeetingSession } = {};
+      const lifecycleOptions = {
+        ...sessionOptions,
+        onInactive: () => {
+          if (tracked.session !== undefined) sessions.delete(tracked.session);
+        },
+      };
       const session = createMeetingSession(options.bridgeFailureRetryLimit === undefined
-        ? sessionOptions
-        : { ...sessionOptions, bridgeFailureRetryLimit: options.bridgeFailureRetryLimit });
+        ? lifecycleOptions
+        : { ...lifecycleOptions, bridgeFailureRetryLimit: options.bridgeFailureRetryLimit });
+      tracked.session = session;
       sessions.add(session);
       return session;
+    },
+    liveSessionCount(): number {
+      return sessions.size;
     },
     close(): Promise<void> {
       if (closePromise !== null) return closePromise;

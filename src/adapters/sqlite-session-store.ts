@@ -32,6 +32,7 @@ import {
   type LeaseReleaseReason,
   type LeaseRow,
   type RecordingGapRow,
+  type RuntimeRecordingGapRow,
   type RecordingRow,
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
@@ -405,6 +406,7 @@ function finalizeSession(
       input.recording.gaps.forEach((gap, ordinal) => {
         insertGap.run(occurrenceId, ordinal, gap.direction, gap.startedAt, gap.endedAt);
       });
+      insertRuntimeGaps(db, "recording_runtime_gaps", [occurrenceId], input.recording.runtimeGaps);
     });
     return session;
   });
@@ -444,6 +446,8 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
     ended_at: string | null;
   }>;
 
+  const runtimeGaps = selectRuntimeGaps(db, "recording_runtime_gaps", "occurrence_id = ?", [occurrenceId]);
+
   return {
     occurrenceId: raw.occurrence_id,
     handle: raw.handle,
@@ -461,6 +465,7 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
         endedAt: gap.ended_at,
       }),
     ),
+    runtimeGaps,
   };
 }
 
@@ -474,7 +479,7 @@ function recordBridgeFailure(
     readonly recording: FinalizeSessionInput["recording"] | null;
   },
 ): BridgeRecoveryResult {
-  const run = db.transaction(() => {
+  const run = db.transaction(() => withConstraintTranslation(() => {
     if (selectSessionRaw(db, input.occurrenceId) === undefined) {
       throw new OrchestrationError("unknown_session", `no session exists for occurrence "${input.occurrenceId}"`);
     }
@@ -501,9 +506,29 @@ function recordBridgeFailure(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(input.occurrenceId, attempt, input.recording.handle, input.recording.encryptedPath,
         input.recording.sha256, input.recording.durationMs, input.recording.format, input.recording.keyId, input.nowMs);
+      insertRuntimeGaps(
+        db,
+        "bridge_failure_recording_runtime_gaps",
+        [input.occurrenceId, attempt],
+        input.recording.runtimeGaps,
+      );
     }
-    return { attempt, retryAllowed: attempt <= input.maxRetries };
-  });
+    const retryAllowed = attempt <= input.maxRetries;
+    if (!retryAllowed) {
+      // This nested transaction is a SQLite savepoint: the failure count,
+      // failed-generation evidence, and terminal occurrence edge commit or
+      // roll back together.
+      transition(db, {
+        occurrenceId: input.occurrenceId,
+        fromState: "listening",
+        toState: "failed",
+        reason: "fail",
+        terminalReason: "bridge_failure_exhausted",
+        nowMs: input.nowMs,
+      });
+    }
+    return { attempt, retryAllowed };
+  }));
   return run();
 }
 
@@ -519,9 +544,67 @@ function getBridgeFailureRecording(
     `SELECT ordinal, direction, started_at, ended_at FROM bridge_recovery_gaps
        WHERE occurrence_id = ? AND attempt = ? ORDER BY ordinal`,
   ).all(occurrenceId, attempt) as Array<{ ordinal: number; direction: string; started_at: string; ended_at: string | null }>;
+  const runtimeGaps = selectRuntimeGaps(
+    db,
+    "bridge_failure_recording_runtime_gaps",
+    "occurrence_id = ? AND attempt = ?",
+    [occurrenceId, attempt],
+  );
   return { occurrenceId, attempt, handle: row.handle, encryptedPath: row.encrypted_path, sha256: row.sha256,
     durationMs: row.duration_ms, format: row.format, keyId: row.key_id, finalizedAtMs: row.finalized_at_ms,
-    gaps: gaps.map((gap) => ({ ordinal: gap.ordinal, direction: gap.direction as RecordingGapRow["direction"], startedAt: gap.started_at, endedAt: gap.ended_at })) };
+    gaps: gaps.map((gap) => ({ ordinal: gap.ordinal, direction: gap.direction as RecordingGapRow["direction"], startedAt: gap.started_at, endedAt: gap.ended_at })),
+    runtimeGaps };
+}
+
+type RuntimeGapInput = FinalizeSessionInput["recording"]["runtimeGaps"];
+
+function insertRuntimeGaps(
+  db: Database.Database,
+  table: "recording_runtime_gaps" | "bridge_failure_recording_runtime_gaps",
+  parentValues: readonly [string] | readonly [string, number],
+  gaps: RuntimeGapInput,
+): void {
+  const parentColumns = table === "recording_runtime_gaps"
+    ? "occurrence_id"
+    : "occurrence_id, attempt";
+  const placeholders = parentValues.map(() => "?").join(", ");
+  const insert = db.prepare(
+    `INSERT INTO ${table}
+       (${parentColumns}, ordinal, started_at_ms, ended_at_ms, reason)
+     VALUES (${placeholders}, ?, ?, ?, ?)`,
+  );
+  gaps.forEach((gap, ordinal) => {
+    insert.run(
+      ...parentValues,
+      ordinal,
+      gap.startedAtMs.toString(),
+      gap.endedAtMs?.toString() ?? null,
+      gap.reason,
+    );
+  });
+}
+
+function selectRuntimeGaps(
+  db: Database.Database,
+  table: "recording_runtime_gaps" | "bridge_failure_recording_runtime_gaps",
+  where: string,
+  values: readonly [string] | readonly [string, number],
+): RuntimeRecordingGapRow[] {
+  const rows = db.prepare(
+    `SELECT ordinal, started_at_ms, ended_at_ms, reason
+       FROM ${table} WHERE ${where} ORDER BY ordinal`,
+  ).all(...values) as Array<{
+    ordinal: number;
+    started_at_ms: string;
+    ended_at_ms: string | null;
+    reason: string;
+  }>;
+  return rows.map((row) => ({
+    ordinal: row.ordinal,
+    startedAtMs: BigInt(row.started_at_ms),
+    endedAtMs: row.ended_at_ms === null ? null : BigInt(row.ended_at_ms),
+    reason: row.reason,
+  }));
 }
 
 function toTransitionRow(raw: {

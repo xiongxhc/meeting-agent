@@ -386,6 +386,57 @@ test("negative control: endpoint spelling cannot exempt aliased fetch or an alia
   });
 });
 
+test("negative control: direct network and filesystem capability re-exports are owned capabilities", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-capability-reexports.ts"),
+      [
+        'export { request as providerRequest } from "node:https";',
+        'export { writeFileSync as overwriteVault } from "node:fs";',
+        '',
+      ].join("\n"),
+    );
+    const result = scanProductionTree(dir);
+    assert.equal(findForbiddenRuntimeBoundaryAccess(result).length, 1);
+    assert.equal(findForbiddenFilesystemWriteCapabilities(result).length, 1);
+  });
+});
+
+test("negative control: TypeScript import-equals cannot acquire network or filesystem capabilities", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-import-equals.ts"),
+      [
+        'import https = require("node:https");',
+        'import fs = require("node:fs");',
+        'export const capabilities = { https, fs };',
+        '',
+      ].join("\n"),
+    );
+    const result = scanProductionTree(dir);
+    assert.equal(findForbiddenRuntimeBoundaryAccess(result).length, 1);
+    assert.equal(findForbiddenFilesystemWriteCapabilities(result).length, 1);
+  });
+});
+
+test("type-only HTTP exports and read-only fs re-exports acquire no runtime/write capability", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "ok-capability-types.ts"),
+      [
+        'import type { RequestOptions } from "node:https";',
+        'export type { AgentOptions } from "node:https";',
+        'export { readFileSync } from "node:fs";',
+        'export type Combined = RequestOptions;',
+        '',
+      ].join("\n"),
+    );
+    const result = scanProductionTree(dir);
+    assert.deepEqual(findForbiddenRuntimeBoundaryAccess(result), []);
+    assert.deepEqual(findForbiddenFilesystemWriteCapabilities(result), []);
+  });
+});
+
 test("negative control: globalThis.fetch is direct network capability outside an adapter", () => {
   withTempDir((dir) => {
     writeFileSync(

@@ -91,6 +91,16 @@ export type RecordingGapRow = {
   readonly endedAt: string | null;
 };
 
+/** One exact SDK RecordingSummary gap. This is deliberately separate from
+ * RecordingGapRow: runtime gaps use a bigint media timeline plus a reason,
+ * while bridge gaps use wall-clock instants plus a direction. */
+export type RuntimeRecordingGapRow = {
+  readonly ordinal: number;
+  readonly startedAtMs: bigint;
+  readonly endedAtMs: bigint | null;
+  readonly reason: string;
+};
+
 /** The finalized recording's METADATA. Never audio bytes: `handle` is an
  * opaque reference to the ENCRYPTED recording, and Meeting Agent never holds
  * the recording key. */
@@ -104,6 +114,7 @@ export type RecordingRow = {
   readonly keyId: string | null;
   readonly finalizedAtMs: number;
   readonly gaps: readonly RecordingGapRow[];
+  readonly runtimeGaps: readonly RuntimeRecordingGapRow[];
 };
 
 /** What a caller supplies to persist a recording. `occurrenceId` and
@@ -121,6 +132,11 @@ export type RecordingInput = {
     readonly direction: "capture" | "playback";
     readonly startedAt: string;
     readonly endedAt: string | null;
+  }>;
+  readonly runtimeGaps: ReadonlyArray<{
+    readonly startedAtMs: bigint;
+    readonly endedAtMs: bigint | null;
+    readonly reason: string;
   }>;
 };
 

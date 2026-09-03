@@ -280,6 +280,10 @@ export type CreateMeetingSessionOptions = {
    * (e.g. wired to a fake Team Vault index), used instead of the session
    * building one from `teamVaultDir`. */
   readonly retrieval?: RetrievalRouter;
+  /** Composition lifecycle hook. Called once, only after terminal/disposal
+   * cleanup has finished, so applications can stop retaining sensitive
+   * session state without reopening shutdown races. */
+  readonly onInactive?: () => void;
 };
 
 type QueueItem =
@@ -338,6 +342,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let runtimeClosed = false;
   let joinCommandSent = false;
   let disposePromise: Promise<void> | null = null;
+  let activeJoinPromise: Promise<void> | null = null;
+  let inactiveNotified = false;
 
   const observedGaps: ObservedAudioGap[] = [];
   const commandResults: BridgeCommandResult[] = [];
@@ -854,13 +860,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       await finalizeRecording();
       if (reason === "bridge_failure") {
         const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps);
-        const recovery = coordinator.recordBridgeFailure(
+        coordinator.recordBridgeFailure(
           identity.occurrenceId,
           bridgeFailureRetryLimit,
           observedGaps.map((gap) => ({ ...gap })),
           persistedRecording,
         );
-        if (!recovery.retryAllowed) coordinator.fail(identity.occurrenceId, "bridge_failure_exhausted");
       } else {
         applyTerminalTransition(reason);
       }
@@ -874,6 +879,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       await closeRuntime();
       releaseLease(reason === "bridge_failure" ? "bridge_failure" : "left");
       unsubscribe();
+      markInactive();
     }
   }
 
@@ -1000,14 +1006,104 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // leave the session subscribed to two planes it has already declared
       // itself terminal for.
       unsubscribe();
+      markInactive();
     }
   }
 
   function unsubscribe(): void {
-    unsubscribeBridge?.();
-    unsubscribeRuntime?.();
+    const bridgeUnsubscribe = unsubscribeBridge;
+    const runtimeUnsubscribe = unsubscribeRuntime;
     unsubscribeBridge = null;
     unsubscribeRuntime = null;
+    for (const cleanup of [bridgeUnsubscribe, runtimeUnsubscribe]) {
+      if (cleanup === null) continue;
+      try {
+        cleanup();
+      } catch (error) {
+        routingErrors.push({ source: "join_cleanup", error });
+      }
+    }
+  }
+
+  function markInactive(): void {
+    if (inactiveNotified) return;
+    inactiveNotified = true;
+    options.onInactive?.();
+  }
+
+  function assertJoinCanContinue(): void {
+    if (disposed || terminalReason !== null) {
+      throw new Error("meeting session join was cancelled because the session was disposed or became terminal");
+    }
+  }
+
+  async function performJoin(): Promise<void> {
+    if (disposed) throw new Error("meeting session was disposed and cannot join");
+    if (terminalReason !== null) {
+      throw new Error(
+        `meeting session is terminal ("${terminalReason}"); bridge-session/v1 has no re-open, so resuming means a new session against a new lease`,
+      );
+    }
+    if (phase !== "created") {
+      throw new Error(`meeting session has already joined (phase "${phase}")`);
+    }
+
+    phase = "joining";
+    const existing = coordinator.get(identity.occurrenceId);
+    if (existing?.state === "discovered") coordinator.advance(identity.occurrenceId, "joining");
+    else if (existing?.state !== "listening") {
+      throw new Error(`occurrence cannot start a bridge generation from state "${existing?.state ?? "missing"}"`);
+    }
+    try {
+      const lease = coordinator.acquireBridgeLease(identity.occurrenceId, {
+        bridgeId,
+        bridgeSessionId,
+      });
+      leaseId = lease.leaseId;
+
+      unsubscribeBridge = bridge.subscribe((raw) => {
+        enqueue({ source: "bridge", raw });
+      });
+      unsubscribeRuntime = runtime.subscribe((event) => {
+        enqueue({ source: "runtime", event });
+      });
+
+      await issue({
+        type: "join",
+        meetingOccurrenceId: identity.occurrenceId,
+        meetingNo: identity.meetingNo,
+        leaseId: lease.leaseId,
+      });
+      assertJoinCanContinue();
+
+      runtimeStartAttempted = true;
+      const handle = await runtime.startVoiceSession({
+        profile: PINNED_PROFILE,
+        responseMode: PINNED_RESPONSE_MODE,
+      });
+      runtimeSessionId = handle.sessionId;
+      assertJoinCanContinue();
+      if (handle.profile !== PINNED_PROFILE) {
+        abortSpeaking("profile_mismatch");
+      } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
+        abortSpeaking("response_mode_mismatch");
+      } else if (handle.status !== "ready") {
+        abortSpeaking(`runtime_${handle.status}`);
+      }
+
+      await issue({ type: "connect_media", ...handle.media });
+      assertJoinCanContinue();
+
+      try {
+        await disclosurePublisher.publish(disclosureText);
+      } catch {
+        disclosure = "failed";
+      }
+      assertJoinCanContinue();
+    } catch (error) {
+      await failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
+      throw error;
+    }
   }
 
   // ---- public surface ---------------------------------------------------
@@ -1015,87 +1111,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   return {
     bridgeSessionId,
 
-    async join(): Promise<void> {
-      if (disposed) throw new Error("meeting session was disposed and cannot join");
-      if (terminalReason !== null) {
-        throw new Error(
-          `meeting session is terminal ("${terminalReason}"); bridge-session/v1 has no re-open, so resuming means a new session against a new lease`,
-        );
-      }
-      if (phase !== "created") {
-        throw new Error(`meeting session has already joined (phase "${phase}")`);
-      }
-
-      phase = "joining";
-      const existing = coordinator.get(identity.occurrenceId);
-      if (existing?.state === "discovered") coordinator.advance(identity.occurrenceId, "joining");
-      else if (existing?.state !== "listening") {
-        throw new Error(`occurrence cannot start a bridge generation from state "${existing?.state ?? "missing"}"`);
-      }
-      // ONE cleanup for every way the rest of join can fail. The lease is
-      // already taken by this point, and nothing sweeps an abandoned one: the
-      // coordinator recovers a stale lease only inside a subsequent
-      // acquireBridgeLease for the SAME occurrence, which for a join that
-      // failed will never come. A runtime outage or a transport failure here
-      // would otherwise strand the occurrence permanently -- lease live, both
-      // planes subscribed, the row sitting in "joining" with no terminal
-      // reason and no way to retry.
-      try {
-        const lease = coordinator.acquireBridgeLease(identity.occurrenceId, {
-          bridgeId,
-          bridgeSessionId,
-        });
-        leaseId = lease.leaseId;
-
-        unsubscribeBridge = bridge.subscribe((raw) => {
-          enqueue({ source: "bridge", raw });
-        });
-        unsubscribeRuntime = runtime.subscribe((event) => {
-          enqueue({ source: "runtime", event });
-        });
-
-        await issue({
-          type: "join",
-          meetingOccurrenceId: identity.occurrenceId,
-          meetingNo: identity.meetingNo,
-          leaseId: lease.leaseId,
-        });
-
-        // Exactly one runtime session, with both values pinned explicitly. The
-        // runtime's own default profile stays "offline"; nothing here switches
-        // it silently, and nothing accepts a substitute.
-        runtimeStartAttempted = true;
-        const handle = await runtime.startVoiceSession({
-          profile: PINNED_PROFILE,
-          responseMode: PINNED_RESPONSE_MODE,
-        });
-        runtimeSessionId = handle.sessionId;
-        if (handle.profile !== PINNED_PROFILE) {
-          abortSpeaking("profile_mismatch");
-        } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
-          abortSpeaking("response_mode_mismatch");
-        } else if (handle.status !== "ready") {
-          abortSpeaking(`runtime_${handle.status}`);
-        }
-
-        await issue({ type: "connect_media", ...handle.media });
-      } catch (error) {
-        // A descriptor the contract refuses is one the bridge would refuse
-        // too, and it keeps its own, more specific reason so an operator can
-        // tell a bad media format from a runtime outage at a glance. Everything
-        // else is a plain failed join.
-        await failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
-        throw error;
-      }
-
-      // Disclosure is meeting-chat TEXT, attempted by the bridge alone, and
-      // failing to disclose never blocks joining -- which is why it sits
-      // OUTSIDE the cleanup above and can never trigger it.
-      try {
-        await disclosurePublisher.publish(disclosureText);
-      } catch {
-        disclosure = "failed";
-      }
+    join(): Promise<void> {
+      const operation = performJoin();
+      activeJoinPromise = operation;
+      void operation.finally(() => {
+        if (activeJoinPromise === operation) activeJoinPromise = null;
+      }).catch(() => {});
+      return operation;
     },
 
     async leave(reason: "meeting_ended" | "coordinator_stop"): Promise<void> {
@@ -1148,6 +1170,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       queue.length = 0;
       disposePromise = (async () => {
         try {
+          const join = activeJoinPromise;
+          if (join !== null) await Promise.allSettled([join]);
+          await whenIdle();
           if (terminalReason === null && phase !== "created") {
             if (joinCommandSent) {
               try { await issue({ type: "leave", reason: "coordinator_stop" }); }
@@ -1160,6 +1185,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           }
         } catch (error) {
           routingErrors.push({ source: "join_cleanup", error });
+        } finally {
+          markInactive();
         }
       })();
       return disposePromise;
@@ -1184,5 +1211,6 @@ function recordingInput(summary: RecordingSummary, bridgeGaps: readonly Observed
     // These are bridge-observed control-plane gaps, deliberately independent
     // from RecordingSummary.gaps' runtime media timeline and reason tokens.
     gaps: bridgeGaps.map((gap) => ({ ...gap })),
+    runtimeGaps: summary.gaps.map((gap) => ({ ...gap })),
   };
 }

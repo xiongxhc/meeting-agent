@@ -172,7 +172,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 6);
+      assert.equal(store.schemaVersion, 7);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -180,6 +180,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
         { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
         { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
+        { version: 7, name: "007_recording_runtime_gaps.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -224,7 +225,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 6);
+      assert.equal(second.schemaVersion, 7);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -234,6 +235,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 4, name: "004_recording_runtime_metadata.sql", appliedAtMs: BASE_MS },
         { version: 5, name: "005_bridge_recovery.sql", appliedAtMs: BASE_MS },
         { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
+        { version: 7, name: "007_recording_runtime_gaps.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -263,7 +265,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 6);
+      assert.equal(store.schemaVersion, 7);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);
@@ -957,24 +959,145 @@ test("bridge failure recovery is durable, bounded, and keeps the occurrence reus
     coordinator.discover(id);
     coordinator.advance(id.occurrenceId, "joining");
     coordinator.advance(id.occurrenceId, "listening");
-    const firstFailure = coordinator.recordBridgeFailure(id.occurrenceId, 1, [
+    const invalidHistory = coordinator.history(id.occurrenceId);
+    assert.throws(
+      () => coordinator.recordBridgeFailure(id.occurrenceId, 0, [], {
+        handle: "invalid handle",
+        encryptedPath: "/enc/invalid",
+        sha256: "b".repeat(64),
+        durationMs: 1,
+        format: "ogg/opus",
+        keyId: "key",
+        gaps: [],
+        runtimeGaps: [],
+      }),
+      isOrchestrationError("constraint_violation"),
+    );
+    assert.equal(coordinator.get(id.occurrenceId)?.state, "listening");
+    assert.deepEqual(coordinator.history(id.occurrenceId), invalidHistory);
+    assert.equal(coordinator.bridgeFailureRecording(id.occurrenceId, 1), null);
+
+    const firstFailure = coordinator.recordBridgeFailure(id.occurrenceId, 0, [
       { direction: "capture", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" },
-    ], null);
-    assert.deepEqual(firstFailure, { attempt: 1, retryAllowed: true });
+    ], {
+      handle: "failed1",
+      encryptedPath: "/enc/failed1",
+      sha256: "a".repeat(64),
+      durationMs: 1,
+      format: "ogg/opus",
+      keyId: "key",
+      gaps: [],
+      runtimeGaps: [{
+        startedAtMs: 9_007_199_254_740_993n,
+        endedAtMs: null,
+        reason: "capture_gap",
+      }],
+    });
+    assert.deepEqual(firstFailure, { attempt: 1, retryAllowed: false });
     first.close();
 
     const resumed = h.open();
     try {
       const resumedCoordinator = coordinatorFor(resumed, clock);
-      assert.equal(resumedCoordinator.get(id.occurrenceId)?.state, "listening");
-      assert.deepEqual(resumedCoordinator.recordBridgeFailure(id.occurrenceId, 1, [], null), {
-        attempt: 2,
-        retryAllowed: false,
-      });
-      resumedCoordinator.fail(id.occurrenceId, "bridge_failure_exhausted");
       assert.equal(resumedCoordinator.get(id.occurrenceId)?.state, "failed");
+      assert.equal(resumedCoordinator.get(id.occurrenceId)?.terminalReason, "bridge_failure_exhausted");
+      assert.deepEqual(
+        resumedCoordinator.history(id.occurrenceId).at(-1),
+        {
+          id: resumedCoordinator.history(id.occurrenceId).at(-1)?.id,
+          occurrenceId: id.occurrenceId,
+          fromState: "listening",
+          toState: "failed",
+          reason: "fail",
+          terminalReason: "bridge_failure_exhausted",
+          occurredAtMs: clock.now(),
+        },
+      );
+      assert.deepEqual(resumedCoordinator.bridgeFailureRecording(id.occurrenceId, 1), {
+        occurrenceId: id.occurrenceId, attempt: 1, handle: "failed1", encryptedPath: "/enc/failed1", sha256: "a".repeat(64), durationMs: 1, format: "ogg/opus", keyId: "key", finalizedAtMs: clock.now(),
+        gaps: [{ ordinal: 0, direction: "capture", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" }],
+        runtimeGaps: [{ ordinal: 0, startedAtMs: 9_007_199_254_740_993n, endedAtMs: null, reason: "capture_gap" }],
+      });
     } finally {
       resumed.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("runtime recording-gap child rows enforce foreign keys and cascade with both recording parents", () => {
+  const h = harness();
+  try {
+    const store = h.open();
+    const coordinator = coordinatorFor(store, fakeClock());
+    const normal = identity(74);
+    const failed = identity(75);
+    coordinator.discover(normal);
+    coordinator.advance(normal.occurrenceId, "joining");
+    coordinator.advance(normal.occurrenceId, "listening");
+    coordinator.finalizeWithRecording(normal.occurrenceId, { kind: "advance", toState: "finalizing" }, {
+      handle: "normal1",
+      encryptedPath: "/enc/normal1",
+      sha256: "c".repeat(64),
+      durationMs: 1,
+      format: "ogg/opus",
+      keyId: "key",
+      gaps: [],
+      runtimeGaps: [{ startedAtMs: 1n, endedAtMs: 2n, reason: "normal_gap" }],
+    });
+    coordinator.discover(failed);
+    coordinator.advance(failed.occurrenceId, "joining");
+    coordinator.advance(failed.occurrenceId, "listening");
+    coordinator.recordBridgeFailure(failed.occurrenceId, 1, [], {
+      handle: "failed2",
+      encryptedPath: "/enc/failed2",
+      sha256: "d".repeat(64),
+      durationMs: 1,
+      format: "ogg/opus",
+      keyId: "key",
+      gaps: [],
+      runtimeGaps: [{ startedAtMs: 3n, endedAtMs: null, reason: "failed_gap" }],
+    });
+    store.close();
+
+    const raw = new Database(h.dbPath);
+    raw.pragma("foreign_keys = ON");
+    try {
+      const fkViolation = (error: unknown): boolean =>
+        error instanceof Database.SqliteError && error.code === "SQLITE_CONSTRAINT_FOREIGNKEY";
+      assert.throws(
+        () => raw.prepare(
+          `INSERT INTO recording_runtime_gaps
+             (occurrence_id, ordinal, started_at_ms, ended_at_ms, reason)
+           VALUES ('missing', 0, '1', NULL, 'orphan')`,
+        ).run(),
+        fkViolation,
+      );
+      assert.throws(
+        () => raw.prepare(
+          `INSERT INTO bridge_failure_recording_runtime_gaps
+             (occurrence_id, attempt, ordinal, started_at_ms, ended_at_ms, reason)
+           VALUES ('missing', 1, 0, '1', NULL, 'orphan')`,
+        ).run(),
+        fkViolation,
+      );
+
+      raw.prepare("DELETE FROM recordings WHERE occurrence_id = ?").run(normal.occurrenceId);
+      raw.prepare(
+        "DELETE FROM bridge_failure_recordings WHERE occurrence_id = ? AND attempt = 1",
+      ).run(failed.occurrenceId);
+      assert.equal(
+        (raw.prepare("SELECT count(*) AS count FROM recording_runtime_gaps").get() as { count: number }).count,
+        0,
+      );
+      assert.equal(
+        (raw.prepare("SELECT count(*) AS count FROM bridge_failure_recording_runtime_gaps").get() as { count: number }).count,
+        0,
+      );
+      assert.deepEqual(raw.pragma("foreign_key_check"), []);
+    } finally {
+      raw.close();
     }
   } finally {
     h.cleanup();
