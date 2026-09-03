@@ -411,11 +411,15 @@ test("a different wh-word contraction opens a question and authorizes", () => {
   assertPositive(decide(segment("Meetbot, who's next?"), IDENTITY), "Meetbot");
 });
 
-test("an ASR misspelling of the same question still authorizes -- punctuation, not vocabulary, decides", () => {
-  // Round 3/4 rejected this (the token "whats" was not in the cue list).
-  // Under R43 the missing apostrophe is irrelevant: the clause ends in a
-  // question mark, so it is a request.
-  assertPositive(decide(segment("Meetbot: whats the plan?"), IDENTITY), "Meetbot");
+test("KNOWN LIMITATION (R43 conjunct): an ASR misspelling that destroys the wh-word does not authorize", () => {
+  // "what's" contributes the stem "what" (clauseTokens splits at the
+  // apostrophe), but "whats" is a token of its own and matches no wh-word,
+  // so the clause carries no evidence of address and the question mark
+  // alone is not enough. Documented false negative -- the same
+  // misspelling in an unambiguously addressed phrasing
+  // ("Meetbot: whats your plan?") still authorizes on "your".
+  assertNegative(decide(segment("Meetbot: whats the plan?"), IDENTITY), "incidental_mention");
+  assertPositive(decide(segment("Meetbot: whats your plan?"), IDENTITY), "Meetbot");
 });
 
 // ---------------------------------------------------------------------------
@@ -528,14 +532,14 @@ test("additionalAntiCues extends (not replaces) the default anti-cue lexicon", (
   // The question mark is what would authorize this one -- an anti-cue is
   // the only thing that can still suppress it, which is exactly the job
   // the list has left under R43.
-  const baselineWithoutExtension = decide(segment("Meetbot, can we not do this today?"), IDENTITY);
+  const baselineWithoutExtension = decide(segment("Meetbot, can you not do this today?"), IDENTITY);
   assertPositive(baselineWithoutExtension, "Meetbot");
 
   const extended: InvocationGateIdentity = {
     ...IDENTITY,
-    additionalAntiCues: ["can we not"],
+    additionalAntiCues: ["can you not"],
   };
-  assertNegative(decide(segment("Meetbot, can we not do this today?"), extended), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, can you not do this today?"), extended), "incidental_mention");
 
   // The built-in anti-cues still work under the extended identity too.
   assertNegative(decide(segment("Meetbot, what a mess?", true), extended), "incidental_mention");
@@ -669,6 +673,100 @@ test("R43: the deleted cue words no longer authorize anything on their own", () 
   ]) {
     assertNegative(decide(segment(text, true), CJK_IDENTITY), "incidental_mention");
   }
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 6 (R43 refinement): a question mark says a question was asked, not
+// who was asked. On the INTERROGATIVE branch only, the clause must also
+// carry evidence of address -- a wh-word, a second-person pronoun, or a
+// request marker, anywhere in it. The marker branch and the Chinese path
+// are untouched.
+// ---------------------------------------------------------------------------
+
+const CONJUNCT_NEGATIVES: readonly string[] = [
+  "Meetbot, seriously?",
+  "Meetbot, right?",
+  "Meetbot, the note taker?",
+  "Meetbot, is it broken?",
+  "Meetbot, is that the new one?",
+  "Meetbot, again?",
+  "Next topic, Meetbot?",
+];
+
+for (const text of CONJUNCT_NEGATIVES) {
+  test(`ROUND 6 conjunct: "${text}" does not authorize -- interrogative, but no wh-word, second person or marker`, () => {
+    const decision = decide(segment(text), IDENTITY);
+    assert.equal(
+      decision.authorize,
+      false,
+      `expected authorize=false for ${JSON.stringify(text)}, got ${JSON.stringify(decision)}`,
+    );
+  });
+}
+
+test("ROUND 6 conjunct: the one-word difference that decides the pair", () => {
+  // The whole refinement in two fixtures: same shape, same punctuation,
+  // and only "it" versus "you" between them.
+  assertNegative(decide(segment("Meetbot, is it broken?"), IDENTITY), "incidental_mention");
+  assertPositive(decide(segment("Meetbot, are you broken?"), IDENTITY), "Meetbot");
+});
+
+test("ROUND 6 conjunct: a wh-word anywhere in the clause is enough, not only at its start", () => {
+  assertPositive(decide(segment("Meetbot, remind me what we decided?"), IDENTITY), "Meetbot");
+});
+
+test("ROUND 6 conjunct: a second-person pronoun anywhere in the clause is enough", () => {
+  assertPositive(decide(segment("Meetbot, is that your best guess?"), IDENTITY), "Meetbot");
+});
+
+test("ROUND 6 conjunct: a contraction contributes its stem", () => {
+  // "what's" -> "what", "you're" -> "you". Without the apostrophe split
+  // neither token would match anything.
+  assertPositive(decide(segment("Meetbot: what's the plan?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, you're still recording?"), IDENTITY), "Meetbot");
+});
+
+test("ROUND 6 conjunct: evidence is matched as a whole token, not a substring", () => {
+  // "youtube" must not count as "you", and "howling" must not count as
+  // "how".
+  assertNegative(decide(segment("Meetbot, the youtube link?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, that howling noise?"), IDENTITY), "incidental_mention");
+});
+
+test("ROUND 6 conjunct: it constrains ONLY the interrogative branch", () => {
+  // No wh-word, no second person -- authorizes anyway, through the marker
+  // branch, with no question mark in sight.
+  assertPositive(decide(segment("Meetbot, please close the ticket."), IDENTITY), "Meetbot");
+  // And the Chinese path is unchanged: marker in, no marker out.
+  assertPositive(decide(segment("会议机器人，请总结一下", true), CJK_IDENTITY), "会议机器人");
+  assertNegative(decide(segment("会议机器人，它坏了吗？", true), CJK_IDENTITY), "incidental_mention");
+});
+
+test("ROUND 6 conjunct: for a trailing vocative it is tested on the PRECEDING clause", () => {
+  // "next topic" carries nothing; "can you take a note" carries "you".
+  // Both segments end in the same question mark.
+  assertNegative(decide(segment("Next topic, Meetbot?"), IDENTITY), "incidental_mention");
+  assertPositive(decide(segment("Can you take a note, Meetbot?"), IDENTITY), "Meetbot");
+});
+
+test("KNOWN LIMITATION (R43 conjunct): a bare-adjective question does not authorize", () => {
+  // "Meetbot, ready?" and "Meetbot, done?" are genuine addresses that
+  // carry no wh-word, no second-person pronoun and no marker, so they are
+  // indistinguishable by this rule from "Meetbot, seriously?" and
+  // "Meetbot, right?", which must stay negative. Documented false
+  // negatives: under the standing ruling a person repeating themselves is
+  // the correct direction to fail. Recoverable per deployment with
+  // additionalRequestMarkers.
+  assertNegative(decide(segment("Meetbot, ready?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, done?"), IDENTITY), "incidental_mention");
+  assertNegative(decide(segment("Meetbot, anything?"), IDENTITY), "incidental_mention");
+});
+
+test("ROUND 6 conjunct: the residual ambiguity the ruling explicitly accepts", () => {
+  // Both authorize on their wh-word and both are plausibly addressed to
+  // the agent. Pinned so a later round does not "fix" them by accident.
+  assertPositive(decide(segment("Meetbot, what is it?"), IDENTITY), "Meetbot");
+  assertPositive(decide(segment("Meetbot, who broke it?"), IDENTITY), "Meetbot");
 });
 
 test("KNOWN LIMITATION (R43): an imperative with no question mark and no request marker does not authorize", () => {
@@ -1277,6 +1375,10 @@ test("property 1: arbitrary generated text containing no configured alias never 
 //   - a question mark anywhere in the SEGMENT counting as "this clause is
 //     interrogative" for a leading vocative (mode 3 puts a question mark
 //     past the adjoining clause's own boundary);
+//   - interrogative punctuation authorizing on its own, without the
+//     round-6 conjunct (modes 4 and 5 end in a real question mark and draw
+//     their clause from a pool with no wh-word, no second-person pronoun
+//     and no request marker in it);
 //   - the request test collapsing to "any adjoining clause is an address".
 // Mode 0 keeps round 3's fully-embedded case, which exercises the
 // hyphen/apostrophe/word-continuation adjacency guard instead; it does not
@@ -1316,7 +1418,10 @@ function randomJoiner(rng: () => number): string {
 }
 
 // Ordinary filler words a real appositive/reported-speech sentence would
-// use, deliberately disjoint from BURIED_MARKER_POOL below.
+// use. Deliberately disjoint from BURIED_MARKER_POOL below, and checked by
+// its own test to contain no wh-word and no second-person pronoun, so a
+// phrase built from it carries no evidence of address (see the round-6
+// conjunct) even when it ends in a question mark.
 const WORD_POOL = [
   "the",
   "team",
@@ -1384,10 +1489,34 @@ function randomTerminator(rng: () => number): string {
   return NON_INTERROGATIVE_TERMINATORS[Math.floor(rng() * NON_INTERROGATIVE_TERMINATORS.length)] ?? ".";
 }
 
+/** A multi-word phrase drawn only from WORD_POOL: no wh-word, no
+ * second-person pronoun, no request marker. Used by the interrogative
+ * modes, where the question mark is real and only the round-6 conjunct
+ * stands between the phrase and authorize. */
+function randomEvidenceFreePhrase(rng: () => number): string {
+  const wordCount = 2 + Math.floor(rng() * 3);
+  const words: string[] = [];
+  for (let i = 0; i < wordCount; i += 1) words.push(randomWord(rng, WORD_POOL));
+  return words.join(" ");
+}
+
+test("the property-2 word pool really carries no evidence of address", () => {
+  // If this ever fails, modes 4 and 5 below stop testing the conjunct and
+  // start passing for the wrong reason.
+  const evidence = new Set([
+    ...["what", "when", "where", "who", "whom", "whose", "which", "why", "how"],
+    ...["you", "your", "yours", "yourself", "yourselves"],
+    ...["please", "kindly"],
+  ]);
+  for (const word of WORD_POOL) {
+    assert.ok(!evidence.has(word), `WORD_POOL must not contain the evidence word ${JSON.stringify(word)}`);
+  }
+});
+
 test("property 2: an alias beside a non-request clause never authorizes, at a real segment edge or embedded", () => {
   const SEED = 0x656d_6265; // "embe", arbitrary fixed constant -- deterministic across runs
   const rng = mulberry32(SEED);
-  const SAMPLES = 400;
+  const SAMPLES = 600;
   const identity = IDENTITY;
   const alias = "Meetbot";
   const foldedFillers = new Set(["hey", "hi", "hello", "so", "ok", "okay", "um", "uh"]);
@@ -1402,7 +1531,13 @@ test("property 2: an alias beside a non-request clause never authorizes, at a re
     // 3. LEADING BOUNDARY WITH A LATER QUESTION: same as mode 1, plus a
     //    second clause that DOES end in "?" -- the question mark must not
     //    reach back across the clause boundary.
-    const mode = i % 4;
+    // 4. LEADING INTERROGATIVE, NO EVIDENCE: a real question mark on the
+    //    adjoining clause, but the clause carries no wh-word, no
+    //    second-person pronoun and no marker -- only the round-6 conjunct
+    //    keeps this negative.
+    // 5. TRAILING INTERROGATIVE, NO EVIDENCE: the mirror image
+    //    ("next topic, Meetbot?").
+    const mode = i % 6;
 
     if (mode === 0) {
       let prefix = randomEmbeddingText(rng);
@@ -1432,10 +1567,12 @@ test("property 2: an alias beside a non-request clause never authorizes, at a re
       continue;
     }
 
-    let clause = randomBuriedMarkerPhrase(rng);
+    const interrogativeMode = mode === 4 || mode === 5;
+    const makeClause = interrogativeMode ? randomEvidenceFreePhrase : randomBuriedMarkerPhrase;
+    let clause = makeClause(rng);
     let guard = 0;
     while (containsAnyAliasSubstring(clause, identity) && guard < 15) {
-      clause = randomBuriedMarkerPhrase(rng);
+      clause = makeClause(rng);
       guard += 1;
     }
     assert.ok(
@@ -1449,6 +1586,10 @@ test("property 2: an alias beside a non-request clause never authorizes, at a re
       text = `${alias}${sep} ${clause}${randomTerminator(rng)}`;
     } else if (mode === 2) {
       text = `${clause}${sep} ${alias}${randomTerminator(rng)}`;
+    } else if (mode === 4) {
+      text = `${alias}${sep} ${clause}?`;
+    } else if (mode === 5) {
+      text = `${clause}${sep} ${alias}?`;
     } else {
       let tail = randomBuriedMarkerPhrase(rng);
       let tailGuard = 0;

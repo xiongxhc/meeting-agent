@@ -407,6 +407,41 @@ const DEFAULT_REQUEST_MARKERS: readonly string[] = [
   "帮忙",
 ];
 
+/** R43 refinement (round 6): the evidence a clause must carry, ANYWHERE in
+ * it, before interrogative punctuation is allowed to mean "request".
+ *
+ * A question mark alone says a question was asked; it does not say who was
+ * asked. "Meetbot, is it broken?" and "Meetbot, did you catch that?" are
+ * the same shape, and the difference between them is one word: "it" versus
+ * "you". A clause with no wh-word, no second-person pronoun and no request
+ * marker carries no evidence that anybody was addressed at all --
+ * "seriously?", "right?", "the note taker?", "or Otter?", "next topic" --
+ * and those are precisely the false positives the punctuation test let
+ * through on its own.
+ *
+ * Both lists are closed grammatical classes, not idiom enumerations. That
+ * is the whole difference between this conjunct and the address-cue
+ * lexicon R43 deleted: the cue list asked which word OPENS the clause (an
+ * exclamative opens the same way a question does), while this asks whether
+ * the clause contains, anywhere, a word that can only be doing deictic or
+ * interrogative work. */
+const WH_WORDS: readonly string[] = [
+  "what",
+  "when",
+  "where",
+  "who",
+  "whom",
+  "whose",
+  "which",
+  "why",
+  "how",
+];
+
+/** Second-person reference: the clearest evidence in English that a clause
+ * addresses somebody. "yourselves" is the one entry beyond the four the
+ * ruling named -- same closed class, same job. */
+const SECOND_PERSON: readonly string[] = ["you", "your", "yours", "yourself", "yourselves"];
+
 /** Short address/greeting fillers that may precede a leading vocative
  * ("Hey Meetbot, ...") without defeating the start-boundary check. Only
  * recognized as a whole leading token -- see the filler-matching loop in
@@ -530,6 +565,28 @@ function clauseStartsWithPhrase(clause: string, phrase: string): boolean {
   return clause === phrase || clause.startsWith(`${phrase} `);
 }
 
+/** Every whitespace-delimited token of `clause`, stripped of leading and
+ * trailing non-alphanumerics, and split at any internal apostrophe so a
+ * contraction contributes its stem ("what's" -> "what", "you're" -> "you").
+ * Empty pieces are dropped. */
+function clauseTokens(clause: string): string[] {
+  return clause
+    .split(/\s+/u)
+    .flatMap((token) => token.split(/['\u2019]/u))
+    .map((piece) => piece.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+    .filter((piece) => piece !== "");
+}
+
+/** True when `clause` contains, anywhere, a wh-word, a second-person
+ * pronoun, or a request marker -- the conjunct the interrogative branch of
+ * the request test requires. See WH_WORDS / SECOND_PERSON. */
+function clauseCarriesAddressEvidence(clause: string, requestMarkers: readonly string[]): boolean {
+  return clauseTokens(clause).some(
+    (token) =>
+      WH_WORDS.includes(token) || SECOND_PERSON.includes(token) || requestMarkers.includes(token),
+  );
+}
+
 /** The first whitespace-delimited token of `clause`, stripped of leading and
  * trailing non-alphanumerics. "" when the clause has no such token. */
 function firstToken(clause: string): string {
@@ -551,7 +608,10 @@ function firstToken(clause: string): string {
  *      exclamation someone punctuated as a question.
  *   3. A Chinese clause must carry an explicit request marker, matched as a
  *      raw prefix -- see THE HAN CARVE-OUT below.
- *   4. Otherwise an INTERROGATIVE clause is a request. `interrogative` is
+ *   4. Otherwise an INTERROGATIVE clause is a request IF it also carries
+ *      evidence that somebody was addressed -- a wh-word, a second-person
+ *      pronoun, or a request marker, anywhere in the clause (round 6\'s
+ *      refinement; see clauseCarriesAddressEvidence). `interrogative` is
  *      computed by the caller, because where the question mark lives
  *      depends on which side of the alias the clause is on -- see
  *      isVocativeBoundary.
@@ -595,7 +655,7 @@ function clauseIsRequest(
     return requestMarkers.some((marker) => marker !== "" && clause.startsWith(marker));
   }
 
-  if (interrogative) return true;
+  if (interrogative && clauseCarriesAddressEvidence(clause, requestMarkers)) return true;
 
   const opener = firstToken(clause);
   return opener !== "" && requestMarkers.includes(opener);
