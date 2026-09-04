@@ -119,7 +119,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
   const endedAtMs = parseInstant(input.endedAt, "endedAt") - originMs;
 
   const evidence = [...input.evidence].sort((a, b) => {
-    const instant = parseInstant(a.observedAt, "observation observedAt") - parseInstant(b.observedAt, "observation observedAt");
+    const instant = observationInstant(a) - observationInstant(b);
     return instant !== 0 ? instant : a.sequence - b.sequence || a.bridgeSessionId.localeCompare(b.bridgeSessionId);
   });
   const states = aligned ? evidenceStates(evidence, originMs, endedAtMs) : [];
@@ -282,18 +282,18 @@ export async function reconcilePersistedSpeakers(input: {
   const attendanceEvents: Parameters<typeof reduceAttendance>[0][number][] = [];
   for (const event of evidence.bridgeEvents) {
     if (event.type === "participant_joined" && event.feishuUserId !== null && event.displayName !== null) {
-      attendanceEvents.push({ type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, occurredAt: event.observedAt });
+      attendanceEvents.push({ type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, occurredAt: event.observedAt, sequence: event.sequence, bridgeSessionId: event.bridgeSessionId, ...(event.observedAtMs === undefined ? {} : { occurredAtMs: event.observedAtMs }) });
     }
     if (event.type === "participant_left" && event.feishuUserId !== null) {
-      attendanceEvents.push({ type: "participant_left", feishuUserId: event.feishuUserId, occurredAt: event.observedAt });
+      attendanceEvents.push({ type: "participant_left", feishuUserId: event.feishuUserId, occurredAt: event.observedAt, sequence: event.sequence, bridgeSessionId: event.bridgeSessionId, ...(event.observedAtMs === undefined ? {} : { occurredAtMs: event.observedAtMs }) });
     }
   }
   const attendance = reduceAttendance(attendanceEvents);
   const active = evidence.bridgeEvents.flatMap((event): ActiveSpeakerObservation[] => {
     if (event.type !== "active_speaker" || event.confidence === null) return [];
     return event.confidence === "ui_exact" && event.feishuUserId !== null
-      ? [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId }]
-      : [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null }];
+      ? [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId, ...(event.observedAtMs === undefined ? {} : { observedAtMs: event.observedAtMs }) }]
+      : [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null, ...(event.observedAtMs === undefined ? {} : { observedAtMs: event.observedAtMs }) }];
   });
   const endedAt = [...evidence.bridgeEvents.map((event) => event.observedAt), ...evidence.liveSegments.map((segment) => segment.endedAt)]
     .sort((a, b) => parseInstant(a, "persisted evidence") - parseInstant(b, "persisted evidence")).at(-1) ?? "1970-01-01T00:00:00.000Z";
@@ -361,6 +361,10 @@ function parseInstant(value: string, what: string): number {
   return ms;
 }
 
+function observationInstant(observation: ActiveSpeakerObservation): number {
+  return observation.observedAtMs ?? parseInstant(observation.observedAt, "observation observedAt");
+}
+
 /** Domain transcript intervals are numbers; do not silently truncate an SDK
  * bigint outside that exact range. The caller turns this into the existing
  * typed reconciliation-unavailable result rather than guessing a timeline. */
@@ -396,8 +400,8 @@ function evidenceStates(
   for (let i = 0; i < evidence.length; i += 1) {
     const observation = evidence[i] as ActiveSpeakerObservation;
     const next = evidence[i + 1];
-    const start = parseInstant(observation.observedAt, "observation observedAt") - originMs;
-    const end = next === undefined ? Math.max(start, endedAtMs) : parseInstant(next.observedAt, "observation observedAt") - originMs;
+    const start = observationInstant(observation) - originMs;
+    const end = next === undefined ? Math.max(start, endedAtMs) : observationInstant(next) - originMs;
     states.push({ start, end, observation });
   }
   return states;

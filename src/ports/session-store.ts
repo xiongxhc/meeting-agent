@@ -121,19 +121,20 @@ export type RecordingRow = {
  * Team Vault/output path: live words are retained only so post-meeting
  * reconciliation survives a coordinator restart. */
 export type ReconciliationBridgeEventRow = {
-  readonly generationId: string;
   readonly bridgeSessionId: string;
   readonly sequence: number;
   /** Original bridge envelope schema, retained with the payload and order. */
   readonly schema: "bridge-session/v1";
   readonly observedAt: string;
+  /** Validated at persistence time; recovery readers do not reparse text. */
+  readonly observedAtMs?: number;
   readonly type: "active_speaker" | "participant_joined" | "participant_left";
   readonly feishuUserId: string | null;
   readonly displayName: string | null;
   readonly confidence: "ui_exact" | "ambiguous" | null;
 };
 export type ReconciliationLiveSegmentRow = {
-  readonly generationId: string;
+  readonly bridgeSessionId: string;
   readonly segmentId: string;
   readonly text: string;
   readonly startedAt: string;
@@ -149,7 +150,8 @@ export type ReconciliationEvidenceRow = {
   readonly alignmentStatus: "unavailable_current_sdk";
   readonly captureComplete: boolean;
   readonly incompleteReason: "event_limit_exceeded" | "live_text_limit_exceeded" | null;
-  readonly expiresAtMs: number;
+  readonly expiresAtMs: number | null;
+  readonly terminalAtMs: number | null;
   readonly bridgeEvents: readonly ReconciliationBridgeEventRow[];
   readonly liveSegments: readonly ReconciliationLiveSegmentRow[];
 };
@@ -182,7 +184,9 @@ export type FinalizeSessionInput = {
   readonly recording: RecordingInput;
   /** Immutable bridge/runtime generation whose evidence this exact recording
    * finalizes. The store links both in the same transaction. */
-  readonly reconciliationGenerationId?: string;
+  readonly reconciliationBridgeSessionId?: string;
+  /** Observed bridge terminal instant when available; never generation start. */
+  readonly reconciliationTerminalAtMs?: number;
 };
 
 export type FinalizeSessionResult = {
@@ -292,8 +296,9 @@ export type SessionStore = {
    * may land alone. */
   finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
   getRecording(occurrenceId: string): RecordingRow | null;
-  beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string, createdAtMs: number, expiresAtMs: number): void;
-  setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void;
+  beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, createdAtMs: number): void;
+  setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
+  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   getReconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;

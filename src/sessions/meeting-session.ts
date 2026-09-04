@@ -311,7 +311,6 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   const isRecoveryGeneration = coordinator.get(identity.occurrenceId)?.state === "listening";
   // A bridge session is the immutable generation boundary. Runtime IDs arrive
   // later and recordings are atomically associated at finalization.
-  const reconciliationGenerationId = bridgeSessionId;
 
   const validator = createBridgeSessionValidator(bridgeSessionId);
   const issuedCommandTypes = new Map<string, BridgeCommand["type"]>();
@@ -681,7 +680,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         return;
 
       case "left":
-        await terminate(event.reason);
+        await terminate(event.reason, Date.parse(event.observedAt));
         return;
 
       case "media_connected":
@@ -744,7 +743,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             : { bridgeSessionId: event.sessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null },
         );
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "active_speaker", feishuUserId: event.feishuUserId, displayName: null, confidence: event.confidence,
         });
         return;
@@ -754,13 +753,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // evidence is complete.
       case "participant_joined":
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, confidence: null,
         });
         return;
       case "participant_left":
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_left", feishuUserId: event.feishuUserId, displayName: null, confidence: null,
         });
         return;
@@ -784,7 +783,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         if (event.segment.final) {
           liveTranscript.push(event.segment);
           coordinator.appendReconciliationLiveSegment(identity.occurrenceId, {
-            generationId: reconciliationGenerationId, segmentId: event.segment.segmentId, text: event.segment.text,
+            bridgeSessionId, segmentId: event.segment.segmentId, text: event.segment.text,
             startedAt: event.segment.startedAt, endedAt: event.segment.endedAt,
           });
         }
@@ -867,7 +866,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * declares -- `bridge_failure` included. bridge-session/v1 has no re-open,
    * so resuming a meeting means a NEW session against a NEW lease, which is
    * the coordinator's business, not this session's. */
-  async function terminate(reason: "ended" | "removed" | "bridge_failure"): Promise<void> {
+  async function terminate(reason: "ended" | "removed" | "bridge_failure", terminalAtMs?: number): Promise<void> {
     if (terminalReason !== null) return;
     terminalReason = reason;
     phase = "ended";
@@ -889,8 +888,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           observedGaps.map((gap) => ({ ...gap })),
           persistedRecording,
         );
+        // This bridge generation is over even when recovery will create a
+        // fresh one; its local wording must not remain a live generation.
+        coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs);
       } else {
-        applyTerminalTransition(reason);
+        applyTerminalTransition(reason, terminalAtMs);
       }
     } finally {
       // In a `finally`, because a finalization that throws must not leave the
@@ -918,7 +920,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * goes in alone -- the session really did end, and refusing to record that
    * because the recording was lost would strand the occurrence on top of
    * losing the audio. */
-  function applyTerminalTransition(reason: "ended" | "removed" | "bridge_failure"): void {
+  function applyTerminalTransition(reason: "ended" | "removed" | "bridge_failure", terminalAtMs?: number): void {
     const state = coordinator.get(identity.occurrenceId)?.state ?? null;
     if (state === null || state === "notified" || state === "failed") return;
 
@@ -930,7 +932,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           : { kind: "fail", terminalReason: reason };
 
     if (recording !== null) {
-      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), reconciliationGenerationId);
+      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), bridgeSessionId, terminalAtMs);
       return;
     }
     if (outcome.kind === "fail") {
@@ -938,6 +940,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     } else {
       coordinator.advance(identity.occurrenceId, outcome.toState);
     }
+    coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs);
   }
 
   /**
@@ -1084,7 +1087,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         bridgeSessionId,
       });
       leaseId = lease.leaseId;
-      coordinator.beginReconciliationGeneration(identity.occurrenceId, reconciliationGenerationId, bridgeSessionId);
+      coordinator.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
 
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });
@@ -1107,7 +1110,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         responseMode: PINNED_RESPONSE_MODE,
       });
       runtimeSessionId = handle.sessionId;
-      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, reconciliationGenerationId, handle.sessionId);
+      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, handle.sessionId);
       assertJoinCanContinue();
       if (handle.profile !== PINNED_PROFILE) {
         abortSpeaking("profile_mismatch");

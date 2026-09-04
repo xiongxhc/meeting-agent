@@ -733,12 +733,12 @@ test("the durable production entry cannot promote exact UI evidence without a pe
     alignmentStatus: "unavailable_current_sdk",
     captureComplete: true,
     incompleteReason: null,
-    expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
+    terminalAtMs: Date.parse(ENDED_AT), expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
     bridgeEvents: [
-      { generationId: "bridge_durable", bridgeSessionId: "bridge_durable", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null },
-      { generationId: "bridge_durable", bridgeSessionId: "bridge_durable", sequence: 2, schema: "bridge-session/v1", observedAt: at(9_900), type: "active_speaker", feishuUserId: ALPHA, displayName: null, confidence: "ui_exact" },
+      { bridgeSessionId: "bridge_durable", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null },
+      { bridgeSessionId: "bridge_durable", sequence: 2, schema: "bridge-session/v1", observedAt: at(9_900), type: "active_speaker", feishuUserId: ALPHA, displayName: null, confidence: "ui_exact" },
     ],
-    liveSegments: [{ ...live("seg_durable", 10_000, 14_000, "durably retained wording"), generationId: "bridge_durable" }],
+    liveSegments: [{ ...live("seg_durable", 10_000, 14_000, "durably retained wording"), bridgeSessionId: "bridge_durable" }],
   };
   const result = await reconcilePersistedSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
@@ -764,9 +764,9 @@ test("missing durable runtime identity still returns persisted attendance and li
     alignmentStatus: "unavailable_current_sdk",
     captureComplete: true,
     incompleteReason: null,
-    expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
-    bridgeEvents: [{ generationId: "bridge_no_runtime", bridgeSessionId: "bridge_no_runtime", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null }],
-    liveSegments: [{ ...live("seg_before_start_failure", 10_000, 14_000, "words before runtime start failure"), generationId: "bridge_no_runtime" }],
+    terminalAtMs: Date.parse(ENDED_AT), expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
+    bridgeEvents: [{ bridgeSessionId: "bridge_no_runtime", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null }],
+    liveSegments: [{ ...live("seg_before_start_failure", 10_000, 14_000, "words before runtime start failure"), bridgeSessionId: "bridge_no_runtime" }],
   };
   const result = await reconcilePersistedSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,

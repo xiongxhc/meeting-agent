@@ -20,12 +20,18 @@ export type ParticipantJoinedEvent = {
   readonly feishuUserId: string;
   readonly displayName: string;
   readonly occurredAt: string;
+  readonly occurredAtMs?: number;
+  readonly sequence?: number;
+  readonly bridgeSessionId?: string;
 };
 
 export type ParticipantLeftEvent = {
   readonly type: "participant_left";
   readonly feishuUserId: string;
   readonly occurredAt: string;
+  readonly occurredAtMs?: number;
+  readonly sequence?: number;
+  readonly bridgeSessionId?: string;
 };
 
 /** An invitation, never itself observed attendance. */
@@ -93,7 +99,9 @@ export function reduceAttendance(events: readonly MeetingLifecycleEvent[]): Atte
   const intervals: AttendanceInterval[] = [];
 
   for (const [feishuUserId, userEvents] of byUser) {
-    const ordered = [...userEvents].sort((a, b) => timeKey(a) - timeKey(b));
+    const ordered = [...userEvents].sort((a, b) => timeKey(a) - timeKey(b)
+      || sequenceKey(a) - sequenceKey(b)
+      || bridgeKey(a).localeCompare(bridgeKey(b)));
 
     let open: OpenInterval | null = null;
 
@@ -157,5 +165,15 @@ export function reduceAttendance(events: readonly MeetingLifecycleEvent[]): Atte
  * their relative order among themselves never matters; they sort by an
  * empty key, which is stable and harmless. */
 function timeKey(event: MeetingLifecycleEvent): number {
-  return "occurredAt" in event ? Date.parse(event.occurredAt) : Number.NEGATIVE_INFINITY;
+  return "occurredAt" in event
+    ? (("occurredAtMs" in event ? event.occurredAtMs : undefined) ?? Date.parse(event.occurredAt))
+    : Number.NEGATIVE_INFINITY;
+}
+
+function sequenceKey(event: MeetingLifecycleEvent): number {
+  return "sequence" in event ? (event.sequence ?? 0) : 0;
+}
+
+function bridgeKey(event: MeetingLifecycleEvent): string {
+  return "bridgeSessionId" in event ? (event.bridgeSessionId ?? "") : "";
 }

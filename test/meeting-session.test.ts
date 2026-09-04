@@ -1348,20 +1348,21 @@ test("active_speaker observations and finalized segments are retained as provisi
     assert.equal("speaker" in (h.session.state().liveTranscript[0] ?? {}), false);
     assert.deepEqual(h.coordinator.reconciliationEvidence(IDENTITY.occurrenceId, null), {
       occurrenceId: IDENTITY.occurrenceId,
-      generationId: BRIDGE_SESSION_ID,
+      generationId: `${Buffer.from(IDENTITY.occurrenceId).toString("hex")}:${Buffer.from(BRIDGE_SESSION_ID).toString("hex")}`,
       runtimeSessionId: 17n,
       alignment: null,
       alignmentStatus: "unavailable_current_sdk",
       captureComplete: true,
       incompleteReason: null,
-      expiresAtMs: BASE_MS + 14 * 24 * 60 * 60 * 1000,
+      terminalAtMs: null,
+      expiresAtMs: null,
       bridgeEvents: [
-        { generationId: BRIDGE_SESSION_ID, bridgeSessionId: BRIDGE_SESSION_ID, sequence: 2, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "active_speaker", feishuUserId: "ou_synthetic_1", displayName: null, confidence: "ui_exact" },
-        { generationId: BRIDGE_SESSION_ID, bridgeSessionId: BRIDGE_SESSION_ID, sequence: 3, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "active_speaker", feishuUserId: null, displayName: null, confidence: "ambiguous" },
+        { bridgeSessionId: BRIDGE_SESSION_ID, sequence: 2, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", observedAtMs: Date.parse("2026-09-02T14:00:00Z"), type: "active_speaker", feishuUserId: "ou_synthetic_1", displayName: null, confidence: "ui_exact" },
+        { bridgeSessionId: BRIDGE_SESSION_ID, sequence: 3, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", observedAtMs: Date.parse("2026-09-02T14:00:00Z"), type: "active_speaker", feishuUserId: null, displayName: null, confidence: "ambiguous" },
       ],
       liveSegments: [
-        { generationId: BRIDGE_SESSION_ID, segmentId: "seg_01", text: "we should ship on friday", startedAt: "2026-09-02T14:05:00Z", endedAt: "2026-09-02T14:05:04Z" },
-        { generationId: BRIDGE_SESSION_ID, segmentId: "seg_03", text: "and freeze on thursday", startedAt: "2026-09-02T14:05:00Z", endedAt: "2026-09-02T14:05:04Z" },
+        { bridgeSessionId: BRIDGE_SESSION_ID, segmentId: "seg_01", text: "we should ship on friday", startedAt: "2026-09-02T14:05:00Z", endedAt: "2026-09-02T14:05:04Z" },
+        { bridgeSessionId: BRIDGE_SESSION_ID, segmentId: "seg_03", text: "and freeze on thursday", startedAt: "2026-09-02T14:05:00Z", endedAt: "2026-09-02T14:05:04Z" },
       ],
     });
   } finally {

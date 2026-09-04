@@ -67,7 +67,6 @@ export const SESSION_STATES: readonly SessionState[] = SESSION_STATE_VALUES;
  * "no re-open" rule means "notified" and "failed" are both dead ends here:
  * resuming after either means a brand new occurrence/session. */
 export const TERMINAL_STATES: readonly SessionState[] = ["notified", "failed"];
-export const RECONCILIATION_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** The forward path, in order, excluding the initial "discovered" state.
  * Used by advance() callers to walk a session from discovery to notified. */
@@ -169,14 +168,16 @@ export type SessionCoordinator = {
     occurrenceId: string,
     outcome: TerminalOutcome,
     recording: RecordingInput,
-    reconciliationGenerationId?: string,
+    reconciliationBridgeSessionId?: string,
+    reconciliationTerminalAtMs?: number,
   ): SessionRow;
 
   /** The persisted recording for an occurrence, or null if it never finalized
    * (or finalization failed). */
   recording(occurrenceId: string): RecordingRow | null;
-  beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string): void;
-  setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void;
+  beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string): void;
+  setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
+  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs?: number): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   reconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;
@@ -327,12 +328,14 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     occurrenceId: string,
     outcome: TerminalOutcome,
     recording: RecordingInput,
-    reconciliationGenerationId?: string,
+    reconciliationBridgeSessionId?: string,
+    reconciliationTerminalAtMs?: number,
     ): SessionRow {
       return store.finalizeSession({
         transition: transitionFor(occurrenceId, outcome),
         recording,
-        ...(reconciliationGenerationId === undefined ? {} : { reconciliationGenerationId }),
+        ...(reconciliationBridgeSessionId === undefined ? {} : { reconciliationBridgeSessionId }),
+        ...(reconciliationTerminalAtMs === undefined ? {} : { reconciliationTerminalAtMs }),
       }).session;
     },
 
@@ -340,12 +343,15 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
       return store.getRecording(occurrenceId);
     },
 
-    beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string): void {
+    beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string): void {
       const nowMs = clock.now();
-      store.beginReconciliationGeneration(occurrenceId, generationId, bridgeSessionId, nowMs, nowMs + RECONCILIATION_EVIDENCE_RETENTION_MS);
+      store.beginReconciliationGeneration(occurrenceId, bridgeSessionId, nowMs);
     },
-    setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void {
-      store.setReconciliationRuntimeSession(occurrenceId, generationId, runtimeSessionId);
+    setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void {
+      store.setReconciliationRuntimeSession(occurrenceId, bridgeSessionId, runtimeSessionId);
+    },
+    completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs = clock.now()): void {
+      store.completeReconciliationGeneration(occurrenceId, bridgeSessionId, terminalAtMs);
     },
     appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void {
       store.appendReconciliationBridgeEvent(occurrenceId, event);

@@ -30,8 +30,8 @@
  * `ambiguous` observation that names anyone, and this type cannot express
  * one either. */
 export type ActiveSpeakerObservation =
-  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly confidence: "ui_exact"; readonly feishuUserId: string }
-  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly confidence: "ambiguous"; readonly feishuUserId: null };
+  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly observedAtMs?: number; readonly confidence: "ui_exact"; readonly feishuUserId: string }
+  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly observedAtMs?: number; readonly confidence: "ambiguous"; readonly feishuUserId: null };
 
 export type SpeakerAttribution =
   | { readonly kind: "named"; readonly feishuUserId: string }
