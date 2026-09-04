@@ -19,6 +19,9 @@ import {
   SESSION_STATE_VALUES,
   type RecordingInput,
   type RecordingRow,
+  type ReconciliationBridgeEventRow,
+  type ReconciliationEvidenceRow,
+  type ReconciliationLiveSegmentRow,
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
   type TransitionInput,
@@ -170,6 +173,10 @@ export type SessionCoordinator = {
   /** The persisted recording for an occurrence, or null if it never finalized
    * (or finalization failed). */
   recording(occurrenceId: string): RecordingRow | null;
+  setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void;
+  appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
+  appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
+  reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null;
   recordBridgeFailure(
     occurrenceId: string,
     maxRetries: number,
@@ -325,6 +332,19 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
 
     recording(occurrenceId: string): RecordingRow | null {
       return store.getRecording(occurrenceId);
+    },
+
+    setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void {
+      store.setReconciliationRuntimeSession(occurrenceId, runtimeSessionId);
+    },
+    appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void {
+      store.appendReconciliationBridgeEvent(occurrenceId, event);
+    },
+    appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void {
+      store.appendReconciliationLiveSegment(occurrenceId, segment);
+    },
+    reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null {
+      return store.getReconciliationEvidence(occurrenceId);
     },
 
     recordBridgeFailure(

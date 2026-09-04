@@ -117,6 +117,37 @@ export type RecordingRow = {
   readonly runtimeGaps: readonly RuntimeRecordingGapRow[];
 };
 
+/** Local-only reconciliation input. It is deliberately separate from the
+ * Team Vault/output path: live words are retained only so post-meeting
+ * reconciliation survives a coordinator restart. */
+export type ReconciliationBridgeEventRow = {
+  readonly bridgeSessionId: string;
+  readonly sequence: number;
+  /** Original bridge envelope schema, retained with the payload and order. */
+  readonly schema: "bridge-session/v1";
+  readonly observedAt: string;
+  readonly type: "active_speaker" | "participant_joined" | "participant_left";
+  readonly feishuUserId: string | null;
+  readonly displayName: string | null;
+  readonly confidence: "ui_exact" | "ambiguous" | null;
+};
+export type ReconciliationLiveSegmentRow = {
+  readonly segmentId: string;
+  readonly text: string;
+  readonly startedAt: string;
+  readonly endedAt: string;
+};
+export type ReconciliationEvidenceRow = {
+  readonly occurrenceId: string;
+  readonly runtimeSessionId: bigint | null;
+  /** Current Runtime SDK does not expose a wall-clock/media-zero pair. */
+  readonly alignment: null;
+  /** Durable reason that `alignment` is absent rather than caller supplied. */
+  readonly alignmentStatus: "unavailable_current_sdk";
+  readonly bridgeEvents: readonly ReconciliationBridgeEventRow[];
+  readonly liveSegments: readonly ReconciliationLiveSegmentRow[];
+};
+
 /** What a caller supplies to persist a recording. `occurrenceId` and
  * `finalizedAtMs` are not fields here: both come from the transition the
  * recording is written with, so the two halves cannot disagree about which
@@ -252,6 +283,10 @@ export type SessionStore = {
    * may land alone. */
   finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
   getRecording(occurrenceId: string): RecordingRow | null;
+  setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void;
+  appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
+  appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
+  getReconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null;
   recordBridgeFailure(input: {
     readonly occurrenceId: string;
     readonly nowMs: number;

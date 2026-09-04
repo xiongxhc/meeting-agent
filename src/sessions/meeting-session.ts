@@ -226,8 +226,8 @@ export type MeetingSessionState = {
   readonly speakerEvidence: readonly ActiveSpeakerObservation[];
   /** Every FINAL transcript segment, in arrival order -- the live wording the
    * reconciler falls back to when the diarization backend supplies none
-   * (ruling R55). In memory only; the orchestration database never holds
-   * transcript text. */
+   * (ruling R55). The same final segments are durably retained in the local
+   * reconciliation ledger only; they never enter Team Vault or output paths. */
   readonly liveTranscript: readonly TranscriptSegment[];
 };
 
@@ -737,16 +737,29 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // job, after the meeting, and it is allowed to say "cannot say".
         speakerEvidence.push(
           event.confidence === "ui_exact"
-            ? { observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId }
-            : { observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null },
+            ? { bridgeSessionId: event.sessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId }
+            : { bridgeSessionId: event.sessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null },
         );
+        coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          type: "active_speaker", feishuUserId: event.feishuUserId, displayName: null, confidence: event.confidence,
+        });
         return;
 
       // Attendance is reduced by src/domain/participants.ts. Routed and
       // counted here so the "every routed type is a declared contract type"
       // evidence is complete.
       case "participant_joined":
+        coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, confidence: null,
+        });
+        return;
       case "participant_left":
+        coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
+          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          type: "participant_left", feishuUserId: event.feishuUserId, displayName: null, confidence: null,
+        });
         return;
     }
   }
@@ -765,7 +778,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         if (settledTurns.has(segmentId) || openTurns.has(segmentId)) return; // redelivery
 
         // Final segments only: a partial is neither transcript nor evidence.
-        if (event.segment.final) liveTranscript.push(event.segment);
+        if (event.segment.final) {
+          liveTranscript.push(event.segment);
+          coordinator.appendReconciliationLiveSegment(identity.occurrenceId, {
+            segmentId: event.segment.segmentId, text: event.segment.text,
+            startedAt: event.segment.startedAt, endedAt: event.segment.endedAt,
+          });
+        }
 
         const meetingSegment = {
           segmentId,
@@ -1084,6 +1103,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         responseMode: PINNED_RESPONSE_MODE,
       });
       runtimeSessionId = handle.sessionId;
+      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, handle.sessionId);
       assertJoinCanContinue();
       if (handle.profile !== PINNED_PROFILE) {
         abortSpeaking("profile_mismatch");

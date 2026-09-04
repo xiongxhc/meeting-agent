@@ -56,7 +56,7 @@
 // warnings (a conflicted cluster, a straddling segment) are on the record but
 // are not incompleteness: re-running the reconciliation would not change them.
 
-import type { AttendanceInterval } from "../domain/participants.ts";
+import { reduceAttendance, type AttendanceInterval } from "../domain/participants.ts";
 import {
   INCOMPLETE_TRANSCRIPT_CODES,
   type ActiveSpeakerObservation,
@@ -72,11 +72,21 @@ import type {
   RecordingReconciliation,
   TranscriptSegment,
 } from "../ports/conversation-runtime.ts";
-import type { RecordingRow } from "../ports/session-store.ts";
+import type { ReconciliationEvidenceRow, RecordingRow } from "../ports/session-store.ts";
 
 export const MIN_ALIGNED_COVERAGE = 0.8;
 export const MAX_CONFLICTING_OVERLAP_MS = 500;
 export const FRESH_OBSERVATION_LEAD_MS = 2_000;
+
+/** A cross-clock conversion is permitted only when a runtime-issued session
+ * identity and the recorded media-zero wall instant were durably captured
+ * together. Current Runtime declarations do not supply this fact, so normal
+ * Task 7 persistence records null and reconciliation fails closed. */
+export type MediaTimelineAlignment = {
+  readonly kind: "durable_runtime_anchor";
+  readonly mediaOriginAt: string;
+  readonly runtimeSessionId: bigint;
+};
 
 export type ReconcileTranscriptInput = {
   /** Actual joiners, from src/domain/participants.ts. Used only to report
@@ -90,10 +100,9 @@ export type ReconcileTranscriptInput = {
   readonly evidence: readonly ActiveSpeakerObservation[];
   /** The runtime's reconciliation, or why there is none. */
   readonly reconciliation: RecordingReconciliation | { readonly unavailable: string };
-  /** The wall-clock instant at media-timeline zero -- the start of the
-   * recording. Live segments and observations are converted onto the media
-   * timeline against it. */
-  readonly mediaOriginAt: string;
+  /** A durable, provenance-bearing relation between wall clock and media
+   * timeline. Never accept a caller's bare wall-clock assertion. */
+  readonly alignment: MediaTimelineAlignment | null;
   /** When the meeting ended. Closes the last observed active-speaker state. */
   readonly endedAt: string;
 };
@@ -102,11 +111,25 @@ export type ReconcileTranscriptInput = {
  * Pure. Same inputs, same transcript; no clock, no I/O.
  */
 export function reconcileTranscript(input: ReconcileTranscriptInput): ReconciledTranscript {
-  const originMs = parseInstant(input.mediaOriginAt, "mediaOriginAt");
+  const aligned = input.alignment !== null;
+  // When no anchor exists we retain the two timelines independently (rather
+  // than equating wall time with media zero). No state derived across them can
+  // name a person; the warning makes the result non-deletable.
+  const originMs = aligned ? parseInstant(input.alignment.mediaOriginAt, "media alignment origin") : 0;
   const endedAtMs = parseInstant(input.endedAt, "endedAt") - originMs;
 
-  const evidence = [...input.evidence].sort((a, b) => a.observedAt.localeCompare(b.observedAt));
-  const states = evidenceStates(evidence, originMs, endedAtMs);
+  const evidence = [...input.evidence].sort((a, b) => {
+    const instant = parseInstant(a.observedAt, "observation observedAt") - parseInstant(b.observedAt, "observation observedAt");
+    return instant !== 0 ? instant : a.sequence - b.sequence;
+  });
+  const states = aligned ? evidenceStates(evidence, originMs, endedAtMs) : [];
+  const attendance = aligned
+    ? input.attendance.map((interval) => ({
+        feishuUserId: interval.feishuUserId,
+        start: parseInstant(interval.joinedAt, `attendance ${interval.feishuUserId} joinedAt`) - originMs,
+        end: (interval.leftAt === null ? parseInstant(input.endedAt, "endedAt") : parseInstant(interval.leftAt, `attendance ${interval.feishuUserId} leftAt`)) - originMs,
+      }))
+    : [];
 
   const live: LiveInterval[] = input.liveSegments
     .map((segment) => ({
@@ -118,10 +141,11 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
     .sort(byStartThenId);
 
   const warnings: TranscriptWarning[] = [];
+  if (!aligned) warnings.push({ code: "media_timeline_alignment_unavailable" });
   const units = buildUnits(live, input.reconciliation, warnings);
 
   // Attribution from UI evidence -- the only source of a name.
-  const attributed = units.map((unit) => ({ unit, ...attributeFromUi(unit, states) }));
+  const attributed = units.map((unit) => ({ unit, ...attributeFromUi(unit, states, attendance) }));
 
   // Clusters can veto a name; they cannot grant one.
   applyClusterVetoes(attributed, warnings);
@@ -129,8 +153,9 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
   // speaker_NN labels, numbered by first appearance of each cluster.
   const labels = new Map<string, string>();
   for (const { unit } of attributed) {
-    if (unit.cluster !== null && !labels.has(unit.cluster)) {
-      labels.set(unit.cluster, `speaker_${String(labels.size + 1).padStart(2, "0")}`);
+    const identity = unit.cluster ?? `unclustered:${unit.segmentId}`;
+    if (!labels.has(identity)) {
+      labels.set(identity, `speaker_${String(labels.size + 1).padStart(2, "0")}`);
     }
   }
 
@@ -143,7 +168,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
     } else if (reason === "ui_conflict" || reason === "ui_ambiguous" || reason === "multi_voice" || reason === "cluster_conflict") {
       speaker = { kind: "ambiguous" };
     } else {
-      speaker = { kind: "anonymous", label: unit.cluster === null ? null : (labels.get(unit.cluster) ?? null) };
+      speaker = { kind: "anonymous", label: labels.get(unit.cluster ?? `unclustered:${unit.segmentId}`)! };
     }
     return {
       segmentId: unit.segmentId,
@@ -164,13 +189,20 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
   });
 
   const attendees = [...new Set(input.attendance.map((interval) => interval.feishuUserId))].sort();
+  const observedSpeaking = new Set<string>();
+  for (const segment of segments) {
+    for (const [id, ms] of Object.entries(segment.provenance.uiExactMs)) {
+      if (ms > 0 && !named.has(id) && attendees.includes(id)) observedSpeaking.add(id);
+    }
+  }
 
   return {
     segments,
     warnings,
     transcriptComplete: !warnings.some((warning) => INCOMPLETE_TRANSCRIPT_CODES.has(warning.code)),
     evidence,
-    silentAttendees: attendees.filter((id) => !named.has(id)),
+    silentAttendees: attendees.filter((id) => !named.has(id) && !observedSpeaking.has(id)),
+    spokeButUnattributed: [...observedSpeaking].sort(),
   };
 }
 
@@ -204,24 +236,70 @@ export type SpeakerReconciliationResult = ReconciledTranscript & {
  */
 export async function reconcileSpeakers(input: ReconcileSpeakersInput): Promise<SpeakerReconciliationResult> {
   const { occurrenceId, sessionId, recordings, runtime, ...rest } = input;
+  // An anchor belongs to the Runtime session that issued it. A typed-looking
+  // record for a different bigint session is no more trustworthy than none.
+  const alignment = rest.alignment?.runtimeSessionId === sessionId ? rest.alignment : null;
   const row = recordings.recording(occurrenceId);
   if (row === null) {
     return {
       recordingHandle: null,
       ...reconcileTranscript({
         ...rest,
+        alignment,
         reconciliation: { unavailable: `no persisted recording for occurrence ${occurrenceId}` },
       }),
     };
   }
 
-  let reconciliation: ReconcileTranscriptInput["reconciliation"];
   try {
-    reconciliation = await runtime.reconcileRecording({ sessionId, recordingHandle: row.handle });
+    const reconciliation = await runtime.reconcileRecording({ sessionId, recordingHandle: row.handle });
+    return { recordingHandle: row.handle, ...reconcileTranscript({ ...rest, alignment, reconciliation }) };
   } catch (error) {
-    reconciliation = { unavailable: error instanceof Error ? error.message : String(error) };
+    const detail = error instanceof Error ? error.message : String(error);
+    return { recordingHandle: row.handle, ...reconcileTranscript({ ...rest, alignment, reconciliation: { unavailable: detail } }) };
   }
-  return { recordingHandle: row.handle, ...reconcileTranscript({ ...rest, reconciliation }) };
+}
+
+/** Production post-restart entry point. Its inputs are the durable ledger,
+ * not a live session's closure state. Current Runtime declarations do not
+ * establish a media-zero anchor, so alignment is deliberately null and this
+ * path can never name a person until a future contract supplies one. */
+export async function reconcilePersistedSpeakers(input: {
+  readonly occurrenceId: string;
+  readonly recordings: { recording(occurrenceId: string): RecordingRow | null };
+  readonly evidence: { reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null };
+  readonly runtime: Pick<ConversationRuntimePort, "reconcileRecording">;
+}): Promise<SpeakerReconciliationResult> {
+  const evidence = input.evidence.reconciliationEvidence(input.occurrenceId);
+  if (evidence === null || evidence.runtimeSessionId === null) {
+    return { recordingHandle: null, ...reconcileTranscript({
+      attendance: [], liveSegments: [], evidence: [], reconciliation: { unavailable: "durable runtime session identity is unavailable" },
+      alignment: null, endedAt: "1970-01-01T00:00:00.000Z",
+    }) };
+  }
+  const attendanceEvents: Parameters<typeof reduceAttendance>[0][number][] = [];
+  for (const event of evidence.bridgeEvents) {
+    if (event.type === "participant_joined" && event.feishuUserId !== null && event.displayName !== null) {
+      attendanceEvents.push({ type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, occurredAt: event.observedAt });
+    }
+    if (event.type === "participant_left" && event.feishuUserId !== null) {
+      attendanceEvents.push({ type: "participant_left", feishuUserId: event.feishuUserId, occurredAt: event.observedAt });
+    }
+  }
+  const attendance = reduceAttendance(attendanceEvents);
+  const active = evidence.bridgeEvents.flatMap((event): ActiveSpeakerObservation[] => {
+    if (event.type !== "active_speaker" || event.confidence === null) return [];
+    return event.confidence === "ui_exact" && event.feishuUserId !== null
+      ? [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ui_exact", feishuUserId: event.feishuUserId }]
+      : [{ bridgeSessionId: event.bridgeSessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null }];
+  });
+  const endedAt = [...evidence.bridgeEvents.map((event) => event.observedAt), ...evidence.liveSegments.map((segment) => segment.endedAt)]
+    .sort((a, b) => parseInstant(a, "persisted evidence") - parseInstant(b, "persisted evidence")).at(-1) ?? "1970-01-01T00:00:00.000Z";
+  return reconcileSpeakers({
+    occurrenceId: input.occurrenceId, sessionId: evidence.runtimeSessionId, recordings: input.recordings, runtime: input.runtime,
+    attendance, liveSegments: evidence.liveSegments.map((segment) => ({ ...segment, final: true })), evidence: active,
+    alignment: evidence.alignment, endedAt,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +326,7 @@ type Unit = Interval & {
 
 /** One observed active-speaker state, from its observation to the next. */
 type EvidenceState = Interval & { readonly observation: ActiveSpeakerObservation };
+type AttendanceTimeline = Interval & { readonly feishuUserId: string };
 
 type UiAttribution = {
   readonly reason: AttributionReason;
@@ -351,13 +430,16 @@ function buildUnits(
   const outside: string[] = [];
   const multiVoice: string[] = [];
   for (const segment of live) {
-    // A live segment the reconciled wording covers is superseded by it.
-    const consumedMs = worded.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
-    if (worded.length > 0 && duration(segment) > 0 && consumedMs >= MIN_ALIGNED_COVERAGE * duration(segment)) continue;
+    // Coverage is about recovered speech intervals, not whether the selected
+    // diarizer backend also transcribed their text. SpeechBrain's normal
+    // empty-text cluster result is complete when it covers the live wording.
+    const diarizedConsumedMs = diarized.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
+    const wordedConsumedMs = worded.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
+    if (worded.length > 0 && duration(segment) > 0 && wordedConsumedMs >= MIN_ALIGNED_COVERAGE * duration(segment)) continue;
 
     const { cluster, straddles } = clusterFor(segment, diarized);
     units.push(liveUnit(segment, cluster, straddles));
-    if (worded.length > 0) outside.push(segment.segmentId);
+    if (diarized.length === 0 || diarizedConsumedMs < MIN_ALIGNED_COVERAGE * duration(segment)) outside.push(segment.segmentId);
     if (straddles) multiVoice.push(segment.segmentId);
   }
   if (outside.length > 0) warnings.push({ code: "live_segment_outside_reconciliation", segmentIds: outside });
@@ -405,7 +487,11 @@ function clusterFor(
 }
 
 /** The only function that can propose a name. */
-function attributeFromUi(unit: Unit, states: readonly EvidenceState[]): UiAttribution {
+function attributeFromUi(
+  unit: Unit,
+  states: readonly EvidenceState[],
+  attendance: readonly AttendanceTimeline[],
+): UiAttribution {
   const uiExactMs: Record<string, number> = {};
   let ambiguousMs = 0;
   let observedMs = 0;
@@ -416,13 +502,17 @@ function attributeFromUi(unit: Unit, states: readonly EvidenceState[]): UiAttrib
       observedMs += ms;
       if (state.observation.confidence === "ui_exact") {
         const id = state.observation.feishuUserId;
-        uiExactMs[id] = (uiExactMs[id] ?? 0) + ms;
+        const attendedMs = attendance
+          .filter((interval) => interval.feishuUserId === id)
+          .reduce((sum, interval) => sum + overlap(unit, { start: Math.max(state.start, interval.start), end: Math.min(state.end, interval.end) }), 0);
+        if (attendedMs > 0) uiExactMs[id] = (uiExactMs[id] ?? 0) + attendedMs;
       } else {
         ambiguousMs += ms;
       }
     }
     if (
       state.observation.confidence === "ui_exact" &&
+      attendance.some((interval) => interval.feishuUserId === state.observation.feishuUserId && overlap(state, interval) > 0) &&
       state.start >= unit.start - FRESH_OBSERVATION_LEAD_MS &&
       state.start < unit.end
     ) {
@@ -445,7 +535,7 @@ function attributeFromUi(unit: Unit, states: readonly EvidenceState[]): UiAttrib
   const otherIdentitiesMs = ranked.slice(1).reduce((sum, [, ms]) => sum + ms, 0);
   const conflictingMs = otherIdentitiesMs + ambiguousMs;
 
-  if (coveredMs >= MIN_ALIGNED_COVERAGE * dur && conflictingMs <= MAX_CONFLICTING_OVERLAP_MS) {
+  if (coveredMs >= MIN_ALIGNED_COVERAGE * dur && conflictingMs <= MAX_CONFLICTING_OVERLAP_MS && fresh.has(identity)) {
     return { ...base, reason: "ui_aligned", candidate: identity, fresh: fresh.has(identity) };
   }
   if (otherIdentitiesMs > MAX_CONFLICTING_OVERLAP_MS) return { ...base, reason: "ui_conflict" };

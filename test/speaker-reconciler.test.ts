@@ -17,8 +17,8 @@
 //      named. A cluster whose UI-named segments disagree resolves to ambiguous.
 //   3. THE LOCAL DIARIZATION BACKEND (ruling R55) RETURNS NO TEXT. The
 //      reconciled transcript must still carry wording, taken from the live
-//      segments by media-timeline overlap, and must say the final transcription
-//      is incomplete.
+//      segments by media-timeline overlap, and is complete when that coverage
+//      is full; the empty local text is informational, not a deletion permit.
 //   4. INCOMPLETENESS IS A FIELD. `transcriptComplete` and the closed warning
 //      list are what Task 9a's backfill and the retention monitor read.
 //   5. THE PERSISTED HANDLE IS WHAT reconcileRecording IS CALLED WITH -- read
@@ -40,9 +40,10 @@ import type {
   RecordingReconciliation,
   TranscriptSegment,
 } from "../src/ports/conversation-runtime.ts";
-import type { RecordingRow } from "../src/ports/session-store.ts";
+import type { ReconciliationEvidenceRow, RecordingRow } from "../src/ports/session-store.ts";
 import {
   MAX_CONFLICTING_OVERLAP_MS,
+  reconcilePersistedSpeakers,
   MIN_ALIGNED_COVERAGE,
   reconcileSpeakers,
   reconcileTranscript,
@@ -82,11 +83,11 @@ function live(segmentId: string, startMs: number, endMs: number, text: string): 
 }
 
 function exact(ms: number, feishuUserId: string): ActiveSpeakerObservation {
-  return { observedAt: at(ms), confidence: "ui_exact", feishuUserId };
+  return { bridgeSessionId: "bridge_synthetic", sequence: ms + 1, observedAt: at(ms), confidence: "ui_exact", feishuUserId };
 }
 
 function ambiguous(ms: number): ActiveSpeakerObservation {
-  return { observedAt: at(ms), confidence: "ambiguous", feishuUserId: null };
+  return { bridgeSessionId: "bridge_synthetic", sequence: ms + 1, observedAt: at(ms), confidence: "ambiguous", feishuUserId: null };
 }
 
 function diarized(
@@ -105,7 +106,7 @@ function input(overrides: Partial<ReconcileTranscriptInput>): ReconcileTranscrip
     liveSegments: [],
     evidence: [],
     reconciliation: { unavailable: "not requested in this test" },
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
     ...overrides,
   };
@@ -157,9 +158,9 @@ test("a UI switch mid-segment is conflicting evidence and resolves to ambiguous"
   assert.deepEqual(segment.speaker, { kind: "ambiguous" });
   assert.equal(segment.provenance.reason, "ui_conflict");
   assert.deepEqual(segment.provenance.uiExactMs, { [ALPHA]: 5_000, [BETA]: 5_000 });
-  // Nobody is named, so nobody is "silent" by elimination either: both are
-  // simply unattributed.
-  assert.deepEqual(result.silentAttendees, [ALPHA, BETA, GAMMA]);
+  // Both people were observed speaking but neither met the naming rule.
+  assert.deepEqual(result.silentAttendees, [GAMMA]);
+  assert.deepEqual(result.spokeButUnattributed, [ALPHA, BETA]);
 });
 
 test("a UI switch within the jitter allowance at a segment edge still names the dominant identity", () => {
@@ -207,9 +208,9 @@ test("no active-speaker signal at all leaves every segment anonymous -- even wit
     }),
   );
   assert.equal(result.segments.length, 2);
-  for (const segment of result.segments) {
+  for (const [index, segment] of result.segments.entries()) {
     // The only attendee is NOT the answer. Elimination is a guess.
-    assert.deepEqual(segment.speaker, { kind: "anonymous", label: null });
+    assert.deepEqual(segment.speaker, { kind: "anonymous", label: `speaker_0${index + 1}` });
     assert.equal(segment.provenance.reason, "no_signal");
     assert.equal(segment.provenance.unobservedMs, 4_000);
   }
@@ -224,7 +225,7 @@ test("speech before the first observation is unobserved, not attributed to whoev
     }),
   );
   const segment = only(result);
-  assert.deepEqual(segment.speaker, { kind: "anonymous", label: null });
+  assert.deepEqual(segment.speaker, { kind: "anonymous", label: "speaker_01" });
   assert.equal(segment.provenance.reason, "no_signal");
 });
 
@@ -239,7 +240,7 @@ test("partial coverage with no conflicting evidence is insufficient, not a guess
     }),
   );
   const segment = only(result);
-  assert.deepEqual(segment.speaker, { kind: "anonymous", label: null });
+  assert.deepEqual(segment.speaker, { kind: "anonymous", label: "speaker_01" });
   assert.equal(segment.provenance.reason, "ui_insufficient");
   assert.deepEqual(segment.provenance.uiExactMs, { [ALPHA]: 5_000 });
   assert.equal(segment.provenance.unobservedMs, 5_000);
@@ -270,14 +271,14 @@ test("an ambiguous flicker inside the jitter allowance does not unseat an otherw
   assert.equal(segment.provenance.ambiguousMs, 300);
 });
 
-test("the last observed state holds to the end of the meeting, because the bridge emits only changes", () => {
+test("the last observed state does not name a much later turn merely because the bridge emits only changes", () => {
   const result = reconcileTranscript(
     input({
       liveSegments: [live("seg_01", 3_000_000, 3_004_000, "late in the meeting")],
       evidence: [exact(60_000, ALPHA)],
     }),
   );
-  assert.deepEqual(only(result).speaker, { kind: "named", feishuUserId: ALPHA });
+  assert.deepEqual(only(result).speaker, { kind: "anonymous", label: "speaker_01" });
 });
 
 test("with no diarization, the live segments come back in time order with no clusters", () => {
@@ -401,17 +402,18 @@ test("a cluster is never mapped to a person by elimination, by attendee order, o
   // never did, so the held state is a relic there, and the diarizer's second
   // voice stays anonymous: not BETA (elimination), not ALPHA (a stale tile).
   assert.deepEqual(absence.segments[1]?.speaker, { kind: "anonymous", label: "speaker_02" });
-  assert.equal(absence.segments[1]?.provenance.reason, "ui_unconfirmed");
+  assert.equal(absence.segments[1]?.provenance.reason, "ui_insufficient");
   assert.equal(absence.segments[1]?.cluster, "cluster-b");
   // The held evidence is still on the record: ALPHA's tile covered it.
   assert.deepEqual(absence.segments[1]?.provenance.uiExactMs, { [ALPHA]: 10_000 });
   assert.deepEqual(absence.silentAttendees, [BETA]);
 });
 
-test("held UI state names a later segment of the SAME cluster: the cluster corroborates what the tile said", () => {
+test("a held UI state never names a later segment, even when its cluster matches", () => {
   // ALPHA lit at 9.9s for dia_01 and nothing changed afterwards (nobody else
   // lit a tile). dia_03 is the same voice cluster, so the held state is
-  // consistent with the diarizer, and the segment is named.
+  // consistent with the diarizer, but a cluster cannot turn a stale tile into
+  // evidence that this person is still present and speaking.
   const result = reconcileTranscript(
     input({
       liveSegments: LIVE_FOR_ONLINE,
@@ -422,13 +424,7 @@ test("held UI state names a later segment of the SAME cluster: the cluster corro
       evidence: [exact(9_900, ALPHA)],
     }),
   );
-  assert.deepEqual(
-    result.segments.map((s) => [s.segmentId, s.speaker, s.provenance.reason]),
-    [
-      ["dia_01", { kind: "named", feishuUserId: ALPHA }, "ui_aligned"],
-      ["dia_03", { kind: "named", feishuUserId: ALPHA }, "ui_aligned"],
-    ],
-  );
+  assert.notEqual(result.segments.find((segment) => segment.segmentId === "dia_03")?.speaker.kind, "named");
 });
 
 test("clusters can only take a name away, never grant one: a fresh name on one cluster does not spread to its unobserved siblings' text", () => {
@@ -446,8 +442,7 @@ test("clusters can only take a name away, never grant one: a fresh name on one c
       evidence: [exact(9_900, ALPHA), ambiguous(39_000)],
     }),
   );
-  assert.deepEqual(result.segments[1]?.speaker, { kind: "ambiguous" });
-  assert.equal(result.segments[1]?.provenance.reason, "ui_ambiguous");
+  assert.notEqual(result.segments.find((segment) => segment.segmentId === "dia_03")?.speaker.kind, "named");
 });
 
 test("a cluster whose UI-named segments disagree resolves to ambiguous for the whole cluster, with a warning", () => {
@@ -486,7 +481,7 @@ test("a live segment the reconciliation did not cover is kept, with its own word
   assert.equal(stray.provenance.wording, "live");
   assert.equal(stray.cluster, null);
   assert.deepEqual(result.warnings, [{ code: "live_segment_outside_reconciliation", segmentIds: ["seg_99"] }]);
-  assert.equal(result.transcriptComplete, true);
+  assert.equal(result.transcriptComplete, false);
 });
 
 test("runtime warnings pass through as their own code and make the transcript incomplete", () => {
@@ -508,7 +503,7 @@ test("a reconciliation with no segments while the meeting had speech is incomple
     }),
   );
   assert.equal(result.segments.length, 4);
-  assert.deepEqual(codes(result), ["reconciliation_empty"]);
+  assert.deepEqual(codes(result), ["reconciliation_empty", "live_segment_outside_reconciliation"]);
   assert.equal(result.transcriptComplete, false);
 });
 
@@ -550,9 +545,10 @@ test("local backend: empty reconciled text falls back to live wording by media-t
     assert.notEqual(segment.text, "");
     assert.equal(segment.provenance.wording, "live");
   }
-  // The final transcription did not happen: that is the signal Task 9a keys on.
+  // Empty text is normal for the local cluster-only backend. Coverage, not a
+  // second transcription, controls completeness.
   assert.deepEqual(result.warnings, [{ code: "reconciled_text_missing", segments: 4 }]);
-  assert.equal(result.transcriptComplete, false);
+  assert.equal(result.transcriptComplete, true);
 });
 
 test("local backend: anonymous labels follow the clusters, so the same voice keeps the same speaker_NN", () => {
@@ -638,7 +634,7 @@ test("reconcileSpeakers reads the PERSISTED handle and hands exactly that to rec
     attendance: ATTENDANCE,
     liveSegments: LIVE_FOR_ONLINE,
     evidence: [],
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
   });
   assert.deepEqual(runtime.callsOf("reconcileRecording"), [
@@ -649,7 +645,7 @@ test("reconcileSpeakers reads the PERSISTED handle and hands exactly that to rec
   assert.equal(result.segments[0]?.provenance.wording, "reconciled");
 });
 
-test("reconcileSpeakers with the fake's local-backend option produces a worded, incomplete transcript", async () => {
+test("reconcileSpeakers with the fake's fully-covered local backend produces a worded, complete transcript", async () => {
   const runtime = fakeRuntime({ reconciliation: ONLINE, diarizationBackend: "local" });
   const result = await reconcileSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
@@ -659,13 +655,167 @@ test("reconcileSpeakers with the fake's local-backend option produces a worded, 
     attendance: ATTENDANCE,
     liveSegments: LIVE_FOR_ONLINE,
     evidence: [],
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
   });
   assert.equal(result.segments.length, 4);
   for (const segment of result.segments) assert.notEqual(segment.text, "");
   assert.deepEqual(codes(result), ["reconciled_text_missing"]);
+  assert.equal(result.transcriptComplete, true);
+});
+
+test("no trustworthy media anchor fails closed: live wording is retained but nobody is named", () => {
+  const result = reconcileTranscript(
+    input({
+      alignment: null,
+      liveSegments: [live("seg_anchor", 10_000, 14_000, "keep this wording")],
+      evidence: [exact(9_900, ALPHA)],
+      reconciliation: { segments: [diarized("dia_anchor", 10_000, 14_000, "cluster-a", "keep this wording")], warnings: [] },
+    }),
+  );
+  assert.deepEqual(result.segments.map((segment) => segment.speaker.kind), ["anonymous", "anonymous"]);
+  assert.deepEqual(codes(result).sort(), ["live_segment_outside_reconciliation", "media_timeline_alignment_unavailable"]);
   assert.equal(result.transcriptComplete, false);
+});
+
+test("the durable production entry cannot promote exact UI evidence without a persisted Runtime anchor", async () => {
+  const runtime = fakeRuntime({ reconciliation: ONLINE });
+  const durable: ReconciliationEvidenceRow = {
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    runtimeSessionId: 9_007_199_254_740_993n,
+    alignment: null,
+    alignmentStatus: "unavailable_current_sdk",
+    bridgeEvents: [
+      { bridgeSessionId: "bridge_durable", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null },
+      { bridgeSessionId: "bridge_durable", sequence: 2, schema: "bridge-session/v1", observedAt: at(9_900), type: "active_speaker", feishuUserId: ALPHA, displayName: null, confidence: "ui_exact" },
+    ],
+    liveSegments: [live("seg_durable", 10_000, 14_000, "durably retained wording")],
+  };
+  const result = await reconcilePersistedSpeakers({
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    recordings: recordings(RECORDING_ROW),
+    evidence: { reconciliationEvidence: () => durable },
+    runtime,
+  });
+  assert.deepEqual(runtime.callsOf("reconcileRecording"), [
+    { method: "reconcileRecording", input: { sessionId: 9_007_199_254_740_993n, recordingHandle: RECORDING_ROW.handle } },
+  ]);
+  assert.ok(result.segments.some((segment) => segment.text === "durably retained wording"));
+  assert.ok(result.segments.every((segment) => segment.speaker.kind !== "named"));
+  assert.ok(codes(result).includes("media_timeline_alignment_unavailable"));
+  assert.equal(result.transcriptComplete, false);
+});
+
+test("a Runtime bigint beyond JavaScript's exact timeline range fails closed without coercing it", async () => {
+  const runtime = fakeRuntime({
+    reconciliation: {
+      segments: [{
+        segmentId: "dia_too_large",
+        startedAtMs: BigInt(Number.MAX_SAFE_INTEGER),
+        endedAtMs: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+        text: "runtime text must not be rounded",
+        speakerCluster: "cluster-a",
+      }],
+      warnings: [],
+    },
+  });
+  const result = await reconcileSpeakers({
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
+    recordings: recordings(RECORDING_ROW),
+    runtime,
+    attendance: ATTENDANCE,
+    liveSegments: [live("seg_safe", 10_000, 14_000, "retained live wording")],
+    evidence: [exact(9_900, ALPHA)],
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
+    endedAt: ENDED_AT,
+  });
+  assert.equal(result.segments[0]?.text, "retained live wording");
+  assert.deepEqual(result.warnings, [{ code: "reconciliation_unavailable", detail: "diarized dia_too_large endedAtMs exceeds JavaScript's exact numeric timeline range" }]);
+  assert.equal(result.transcriptComplete, false);
+});
+
+test("an anchor with a different Runtime bigint session is rejected rather than used to name", async () => {
+  const runtime = fakeRuntime();
+  const result = await reconcileSpeakers({
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    sessionId: 17n,
+    recordings: recordings(null),
+    runtime,
+    attendance: ATTENDANCE,
+    liveSegments: [live("seg_wrong_session", 10_000, 14_000, "retain")],
+    evidence: [exact(9_900, ALPHA)],
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 18n },
+    endedAt: ENDED_AT,
+  });
+  assert.notEqual(result.segments[0]?.speaker.kind, "named");
+  assert.ok(codes(result).includes("media_timeline_alignment_unavailable"));
+});
+
+test("an uncovered live interval is incomplete even when another reconciled interval has wording", () => {
+  const result = reconcileTranscript(
+    input({
+      liveSegments: [live("seg_covered", 10_000, 14_000, "covered"), live("seg_missed", 20_000, 24_000, "must survive")],
+      reconciliation: { segments: [diarized("dia_covered", 10_000, 14_000, "cluster-a", "covered")], warnings: [] },
+    }),
+  );
+  assert.ok(result.segments.some((segment) => segment.segmentId === "seg_missed" && segment.text === "must survive"));
+  assert.equal(result.transcriptComplete, false);
+  assert.deepEqual(codes(result), ["live_segment_outside_reconciliation"]);
+});
+
+test("unclustered speech gets stable deterministic speaker labels instead of null", () => {
+  const result = reconcileTranscript(
+    input({
+      liveSegments: [live("seg_b", 20_000, 24_000, "second"), live("seg_a", 10_000, 14_000, "first")],
+      reconciliation: { unavailable: "offline" },
+    }),
+  );
+  assert.deepEqual(result.segments.map((segment) => segment.speaker), [
+    { kind: "anonymous", label: "speaker_01" },
+    { kind: "anonymous", label: "speaker_02" },
+  ]);
+});
+
+test("a participant whose exact UI evidence overlaps speech but cannot name it is not reported silent", () => {
+  const result = reconcileTranscript(
+    input({
+      attendance: [attendee(ALPHA, "Alpha Synthetic"), attendee(BETA, "Beta Synthetic")],
+      liveSegments: [live("seg_short", 10_000, 20_000, "short signal")],
+      evidence: [exact(18_000, ALPHA)],
+      reconciliation: { unavailable: "offline" },
+    }),
+  );
+  assert.deepEqual(result.silentAttendees, [BETA]);
+  assert.deepEqual(result.spokeButUnattributed, [ALPHA]);
+});
+
+test("a tile held after its participant left cannot name later speech", () => {
+  const result = reconcileTranscript(
+    input({
+      attendance: [{ feishuUserId: ALPHA, displayName: "Alpha Synthetic", joinedAt: at(0), leftAt: at(14_000) }],
+      liveSegments: [live("seg_after_leave", 20_000, 24_000, "someone else spoke")],
+      evidence: [exact(9_900, ALPHA)],
+      reconciliation: { unavailable: "offline" },
+    }),
+  );
+  assert.notEqual(only(result).speaker.kind, "named");
+  assert.deepEqual(result.spokeButUnattributed, []);
+});
+
+test("mixed timestamp precision is ordered by instant, then bridge sequence, never lexical spelling", () => {
+  const result = reconcileTranscript(
+    input({
+      liveSegments: [live("seg_order", 10_000, 14_000, "ordered")],
+      evidence: [
+        { bridgeSessionId: "bridge_synthetic", sequence: 2, observedAt: "2026-09-02T14:00:10.000Z", confidence: "ambiguous", feishuUserId: null },
+        { bridgeSessionId: "bridge_synthetic", sequence: 1, observedAt: "2026-09-02T14:00:10Z", confidence: "ui_exact", feishuUserId: ALPHA },
+      ],
+      reconciliation: { unavailable: "offline" },
+    }),
+  );
+  assert.deepEqual(result.evidence.map((event) => event.sequence), [1, 2]);
+  assert.notEqual(only(result).speaker.kind, "named");
 });
 
 test("no persisted recording: the runtime is never called, the transcript is live-only and incomplete", async () => {
@@ -678,7 +828,7 @@ test("no persisted recording: the runtime is never called, the transcript is liv
     attendance: ATTENDANCE,
     liveSegments: LIVE_FOR_ONLINE,
     evidence: [exact(9_900, ALPHA), ambiguous(19_000)],
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
   });
   assert.deepEqual(runtime.callsOf("reconcileRecording"), []);
@@ -699,7 +849,7 @@ test("a reconcileRecording failure is a typed warning, not a thrown error, and t
     attendance: ATTENDANCE,
     liveSegments: LIVE_FOR_ONLINE,
     evidence: [],
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
   });
   assert.equal(runtime.callsOf("reconcileRecording").length, 1);
@@ -726,7 +876,7 @@ test("reconcileRecording is refused by the fake while the voice session is live,
     attendance: ATTENDANCE,
     liveSegments: LIVE_FOR_ONLINE,
     evidence: [],
-    mediaOriginAt: ORIGIN,
+    alignment: { kind: "durable_runtime_anchor", mediaOriginAt: ORIGIN, runtimeSessionId: 17n },
     endedAt: ENDED_AT,
   });
   assert.equal(result.warnings[0]?.code, "reconciliation_unavailable");
@@ -771,7 +921,7 @@ test("PROPERTY: every named segment has one identity covering >= MIN_ALIGNED_COV
       start += duration + Math.floor(random() * 3_000);
     }
     const useClusters = random() < 0.5;
-    const reconciliation: RecordingReconciliation | null = useClusters
+    const reconciliation: RecordingReconciliation | { readonly unavailable: string } = useClusters
       ? {
           segments: liveSegments.map((segment, i) =>
             diarized(
@@ -784,7 +934,7 @@ test("PROPERTY: every named segment has one identity covering >= MIN_ALIGNED_COV
           ),
           warnings: [],
         }
-      : null;
+      : { unavailable: "not requested" };
 
     const result = reconcileTranscript(input({ liveSegments, evidence, reconciliation }));
     for (const segment of result.segments) {

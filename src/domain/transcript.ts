@@ -7,9 +7,8 @@
 // active-speaker observations aligned with the segment on the media timeline
 // (the rule itself lives in src/sessions/speaker-reconciler.ts). `anonymous`
 // is a voice: the diarizer's cluster gives it a stable `speaker_NN` label,
-// and when there is no cluster the label is null rather than a fresh number
-// per segment, because an unclustered voice is not known to be the same as
-// or different from any other. `ambiguous` is positive evidence that the
+// and when there is no cluster it still receives a stable `speaker_NN` label
+// by transcript order. `ambiguous` is positive evidence that the
 // segment cannot be attributed -- two lit tiles, a UI switch inside it, two
 // voices in one STT segment, or a cluster whose own evidence disagrees.
 //
@@ -31,14 +30,15 @@
  * `ambiguous` observation that names anyone, and this type cannot express
  * one either. */
 export type ActiveSpeakerObservation =
-  | { readonly observedAt: string; readonly confidence: "ui_exact"; readonly feishuUserId: string }
-  | { readonly observedAt: string; readonly confidence: "ambiguous"; readonly feishuUserId: null };
+  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly confidence: "ui_exact"; readonly feishuUserId: string }
+  | { readonly bridgeSessionId: string; readonly sequence: number; readonly observedAt: string; readonly confidence: "ambiguous"; readonly feishuUserId: null };
 
 export type SpeakerAttribution =
   | { readonly kind: "named"; readonly feishuUserId: string }
-  /** `label` is `speaker_NN`, numbered by first appearance of the voice
-   * cluster in the transcript; null when the segment has no cluster. */
-  | { readonly kind: "anonymous"; readonly label: string | null }
+  /** `label` is `speaker_NN`, numbered by first appearance in the transcript.
+   * Even an unclustered unit gets one: null would make an unresolved speaker
+   * non-deterministic across rendering and recovery. */
+  | { readonly kind: "anonymous"; readonly label: string }
   | { readonly kind: "ambiguous" };
 
 /** Why a segment got the attribution it did. One value per segment; the
@@ -117,6 +117,9 @@ export type TranscriptWarning =
    * clusters voices without transcribing (ruling R55). The wording fell back
    * to the live segments. `segments` is how many lacked text. */
   | { readonly code: "reconciled_text_missing"; readonly segments: number }
+  /** No durable fact relates the bridge/STT wall clock to the Runtime media
+   * timeline. Cross-clock matching (and therefore naming) was refused. */
+  | { readonly code: "media_timeline_alignment_unavailable" }
   /** A warning the runtime attached to the reconciliation, verbatim. */
   | { readonly code: "runtime_warning"; readonly detail: string }
   /** Live segments the reconciled transcript did not cover; kept with their
@@ -133,7 +136,13 @@ export type TranscriptWarning =
 
 export const INCOMPLETE_TRANSCRIPT_CODES: ReadonlySet<TranscriptWarning["code"]> = new Set<
   TranscriptWarning["code"]
->(["reconciliation_unavailable", "reconciliation_empty", "reconciled_text_missing", "runtime_warning"]);
+>([
+  "reconciliation_unavailable",
+  "reconciliation_empty",
+  "runtime_warning",
+  "live_segment_outside_reconciliation",
+  "media_timeline_alignment_unavailable",
+]);
 
 export type ReconciledTranscript = {
   /** In media-timeline order. */
@@ -148,4 +157,8 @@ export type ReconciledTranscript = {
   /** Observed attendees (actual joiners) whom no segment names. Reported,
    * never used: a silent attendee is exactly who elimination would guess. */
   readonly silentAttendees: readonly string[];
+  /** Actual attendees for whom the bridge observed speaking during a unit, but
+   * whose identity did not meet the naming rule. This is never an input to
+   * attribution and is deliberately separate from silence. */
+  readonly spokeButUnattributed: readonly string[];
 };

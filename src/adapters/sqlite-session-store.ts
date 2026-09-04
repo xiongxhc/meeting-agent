@@ -11,11 +11,10 @@
 // This module is a thin, honest wrapper over migrations/001_orchestration.sql:
 // every method takes an explicit `nowMs` rather than reading a clock itself,
 // so every timing decision in the system stays testable with an injected
-// clock (see src/sessions/coordinator.ts). It holds orchestration state only
-// -- session lifecycle, its audit trail, and bridge leases -- never
-// transcript text and never audio bytes; migrations/001_orchestration.sql's
-// STRICT tables and CHECK constraints make that structural, not just a
-// convention followed here.
+// clock (see src/sessions/coordinator.ts). Its control tables hold session
+// lifecycle, audit trail, and bridge leases. Task 7 additionally has an
+// explicit local-only reconciliation ledger for final live wording; it never
+// stores audio and is not a Team Vault/output path.
 
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -34,6 +33,9 @@ import {
   type RecordingGapRow,
   type RuntimeRecordingGapRow,
   type RecordingRow,
+  type ReconciliationBridgeEventRow,
+  type ReconciliationEvidenceRow,
+  type ReconciliationLiveSegmentRow,
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
   type MigrationRow,
@@ -92,6 +94,10 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
 
     finalizeSession: (input) => finalizeSession(db, input),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
+    setReconciliationRuntimeSession: (occurrenceId, runtimeSessionId) => setReconciliationRuntimeSession(db, occurrenceId, runtimeSessionId),
+    appendReconciliationBridgeEvent: (occurrenceId, event) => appendReconciliationBridgeEvent(db, occurrenceId, event),
+    appendReconciliationLiveSegment: (occurrenceId, segment) => appendReconciliationLiveSegment(db, occurrenceId, segment),
+    getReconciliationEvidence: (occurrenceId) => getReconciliationEvidence(db, occurrenceId),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
 
@@ -466,6 +472,72 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
       }),
     ),
     runtimeGaps,
+  };
+}
+
+function ensureReconciliationSession(db: Database.Database, occurrenceId: string): void {
+  db.prepare("INSERT OR IGNORE INTO reconciliation_sessions (occurrence_id) VALUES (?)").run(occurrenceId);
+}
+
+function setReconciliationRuntimeSession(db: Database.Database, occurrenceId: string, runtimeSessionId: bigint): void {
+  ensureReconciliationSession(db, occurrenceId);
+  db.prepare("UPDATE reconciliation_sessions SET runtime_session_id = ? WHERE occurrence_id = ?")
+    .run(runtimeSessionId.toString(), occurrenceId);
+}
+
+function appendReconciliationBridgeEvent(
+  db: Database.Database,
+  occurrenceId: string,
+  event: ReconciliationBridgeEventRow,
+): void {
+  ensureReconciliationSession(db, occurrenceId);
+  db.prepare(
+    `INSERT INTO reconciliation_bridge_events
+       (occurrence_id, bridge_session_id, sequence, schema, observed_at, type, feishu_user_id, display_name, confidence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(occurrenceId, event.bridgeSessionId, event.sequence, event.schema, event.observedAt, event.type,
+    event.feishuUserId, event.displayName, event.confidence);
+}
+
+function appendReconciliationLiveSegment(
+  db: Database.Database,
+  occurrenceId: string,
+  segment: ReconciliationLiveSegmentRow,
+): void {
+  ensureReconciliationSession(db, occurrenceId);
+  db.prepare(
+    `INSERT INTO reconciliation_live_segments (occurrence_id, segment_id, text, started_at, ended_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(occurrenceId, segment.segmentId, segment.text, segment.startedAt, segment.endedAt);
+}
+
+function getReconciliationEvidence(db: Database.Database, occurrenceId: string): ReconciliationEvidenceRow | null {
+  const session = db.prepare("SELECT runtime_session_id, alignment_status FROM reconciliation_sessions WHERE occurrence_id = ?")
+    .get(occurrenceId) as { runtime_session_id: string | null; alignment_status: "unavailable_current_sdk" } | undefined;
+  if (session === undefined) return null;
+  const bridgeEvents = db.prepare(
+    `SELECT bridge_session_id, sequence, schema, observed_at, type, feishu_user_id, display_name, confidence
+       FROM reconciliation_bridge_events WHERE occurrence_id = ?`,
+  ).all(occurrenceId) as Array<{ bridge_session_id: string; sequence: number; schema: "bridge-session/v1"; observed_at: string; type: ReconciliationBridgeEventRow["type"]; feishu_user_id: string | null; display_name: string | null; confidence: ReconciliationBridgeEventRow["confidence"] }>;
+  const liveSegments = db.prepare(
+    `SELECT segment_id, text, started_at, ended_at FROM reconciliation_live_segments
+       WHERE occurrence_id = ?`,
+  ).all(occurrenceId) as Array<{ segment_id: string; text: string; started_at: string; ended_at: string }>;
+  return {
+    occurrenceId,
+    runtimeSessionId: session.runtime_session_id === null ? null : BigInt(session.runtime_session_id),
+    alignment: null,
+    alignmentStatus: session.alignment_status,
+    bridgeEvents: bridgeEvents
+      .sort((a, b) => Date.parse(a.observed_at) - Date.parse(b.observed_at)
+        || a.sequence - b.sequence || a.bridge_session_id.localeCompare(b.bridge_session_id))
+      .map((row) => ({ bridgeSessionId: row.bridge_session_id, sequence: row.sequence, schema: row.schema,
+        observedAt: row.observed_at, type: row.type, feishuUserId: row.feishu_user_id,
+        displayName: row.display_name, confidence: row.confidence })),
+    liveSegments: liveSegments
+      .sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.segment_id.localeCompare(b.segment_id))
+      .map((row) => ({ segmentId: row.segment_id, text: row.text,
+        startedAt: row.started_at, endedAt: row.ended_at })),
   };
 }
 
