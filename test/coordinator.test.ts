@@ -172,7 +172,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 8);
+      assert.equal(store.schemaVersion, 9);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -182,6 +182,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
         { version: 7, name: "007_recording_runtime_gaps.sql", appliedAtMs: BASE_MS },
         { version: 8, name: "008_reconciliation_evidence.sql", appliedAtMs: BASE_MS },
+        { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -226,7 +227,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 8);
+      assert.equal(second.schemaVersion, 9);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -238,6 +239,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 6, name: "006_bridge_failure_recordings.sql", appliedAtMs: BASE_MS },
         { version: 7, name: "007_recording_runtime_gaps.sql", appliedAtMs: BASE_MS },
         { version: 8, name: "008_reconciliation_evidence.sql", appliedAtMs: BASE_MS },
+        { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -254,26 +256,87 @@ test("reconciliation evidence survives reopening with exact bigint identity, env
     const id = identity(92);
     const first = h.open();
     first.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
-    first.setReconciliationRuntimeSession(id.occurrenceId, 9_007_199_254_740_993n);
+    first.beginReconciliationGeneration(id.occurrenceId, "generation_1", "bridge_1", BASE_MS, BASE_MS + 14 * 24 * 60 * 60 * 1000);
+    first.setReconciliationRuntimeSession(id.occurrenceId, "generation_1", 9_007_199_254_740_993n);
     // Lexically, .500Z sorts before Z. The read path must use parsed instants
     // and only then bridge sequence, so attendance reaches the reconciler first.
-    first.appendReconciliationBridgeEvent(id.occurrenceId, { bridgeSessionId: "bridge_1", sequence: 7, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "participant_joined", feishuUserId: "ou_a", displayName: "Synthetic", confidence: null });
-    first.appendReconciliationBridgeEvent(id.occurrenceId, { bridgeSessionId: "bridge_1", sequence: 8, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", type: "active_speaker", feishuUserId: "ou_a", displayName: null, confidence: "ui_exact" });
-    first.appendReconciliationLiveSegment(id.occurrenceId, { segmentId: "seg_1", text: "local-only wording", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" });
+    first.appendReconciliationBridgeEvent(id.occurrenceId, { generationId: "generation_1", bridgeSessionId: "bridge_1", sequence: 7, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "participant_joined", feishuUserId: "ou_a", displayName: "Synthetic", confidence: null });
+    first.appendReconciliationBridgeEvent(id.occurrenceId, { generationId: "generation_1", bridgeSessionId: "bridge_1", sequence: 8, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", type: "active_speaker", feishuUserId: "ou_a", displayName: null, confidence: "ui_exact" });
+    first.appendReconciliationLiveSegment(id.occurrenceId, { generationId: "generation_1", segmentId: "seg_1", text: "local-only wording", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" });
     first.close();
     const second = h.open();
     try {
-      assert.deepEqual(second.getReconciliationEvidence(id.occurrenceId), {
-        occurrenceId: id.occurrenceId, runtimeSessionId: 9_007_199_254_740_993n,
-        alignment: null, alignmentStatus: "unavailable_current_sdk",
+      assert.deepEqual(second.getReconciliationEvidence(id.occurrenceId, null), {
+        occurrenceId: id.occurrenceId, generationId: "generation_1", runtimeSessionId: 9_007_199_254_740_993n,
+        alignment: null, alignmentStatus: "unavailable_current_sdk", captureComplete: true, incompleteReason: null, expiresAtMs: BASE_MS + 14 * 24 * 60 * 60 * 1000,
         bridgeEvents: [
-          { bridgeSessionId: "bridge_1", sequence: 7, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "participant_joined", feishuUserId: "ou_a", displayName: "Synthetic", confidence: null },
-          { bridgeSessionId: "bridge_1", sequence: 8, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", type: "active_speaker", feishuUserId: "ou_a", displayName: null, confidence: "ui_exact" },
+          { generationId: "generation_1", bridgeSessionId: "bridge_1", sequence: 7, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", type: "participant_joined", feishuUserId: "ou_a", displayName: "Synthetic", confidence: null },
+          { generationId: "generation_1", bridgeSessionId: "bridge_1", sequence: 8, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", type: "active_speaker", feishuUserId: "ou_a", displayName: null, confidence: "ui_exact" },
         ],
-        liveSegments: [{ segmentId: "seg_1", text: "local-only wording", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" }],
+        liveSegments: [{ generationId: "generation_1", segmentId: "seg_1", text: "local-only wording", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" }],
       });
       assert.deepEqual(second.foreignKeyCheck(), []);
     } finally { second.close(); }
+  } finally { h.cleanup(); }
+});
+
+test("a finalized recording reads only its immutable reconciliation generation after reopen", () => {
+  const h = harness();
+  try {
+    const id = identity(93);
+    const clock = fakeClock();
+    const first = h.open();
+    const coordinator = coordinatorFor(first, clock);
+    coordinator.discover(id);
+    coordinator.advance(id.occurrenceId, "joining");
+    coordinator.advance(id.occurrenceId, "listening");
+    coordinator.beginReconciliationGeneration(id.occurrenceId, "gen_old", "bridge_old");
+    coordinator.setReconciliationRuntimeSession(id.occurrenceId, "gen_old", 17n);
+    coordinator.appendReconciliationLiveSegment(id.occurrenceId, { generationId: "gen_old", segmentId: "same_segment", text: "old wording", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" });
+    coordinator.beginReconciliationGeneration(id.occurrenceId, "gen_final", "bridge_final");
+    coordinator.setReconciliationRuntimeSession(id.occurrenceId, "gen_final", 19n);
+    coordinator.appendReconciliationLiveSegment(id.occurrenceId, { generationId: "gen_final", segmentId: "same_segment", text: "final wording", startedAt: "2026-09-02T14:00:02Z", endedAt: "2026-09-02T14:00:03Z" });
+    coordinator.finalizeWithRecording(id.occurrenceId, { kind: "advance", toState: "finalizing" }, {
+      handle: "finalrecording1", encryptedPath: "/enc/final", sha256: "f".repeat(64), durationMs: 1,
+      format: "ogg/opus", keyId: "key", gaps: [], runtimeGaps: [],
+    }, "gen_final");
+    first.close();
+    const second = h.open();
+    try {
+      assert.deepEqual(second.getReconciliationEvidence(id.occurrenceId, "finalrecording1")?.liveSegments.map((segment) => segment.text), ["final wording"]);
+      assert.equal(second.getReconciliationEvidence(id.occurrenceId, "finalrecording1")?.runtimeSessionId, 19n);
+    } finally { second.close(); }
+  } finally { h.cleanup(); }
+});
+
+test("expired bounded reconciliation evidence purges generation children atomically", () => {
+  const h = harness();
+  try {
+    const id = identity(94);
+    const store = h.open();
+    store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+    store.beginReconciliationGeneration(id.occurrenceId, "gen_expired", "bridge_expired", BASE_MS, BASE_MS + 1);
+    store.appendReconciliationLiveSegment(id.occurrenceId, { generationId: "gen_expired", segmentId: "seg", text: "bounded scratch", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" });
+    assert.equal(store.purgeExpiredReconciliationEvidence(BASE_MS + 1), 1);
+    assert.equal(store.getReconciliationEvidence(id.occurrenceId, null), null);
+    assert.deepEqual(store.foreignKeyCheck(), []);
+    store.close();
+  } finally { h.cleanup(); }
+});
+
+test("oversized live wording marks its generation durably incomplete instead of silently dropping it", () => {
+  const h = harness();
+  try {
+    const id = identity(95);
+    const store = h.open();
+    store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+    store.beginReconciliationGeneration(id.occurrenceId, "gen_bound", "bridge_bound", BASE_MS, BASE_MS + 1);
+    assert.throws(
+      () => store.appendReconciliationLiveSegment(id.occurrenceId, { generationId: "gen_bound", segmentId: "too_large", text: "x".repeat(16_385), startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" }),
+      isOrchestrationError("constraint_violation"),
+    );
+    assert.deepEqual(store.getReconciliationEvidence(id.occurrenceId, null)?.incompleteReason, "live_text_limit_exceeded");
+    store.close();
   } finally { h.cleanup(); }
 });
 
@@ -296,7 +359,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 8);
+      assert.equal(store.schemaVersion, 9);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);
@@ -331,7 +394,7 @@ test("the control tables exclude transcript/audio; local-only reconciliation wor
       // it is never a Team Vault/output table and holds no audio bytes.
       const liveLedger = schema.find((table) => table.name === "reconciliation_live_segments");
       assert.ok(liveLedger !== undefined);
-      assert.deepEqual(liveLedger.columns.map((column) => column.name), ["occurrence_id", "segment_id", "text", "started_at", "ended_at"]);
+      assert.deepEqual(liveLedger.columns.map((column) => column.name), ["generation_id", "segment_id", "text", "started_at", "ended_at"]);
       for (const table of schema.filter((candidate) => !candidate.name.startsWith("reconciliation_"))) {
         assert.ok(!table.columns.some((column) => /transcript|text|audio/i.test(column.name)), `control table ${table.name} must not carry prose`);
       }
@@ -440,8 +503,9 @@ test("the FOREIGN KEY constraints are actually enforced by SQLite -- an orphan r
 
       assert.throws(
         () => raw.prepare(
-          `INSERT INTO reconciliation_sessions (occurrence_id, runtime_session_id, alignment_status)
-           VALUES ('does-not-exist', '17', 'unavailable_current_sdk')`,
+          `INSERT INTO reconciliation_generations
+             (generation_id, occurrence_id, bridge_session_id, created_at_ms, expires_at_ms)
+           VALUES ('orphan-generation', 'does-not-exist', 'bridge-orphan', 1, 2)`,
         ).run(),
         isForeignKeyViolation,
         "an orphan reconciliation ledger must be rejected by the FOREIGN KEY constraint",

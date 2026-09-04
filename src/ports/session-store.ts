@@ -121,6 +121,7 @@ export type RecordingRow = {
  * Team Vault/output path: live words are retained only so post-meeting
  * reconciliation survives a coordinator restart. */
 export type ReconciliationBridgeEventRow = {
+  readonly generationId: string;
   readonly bridgeSessionId: string;
   readonly sequence: number;
   /** Original bridge envelope schema, retained with the payload and order. */
@@ -132,6 +133,7 @@ export type ReconciliationBridgeEventRow = {
   readonly confidence: "ui_exact" | "ambiguous" | null;
 };
 export type ReconciliationLiveSegmentRow = {
+  readonly generationId: string;
   readonly segmentId: string;
   readonly text: string;
   readonly startedAt: string;
@@ -139,11 +141,15 @@ export type ReconciliationLiveSegmentRow = {
 };
 export type ReconciliationEvidenceRow = {
   readonly occurrenceId: string;
+  readonly generationId: string;
   readonly runtimeSessionId: bigint | null;
   /** Current Runtime SDK does not expose a wall-clock/media-zero pair. */
   readonly alignment: null;
   /** Durable reason that `alignment` is absent rather than caller supplied. */
   readonly alignmentStatus: "unavailable_current_sdk";
+  readonly captureComplete: boolean;
+  readonly incompleteReason: "event_limit_exceeded" | "live_text_limit_exceeded" | null;
+  readonly expiresAtMs: number;
   readonly bridgeEvents: readonly ReconciliationBridgeEventRow[];
   readonly liveSegments: readonly ReconciliationLiveSegmentRow[];
 };
@@ -174,6 +180,9 @@ export type RecordingInput = {
 export type FinalizeSessionInput = {
   readonly transition: TransitionInput;
   readonly recording: RecordingInput;
+  /** Immutable bridge/runtime generation whose evidence this exact recording
+   * finalizes. The store links both in the same transaction. */
+  readonly reconciliationGenerationId?: string;
 };
 
 export type FinalizeSessionResult = {
@@ -283,10 +292,12 @@ export type SessionStore = {
    * may land alone. */
   finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
   getRecording(occurrenceId: string): RecordingRow | null;
-  setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void;
+  beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string, createdAtMs: number, expiresAtMs: number): void;
+  setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
-  getReconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null;
+  getReconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;
+  purgeExpiredReconciliationEvidence(nowMs: number): number;
   recordBridgeFailure(input: {
     readonly occurrenceId: string;
     readonly nowMs: number;

@@ -599,6 +599,51 @@ test("local backend: a diarized segment the STT heard nothing in is dropped, not
   assert.equal(only(result).cluster, "cluster-a");
 });
 
+test("duplicate empty-text diarization rows covering only part of live speech cannot certify it complete", () => {
+  const result = reconcileTranscript(input({
+    liveSegments: [live("seg_duplicate", 10_000, 20_000, "all ten seconds must survive")],
+    reconciliation: {
+      segments: [
+        diarized("dia_one", 10_000, 14_000, "cluster-a"),
+        diarized("dia_duplicate", 10_000, 14_000, "cluster-a"),
+      ],
+      warnings: [],
+    },
+  }));
+  assert.ok(result.segments.some((segment) => segment.segmentId === "seg_duplicate"));
+  assert.ok(codes(result).includes("live_segment_outside_reconciliation"));
+  assert.equal(result.transcriptComplete, false);
+});
+
+test("R55 union coverage handles overlapping, nested, adjacent, and gapped diarization without duplicate credit", () => {
+  const cases: ReadonlyArray<{ readonly name: string; readonly ranges: readonly [number, number][]; readonly complete: boolean }> = [
+    { name: "overlapping partial", ranges: [[10_000, 14_000], [13_000, 16_000]], complete: false },
+    { name: "nested full", ranges: [[10_000, 20_000], [12_000, 14_000]], complete: true },
+    { name: "adjacent full", ranges: [[10_000, 15_000], [15_000, 20_000]], complete: true },
+    { name: "partial gap", ranges: [[10_000, 14_000], [16_000, 20_000]], complete: false },
+  ];
+  for (const fixture of cases) {
+    const result = reconcileTranscript(input({
+      liveSegments: [live(`seg_${fixture.name}`, 10_000, 20_000, "local wording")],
+      reconciliation: { segments: fixture.ranges.map(([start, end], index) => diarized(`dia_${index}`, start, end, "cluster-a")), warnings: [] },
+    }));
+    assert.equal(result.transcriptComplete, fixture.complete, fixture.name);
+    assert.equal(codes(result).includes("live_segment_outside_reconciliation"), !fixture.complete, fixture.name);
+    assert.equal(result.segments.filter((segment) => segment.text === "local wording").length, 1, fixture.name);
+  }
+});
+
+test("an unanchored online reconciliation keeps durable live wording exactly once", () => {
+  const result = reconcileTranscript(input({
+    alignment: null,
+    liveSegments: [live("seg_once", 10_000, 14_000, "do not duplicate this")],
+    reconciliation: { segments: [diarized("dia_once", 10_000, 14_000, "cluster-a", "do not duplicate this")], warnings: [] },
+  }));
+  assert.deepEqual(result.segments.map((segment) => segment.text), ["do not duplicate this"]);
+  assert.ok(result.segments.every((segment) => segment.speaker.kind !== "named"));
+  assert.equal(result.transcriptComplete, false);
+});
+
 // ---------------------------------------------------------------------------
 // 4. reconcileSpeakers: the persisted handle and the runtime call
 // ---------------------------------------------------------------------------
@@ -673,8 +718,8 @@ test("no trustworthy media anchor fails closed: live wording is retained but nob
       reconciliation: { segments: [diarized("dia_anchor", 10_000, 14_000, "cluster-a", "keep this wording")], warnings: [] },
     }),
   );
-  assert.deepEqual(result.segments.map((segment) => segment.speaker.kind), ["anonymous", "anonymous"]);
-  assert.deepEqual(codes(result).sort(), ["live_segment_outside_reconciliation", "media_timeline_alignment_unavailable"]);
+  assert.deepEqual(result.segments.map((segment) => segment.speaker.kind), ["anonymous"]);
+  assert.deepEqual(codes(result).sort(), ["media_timeline_alignment_unavailable"]);
   assert.equal(result.transcriptComplete, false);
 });
 
@@ -682,14 +727,18 @@ test("the durable production entry cannot promote exact UI evidence without a pe
   const runtime = fakeRuntime({ reconciliation: ONLINE });
   const durable: ReconciliationEvidenceRow = {
     occurrenceId: RECORDING_ROW.occurrenceId,
+    generationId: "bridge_durable",
     runtimeSessionId: 9_007_199_254_740_993n,
     alignment: null,
     alignmentStatus: "unavailable_current_sdk",
+    captureComplete: true,
+    incompleteReason: null,
+    expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
     bridgeEvents: [
-      { bridgeSessionId: "bridge_durable", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null },
-      { bridgeSessionId: "bridge_durable", sequence: 2, schema: "bridge-session/v1", observedAt: at(9_900), type: "active_speaker", feishuUserId: ALPHA, displayName: null, confidence: "ui_exact" },
+      { generationId: "bridge_durable", bridgeSessionId: "bridge_durable", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null },
+      { generationId: "bridge_durable", bridgeSessionId: "bridge_durable", sequence: 2, schema: "bridge-session/v1", observedAt: at(9_900), type: "active_speaker", feishuUserId: ALPHA, displayName: null, confidence: "ui_exact" },
     ],
-    liveSegments: [live("seg_durable", 10_000, 14_000, "durably retained wording")],
+    liveSegments: [{ ...live("seg_durable", 10_000, 14_000, "durably retained wording"), generationId: "bridge_durable" }],
   };
   const result = await reconcilePersistedSpeakers({
     occurrenceId: RECORDING_ROW.occurrenceId,
@@ -703,6 +752,32 @@ test("the durable production entry cannot promote exact UI evidence without a pe
   assert.ok(result.segments.some((segment) => segment.text === "durably retained wording"));
   assert.ok(result.segments.every((segment) => segment.speaker.kind !== "named"));
   assert.ok(codes(result).includes("media_timeline_alignment_unavailable"));
+  assert.equal(result.transcriptComplete, false);
+});
+
+test("missing durable runtime identity still returns persisted attendance and live wording", async () => {
+  const durable: ReconciliationEvidenceRow = {
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    generationId: "bridge_no_runtime",
+    runtimeSessionId: null,
+    alignment: null,
+    alignmentStatus: "unavailable_current_sdk",
+    captureComplete: true,
+    incompleteReason: null,
+    expiresAtMs: Date.parse(ENDED_AT) + 14 * 24 * 60 * 60 * 1000,
+    bridgeEvents: [{ generationId: "bridge_no_runtime", bridgeSessionId: "bridge_no_runtime", sequence: 1, schema: "bridge-session/v1", observedAt: at(0), type: "participant_joined", feishuUserId: ALPHA, displayName: "Alpha Synthetic", confidence: null }],
+    liveSegments: [{ ...live("seg_before_start_failure", 10_000, 14_000, "words before runtime start failure"), generationId: "bridge_no_runtime" }],
+  };
+  const result = await reconcilePersistedSpeakers({
+    occurrenceId: RECORDING_ROW.occurrenceId,
+    recordings: recordings(null),
+    evidence: { reconciliationEvidence: () => durable },
+    runtime: fakeRuntime(),
+  });
+  assert.deepEqual(result.segments.map((segment) => segment.text), ["words before runtime start failure"]);
+  assert.deepEqual(result.silentAttendees, [ALPHA]);
+  assert.equal(result.recordingHandle, null);
+  assert.ok(codes(result).includes("reconciliation_unavailable"));
   assert.equal(result.transcriptComplete, false);
 });
 

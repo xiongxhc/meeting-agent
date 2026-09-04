@@ -67,6 +67,7 @@ export const SESSION_STATES: readonly SessionState[] = SESSION_STATE_VALUES;
  * "no re-open" rule means "notified" and "failed" are both dead ends here:
  * resuming after either means a brand new occurrence/session. */
 export const TERMINAL_STATES: readonly SessionState[] = ["notified", "failed"];
+export const RECONCILIATION_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** The forward path, in order, excluding the initial "discovered" state.
  * Used by advance() callers to walk a session from discovery to notified. */
@@ -168,15 +169,18 @@ export type SessionCoordinator = {
     occurrenceId: string,
     outcome: TerminalOutcome,
     recording: RecordingInput,
+    reconciliationGenerationId?: string,
   ): SessionRow;
 
   /** The persisted recording for an occurrence, or null if it never finalized
    * (or finalization failed). */
   recording(occurrenceId: string): RecordingRow | null;
-  setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void;
+  beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string): void;
+  setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
-  reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null;
+  reconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;
+  purgeExpiredReconciliationEvidence(): number;
   recordBridgeFailure(
     occurrenceId: string,
     maxRetries: number,
@@ -320,13 +324,15 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     },
 
     finalizeWithRecording(
-      occurrenceId: string,
-      outcome: TerminalOutcome,
-      recording: RecordingInput,
+    occurrenceId: string,
+    outcome: TerminalOutcome,
+    recording: RecordingInput,
+    reconciliationGenerationId?: string,
     ): SessionRow {
       return store.finalizeSession({
         transition: transitionFor(occurrenceId, outcome),
         recording,
+        ...(reconciliationGenerationId === undefined ? {} : { reconciliationGenerationId }),
       }).session;
     },
 
@@ -334,8 +340,12 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
       return store.getRecording(occurrenceId);
     },
 
-    setReconciliationRuntimeSession(occurrenceId: string, runtimeSessionId: bigint): void {
-      store.setReconciliationRuntimeSession(occurrenceId, runtimeSessionId);
+    beginReconciliationGeneration(occurrenceId: string, generationId: string, bridgeSessionId: string): void {
+      const nowMs = clock.now();
+      store.beginReconciliationGeneration(occurrenceId, generationId, bridgeSessionId, nowMs, nowMs + RECONCILIATION_EVIDENCE_RETENTION_MS);
+    },
+    setReconciliationRuntimeSession(occurrenceId: string, generationId: string, runtimeSessionId: bigint): void {
+      store.setReconciliationRuntimeSession(occurrenceId, generationId, runtimeSessionId);
     },
     appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void {
       store.appendReconciliationBridgeEvent(occurrenceId, event);
@@ -343,8 +353,11 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void {
       store.appendReconciliationLiveSegment(occurrenceId, segment);
     },
-    reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null {
-      return store.getReconciliationEvidence(occurrenceId);
+    reconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null {
+      return store.getReconciliationEvidence(occurrenceId, recordingHandle);
+    },
+    purgeExpiredReconciliationEvidence(): number {
+      return store.purgeExpiredReconciliationEvidence(clock.now());
     },
 
     recordBridgeFailure(

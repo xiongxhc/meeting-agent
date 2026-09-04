@@ -93,7 +93,7 @@ export function reduceAttendance(events: readonly MeetingLifecycleEvent[]): Atte
   const intervals: AttendanceInterval[] = [];
 
   for (const [feishuUserId, userEvents] of byUser) {
-    const ordered = [...userEvents].sort((a, b) => timeKey(a).localeCompare(timeKey(b)));
+    const ordered = [...userEvents].sort((a, b) => timeKey(a) - timeKey(b));
 
     let open: OpenInterval | null = null;
 
@@ -145,7 +145,7 @@ export function reduceAttendance(events: readonly MeetingLifecycleEvent[]): Atte
   }
 
   intervals.sort((a, b) => {
-    const byTime = a.joinedAt.localeCompare(b.joinedAt);
+    const byTime = Date.parse(a.joinedAt) - Date.parse(b.joinedAt);
     return byTime !== 0 ? byTime : a.feishuUserId.localeCompare(b.feishuUserId);
   });
 
@@ -156,6 +156,6 @@ export function reduceAttendance(events: readonly MeetingLifecycleEvent[]): Atte
  * no occurredAt (participant_invited) never open or close an interval, so
  * their relative order among themselves never matters; they sort by an
  * empty key, which is stable and harmless. */
-function timeKey(event: MeetingLifecycleEvent): string {
-  return "occurredAt" in event ? event.occurredAt : "";
+function timeKey(event: MeetingLifecycleEvent): number {
+  return "occurredAt" in event ? Date.parse(event.occurredAt) : Number.NEGATIVE_INFINITY;
 }

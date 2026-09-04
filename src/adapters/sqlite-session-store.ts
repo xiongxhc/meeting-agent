@@ -94,10 +94,12 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
 
     finalizeSession: (input) => finalizeSession(db, input),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
-    setReconciliationRuntimeSession: (occurrenceId, runtimeSessionId) => setReconciliationRuntimeSession(db, occurrenceId, runtimeSessionId),
+    beginReconciliationGeneration: (occurrenceId, generationId, bridgeSessionId, createdAtMs, expiresAtMs) => beginReconciliationGeneration(db, occurrenceId, generationId, bridgeSessionId, createdAtMs, expiresAtMs),
+    setReconciliationRuntimeSession: (occurrenceId, generationId, runtimeSessionId) => setReconciliationRuntimeSession(db, occurrenceId, generationId, runtimeSessionId),
     appendReconciliationBridgeEvent: (occurrenceId, event) => appendReconciliationBridgeEvent(db, occurrenceId, event),
     appendReconciliationLiveSegment: (occurrenceId, segment) => appendReconciliationLiveSegment(db, occurrenceId, segment),
-    getReconciliationEvidence: (occurrenceId) => getReconciliationEvidence(db, occurrenceId),
+    getReconciliationEvidence: (occurrenceId, recordingHandle) => getReconciliationEvidence(db, occurrenceId, recordingHandle),
+    purgeExpiredReconciliationEvidence: (nowMs) => purgeExpiredReconciliationEvidence(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
 
@@ -413,6 +415,13 @@ function finalizeSession(
         insertGap.run(occurrenceId, ordinal, gap.direction, gap.startedAt, gap.endedAt);
       });
       insertRuntimeGaps(db, "recording_runtime_gaps", [occurrenceId], input.recording.runtimeGaps);
+      if (input.reconciliationGenerationId !== undefined) {
+        const associated = db.prepare(
+          `UPDATE reconciliation_generations SET recording_handle = ?
+           WHERE generation_id = ? AND occurrence_id = ? AND recording_handle IS NULL`,
+        ).run(input.recording.handle, input.reconciliationGenerationId, occurrenceId).changes;
+        if (associated !== 1) throw new OrchestrationError("constraint_violation", "reconciliation generation cannot be associated with finalized recording");
+      }
     });
     return session;
   });
@@ -475,14 +484,22 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
   };
 }
 
-function ensureReconciliationSession(db: Database.Database, occurrenceId: string): void {
-  db.prepare("INSERT OR IGNORE INTO reconciliation_sessions (occurrence_id) VALUES (?)").run(occurrenceId);
+const MAX_RECONCILIATION_EVENTS_PER_GENERATION = 256;
+
+function beginReconciliationGeneration(db: Database.Database, occurrenceId: string, generationId: string, bridgeSessionId: string, createdAtMs: number, expiresAtMs: number): void {
+  withConstraintTranslation(() => db.prepare(
+    `INSERT INTO reconciliation_generations
+       (generation_id, occurrence_id, bridge_session_id, created_at_ms, expires_at_ms)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(generationId, occurrenceId, bridgeSessionId, createdAtMs, expiresAtMs));
 }
 
-function setReconciliationRuntimeSession(db: Database.Database, occurrenceId: string, runtimeSessionId: bigint): void {
-  ensureReconciliationSession(db, occurrenceId);
-  db.prepare("UPDATE reconciliation_sessions SET runtime_session_id = ? WHERE occurrence_id = ?")
-    .run(runtimeSessionId.toString(), occurrenceId);
+function setReconciliationRuntimeSession(db: Database.Database, occurrenceId: string, generationId: string, runtimeSessionId: bigint): void {
+  const changed = db.prepare(
+    `UPDATE reconciliation_generations SET runtime_session_id = ?
+     WHERE generation_id = ? AND occurrence_id = ? AND runtime_session_id IS NULL`,
+  ).run(runtimeSessionId.toString(), generationId, occurrenceId).changes;
+  if (changed !== 1) throw new OrchestrationError("constraint_violation", "reconciliation generation is unknown or already has a runtime session");
 }
 
 function appendReconciliationBridgeEvent(
@@ -490,13 +507,27 @@ function appendReconciliationBridgeEvent(
   occurrenceId: string,
   event: ReconciliationBridgeEventRow,
 ): void {
-  ensureReconciliationSession(db, occurrenceId);
-  db.prepare(
+  const count = db.prepare("SELECT count(*) AS count FROM reconciliation_bridge_events WHERE generation_id = ?")
+    .get(event.generationId) as { count: number };
+  if (count.count >= MAX_RECONCILIATION_EVENTS_PER_GENERATION) {
+    db.prepare("UPDATE reconciliation_generations SET capture_complete = 0, incomplete_reason = 'event_limit_exceeded' WHERE generation_id = ? AND occurrence_id = ?")
+      .run(event.generationId, occurrenceId);
+    throw new OrchestrationError("constraint_violation", "reconciliation event limit exceeded");
+  }
+  const run = db.transaction(() => {
+    const generation = db.prepare("SELECT bridge_session_id FROM reconciliation_generations WHERE generation_id = ? AND occurrence_id = ?")
+      .get(event.generationId, occurrenceId) as { bridge_session_id: string } | undefined;
+    if (generation === undefined || generation.bridge_session_id !== event.bridgeSessionId) {
+      throw new OrchestrationError("constraint_violation", "bridge event does not belong to reconciliation generation");
+    }
+    db.prepare(
     `INSERT INTO reconciliation_bridge_events
-       (occurrence_id, bridge_session_id, sequence, schema, observed_at, type, feishu_user_id, display_name, confidence)
+       (generation_id, bridge_session_id, sequence, schema, observed_at, type, feishu_user_id, display_name, confidence)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(occurrenceId, event.bridgeSessionId, event.sequence, event.schema, event.observedAt, event.type,
-    event.feishuUserId, event.displayName, event.confidence);
+    ).run(event.generationId, event.bridgeSessionId, event.sequence, event.schema, event.observedAt, event.type,
+      event.feishuUserId, event.displayName, event.confidence);
+  });
+  withConstraintTranslation(run);
 }
 
 function appendReconciliationLiveSegment(
@@ -504,41 +535,66 @@ function appendReconciliationLiveSegment(
   occurrenceId: string,
   segment: ReconciliationLiveSegmentRow,
 ): void {
-  ensureReconciliationSession(db, occurrenceId);
-  db.prepare(
-    `INSERT INTO reconciliation_live_segments (occurrence_id, segment_id, text, started_at, ended_at)
+  const count = db.prepare("SELECT count(*) AS count FROM reconciliation_live_segments WHERE generation_id = ?")
+    .get(segment.generationId) as { count: number };
+  if (count.count >= MAX_RECONCILIATION_EVENTS_PER_GENERATION || Buffer.byteLength(segment.text, "utf8") > 16_384) {
+    db.prepare("UPDATE reconciliation_generations SET capture_complete = 0, incomplete_reason = ? WHERE generation_id = ? AND occurrence_id = ?")
+      .run(count.count >= MAX_RECONCILIATION_EVENTS_PER_GENERATION ? "event_limit_exceeded" : "live_text_limit_exceeded", segment.generationId, occurrenceId);
+    throw new OrchestrationError("constraint_violation", "reconciliation live evidence limit exceeded");
+  }
+  const run = db.transaction(() => {
+    const generation = db.prepare("SELECT 1 FROM reconciliation_generations WHERE generation_id = ? AND occurrence_id = ?")
+      .get(segment.generationId, occurrenceId);
+    if (generation === undefined) throw new OrchestrationError("constraint_violation", "live segment does not belong to reconciliation generation");
+    db.prepare(
+    `INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, ended_at)
      VALUES (?, ?, ?, ?, ?)`,
-  ).run(occurrenceId, segment.segmentId, segment.text, segment.startedAt, segment.endedAt);
+    ).run(segment.generationId, segment.segmentId, segment.text, segment.startedAt, segment.endedAt);
+  });
+  withConstraintTranslation(run);
 }
 
-function getReconciliationEvidence(db: Database.Database, occurrenceId: string): ReconciliationEvidenceRow | null {
-  const session = db.prepare("SELECT runtime_session_id, alignment_status FROM reconciliation_sessions WHERE occurrence_id = ?")
-    .get(occurrenceId) as { runtime_session_id: string | null; alignment_status: "unavailable_current_sdk" } | undefined;
-  if (session === undefined) return null;
+function getReconciliationEvidence(db: Database.Database, occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null {
+  const generation = db.prepare(
+    recordingHandle === null
+      ? `SELECT generation_id, runtime_session_id, alignment_status, capture_complete, incomplete_reason, expires_at_ms
+           FROM reconciliation_generations WHERE occurrence_id = ? ORDER BY created_at_ms DESC, generation_id DESC LIMIT 1`
+      : `SELECT generation_id, runtime_session_id, alignment_status, capture_complete, incomplete_reason, expires_at_ms
+           FROM reconciliation_generations WHERE occurrence_id = ? AND recording_handle = ?`,
+  ).get(...(recordingHandle === null ? [occurrenceId] : [occurrenceId, recordingHandle])) as { generation_id: string; runtime_session_id: string | null; alignment_status: "unavailable_current_sdk"; capture_complete: 0 | 1; incomplete_reason: ReconciliationEvidenceRow["incompleteReason"]; expires_at_ms: number } | undefined;
+  if (generation === undefined) return null;
   const bridgeEvents = db.prepare(
     `SELECT bridge_session_id, sequence, schema, observed_at, type, feishu_user_id, display_name, confidence
-       FROM reconciliation_bridge_events WHERE occurrence_id = ?`,
-  ).all(occurrenceId) as Array<{ bridge_session_id: string; sequence: number; schema: "bridge-session/v1"; observed_at: string; type: ReconciliationBridgeEventRow["type"]; feishu_user_id: string | null; display_name: string | null; confidence: ReconciliationBridgeEventRow["confidence"] }>;
+       FROM reconciliation_bridge_events WHERE generation_id = ?`,
+  ).all(generation.generation_id) as Array<{ bridge_session_id: string; sequence: number; schema: "bridge-session/v1"; observed_at: string; type: ReconciliationBridgeEventRow["type"]; feishu_user_id: string | null; display_name: string | null; confidence: ReconciliationBridgeEventRow["confidence"] }>;
   const liveSegments = db.prepare(
     `SELECT segment_id, text, started_at, ended_at FROM reconciliation_live_segments
-       WHERE occurrence_id = ?`,
-  ).all(occurrenceId) as Array<{ segment_id: string; text: string; started_at: string; ended_at: string }>;
+       WHERE generation_id = ?`,
+  ).all(generation.generation_id) as Array<{ segment_id: string; text: string; started_at: string; ended_at: string }>;
   return {
     occurrenceId,
-    runtimeSessionId: session.runtime_session_id === null ? null : BigInt(session.runtime_session_id),
+    generationId: generation.generation_id,
+    runtimeSessionId: generation.runtime_session_id === null ? null : BigInt(generation.runtime_session_id),
     alignment: null,
-    alignmentStatus: session.alignment_status,
+    alignmentStatus: generation.alignment_status,
+    captureComplete: generation.capture_complete === 1,
+    incompleteReason: generation.incomplete_reason,
+    expiresAtMs: generation.expires_at_ms,
     bridgeEvents: bridgeEvents
       .sort((a, b) => Date.parse(a.observed_at) - Date.parse(b.observed_at)
         || a.sequence - b.sequence || a.bridge_session_id.localeCompare(b.bridge_session_id))
-      .map((row) => ({ bridgeSessionId: row.bridge_session_id, sequence: row.sequence, schema: row.schema,
+      .map((row) => ({ generationId: generation.generation_id, bridgeSessionId: row.bridge_session_id, sequence: row.sequence, schema: row.schema,
         observedAt: row.observed_at, type: row.type, feishuUserId: row.feishu_user_id,
         displayName: row.display_name, confidence: row.confidence })),
     liveSegments: liveSegments
       .sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.segment_id.localeCompare(b.segment_id))
-      .map((row) => ({ segmentId: row.segment_id, text: row.text,
+      .map((row) => ({ generationId: generation.generation_id, segmentId: row.segment_id, text: row.text,
         startedAt: row.started_at, endedAt: row.ended_at })),
   };
+}
+
+function purgeExpiredReconciliationEvidence(db: Database.Database, nowMs: number): number {
+  return db.prepare("DELETE FROM reconciliation_generations WHERE expires_at_ms <= ?").run(nowMs).changes;
 }
 
 function recordBridgeFailure(

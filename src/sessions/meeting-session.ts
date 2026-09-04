@@ -309,6 +309,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // This is captured before join so a duplicate `joined` on one generation is
   // still a protocol error rather than being mistaken for recovery.
   const isRecoveryGeneration = coordinator.get(identity.occurrenceId)?.state === "listening";
+  // A bridge session is the immutable generation boundary. Runtime IDs arrive
+  // later and recordings are atomically associated at finalization.
+  const reconciliationGenerationId = bridgeSessionId;
 
   const validator = createBridgeSessionValidator(bridgeSessionId);
   const issuedCommandTypes = new Map<string, BridgeCommand["type"]>();
@@ -741,7 +744,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             : { bridgeSessionId: event.sessionId, sequence: event.sequence, observedAt: event.observedAt, confidence: "ambiguous", feishuUserId: null },
         );
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "active_speaker", feishuUserId: event.feishuUserId, displayName: null, confidence: event.confidence,
         });
         return;
@@ -751,13 +754,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // evidence is complete.
       case "participant_joined":
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, confidence: null,
         });
         return;
       case "participant_left":
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
-          bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
+          generationId: reconciliationGenerationId, bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_left", feishuUserId: event.feishuUserId, displayName: null, confidence: null,
         });
         return;
@@ -781,7 +784,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         if (event.segment.final) {
           liveTranscript.push(event.segment);
           coordinator.appendReconciliationLiveSegment(identity.occurrenceId, {
-            segmentId: event.segment.segmentId, text: event.segment.text,
+            generationId: reconciliationGenerationId, segmentId: event.segment.segmentId, text: event.segment.text,
             startedAt: event.segment.startedAt, endedAt: event.segment.endedAt,
           });
         }
@@ -927,7 +930,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           : { kind: "fail", terminalReason: reason };
 
     if (recording !== null) {
-      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps));
+      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), reconciliationGenerationId);
       return;
     }
     if (outcome.kind === "fail") {
@@ -1081,6 +1084,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         bridgeSessionId,
       });
       leaseId = lease.leaseId;
+      coordinator.beginReconciliationGeneration(identity.occurrenceId, reconciliationGenerationId, bridgeSessionId);
 
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });
@@ -1103,7 +1107,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         responseMode: PINNED_RESPONSE_MODE,
       });
       runtimeSessionId = handle.sessionId;
-      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, handle.sessionId);
+      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, reconciliationGenerationId, handle.sessionId);
       assertJoinCanContinue();
       if (handle.profile !== PINNED_PROFILE) {
         abortSpeaking("profile_mismatch");

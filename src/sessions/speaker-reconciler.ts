@@ -36,11 +36,9 @@
 //   participant whose tile never resolves) changes nothing -- so a state can
 //   be held long after its speaker fell silent. An observation is "fresh" for
 //   a segment when it was made no earlier than this before the segment began
-//   and no later than its end: the tile lit for THIS turn. A held state is
-//   trusted only where the diarizer corroborates it -- the segment's cluster
-//   has some segment for which that identity's tile freshly lit. Two seconds
-//   is the scale of a turn boundary; a held state older than that on a
-//   cluster the identity was never fresh on is treated as a relic.
+//   and no later than its end: the tile lit for THIS turn. A held state never
+//   names a later turn; clusters can only veto a fresh UI result, never extend
+//   it. Two seconds is the scale of a turn boundary.
 //
 // THE TWO BACKENDS (ruling R55). With the online diarization backend the
 // reconciliation carries text and its segments are the transcript's units.
@@ -103,6 +101,8 @@ export type ReconcileTranscriptInput = {
   /** A durable, provenance-bearing relation between wall clock and media
    * timeline. Never accept a caller's bare wall-clock assertion. */
   readonly alignment: MediaTimelineAlignment | null;
+  /** Store-level bounded-capture failure. It makes the artifact non-deletable. */
+  readonly durableIncompleteReason?: "event_limit_exceeded" | "live_text_limit_exceeded";
   /** When the meeting ended. Closes the last observed active-speaker state. */
   readonly endedAt: string;
 };
@@ -120,7 +120,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
 
   const evidence = [...input.evidence].sort((a, b) => {
     const instant = parseInstant(a.observedAt, "observation observedAt") - parseInstant(b.observedAt, "observation observedAt");
-    return instant !== 0 ? instant : a.sequence - b.sequence;
+    return instant !== 0 ? instant : a.sequence - b.sequence || a.bridgeSessionId.localeCompare(b.bridgeSessionId);
   });
   const states = aligned ? evidenceStates(evidence, originMs, endedAtMs) : [];
   const attendance = aligned
@@ -142,7 +142,8 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
 
   const warnings: TranscriptWarning[] = [];
   if (!aligned) warnings.push({ code: "media_timeline_alignment_unavailable" });
-  const units = buildUnits(live, input.reconciliation, warnings);
+  if (input.durableIncompleteReason !== undefined) warnings.push({ code: "durable_evidence_incomplete", reason: input.durableIncompleteReason });
+  const units = buildUnits(live, input.reconciliation, warnings, aligned);
 
   // Attribution from UI evidence -- the only source of a name.
   const attributed = units.map((unit) => ({ unit, ...attributeFromUi(unit, states, attendance) }));
@@ -267,11 +268,12 @@ export async function reconcileSpeakers(input: ReconcileSpeakersInput): Promise<
 export async function reconcilePersistedSpeakers(input: {
   readonly occurrenceId: string;
   readonly recordings: { recording(occurrenceId: string): RecordingRow | null };
-  readonly evidence: { reconciliationEvidence(occurrenceId: string): ReconciliationEvidenceRow | null };
+  readonly evidence: { reconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null };
   readonly runtime: Pick<ConversationRuntimePort, "reconcileRecording">;
 }): Promise<SpeakerReconciliationResult> {
-  const evidence = input.evidence.reconciliationEvidence(input.occurrenceId);
-  if (evidence === null || evidence.runtimeSessionId === null) {
+  const recording = input.recordings.recording(input.occurrenceId);
+  const evidence = input.evidence.reconciliationEvidence(input.occurrenceId, recording?.handle ?? null);
+  if (evidence === null) {
     return { recordingHandle: null, ...reconcileTranscript({
       attendance: [], liveSegments: [], evidence: [], reconciliation: { unavailable: "durable runtime session identity is unavailable" },
       alignment: null, endedAt: "1970-01-01T00:00:00.000Z",
@@ -295,10 +297,23 @@ export async function reconcilePersistedSpeakers(input: {
   });
   const endedAt = [...evidence.bridgeEvents.map((event) => event.observedAt), ...evidence.liveSegments.map((segment) => segment.endedAt)]
     .sort((a, b) => parseInstant(a, "persisted evidence") - parseInstant(b, "persisted evidence")).at(-1) ?? "1970-01-01T00:00:00.000Z";
+  const common = {
+    attendance,
+    liveSegments: evidence.liveSegments.map((segment) => ({ ...segment, final: true })),
+    evidence: active,
+    alignment: evidence.alignment,
+    endedAt,
+    ...(evidence.incompleteReason === null ? {} : { durableIncompleteReason: evidence.incompleteReason }),
+  };
+  if (evidence.runtimeSessionId === null) {
+    return { recordingHandle: recording?.handle ?? null, ...reconcileTranscript({
+      ...common,
+      reconciliation: { unavailable: "durable runtime session identity is unavailable" },
+    }) };
+  }
   return reconcileSpeakers({
     occurrenceId: input.occurrenceId, sessionId: evidence.runtimeSessionId, recordings: input.recordings, runtime: input.runtime,
-    attendance, liveSegments: evidence.liveSegments.map((segment) => ({ ...segment, final: true })), evidence: active,
-    alignment: evidence.alignment, endedAt,
+    ...common,
   });
 }
 
@@ -392,6 +407,7 @@ function buildUnits(
   live: readonly LiveInterval[],
   reconciliation: ReconcileTranscriptInput["reconciliation"],
   warnings: TranscriptWarning[],
+  useReconciledTimeline: boolean,
 ): Unit[] {
   if ("unavailable" in reconciliation) {
     warnings.push({ code: "reconciliation_unavailable", detail: reconciliation.unavailable });
@@ -414,6 +430,13 @@ function buildUnits(
     warnings.push({ code: "reconciled_text_missing", segments: diarized.length - worded.length });
   }
 
+  // Without a durable relation to media zero, Runtime intervals cannot be
+  // compared with wall-clock live wording. Choose the durable live timeline
+  // once rather than emitting two incomparable copies of the same utterance.
+  if (!useReconciledTimeline) {
+    return live.map((segment) => liveUnit(segment, null, false));
+  }
+
   const units: Unit[] = worded.map((segment) => {
     const interval = { start: segment.start, end: segment.end };
     return {
@@ -433,19 +456,42 @@ function buildUnits(
     // Coverage is about recovered speech intervals, not whether the selected
     // diarizer backend also transcribed their text. SpeechBrain's normal
     // empty-text cluster result is complete when it covers the live wording.
-    const diarizedConsumedMs = diarized.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
-    const wordedConsumedMs = worded.reduce((sum, d) => sum + overlap(segment, { start: d.start, end: d.end }), 0);
-    if (worded.length > 0 && duration(segment) > 0 && wordedConsumedMs >= MIN_ALIGNED_COVERAGE * duration(segment)) continue;
+    const diarizedConsumedMs = coveredMs(segment, diarized);
+    const wordedConsumedMs = coveredMs(segment, worded);
+    // Completeness is not attribution calibration. Only total union coverage
+    // of the live interval permits omission of its durable wording.
+    if (worded.length > 0 && duration(segment) > 0 && wordedConsumedMs >= duration(segment)) continue;
 
     const { cluster, straddles } = clusterFor(segment, diarized);
     units.push(liveUnit(segment, cluster, straddles));
-    if (diarized.length === 0 || diarizedConsumedMs < MIN_ALIGNED_COVERAGE * duration(segment)) outside.push(segment.segmentId);
+    if (diarized.length === 0 || diarizedConsumedMs < duration(segment)) outside.push(segment.segmentId);
     if (straddles) multiVoice.push(segment.segmentId);
   }
   if (outside.length > 0) warnings.push({ code: "live_segment_outside_reconciliation", segmentIds: outside });
   if (multiVoice.length > 0) warnings.push({ code: "multi_voice_live_segment", segmentIds: multiVoice });
 
   return units.sort(byStartThenId);
+}
+
+/** Union, never sum: duplicate/nested diarization rows must not count the
+ * same live speech twice toward completeness or cluster confidence. */
+function coveredMs(target: Interval, intervals: readonly Interval[]): number {
+  const clipped = intervals
+    .map((interval) => ({ start: Math.max(target.start, interval.start), end: Math.min(target.end, interval.end) }))
+    .filter((interval) => interval.end > interval.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  let covered = 0;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const interval of clipped) {
+    if (interval.start >= end) {
+      covered += interval.end - interval.start;
+      end = interval.end;
+    } else if (interval.end > end) {
+      covered += interval.end - end;
+      end = interval.end;
+    }
+  }
+  return covered;
 }
 
 function liveUnit(segment: LiveInterval, cluster: string | null, multiVoice: boolean): Unit {
@@ -469,13 +515,16 @@ function clusterFor(
   segment: LiveInterval,
   diarized: readonly DiarizedInterval[],
 ): { cluster: string | null; straddles: boolean } {
-  const byCluster = new Map<string, number>();
+  const byCluster = new Map<string, Interval[]>();
   for (const d of diarized) {
     if (d.speakerCluster === null) continue;
-    const ms = overlap(segment, { start: d.start, end: d.end });
-    if (ms > 0) byCluster.set(d.speakerCluster, (byCluster.get(d.speakerCluster) ?? 0) + ms);
+    const intervals = byCluster.get(d.speakerCluster) ?? [];
+    intervals.push({ start: d.start, end: d.end });
+    byCluster.set(d.speakerCluster, intervals);
   }
-  const ranked = [...byCluster.entries()].sort((a, b) => b[1] - a[1]);
+  const ranked = [...byCluster.entries()]
+    .map(([cluster, intervals]) => [cluster, coveredMs(segment, intervals)] as const)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const dominant = ranked[0];
   if (dominant === undefined || duration(segment) === 0) return { cluster: null, straddles: false };
   const others = ranked.slice(1).reduce((sum, [, ms]) => sum + ms, 0);
@@ -552,12 +601,11 @@ type Attributed = UiAttribution & { readonly unit: Unit };
  *   1. A cluster on which two different identities FRESHLY lit is a cluster
  *      the UI and the diarizer disagree about. Every segment in it becomes
  *      ambiguous; the direct evidence stays in the provenance.
- *   2. A held (non-fresh) name on a cluster whose segments never saw that
- *      identity freshly lit is a stale tile over a voice the UI never
- *      confirmed. The segment becomes anonymous.
+ *   2. A cluster never extends a held UI state. Naming already required a
+ *      fresh observation for this unit; the veto only removes names.
  *
- * Segments with no cluster are untouched: with no diarizer there is nothing
- * to corroborate against, and the held state is the best evidence there is.
+ * Segments with no cluster are untouched: no cluster can create or extend a
+ * name in either case.
  */
 function applyClusterVetoes(attributed: Attributed[], warnings: TranscriptWarning[]): void {
   const freshByCluster = new Map<string, Set<string>>();
