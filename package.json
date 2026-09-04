@@ -29,6 +29,7 @@
     "typescript-eslint": "^8.46.0"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^13.0.3",
+    "zod": "^4.5.4"
   }
 }

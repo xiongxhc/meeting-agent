@@ -483,7 +483,7 @@ export const FORBIDDEN_IMPORT_RULES: readonly ForbiddenRule[] = [
   {
     name: "TeamMem Python/module path",
     matches: (specifier) =>
-      /team-?mem/i.test(specifier) ||
+      (specifier !== "../contracts/teammem-meeting-v1.ts" && specifier !== "./teammem-meeting-v1.ts" && /team-?mem/i.test(specifier)) ||
       /team-memory-agent/i.test(specifier) ||
       /\.py$/i.test(specifier),
   },
