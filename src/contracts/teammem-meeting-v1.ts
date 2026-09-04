@@ -15,9 +15,10 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 const TOKEN = /^[a-z][a-z0-9_-]*$/;
 
-const boundedText = (maximum: number) => z.string().max(maximum).refine((value) => value.trim().length > 0, "must not be blank");
-const instant = z.string().refine(isInstant, "must be a real UTC instant with literal Z");
-const wholeSecondInstant = z.string().refine((value) => WHOLE_SECOND_UTC_INSTANT.test(value) && isInstant(value), "must be a whole-second UTC instant");
+const unicodeScalarString = z.string().refine(isUnicodeScalarString, "must contain only Unicode scalar values");
+const boundedText = (maximum: number) => unicodeScalarString.max(maximum).refine((value) => value.trim().length > 0, "must not be blank");
+const instant = unicodeScalarString.refine(isInstant, "must be a real UTC instant with literal Z");
+const wholeSecondInstant = unicodeScalarString.refine((value) => WHOLE_SECOND_UTC_INSTANT.test(value) && isInstant(value), "must be a whole-second UTC instant");
 const evidenceIds = z.array(boundedText(200)).min(1).max(100).superRefine((ids, context) => {
   if (new Set(ids).size !== ids.length) context.addIssue({ code: "custom", message: "evidence_segment_ids must not repeat an id" });
 });
@@ -54,18 +55,18 @@ const project = z.object({ name: boundedText(200), evidence_segment_ids: evidenc
 const actionItem = z.object({
   text: boundedText(20_000),
   owner: z.object({ person_id: boundedText(200), display_name: boundedText(200), explicitly_stated: z.literal(true) }).strict().nullable(),
-  due_date: z.object({ date: z.string().refine(isDate, "must be a real YYYY-MM-DD date"), explicitly_stated: z.literal(true) }).strict().nullable(),
+  due_date: z.object({ date: unicodeScalarString.refine(isDate, "must be a real YYYY-MM-DD date"), explicitly_stated: z.literal(true) }).strict().nullable(),
   evidence_segment_ids: evidenceIds,
 }).strict();
 const personSummary = z.object({ person_id: boundedText(200), display_name: boundedText(200), text: boundedText(20_000) }).strict();
 const recordingGap = z.object({ started_at: instant, ended_at: instant, reason: boundedText(500) }).strict();
-const processingWarning = z.object({ code: z.string().regex(TOKEN), detail: z.string().max(500) }).strict();
+const processingWarning = z.object({ code: unicodeScalarString.regex(TOKEN), detail: unicodeScalarString.max(500) }).strict();
 
 const meetingArtifactBase = z.object({
   schema: z.literal(TEAMMEM_MEETING_V1_SCHEMA),
-  occurrence_id: z.string().max(400),
+  occurrence_id: unicodeScalarString.max(400),
   revision: z.number().int().min(1).max(1_000_000),
-  provider: z.string().regex(TOKEN),
+  provider: unicodeScalarString.regex(TOKEN),
   provider_meeting_id: boundedText(400),
   title: boundedText(200),
   started_at: wholeSecondInstant,
@@ -99,7 +100,7 @@ const meetingArtifactBase = z.object({
     encryption: boundedText(100),
     duration_seconds: z.number().positive().max(86_400),
     bytes: z.number().int().positive().max(8 * 1024 * 1024 * 1024),
-    sha256: z.string().regex(SHA256),
+    sha256: unicodeScalarString.regex(SHA256),
     expires_at: instant,
   }).strict(),
 }).strict();
@@ -239,6 +240,7 @@ function isInstant(value: string): boolean {
 
 function isDate(value: string): boolean {
   if (!DATE.test(value)) return false;
+  if (Number(value.slice(0, 4)) < 1) return false;
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
@@ -255,6 +257,8 @@ function issue(condition: boolean, message: string): asserts condition {
 function parseUtcInstant(value: string): bigint {
   const match = UTC_INSTANT.exec(value);
   if (!match) throw new Error("invalid UTC instant");
+  const year = Number(value.slice(0, 4));
+  if (year < 1 || year > 9_999) throw new Error("invalid UTC instant");
   const whole = value.slice(0, 19);
   const milliseconds = Date.parse(`${whole}Z`);
   if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString().slice(0, 19) !== whole) {
@@ -277,6 +281,9 @@ function formatMicros(micros: bigint): string {
     throw new Error("UTC instant is outside JavaScript date range");
   }
   const whole = new Date(Number(milliseconds)).toISOString().slice(0, 19);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(whole) || Number(whole.slice(0, 4)) < 1) {
+    throw new Error("UTC instant is outside the supported four-digit year domain");
+  }
   if (fraction === 0n) return `${whole}Z`;
   return `${whole}.${fraction.toString().padStart(6, "0").replace(/0+$/, "")}Z`;
 }
@@ -284,14 +291,37 @@ function formatMicros(micros: bigint): string {
 function encodeCanonicalJson(value: unknown, key: string | null): string {
   if (value === null) return "null";
   switch (typeof value) {
-    case "string": return JSON.stringify(value);
+    case "string":
+      assertUnicodeScalarString(value, "canonical JSON contains a non-Unicode scalar string");
+      return JSON.stringify(value);
     case "boolean": return value ? "true" : "false";
     case "number": return encodePythonNumber(value, key === "duration_seconds");
     case "object":
       if (Array.isArray(value)) return `[${value.map((entry) => encodeCanonicalJson(entry, null)).join(",")}]`;
-      return `{${Object.entries(value).sort(([left], [right]) => compareUnicodeCodePoints(left, right)).map(([entryKey, entry]) => `${JSON.stringify(entryKey)}:${encodeCanonicalJson(entry, entryKey)}`).join(",")}}`;
+      return `{${Object.entries(value).sort(([left], [right]) => compareUnicodeCodePoints(left, right)).map(([entryKey, entry]) => {
+        assertUnicodeScalarString(entryKey, "canonical JSON contains a non-Unicode scalar string");
+        return `${JSON.stringify(entryKey)}:${encodeCanonicalJson(entry, entryKey)}`;
+      }).join(",")}}`;
     default: throw new Error("canonical JSON only accepts JSON values");
   }
+}
+
+export function isUnicodeScalarString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!Number.isInteger(next) || next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertUnicodeScalarString(value: string, message: string): void {
+  if (!isUnicodeScalarString(value)) throw new Error(message);
 }
 
 function encodePythonNumber(value: number, forceFloat: boolean): string {

@@ -1,12 +1,14 @@
 // Post-meeting-only construction of the frozen TeamMem artifact. This module
 // creates no files and performs no delivery: Task 9 owns the outbox/bundle.
 
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import {
   addMillisecondsToUtcInstant,
   canonicalArtifactHash,
   canonicalArtifactJson,
+  isUnicodeScalarString,
   parseTeamMemMeetingArtifact,
   TEAMMEM_MEETING_V1_SCHEMA,
   type TeamMemMeetingArtifact,
@@ -134,7 +136,10 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
     maxOutputBytes: 1_000_000,
   });
   const synthesis = textSynthesis.parse(processed.output);
-  const runtimeWarnings = processed.warnings.map((warning) => runtimeTextWarning(warning, transcript));
+  const runtimeWarnings = processed.warnings.map(runtimeTextWarning);
+  if (input.processingWarnings.length + input.transcript.warnings.length + runtimeWarnings.length > 500) {
+    throw new Error("processing warning limit exceeded");
+  }
   const artifact = parseTeamMemMeetingArtifact({
     schema: TEAMMEM_MEETING_V1_SCHEMA,
     occurrence_id: input.identity.occurrenceId,
@@ -233,7 +238,7 @@ function transcriptFromReconciled(
     ended_at: addMillisecondsToUtcInstant(alignment.mediaOriginAt, segment.endedAtMs),
     text: segment.text,
     speaker: toArtifactSpeaker(segment, names),
-    attribution_confidence: attributionConfidence(segment),
+    attribution_confidence: attributionConfidence(segment, validateReconciledEvidence(segment)),
     provenance: {
       stage: segment.provenance.wording === "reconciled" ? "final_batch" : "live_stream",
       model: segment.provenance.wording === "reconciled" ? provenance.finalBatchModel : provenance.liveStreamModel,
@@ -255,10 +260,23 @@ function toArtifactSpeaker(segment: ReconciledSegment, names: ReadonlyMap<string
   }
 }
 
-function attributionConfidence(segment: ReconciledSegment): number {
+function validateReconciledEvidence(segment: ReconciledSegment): number {
+  if (!Number.isSafeInteger(segment.startedAtMs) || !Number.isSafeInteger(segment.endedAtMs) || segment.startedAtMs < 0 || segment.endedAtMs < segment.startedAtMs) {
+    throw new Error("reconciled attribution evidence is invalid");
+  }
   const duration = segment.endedAtMs - segment.startedAtMs;
-  if (duration <= 0 || segment.speaker.kind !== "named") return 0;
-  return Math.min(1, (segment.provenance.uiExactMs[segment.speaker.feishuUserId] ?? 0) / duration);
+  if (duration <= 0) throw new Error("reconciled attribution evidence is invalid");
+  for (const value of Object.values(segment.provenance.uiExactMs)) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > duration) {
+      throw new Error("reconciled attribution evidence is invalid");
+    }
+  }
+  return duration;
+}
+
+function attributionConfidence(segment: ReconciledSegment, duration: number): number {
+  if (segment.speaker.kind !== "named") return 0;
+  return (segment.provenance.uiExactMs[segment.speaker.feishuUserId] ?? 0) / duration;
 }
 
 function requireMatchingAlignment(alignment: MediaTimelineAlignment | null, sessionId: bigint): MediaTimelineAlignment {
@@ -286,22 +304,10 @@ function transcriptWarning(warning: TranscriptWarning): { readonly code: string;
   }
 }
 
-function runtimeTextWarning(warning: string, transcript: TeamMemMeetingArtifact["transcript"]): { readonly code: string; readonly detail: string } {
-  const containsControl = containsControlCharacter(warning);
-  const looksSensitive = /\b(?:api[ _-]?key|authorization|bearer|credential|password|secret|token)\b/i.test(warning);
-  const repeatsTranscript = transcript.some((segment) => warning.includes(segment.text));
-  if (warning.trim().length === 0 || warning.length > 500 || containsControl || looksSensitive || repeatsTranscript) {
-    throw new Error("runtime text warning cannot be represented safely");
-  }
-  return { code: "runtime_text_warning", detail: warning };
-}
-
-function containsControlCharacter(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x1f || code === 0x7f) return true;
-  }
-  return false;
+function runtimeTextWarning(warning: string): { readonly code: string; readonly detail: string } {
+  if (!isUnicodeScalarString(warning)) throw new Error("runtime text warning cannot be represented safely");
+  const digest = createHash("sha256").update(warning, "utf8").digest("hex");
+  return { code: "runtime_text_warning", detail: `Runtime text processing warning (sha256:${digest})` };
 }
 
 function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript"]): string {

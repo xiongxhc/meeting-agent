@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import {
+  addMillisecondsToUtcInstant,
   canonicalArtifactHash,
   canonicalJson,
   parseTeamMemMeetingArtifact,
@@ -133,6 +134,27 @@ test("canonical JSON orders punctuation, case, BMP, and astral keys by Unicode c
   );
 });
 
+test("artifact strings and canonical JSON reject lone UTF-16 surrogates without echoing them", () => {
+  const high = "\uD800";
+  const low = "\uDC00";
+  for (const invalid of [high, low]) {
+    const artifact = structuredClone(fixture("minimal")) as { summary: string };
+    artifact.summary = `prefix ${invalid} suffix`;
+    assert.throws(
+      () => parseTeamMemMeetingArtifact(artifact),
+      (error: Error) => /Unicode scalar|validation/i.test(error.message) && !error.message.includes(invalid),
+    );
+    for (const value of [{ [invalid]: "valid" }, { valid: { nested: invalid } }]) {
+      assert.throws(
+        () => canonicalJson(value),
+        (error: Error) => /Unicode scalar/i.test(error.message) && !error.message.includes(invalid),
+      );
+    }
+  }
+  const ordinary = { astral: "𐀀", escaped: 'quote " slash \\ line\u2028end' };
+  assert.equal(canonicalJson(ordinary), JSON.stringify(ordinary));
+});
+
 test("strict artifact parsing rejects unknown fields and invalid cross-field speaker, evidence, timing, attendance, and organizer claims", () => {
   const artifact = fixture("minimal") as Record<string, unknown>;
   assert.throws(() => parseTeamMemMeetingArtifact({ ...artifact, unexpected: true }), /unknown|unrecognized|unexpected/i);
@@ -177,6 +199,16 @@ test("strict artifact parsing accepts every legal fractional UTC width and rejec
   assert.throws(() => parseTeamMemMeetingArtifact(gapOverlap), /recording_gaps must be ordered/i);
 });
 
+test("exact instant domain excludes year zero and offset conversion stays inside years 0001 through 9999", () => {
+  const yearZero = structuredClone(fixture("minimal")) as { participants: Array<{ attendance: Array<{ joined_at: string }> }> };
+  yearZero.participants[0]!.attendance[0]!.joined_at = "0000-01-01T00:00:00Z";
+  assert.throws(() => parseTeamMemMeetingArtifact(yearZero), /UTC instant/i);
+  assert.equal(addMillisecondsToUtcInstant("0001-01-01T00:00:00Z", 0), "0001-01-01T00:00:00Z");
+  assert.equal(addMillisecondsToUtcInstant("9999-12-31T23:59:59.999999Z", 0), "9999-12-31T23:59:59.999999Z");
+  assert.throws(() => addMillisecondsToUtcInstant("0001-01-01T00:00:00Z", -1), /outside|UTC instant/i);
+  assert.throws(() => addMillisecondsToUtcInstant("9999-12-31T23:59:59.999999Z", 1), /outside|UTC instant/i);
+});
+
 test("builder calls post-meeting text processing with strict JSON Schema, validates its result, and preserves only observed joiners", async () => {
   const { runtime, calls } = runtimeReturning(synthesis);
   const built = await buildTeamMemMeetingArtifact(buildInput(runtime));
@@ -206,6 +238,7 @@ test("builder converts media offsets only through its session-matched durable Ru
   assert.equal(built.artifact.transcript[0]!.started_at, "2026-09-02T14:00:35Z");
   for (const transcript of [
     { ...reconciled, alignment: null },
+    { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "0000-01-01T00:00:00Z", runtimeSessionId: 42n } },
     { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:30Z", runtimeSessionId: 43n } },
   ]) {
     const runtime = runtimeReturning(synthesis);
@@ -227,6 +260,22 @@ test("builder serializes named confidence from the asserted identity only", asyn
   assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
 });
 
+test("builder rejects non-finite, negative, and over-duration reconciliation evidence before Runtime processing", async () => {
+  for (const evidence of [Infinity, Number.NaN, -1, 10_001]) {
+    const runtime = runtimeReturning(synthesis);
+    const transcript = {
+      ...reconciled,
+      alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
+      segments: [{ ...reconciled.segments[0]!, provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: evidence, ou_competitor: 1 } } }],
+    };
+    await assert.rejects(
+      buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })),
+      (error: Error) => /attribution evidence/i.test(error.message) && !error.message.includes("Atlas is ready"),
+    );
+    assert.equal(runtime.calls.length, 0);
+  }
+});
+
 test("builder fails closed before processText until the voice meeting ended and rejects unsupported text output", async () => {
   const live = runtimeReturning(synthesis);
   await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(live.runtime), meetingEnded: false }), /ended/i);
@@ -235,18 +284,25 @@ test("builder fails closed before processText until the voice meeting ended and 
   await assert.rejects(buildTeamMemMeetingArtifact(buildInput(invalid.runtime)), /unknown|unrecognized|unexpected/i);
 });
 
-test("builder preserves representable Runtime warnings and rejects unsafe or oversized warnings without echoing them", async () => {
-  const safe = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis, ["structured output repaired one omitted field"]).runtime, 1, {
-    transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } },
-  }));
-  assert.deepEqual(safe.artifact.processing_warnings.at(-1), { code: "runtime_text_warning", detail: "structured output repaired one omitted field" });
-  for (const warning of ["unsafe\u0000credential=do-not-echo", "x".repeat(501)]) {
-    const runtime = runtimeReturning(synthesis, [warning]);
-    await assert.rejects(
-      buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } } })),
-      (error: Error) => /warning cannot be represented/i.test(error.message) && !/credential|do-not-echo|unsafe/i.test(error.message),
-    );
+test("builder represents every scalar Runtime warning without retaining raw transcript or credential content", async () => {
+  for (const warning of ["structured output repaired one omitted field", "Atlas is ready", "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", "C1\u0085control", "", "x".repeat(501)]) {
+    const safe = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis, [warning]).runtime, 1, {
+      transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } },
+    }));
+    const detail = safe.artifact.processing_warnings.at(-1)?.detail ?? "";
+    assert.equal(safe.artifact.processing_warnings.at(-1)?.code, "runtime_text_warning");
+    assert.match(detail, /^Runtime text processing warning \(sha256:[a-f0-9]{64}\)$/);
+    assert.notEqual(detail, warning);
+    if (warning.length > 0) assert.ok(!detail.includes(warning));
   }
+});
+
+test("builder rejects non-scalar Runtime warnings generically without returning an artifact", async () => {
+  const invalid = "unsafe\uD800credential";
+  const runtime = runtimeReturning(synthesis, [invalid]);
+  await assert.rejects(buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, {
+    transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } },
+  })), (error: Error) => /warning cannot be represented/i.test(error.message) && !error.message.includes(invalid));
 });
 
 test("builder rejects inferred project evidence, inferred owners and dates, and summaries for silent attendees", async () => {
