@@ -20,7 +20,7 @@
 // Nothing here touches a live TeamMem installation.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -56,6 +56,8 @@ import {
 
 const BASE_MS = 1_700_000_000_000;
 const LEASE_TTL_MS = 30_000;
+const RECONCILIATION_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const MIGRATIONS_DIR = path.resolve(import.meta.dirname, "..", "migrations");
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -79,6 +81,41 @@ function harness(): Harness {
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/** Builds a real historical schema fixture by executing the repository's
+ * numbered migrations and recording them exactly as the production runner
+ * does. The caller can then seed rows that only the historical schema would
+ * accept before openSessionStore applies the remaining migrations. */
+function migrateFixtureThrough(db: Database.Database, latestVersion: number): void {
+  db.pragma("foreign_keys = ON");
+  const migrations = readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith(".sql") && Number.parseInt(name, 10) <= latestVersion)
+    .sort();
+  for (const name of migrations) {
+    const version = Number.parseInt(name, 10);
+    db.transaction(() => {
+      db.exec(readFileSync(path.join(MIGRATIONS_DIR, name), "utf8"));
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)")
+        .run(version, name, BASE_MS);
+    })();
+  }
+}
+
+function seedRawSession(db: Database.Database, id: MeetingIdentity): void {
+  db.prepare(
+    `INSERT INTO sessions
+       (occurrence_id, occurrence_segment, provider_meeting_id, occurrence_started_at,
+        state, terminal_reason, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, 'finalizing', NULL, ?, ?)`,
+  ).run(
+    id.occurrenceId,
+    occurrencePathSegment(id.occurrenceId),
+    id.providerMeetingId,
+    id.occurrenceStartedAt,
+    BASE_MS,
+    BASE_MS,
+  );
 }
 
 type TestClock = Clock & { advance(ms: number): void };
@@ -172,7 +209,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 11);
+      assert.equal(store.schemaVersion, 12);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -185,6 +222,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
         { version: 10, name: "010_reconciliation_evidence_hardening.sql", appliedAtMs: BASE_MS },
         { version: 11, name: "011_reconciliation_provenance_and_terminal.sql", appliedAtMs: BASE_MS },
+        { version: 12, name: "012_reconciliation_upgrade_safety.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -229,7 +267,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 11);
+      assert.equal(second.schemaVersion, 12);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -244,6 +282,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
         { version: 10, name: "010_reconciliation_evidence_hardening.sql", appliedAtMs: BASE_MS },
         { version: 11, name: "011_reconciliation_provenance_and_terminal.sql", appliedAtMs: BASE_MS },
+        { version: 12, name: "012_reconciliation_upgrade_safety.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -383,12 +422,201 @@ test("raw reconciliation rows cannot disagree between retained UTC provenance an
       const generation = raw.prepare("SELECT generation_id FROM reconciliation_generations WHERE occurrence_id = ?").get(id.occurrenceId) as { generation_id: string };
       const event = raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, 'provenance_bridge', ?, 'bridge-session/v1', ?, ?, 'participant_joined', 'ou_a', 'Ada', NULL)");
       assert.throws(() => event.run(generation.generation_id, 1, "2026-09-02T14:00:00Z", 0));
+      assert.throws(() => event.run(generation.generation_id, 3, "not-a-date", 123));
       event.run(generation.generation_id, 2, "2026-09-02T14:00:00.123Z", Date.parse("2026-09-02T14:00:00.123Z"));
+      event.run(generation.generation_id, 4, "2026-09-02T14:00:01Z", Date.parse("2026-09-02T14:00:01Z"));
       const live = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, ?, 'wording', ?, ?, ?, ?)");
       assert.throws(() => live.run(generation.generation_id, "bad", "2026-09-02T14:00:00Z", 0, "2026-09-02T14:00:00.001Z", 1));
+      assert.throws(() => live.run(generation.generation_id, "bad_start", "not-a-date", 10, "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z")));
+      assert.throws(() => live.run(generation.generation_id, "bad_end", "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "not-a-date", Date.parse("2026-09-02T14:00:01Z")));
       live.run(generation.generation_id, "good", "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "2026-09-02T14:00:00.123Z", Date.parse("2026-09-02T14:00:00.123Z"));
+      live.run(generation.generation_id, "good_mixed", "2026-09-02T14:00:00.500Z", Date.parse("2026-09-02T14:00:00.500Z"), "2026-09-02T14:00:01Z", Date.parse("2026-09-02T14:00:01Z"));
     } finally { raw.close(); store.close(); }
   } finally { h.cleanup(); }
+});
+
+test("a schema-10 terminal recording generation upgrades with honest legacy provenance and exact evidence", () => {
+  const h = harness();
+  const id = identity(104);
+  const bridgeSessionId = "legacy_terminal_bridge";
+  const generationId = `${Buffer.from(id.occurrenceId).toString("hex")}:${Buffer.from(bridgeSessionId).toString("hex")}`;
+  const recordingHandle = "legacyrecording10";
+  const terminalAtMs = Date.parse("2026-09-02T14:00:03Z");
+  const expiresAtMs = terminalAtMs + RECONCILIATION_RETENTION_MS;
+  try {
+    const raw = new Database(h.dbPath);
+    try {
+      migrateFixtureThrough(raw, 10);
+      seedRawSession(raw, id);
+      raw.prepare("INSERT INTO recordings (occurrence_id, handle, sha256, duration_ms, finalized_at_ms, encrypted_path, format, key_id) VALUES (?, ?, ?, 3000, ?, '/enc/legacy', 'ogg/opus', 'legacy-key')")
+        .run(id.occurrenceId, recordingHandle, "a".repeat(64), terminalAtMs);
+      raw.prepare("INSERT INTO reconciliation_generations (generation_id, occurrence_id, bridge_session_id, runtime_session_id, recording_handle, alignment_status, capture_complete, incomplete_reason, created_at_ms, terminal_at_ms, expires_at_ms) VALUES (?, ?, ?, '9007199254740993', ?, 'unavailable_current_sdk', 1, NULL, ?, ?, ?)")
+        .run(generationId, id.occurrenceId, bridgeSessionId, recordingHandle, BASE_MS, terminalAtMs, expiresAtMs);
+      raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, ?, 1, 'bridge-session/v1', '2026-09-02T14:00:00Z', ?, 'participant_joined', 'ou_legacy', 'Legacy Person', NULL)")
+        .run(generationId, bridgeSessionId, Date.parse("2026-09-02T14:00:00Z"));
+      raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, ?, 2, 'bridge-session/v1', '2026-09-02T14:00:00.500Z', ?, 'active_speaker', 'ou_legacy', NULL, 'ui_exact')")
+        .run(generationId, bridgeSessionId, Date.parse("2026-09-02T14:00:00.500Z"));
+      raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'legacy_segment', 'exact legacy wording', '2026-09-02T14:00:00.500Z', ?, '2026-09-02T14:00:01Z', ?)")
+        .run(generationId, Date.parse("2026-09-02T14:00:00.500Z"), Date.parse("2026-09-02T14:00:01Z"));
+    } finally {
+      raw.close();
+    }
+
+    const upgraded = h.open(BASE_MS + 1);
+    assert.equal(upgraded.schemaVersion, 12);
+    upgraded.close();
+
+    const reopened = h.open(BASE_MS + 2);
+    try {
+      assert.deepEqual(reopened.getRecording(id.occurrenceId)?.handle, recordingHandle);
+      assert.deepEqual(reopened.getReconciliationEvidence(id.occurrenceId, recordingHandle), {
+        occurrenceId: id.occurrenceId,
+        generationId,
+        runtimeSessionId: 9_007_199_254_740_993n,
+        alignment: null,
+        alignmentStatus: "unavailable_current_sdk",
+        captureComplete: true,
+        incompleteReason: null,
+        terminalAtMs,
+        terminalSource: "legacy_unknown",
+        expiresAtMs,
+        bridgeEvents: [
+          { bridgeSessionId, sequence: 1, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", observedAtMs: Date.parse("2026-09-02T14:00:00Z"), type: "participant_joined", feishuUserId: "ou_legacy", displayName: "Legacy Person", confidence: null },
+          { bridgeSessionId, sequence: 2, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", observedAtMs: Date.parse("2026-09-02T14:00:00.500Z"), type: "active_speaker", feishuUserId: "ou_legacy", displayName: null, confidence: "ui_exact" },
+        ],
+        liveSegments: [{ bridgeSessionId, segmentId: "legacy_segment", text: "exact legacy wording", startedAt: "2026-09-02T14:00:00.500Z", endedAt: "2026-09-02T14:00:01Z" }],
+      });
+      assert.equal(reopened.purgeExpiredReconciliationEvidence(expiresAtMs - 1), 0);
+      assert.notEqual(reopened.getReconciliationEvidence(id.occurrenceId, recordingHandle), null);
+      assert.equal(reopened.purgeExpiredReconciliationEvidence(expiresAtMs), 1);
+      assert.equal(reopened.getReconciliationEvidence(id.occurrenceId, recordingHandle), null);
+      assert.deepEqual(reopened.foreignKeyCheck(), []);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a schema-10 malformed child is discarded without deleting its terminal recording generation", () => {
+  const h = harness();
+  const id = identity(105);
+  const bridgeSessionId = "legacy_malformed_bridge";
+  const generationId = `${Buffer.from(id.occurrenceId).toString("hex")}:${Buffer.from(bridgeSessionId).toString("hex")}`;
+  const terminalAtMs = Date.parse("2026-09-02T14:00:03Z");
+  const expiresAtMs = terminalAtMs + RECONCILIATION_RETENTION_MS;
+  try {
+    const raw = new Database(h.dbPath);
+    try {
+      migrateFixtureThrough(raw, 10);
+      seedRawSession(raw, id);
+      raw.prepare("INSERT INTO reconciliation_generations (generation_id, occurrence_id, bridge_session_id, runtime_session_id, recording_handle, alignment_status, capture_complete, incomplete_reason, created_at_ms, terminal_at_ms, expires_at_ms) VALUES (?, ?, ?, '44', 'malformedlegacy10', 'unavailable_current_sdk', 1, NULL, ?, ?, ?)")
+        .run(generationId, id.occurrenceId, bridgeSessionId, BASE_MS, terminalAtMs, expiresAtMs);
+      raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, ?, 1, 'bridge-session/v1', 'not-a-date', 123, 'participant_joined', 'ou_legacy', 'Legacy Person', NULL)")
+        .run(generationId, bridgeSessionId);
+      raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'trusted_segment', 'trusted legacy wording', '2026-09-02T14:00:00Z', ?, '2026-09-02T14:00:01Z', ?)")
+        .run(generationId, Date.parse("2026-09-02T14:00:00Z"), Date.parse("2026-09-02T14:00:01Z"));
+    } finally {
+      raw.close();
+    }
+
+    const store = h.open();
+    try {
+      const evidence = store.getReconciliationEvidence(id.occurrenceId, "malformedlegacy10");
+      assert.equal(evidence?.runtimeSessionId, 44n);
+      assert.equal(evidence?.terminalAtMs, terminalAtMs);
+      assert.equal(evidence?.terminalSource, "legacy_unknown");
+      assert.equal(evidence?.expiresAtMs, expiresAtMs);
+      assert.equal(evidence?.captureComplete, false);
+      assert.equal(evidence?.incompleteReason, "legacy_evidence_invalid_on_migration");
+      assert.deepEqual(evidence?.bridgeEvents, []);
+      assert.deepEqual(evidence?.liveSegments.map((segment) => segment.text), ["trusted legacy wording"]);
+      assert.deepEqual(store.foreignKeyCheck(), []);
+    } finally {
+      store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a schema-11 database upgrades to the current constraints without losing retained evidence", () => {
+  const h = harness();
+  const id = identity(106);
+  const bridgeSessionId = "schema_11_bridge";
+  const generationId = `${Buffer.from(id.occurrenceId).toString("hex")}:${Buffer.from(bridgeSessionId).toString("hex")}`;
+  const terminalAtMs = Date.parse("2026-09-02T14:00:03Z");
+  try {
+    const raw = new Database(h.dbPath);
+    try {
+      migrateFixtureThrough(raw, 11);
+      seedRawSession(raw, id);
+      raw.prepare("INSERT INTO reconciliation_generations (generation_id, occurrence_id, bridge_session_id, runtime_session_id, recording_handle, alignment_status, capture_complete, incomplete_reason, created_at_ms, terminal_at_ms, terminal_source, expires_at_ms) VALUES (?, ?, ?, '45', 'schema11recording', 'unavailable_current_sdk', 1, NULL, ?, ?, 'bridge_observed', ?)")
+        .run(generationId, id.occurrenceId, bridgeSessionId, BASE_MS, terminalAtMs, terminalAtMs + RECONCILIATION_RETENTION_MS);
+      raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, ?, 1, 'bridge-session/v1', '2026-09-02T14:00:00.125Z', ?, 'participant_joined', 'ou_11', 'Schema Eleven', NULL)")
+        .run(generationId, bridgeSessionId, Date.parse("2026-09-02T14:00:00.125Z"));
+      raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'schema_11_segment', 'schema eleven wording', '2026-09-02T14:00:00Z', ?, '2026-09-02T14:00:01.250Z', ?)")
+        .run(generationId, Date.parse("2026-09-02T14:00:00Z"), Date.parse("2026-09-02T14:00:01.250Z"));
+    } finally {
+      raw.close();
+    }
+
+    const store = h.open();
+    try {
+      assert.equal(store.schemaVersion, 12);
+      const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
+      assert.equal(evidence?.runtimeSessionId, 45n);
+      assert.equal(evidence?.terminalSource, "bridge_observed");
+      assert.deepEqual(evidence?.bridgeEvents.map((event) => event.observedAt), ["2026-09-02T14:00:00.125Z"]);
+      assert.deepEqual(evidence?.liveSegments.map((segment) => [segment.startedAt, segment.endedAt]), [["2026-09-02T14:00:00Z", "2026-09-02T14:00:01.250Z"]]);
+      assert.deepEqual(store.foreignKeyCheck(), []);
+    } finally {
+      store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a schema-11 upgrade quarantines already-admitted garbage without deleting its surviving parent", () => {
+  const h = harness();
+  const id = identity(107);
+  const bridgeSessionId = "schema_11_garbage_bridge";
+  const generationId = `${Buffer.from(id.occurrenceId).toString("hex")}:${Buffer.from(bridgeSessionId).toString("hex")}`;
+  try {
+    const raw = new Database(h.dbPath);
+    try {
+      migrateFixtureThrough(raw, 11);
+      seedRawSession(raw, id);
+      raw.prepare("INSERT INTO reconciliation_generations (generation_id, occurrence_id, bridge_session_id, runtime_session_id, recording_handle, alignment_status, capture_complete, incomplete_reason, created_at_ms) VALUES (?, ?, ?, '46', 'schema11garbage', 'unavailable_current_sdk', 1, NULL, ?)")
+        .run(generationId, id.occurrenceId, bridgeSessionId, BASE_MS);
+      // The historical schema-11 CHECK accepted this row because every date
+      // expression evaluated to NULL. The corrected 011 used to create this
+      // fixture does not, so bypass only its CHECK to reproduce bytes an
+      // already-upgraded database can genuinely contain.
+      raw.pragma("ignore_check_constraints = ON");
+      raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, ?, 1, 'bridge-session/v1', 'not-a-date', 123, 'participant_joined', 'ou_11', 'Schema Eleven', NULL)")
+        .run(generationId, bridgeSessionId);
+      raw.pragma("ignore_check_constraints = OFF");
+    } finally {
+      raw.close();
+    }
+
+    const store = h.open();
+    try {
+      const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11garbage");
+      assert.equal(evidence?.runtimeSessionId, 46n);
+      assert.equal(evidence?.captureComplete, false);
+      assert.equal(evidence?.incompleteReason, "legacy_evidence_invalid_on_migration");
+      assert.deepEqual(evidence?.bridgeEvents, []);
+      assert.deepEqual(store.foreignKeyCheck(), []);
+    } finally {
+      store.close();
+    }
+  } finally {
+    h.cleanup();
+  }
 });
 
 test("the database atomically marks capture incomplete when direct evidence would exceed its hard bound", () => {
@@ -482,7 +710,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 11);
+      assert.equal(store.schemaVersion, 12);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);

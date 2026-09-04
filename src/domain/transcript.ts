@@ -120,8 +120,9 @@ export type TranscriptWarning =
   /** No durable fact relates the bridge/STT wall clock to the Runtime media
    * timeline. Cross-clock matching (and therefore naming) was refused. */
   | { readonly code: "media_timeline_alignment_unavailable" }
-  /** Local reconciliation capture exceeded its durable safety bound. */
-  | { readonly code: "durable_evidence_incomplete"; readonly reason: "event_limit_exceeded" | "live_text_limit_exceeded" }
+  /** Local reconciliation capture is incomplete because a safety bound was
+   * exceeded or an untrustworthy legacy child was quarantined on migration. */
+  | { readonly code: "durable_evidence_incomplete"; readonly reason: "event_limit_exceeded" | "live_text_limit_exceeded" | "legacy_evidence_invalid_on_migration" }
   /** A warning the runtime attached to the reconciliation, verbatim. */
   | { readonly code: "runtime_warning"; readonly detail: string }
   /** Live segments the reconciled transcript did not cover; kept with their

@@ -102,7 +102,7 @@ export type ReconcileTranscriptInput = {
    * timeline. Never accept a caller's bare wall-clock assertion. */
   readonly alignment: MediaTimelineAlignment | null;
   /** Store-level bounded-capture failure. It makes the artifact non-deletable. */
-  readonly durableIncompleteReason?: "event_limit_exceeded" | "live_text_limit_exceeded";
+  readonly durableIncompleteReason?: "event_limit_exceeded" | "live_text_limit_exceeded" | "legacy_evidence_invalid_on_migration";
   /** When the meeting ended. Closes the last observed active-speaker state. */
   readonly endedAt: string;
 };

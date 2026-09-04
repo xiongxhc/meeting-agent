@@ -149,10 +149,12 @@ export type ReconciliationEvidenceRow = {
   /** Durable reason that `alignment` is absent rather than caller supplied. */
   readonly alignmentStatus: "unavailable_current_sdk";
   readonly captureComplete: boolean;
-  readonly incompleteReason: "event_limit_exceeded" | "live_text_limit_exceeded" | null;
+  readonly incompleteReason: "event_limit_exceeded" | "live_text_limit_exceeded" | "legacy_evidence_invalid_on_migration" | null;
   readonly expiresAtMs: number | null;
   readonly terminalAtMs: number | null;
-  readonly terminalSource: "bridge_observed" | "local_clock" | null;
+  /** legacy_unknown is migration provenance only: schema 010 retained the
+   * terminal instant but no fact proving whether bridge or local clock set it. */
+  readonly terminalSource: "bridge_observed" | "local_clock" | "legacy_unknown" | null;
   readonly bridgeEvents: readonly ReconciliationBridgeEventRow[];
   readonly liveSegments: readonly ReconciliationLiveSegmentRow[];
 };
