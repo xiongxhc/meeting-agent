@@ -59,6 +59,7 @@ import {
   INCOMPLETE_TRANSCRIPT_CODES,
   type ActiveSpeakerObservation,
   type AttributionReason,
+  type MediaTimelineAlignment,
   type ReconciledSegment,
   type ReconciledTranscript,
   type SpeakerAttribution,
@@ -80,12 +81,6 @@ export const FRESH_OBSERVATION_LEAD_MS = 2_000;
  * identity and the recorded media-zero wall instant were durably captured
  * together. Current Runtime declarations do not supply this fact, so normal
  * Task 7 persistence records null and reconciliation fails closed. */
-export type MediaTimelineAlignment = {
-  readonly kind: "durable_runtime_anchor";
-  readonly mediaOriginAt: string;
-  readonly runtimeSessionId: bigint;
-};
-
 export type ReconcileTranscriptInput = {
   /** Actual joiners, from src/domain/participants.ts. Used only to report
    * silent attendees -- never to attribute. */
@@ -201,6 +196,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
     segments,
     warnings,
     transcriptComplete: !warnings.some((warning) => INCOMPLETE_TRANSCRIPT_CODES.has(warning.code)),
+    alignment: input.alignment,
     evidence,
     silentAttendees: attendees.filter((id) => !named.has(id) && !observedSpeaking.has(id)),
     spokeButUnattributed: [...observedSpeaking].sort(),

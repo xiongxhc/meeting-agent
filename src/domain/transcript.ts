@@ -104,6 +104,15 @@ export type ReconciledSegment = {
   readonly provenance: SegmentProvenance;
 };
 
+/** A durable Runtime-issued relationship between its media timeline and wall
+ * clock. It is the only fact that permits a media-relative segment to become
+ * a UTC artifact instant; a meeting occurrence start is never a substitute. */
+export type MediaTimelineAlignment = {
+  readonly kind: "durable_runtime_anchor";
+  readonly mediaOriginAt: string;
+  readonly runtimeSessionId: bigint;
+};
+
 /** The closed warning list. The first four make `transcriptComplete` false;
  * the rest describe attribution and are not incompleteness. */
 export type TranscriptWarning =
@@ -155,6 +164,9 @@ export type ReconciledTranscript = {
   /** False when any warning in INCOMPLETE_TRANSCRIPT_CODES is present. The
    * single flag the backfill worker and the retention monitor key on. */
   readonly transcriptComplete: boolean;
+  /** Null when Task 7 could not durably prove the relation between media zero
+   * and wall clock. Task 8 must then refuse to construct a UTC artifact. */
+  readonly alignment: MediaTimelineAlignment | null;
   /** The provisional evidence the attribution was decided on, in observation
    * order. Retained so the artifact can carry attribution provenance. */
   readonly evidence: readonly ActiveSpeakerObservation[];

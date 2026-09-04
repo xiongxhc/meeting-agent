@@ -118,12 +118,26 @@ export function parseTeamMemMeetingArtifact(value: unknown): TeamMemMeetingArtif
 /** TeamMem's canonical JSON hash: sorted object keys, compact separators,
  * UTF-8, and no formatting dependence. */
 export function canonicalArtifactHash(value: TeamMemMeetingArtifact): string {
-  const canonical = JSON.stringify(sortJson(value));
+  const canonical = canonicalJson(value);
   return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
 }
 
 export function canonicalArtifactJson(value: TeamMemMeetingArtifact): string {
-  return JSON.stringify(sortJson(value));
+  return canonicalJson(value);
+}
+
+/** Python `json.dumps(value, sort_keys=True, separators=(",", ":"),
+ * ensure_ascii=False)` for the JSON values this protocol permits. Keys are
+ * compared by Unicode code point, never locale collation. */
+export function canonicalJson(value: unknown): string {
+  return encodeCanonicalJson(value, null);
+}
+
+/** Adds media-timeline milliseconds to a validated UTC anchor without losing
+ * the contract's microsecond precision. */
+export function addMillisecondsToUtcInstant(origin: string, milliseconds: number): string {
+  if (!Number.isSafeInteger(milliseconds)) throw new Error("media offset must be a safe integer millisecond value");
+  return formatMicros(parseUtcInstant(origin) + BigInt(milliseconds) * 1_000n);
 }
 
 function validateRelationships(artifact: TeamMemMeetingArtifact): void {
@@ -215,9 +229,12 @@ function parseOccurrence(value: string): { readonly meetingId: string; readonly 
 }
 
 function isInstant(value: string): boolean {
-  if (!UTC_INSTANT.test(value)) return false;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().startsWith(value.includes(".") ? value.slice(0, value.indexOf(".") + 4) : value.replace("Z", ".000Z").slice(0, 23));
+  try {
+    parseUtcInstant(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isDate(value: string): boolean {
@@ -227,17 +244,79 @@ function isDate(value: string): boolean {
 }
 
 function compareInstants(left: string, right: string): number {
-  return Date.parse(left) - Date.parse(right);
+  const difference = parseUtcInstant(left) - parseUtcInstant(right);
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
 }
 
 function issue(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, sortJson(entry)]));
+function parseUtcInstant(value: string): bigint {
+  const match = UTC_INSTANT.exec(value);
+  if (!match) throw new Error("invalid UTC instant");
+  const whole = value.slice(0, 19);
+  const milliseconds = Date.parse(`${whole}Z`);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString().slice(0, 19) !== whole) {
+    throw new Error("invalid UTC instant");
   }
-  return value;
+  const fractional = (match[0].slice(19, -1).replace(".", "") + "000000").slice(0, 6);
+  return BigInt(milliseconds) * 1_000n + BigInt(fractional);
+}
+
+function formatMicros(micros: bigint): string {
+  const microsPerSecond = 1_000_000n;
+  let seconds = micros / microsPerSecond;
+  let fraction = micros % microsPerSecond;
+  if (fraction < 0n) {
+    seconds -= 1n;
+    fraction += microsPerSecond;
+  }
+  const milliseconds = seconds * 1_000n;
+  if (milliseconds < BigInt(Number.MIN_SAFE_INTEGER) || milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("UTC instant is outside JavaScript date range");
+  }
+  const whole = new Date(Number(milliseconds)).toISOString().slice(0, 19);
+  if (fraction === 0n) return `${whole}Z`;
+  return `${whole}.${fraction.toString().padStart(6, "0").replace(/0+$/, "")}Z`;
+}
+
+function encodeCanonicalJson(value: unknown, key: string | null): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "string": return JSON.stringify(value);
+    case "boolean": return value ? "true" : "false";
+    case "number": return encodePythonNumber(value, key === "duration_seconds");
+    case "object":
+      if (Array.isArray(value)) return `[${value.map((entry) => encodeCanonicalJson(entry, null)).join(",")}]`;
+      return `{${Object.entries(value).sort(([left], [right]) => compareUnicodeCodePoints(left, right)).map(([entryKey, entry]) => `${JSON.stringify(entryKey)}:${encodeCanonicalJson(entry, entryKey)}`).join(",")}}`;
+    default: throw new Error("canonical JSON only accepts JSON values");
+  }
+}
+
+function encodePythonNumber(value: number, forceFloat: boolean): string {
+  if (!Number.isFinite(value)) throw new Error("canonical JSON only accepts finite numbers");
+  if (Object.is(value, -0)) return forceFloat ? "-0.0" : "0";
+  if (Number.isInteger(value)) return forceFloat ? `${value}.0` : String(value);
+  const absolute = Math.abs(value);
+  if (absolute !== 0 && absolute < 0.0001) {
+    const [mantissa, exponent] = value.toExponential().split("e");
+    const sign = exponent![0] === "-" ? "-" : "+";
+    const digits = exponent!.slice(1).padStart(2, "0");
+    return `${mantissa}e${sign}${digits}`;
+  }
+  return String(value);
+}
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const leftPoint = left.codePointAt(leftIndex)!;
+    const rightPoint = right.codePointAt(rightIndex)!;
+    if (leftPoint !== rightPoint) return leftPoint < rightPoint ? -1 : 1;
+    leftIndex += leftPoint > 0xffff ? 2 : 1;
+    rightIndex += rightPoint > 0xffff ? 2 : 1;
+  }
+  return leftIndex === left.length && rightIndex === right.length ? 0 : leftIndex === left.length ? -1 : 1;
 }

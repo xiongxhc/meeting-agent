@@ -4,6 +4,7 @@
 import { z } from "zod";
 
 import {
+  addMillisecondsToUtcInstant,
   canonicalArtifactHash,
   canonicalArtifactJson,
   parseTeamMemMeetingArtifact,
@@ -12,7 +13,7 @@ import {
 } from "../contracts/teammem-meeting-v1.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { AttendanceInterval } from "../domain/participants.ts";
-import type { ReconciledSegment, ReconciledTranscript, TranscriptWarning } from "../domain/transcript.ts";
+import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, TranscriptWarning } from "../domain/transcript.ts";
 import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 
 const text = z.string().min(1).max(20_000);
@@ -122,8 +123,9 @@ export type ArtifactRevisionGuard = { check(artifact: TeamMemMeetingArtifact, ha
  * validates the completed artifact again before returning it. */
 export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Promise<BuiltTeamMemMeetingArtifact> {
   if (!input.meetingEnded) throw new Error("meeting must have ended before processText (R54)");
+  const alignment = requireMatchingAlignment(input.transcript.alignment, input.sessionId);
   const participants = participantsFromAttendance(input.attendance);
-  const transcript = transcriptFromReconciled(input.transcript.segments, input.identity.occurrenceStartedAt, participants, input.provenance);
+  const transcript = transcriptFromReconciled(input.transcript.segments, alignment, participants, input.provenance);
   const processed = await input.runtime.processText({
     sessionId: input.sessionId,
     instructions: "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects.",
@@ -132,6 +134,7 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
     maxOutputBytes: 1_000_000,
   });
   const synthesis = textSynthesis.parse(processed.output);
+  const runtimeWarnings = processed.warnings.map((warning) => runtimeTextWarning(warning, transcript));
   const artifact = parseTeamMemMeetingArtifact({
     schema: TEAMMEM_MEETING_V1_SCHEMA,
     occurrence_id: input.identity.occurrenceId,
@@ -154,7 +157,7 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
     discussion_points: synthesis.discussion_points,
     person_summaries: synthesis.person_summaries,
     recording_gaps: input.recordingGaps.map((gap) => ({ started_at: gap.startedAt, ended_at: gap.endedAt, reason: gap.reason })),
-    processing_warnings: [...input.processingWarnings, ...input.transcript.warnings.map(transcriptWarning)],
+    processing_warnings: [...input.processingWarnings, ...input.transcript.warnings.map(transcriptWarning), ...runtimeWarnings],
     provenance: {
       runtime_profile: input.provenance.runtimeProfile,
       stt_provider: input.provenance.sttProvider,
@@ -187,13 +190,13 @@ export function createArtifactRevisionGuard(): ArtifactRevisionGuard {
   return {
     check(artifact, hash) {
       const revisions = occurrences.get(artifact.occurrence_id) ?? new Map<number, string>();
+      const current = Math.max(0, ...revisions.keys());
+      if (artifact.revision < current) throw new Error("artifact revision is lower than the current revision");
       const existing = revisions.get(artifact.revision);
       if (existing !== undefined) {
         if (existing !== hash) throw new Error("artifact revision is immutable: conflicting content");
         return;
       }
-      const current = Math.max(0, ...revisions.keys());
-      if (artifact.revision < current) throw new Error("artifact revision is lower than the current revision");
       revisions.set(artifact.revision, hash);
       occurrences.set(artifact.occurrence_id, revisions);
     },
@@ -219,15 +222,15 @@ function participantsFromAttendance(attendance: readonly AttendanceInterval[]): 
 
 function transcriptFromReconciled(
   segments: readonly ReconciledSegment[],
-  meetingStartedAt: string,
+  alignment: MediaTimelineAlignment,
   participants: TeamMemMeetingArtifact["participants"],
   provenance: ArtifactBuildInput["provenance"],
 ): TeamMemMeetingArtifact["transcript"] {
   const names = new Map(participants.map((entry) => [entry.person_id, entry.display_name]));
   return segments.map((segment) => ({
     segment_id: segment.segmentId,
-    started_at: offsetInstant(meetingStartedAt, segment.startedAtMs),
-    ended_at: offsetInstant(meetingStartedAt, segment.endedAtMs),
+    started_at: addMillisecondsToUtcInstant(alignment.mediaOriginAt, segment.startedAtMs),
+    ended_at: addMillisecondsToUtcInstant(alignment.mediaOriginAt, segment.endedAtMs),
     text: segment.text,
     speaker: toArtifactSpeaker(segment, names),
     attribution_confidence: attributionConfidence(segment),
@@ -255,13 +258,19 @@ function toArtifactSpeaker(segment: ReconciledSegment, names: ReadonlyMap<string
 function attributionConfidence(segment: ReconciledSegment): number {
   const duration = segment.endedAtMs - segment.startedAtMs;
   if (duration <= 0 || segment.speaker.kind !== "named") return 0;
-  return Math.min(1, Object.values(segment.provenance.uiExactMs).reduce((total, value) => total + value, 0) / duration);
+  return Math.min(1, (segment.provenance.uiExactMs[segment.speaker.feishuUserId] ?? 0) / duration);
 }
 
-function offsetInstant(origin: string, offsetMs: number): string {
-  const timestamp = Date.parse(origin) + offsetMs;
-  if (!Number.isFinite(timestamp)) throw new Error("meeting start or transcript offset is invalid");
-  return new Date(timestamp).toISOString().replace(".000Z", "Z");
+function requireMatchingAlignment(alignment: MediaTimelineAlignment | null, sessionId: bigint): MediaTimelineAlignment {
+  if (alignment === null || alignment.kind !== "durable_runtime_anchor" || alignment.runtimeSessionId !== sessionId) {
+    throw new Error("durable Runtime media timeline alignment is required for artifact construction");
+  }
+  try {
+    addMillisecondsToUtcInstant(alignment.mediaOriginAt, 0);
+  } catch {
+    throw new Error("durable Runtime media timeline alignment is invalid");
+  }
+  return alignment;
 }
 
 function transcriptWarning(warning: TranscriptWarning): { readonly code: string; readonly detail: string } {
@@ -275,6 +284,24 @@ function transcriptWarning(warning: TranscriptWarning): { readonly code: string;
     case "cluster_identity_conflict": return { code: warning.code, detail: `cluster=${warning.cluster};identity_count=${warning.feishuUserIds.length}` };
     default: return { code: warning.code, detail: warning.code };
   }
+}
+
+function runtimeTextWarning(warning: string, transcript: TeamMemMeetingArtifact["transcript"]): { readonly code: string; readonly detail: string } {
+  const containsControl = containsControlCharacter(warning);
+  const looksSensitive = /\b(?:api[ _-]?key|authorization|bearer|credential|password|secret|token)\b/i.test(warning);
+  const repeatsTranscript = transcript.some((segment) => warning.includes(segment.text));
+  if (warning.trim().length === 0 || warning.length > 500 || containsControl || looksSensitive || repeatsTranscript) {
+    throw new Error("runtime text warning cannot be represented safely");
+  }
+  return { code: "runtime_text_warning", detail: warning };
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
 }
 
 function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript"]): string {

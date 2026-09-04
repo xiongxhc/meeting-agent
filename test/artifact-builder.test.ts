@@ -5,6 +5,7 @@ import { test } from "node:test";
 
 import {
   canonicalArtifactHash,
+  canonicalJson,
   parseTeamMemMeetingArtifact,
 } from "../src/contracts/teammem-meeting-v1.ts";
 import {
@@ -44,6 +45,7 @@ const attendance: readonly AttendanceInterval[] = [
 
 const reconciled: ReconciledTranscript = {
   transcriptComplete: true,
+  alignment: { kind: "durable_runtime_anchor", mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
   warnings: [],
   evidence: [],
   silentAttendees: ["ou_silent"],
@@ -79,20 +81,20 @@ const synthesis = {
   person_summaries: [{ person_id: "ou_ada", display_name: "Ada Synthetic", text: "Confirmed Atlas readiness." }],
 };
 
-function runtimeReturning(output: unknown): { readonly runtime: Pick<ConversationRuntimePort, "processText">; readonly calls: ProcessTextRequest[] } {
+function runtimeReturning(output: unknown, warnings: readonly string[] = []): { readonly runtime: Pick<ConversationRuntimePort, "processText">; readonly calls: ProcessTextRequest[] } {
   const calls: ProcessTextRequest[] = [];
   return {
     calls,
     runtime: {
       async processText(request) {
         calls.push(request);
-        return { output, warnings: [] };
+        return { output, warnings };
       },
     },
   };
 }
 
-function buildInput(runtime: Pick<ConversationRuntimePort, "processText">, revision = 1): ArtifactBuildInput {
+function buildInput(runtime: Pick<ConversationRuntimePort, "processText">, revision = 1, overrides: Partial<ArtifactBuildInput> = {}): ArtifactBuildInput {
   return {
     identity,
     provider: "feishu",
@@ -107,17 +109,28 @@ function buildInput(runtime: Pick<ConversationRuntimePort, "processText">, revis
     processingWarnings: [{ code: "synthetic_warning", detail: "Synthetic test warning." }],
     provenance: { runtimeProfile: "online", sttProvider: "synthetic-stt", sttModel: "synthetic-stt-v1", textProvider: "synthetic-text", textModel: "synthetic-text-v1", agentVersion: "meeting-agent/test", processedAt: "2026-09-02T14:11:00Z", finalBatchModel: "synthetic-diarize-v1", liveStreamModel: "synthetic-stream-v1" },
     audio: { format: "opus", encryption: "age-x25519", durationSeconds: 600, bytes: 512, sha256: `sha256:${"a".repeat(64)}`, expiresAt: "2026-09-16T14:10:00Z" },
+    ...overrides,
   };
 }
 
-test("canonical fixtures validate byte-for-byte and preserve cross-language short occurrence ids", () => {
+test("canonical fixtures validate byte-for-byte, use Python canonical bytes/hashes, and preserve cross-language short occurrence ids", () => {
   assert.equal(digest("minimal"), "3ae8e2fb6a65a32586b8baf06d743c2f8b935ef0a8d9f72cf5de7c3fa507d06a");
   assert.equal(digest("complete"), "78446a650a5d230595b30718ccb5bee44e498080fb2e4e1b689d358756bf43a3");
   const minimal = parseTeamMemMeetingArtifact(fixture("minimal"));
   const complete = parseTeamMemMeetingArtifact(fixture("complete"));
   assert.equal(shortOccurrenceId(minimal.occurrence_id as OccurrenceId), "3a16a8e2");
   assert.equal(shortOccurrenceId(complete.occurrence_id as OccurrenceId), "02ef68db");
-  assert.equal(canonicalArtifactHash(minimal), canonicalArtifactHash(JSON.parse(JSON.stringify(minimal))));
+  assert.equal(Buffer.byteLength(canonicalJson(minimal), "utf8"), 1_565);
+  assert.equal(Buffer.byteLength(canonicalJson(complete), "utf8"), 9_989);
+  assert.equal(canonicalArtifactHash(minimal), "sha256:8385539007b68264bff2491bef81a1e3aed6f07a2bbb951bd58e7cf54985a4ca");
+  assert.equal(canonicalArtifactHash(complete), "sha256:4b36ff782f2aee1290e57bde1b9191192bf6d38dfe77e862f6f84a7a31066b88");
+});
+
+test("canonical JSON orders punctuation, case, BMP, and astral keys by Unicode code point", () => {
+  assert.equal(
+    canonicalJson({ "𐀀": 8, "\uE000": 7, é: 6, a: 5, _: 4, Z: 3, A: 2, "!": 1 }),
+    '{"!":1,"A":2,"Z":3,"_":4,"a":5,"é":6,"\uE000":7,"𐀀":8}',
+  );
 });
 
 test("strict artifact parsing rejects unknown fields and invalid cross-field speaker, evidence, timing, attendance, and organizer claims", () => {
@@ -135,6 +148,33 @@ test("strict artifact parsing rejects unknown fields and invalid cross-field spe
   badAttendance.participants[0]!.attendance[0]!.left_at = null;
   badAttendance.participants[0]!.attendance.push({ joined_at: "2026-09-02T09:21:00Z", left_at: "2026-09-02T09:22:00Z" });
   assert.throws(() => parseTeamMemMeetingArtifact(badAttendance), /attendance/i);
+});
+
+test("strict artifact parsing accepts every legal fractional UTC width and rejects impossible and microsecond-reversed timing", () => {
+  for (const fraction of ["1", "12", "123", "1234", "12345", "123456"]) {
+    const artifact = structuredClone(fixture("minimal")) as { ended_at: string };
+    artifact.ended_at = `2026-09-02T09:22:00.${fraction}Z`;
+    assert.doesNotThrow(() => parseTeamMemMeetingArtifact(artifact));
+  }
+  const impossible = structuredClone(fixture("minimal")) as { ended_at: string };
+  impossible.ended_at = "2026-02-30T09:22:00.1Z";
+  assert.throws(() => parseTeamMemMeetingArtifact(impossible), /UTC instant/i);
+  const reversed = structuredClone(fixture("minimal")) as { transcript: Array<{ started_at: string; ended_at: string }> };
+  reversed.transcript[0]!.started_at = "2026-09-02T09:15:10.000002Z";
+  reversed.transcript[0]!.ended_at = "2026-09-02T09:15:10.000001Z";
+  assert.throws(() => parseTeamMemMeetingArtifact(reversed), /transcript ended_at/i);
+  const attendanceOverlap = structuredClone(fixture("minimal")) as { participants: Array<{ attendance: Array<{ joined_at: string; left_at: string | null }> }> };
+  attendanceOverlap.participants[0]!.attendance = [
+    { joined_at: "2026-09-02T09:15:00Z", left_at: "2026-09-02T09:16:00.000002Z" },
+    { joined_at: "2026-09-02T09:16:00.000001Z", left_at: "2026-09-02T09:17:00Z" },
+  ];
+  assert.throws(() => parseTeamMemMeetingArtifact(attendanceOverlap), /attendance must be ordered/i);
+  const gapOverlap = structuredClone(fixture("minimal")) as { recording_gaps: Array<{ started_at: string; ended_at: string; reason: string }> };
+  gapOverlap.recording_gaps = [
+    { started_at: "2026-09-02T09:16:00.000001Z", ended_at: "2026-09-02T09:16:00.000003Z", reason: "gap_a" },
+    { started_at: "2026-09-02T09:16:00.000002Z", ended_at: "2026-09-02T09:16:00.000004Z", reason: "gap_b" },
+  ];
+  assert.throws(() => parseTeamMemMeetingArtifact(gapOverlap), /recording_gaps must be ordered/i);
 });
 
 test("builder calls post-meeting text processing with strict JSON Schema, validates its result, and preserves only observed joiners", async () => {
@@ -156,12 +196,57 @@ test("builder calls post-meeting text processing with strict JSON Schema, valida
   assert.equal(built.artifact_hash, canonicalArtifactHash(built.artifact));
 });
 
+test("builder converts media offsets only through its session-matched durable Runtime anchor", async () => {
+  const anchored = {
+    ...reconciled,
+    alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:30Z", runtimeSessionId: 42n },
+  };
+  const { runtime } = runtimeReturning(synthesis);
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtime, 1, { transcript: anchored }));
+  assert.equal(built.artifact.transcript[0]!.started_at, "2026-09-02T14:00:35Z");
+  for (const transcript of [
+    { ...reconciled, alignment: null },
+    { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:30Z", runtimeSessionId: 43n } },
+  ]) {
+    const runtime = runtimeReturning(synthesis);
+    await assert.rejects(buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })), /alignment|anchor/i);
+    assert.equal(runtime.calls.length, 0);
+  }
+});
+
+test("builder serializes named confidence from the asserted identity only", async () => {
+  const transcript = {
+    ...reconciled,
+    alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
+    segments: [{
+      ...reconciled.segments[0]!,
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 } },
+    }],
+  };
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis).runtime, 1, { transcript }));
+  assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
+});
+
 test("builder fails closed before processText until the voice meeting ended and rejects unsupported text output", async () => {
   const live = runtimeReturning(synthesis);
   await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(live.runtime), meetingEnded: false }), /ended/i);
   assert.equal(live.calls.length, 0);
   const invalid = runtimeReturning({ ...synthesis, unexpected: true });
   await assert.rejects(buildTeamMemMeetingArtifact(buildInput(invalid.runtime)), /unknown|unrecognized|unexpected/i);
+});
+
+test("builder preserves representable Runtime warnings and rejects unsafe or oversized warnings without echoing them", async () => {
+  const safe = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis, ["structured output repaired one omitted field"]).runtime, 1, {
+    transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } },
+  }));
+  assert.deepEqual(safe.artifact.processing_warnings.at(-1), { code: "runtime_text_warning", detail: "structured output repaired one omitted field" });
+  for (const warning of ["unsafe\u0000credential=do-not-echo", "x".repeat(501)]) {
+    const runtime = runtimeReturning(synthesis, [warning]);
+    await assert.rejects(
+      buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript: { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } } })),
+      (error: Error) => /warning cannot be represented/i.test(error.message) && !/credential|do-not-echo|unsafe/i.test(error.message),
+    );
+  }
 });
 
 test("builder rejects inferred project evidence, inferred owners and dates, and summaries for silent attendees", async () => {
@@ -177,13 +262,14 @@ test("builder rejects inferred project evidence, inferred owners and dates, and 
 
 test("revision guard makes same revision byte-stable, rejects conflict and lower revision, and accepts a higher changed revision", async () => {
   const guard = createArtifactRevisionGuard();
-  const first = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime), revisionGuard: guard });
-  const replay = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime), revisionGuard: guard });
+  const aligned = { ...reconciled, alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n } };
+  const first = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime, 1, { transcript: aligned }), revisionGuard: guard });
+  const replay = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime, 1, { transcript: aligned }), revisionGuard: guard });
   assert.equal(first.serialized, replay.serialized);
   assert.equal(first.artifact_hash, replay.artifact_hash);
   const changed = { ...synthesis, summary: "A materially changed summary." };
-  await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(changed).runtime), revisionGuard: guard }), /immutable|conflict/i);
-  await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(changed).runtime, 0), revisionGuard: guard }), /revision/i);
-  const higher = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(changed).runtime, 2), revisionGuard: guard });
+  await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(changed).runtime, 1, { transcript: aligned }), revisionGuard: guard }), /immutable|conflict/i);
+  const higher = await buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(changed).runtime, 2, { transcript: aligned }), revisionGuard: guard });
   assert.notEqual(higher.artifact_hash, first.artifact_hash);
+  await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime, 1, { transcript: aligned }), revisionGuard: guard }), /lower/i);
 });
