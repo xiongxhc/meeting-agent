@@ -266,10 +266,22 @@ function validateReconciledEvidence(segment: ReconciledSegment): number {
   }
   const duration = segment.endedAtMs - segment.startedAtMs;
   if (duration <= 0) throw new Error("reconciled attribution evidence is invalid");
-  for (const value of Object.values(segment.provenance.uiExactMs)) {
+  const components = [
+    ...Object.values(segment.provenance.uiExactMs),
+    segment.provenance.ambiguousMs,
+    segment.provenance.unobservedMs,
+  ];
+  let total = 0n;
+  for (const value of components) {
     if (!Number.isSafeInteger(value) || value < 0 || value > duration) {
       throw new Error("reconciled attribution evidence is invalid");
     }
+    total += BigInt(value);
+  }
+  if (total > BigInt(duration)) throw new Error("reconciled attribution evidence is invalid");
+  if (segment.speaker.kind === "named") {
+    const asserted = segment.provenance.uiExactMs[segment.speaker.feishuUserId];
+    if (asserted === undefined || asserted <= 0) throw new Error("reconciled attribution evidence is invalid");
   }
   return duration;
 }

@@ -276,6 +276,60 @@ test("builder rejects non-finite, negative, and over-duration reconciliation evi
   }
 });
 
+test("builder rejects malformed ambiguous and unobserved provenance components before Runtime processing", async () => {
+  for (const provenance of [
+    { ...reconciled.segments[0]!.provenance, ambiguousMs: Number.NaN },
+    { ...reconciled.segments[0]!.provenance, ambiguousMs: Infinity },
+    { ...reconciled.segments[0]!.provenance, ambiguousMs: -1 },
+    { ...reconciled.segments[0]!.provenance, ambiguousMs: 1.5 },
+    { ...reconciled.segments[0]!.provenance, unobservedMs: Number.NaN },
+    { ...reconciled.segments[0]!.provenance, unobservedMs: Infinity },
+    { ...reconciled.segments[0]!.provenance, unobservedMs: -1 },
+    { ...reconciled.segments[0]!.provenance, unobservedMs: 1.5 },
+  ]) {
+    const runtime = runtimeReturning(synthesis);
+    const transcript = {
+      ...reconciled,
+      alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
+      segments: [{ ...reconciled.segments[0]!, provenance }],
+    };
+    await assert.rejects(buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })), /attribution evidence/i);
+    assert.equal(runtime.calls.length, 0);
+  }
+});
+
+test("builder rejects overfull mutually exclusive attribution evidence and unsupported named claims before Runtime processing", async () => {
+  const invalidProvenance = [
+    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 3_000 } },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 }, ambiguousMs: 1_000, unobservedMs: 1_000 },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_competitor: 500 } },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 0 } },
+  ];
+  for (const provenance of invalidProvenance) {
+    const runtime = runtimeReturning(synthesis);
+    const transcript = {
+      ...reconciled,
+      alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
+      segments: [{ ...reconciled.segments[0]!, provenance }],
+    };
+    await assert.rejects(buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })), /attribution evidence/i);
+    assert.equal(runtime.calls.length, 0);
+  }
+});
+
+test("builder accepts an attribution evidence aggregate exactly equal to the segment duration", async () => {
+  const transcript = {
+    ...reconciled,
+    alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
+    segments: [{
+      ...reconciled.segments[0]!,
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 }, ambiguousMs: 1_000, unobservedMs: 500 },
+    }],
+  };
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis).runtime, 1, { transcript }));
+  assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
+});
+
 test("builder fails closed before processText until the voice meeting ended and rejects unsupported text output", async () => {
   const live = runtimeReturning(synthesis);
   await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(live.runtime), meetingEnded: false }), /ended/i);
