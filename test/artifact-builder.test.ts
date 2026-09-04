@@ -114,6 +114,27 @@ function buildInput(runtime: Pick<ConversationRuntimePort, "processText">, revis
   };
 }
 
+async function assertUiExactMsRejected(uiExactMs: unknown, ambiguousMs = 0): Promise<void> {
+  const runtime = runtimeReturning(synthesis);
+  const transcript = {
+    ...reconciled,
+    segments: [{
+      ...reconciled.segments[0]!,
+      provenance: {
+        ...reconciled.segments[0]!.provenance,
+        uiExactMs: uiExactMs as Readonly<Record<string, number>>,
+        ambiguousMs,
+        unobservedMs: 0,
+      },
+    }],
+  };
+  await assert.rejects(
+    buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })),
+    (error: Error) => error.message === "reconciled attribution evidence is invalid",
+  );
+  assert.equal(runtime.calls.length, 0);
+}
+
 test("canonical fixtures validate byte-for-byte, use Python canonical bytes/hashes, and preserve cross-language short occurrence ids", () => {
   assert.equal(digest("minimal"), "3ae8e2fb6a65a32586b8baf06d743c2f8b935ef0a8d9f72cf5de7c3fa507d06a");
   assert.equal(digest("complete"), "78446a650a5d230595b30718ccb5bee44e498080fb2e4e1b689d358756bf43a3");
@@ -314,6 +335,131 @@ test("builder rejects overfull mutually exclusive attribution evidence and unsup
     };
     await assert.rejects(buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })), /attribution evidence/i);
     assert.equal(runtime.calls.length, 0);
+  }
+});
+
+test("builder rejects inherited asserted evidence before Runtime even when enumerable own evidence fits", async () => {
+  const inherited = Object.create({ ou_ada: 8_000 }) as Record<string, number>;
+  await assertUiExactMsRejected(inherited, 10_000);
+});
+
+test("builder rejects non-enumerable own asserted evidence before Runtime even when enumerable evidence fits", async () => {
+  const nonEnumerable: Record<string, number> = {};
+  Object.defineProperty(nonEnumerable, "ou_ada", { value: 8_000, enumerable: false });
+  await assertUiExactMsRejected(nonEnumerable, 10_000);
+});
+
+test("builder rejects an enumerable stateful evidence getter without reading it", async () => {
+  let reads = 0;
+  const stateful: Record<string, number> = {};
+  Object.defineProperty(stateful, "ou_ada", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return reads === 1 ? 8_000 : Number.NaN;
+    },
+  });
+  await assertUiExactMsRejected(stateful);
+  assert.equal(reads, 0);
+});
+
+test("builder translates a throwing evidence accessor to the generic pre-Runtime error without invoking it", async () => {
+  let reads = 0;
+  const throwing: Record<string, number> = {};
+  Object.defineProperty(throwing, "ou_ada", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error("private getter sentinel");
+    },
+  });
+  await assertUiExactMsRejected(throwing);
+  assert.equal(reads, 0);
+});
+
+test("builder rejects symbol-keyed evidence before Runtime processing", async () => {
+  const symbolKeyed: Record<string | symbol, number> = { ou_ada: 8_000 };
+  Object.defineProperty(symbolKeyed, Symbol("hidden identity"), { value: 3_000, enumerable: true });
+  await assertUiExactMsRejected(symbolKeyed);
+});
+
+test("builder rejects array-shaped evidence before Runtime processing", async () => {
+  const arrayShaped = [0] as unknown as Record<string, number>;
+  Object.defineProperty(arrayShaped, "ou_ada", { value: 8_000, enumerable: true });
+  await assertUiExactMsRejected(arrayShaped);
+});
+
+test("builder rejects class-instance evidence before Runtime processing", async () => {
+  class EvidenceRecord {
+    readonly ou_ada = 8_000;
+  }
+  await assertUiExactMsRejected(new EvidenceRecord());
+});
+
+test("builder rejects exotic built-in evidence before Runtime processing", async () => {
+  const exotic = new Date(0) as unknown as Record<string, number>;
+  Object.defineProperty(exotic, "ou_ada", { value: 8_000, enumerable: true });
+  await assertUiExactMsRejected(exotic);
+});
+
+test("builder translates evidence reflection failures to the generic error before Runtime", async () => {
+  let reflections = 0;
+  const hostile = new Proxy({ ou_ada: 8_000 }, {
+    getOwnPropertyDescriptor() {
+      reflections += 1;
+      throw new Error("private reflection sentinel");
+    },
+  });
+  await assertUiExactMsRejected(hostile);
+  assert.equal(reflections, 0);
+});
+
+test("builder accepts ordinary and null-prototype own enumerable data evidence records", async () => {
+  const ordinary = { ou_ada: 8_000, ou_competitor: 500 };
+  const nullPrototype = Object.create(null) as Record<string, number>;
+  Object.defineProperties(nullPrototype, {
+    ou_ada: { value: 8_000, enumerable: true },
+    ou_competitor: { value: 500, enumerable: true },
+  });
+  for (const uiExactMs of [ordinary, nullPrototype]) {
+    const runtime = runtimeReturning(synthesis);
+    const transcript = {
+      ...reconciled,
+      segments: [{
+        ...reconciled.segments[0]!,
+        provenance: { ...reconciled.segments[0]!.provenance, uiExactMs, ambiguousMs: 1_000, unobservedMs: 500 },
+      }],
+    };
+    const built = await buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript }));
+    assert.equal(runtime.calls.length, 1);
+    assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
+  }
+});
+
+test("builder preserves legitimate anonymous and ambiguous mutually-exclusive evidence", async () => {
+  const nullPrototype = Object.create(null) as Record<string, number>;
+  const cases = [
+    {
+      speaker: { kind: "anonymous" as const, label: "speaker_01" },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: {}, ambiguousMs: 0, unobservedMs: 10_000 },
+      artifactKind: "anonymous",
+    },
+    {
+      speaker: { kind: "ambiguous" as const },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: nullPrototype, ambiguousMs: 10_000, unobservedMs: 0 },
+      artifactKind: "ambiguous",
+    },
+  ];
+  for (const scenario of cases) {
+    const runtime = runtimeReturning({ ...synthesis, person_summaries: [] });
+    const transcript = {
+      ...reconciled,
+      segments: [{ ...reconciled.segments[0]!, speaker: scenario.speaker, provenance: scenario.provenance }],
+    };
+    const built = await buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript }));
+    assert.equal(runtime.calls.length, 1);
+    assert.equal(built.artifact.transcript[0]!.speaker.kind, scenario.artifactKind);
+    assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0);
   }
 });
 

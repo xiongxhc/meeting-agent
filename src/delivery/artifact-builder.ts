@@ -2,6 +2,7 @@
 // creates no files and performs no delivery: Task 9 owns the outbox/bundle.
 
 import { createHash } from "node:crypto";
+import { isProxy } from "node:util/types";
 import { z } from "zod";
 
 import {
@@ -260,14 +261,20 @@ function toArtifactSpeaker(segment: ReconciledSegment, names: ReadonlyMap<string
   }
 }
 
-function validateReconciledEvidence(segment: ReconciledSegment): number {
+type ReconciledEvidenceSnapshot = {
+  readonly duration: number;
+  readonly assertedMs: number;
+};
+
+function validateReconciledEvidence(segment: ReconciledSegment): ReconciledEvidenceSnapshot {
   if (!Number.isSafeInteger(segment.startedAtMs) || !Number.isSafeInteger(segment.endedAtMs) || segment.startedAtMs < 0 || segment.endedAtMs < segment.startedAtMs) {
     throw new Error("reconciled attribution evidence is invalid");
   }
   const duration = segment.endedAtMs - segment.startedAtMs;
   if (duration <= 0) throw new Error("reconciled attribution evidence is invalid");
+  const uiExactMs = snapshotUiExactMs(segment.provenance.uiExactMs);
   const components = [
-    ...Object.values(segment.provenance.uiExactMs),
+    ...uiExactMs.values(),
     segment.provenance.ambiguousMs,
     segment.provenance.unobservedMs,
   ];
@@ -279,16 +286,40 @@ function validateReconciledEvidence(segment: ReconciledSegment): number {
     total += BigInt(value);
   }
   if (total > BigInt(duration)) throw new Error("reconciled attribution evidence is invalid");
+  let assertedMs = 0;
   if (segment.speaker.kind === "named") {
-    const asserted = segment.provenance.uiExactMs[segment.speaker.feishuUserId];
-    if (asserted === undefined || asserted <= 0) throw new Error("reconciled attribution evidence is invalid");
+    if (!uiExactMs.has(segment.speaker.feishuUserId)) throw new Error("reconciled attribution evidence is invalid");
+    assertedMs = uiExactMs.get(segment.speaker.feishuUserId)!;
+    if (assertedMs <= 0) throw new Error("reconciled attribution evidence is invalid");
   }
-  return duration;
+  return { duration, assertedMs };
 }
 
-function attributionConfidence(segment: ReconciledSegment, duration: number): number {
+function snapshotUiExactMs(uiExactMs: Readonly<Record<string, number>>): ReadonlyMap<string, number> {
+  try {
+    if (typeof uiExactMs !== "object" || uiExactMs === null || Array.isArray(uiExactMs) || isProxy(uiExactMs)) {
+      throw new Error("unsupported evidence record");
+    }
+    const prototype = Object.getPrototypeOf(uiExactMs);
+    if (prototype !== Object.prototype && prototype !== null) throw new Error("unsupported evidence record");
+    const snapshot = new Map<string, number>();
+    for (const key of Reflect.ownKeys(uiExactMs)) {
+      if (typeof key !== "string") throw new Error("unsupported evidence record");
+      const descriptor = Object.getOwnPropertyDescriptor(uiExactMs, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new Error("unsupported evidence record");
+      }
+      snapshot.set(key, descriptor.value as number);
+    }
+    return snapshot;
+  } catch {
+    throw new Error("reconciled attribution evidence is invalid");
+  }
+}
+
+function attributionConfidence(segment: ReconciledSegment, evidence: ReconciledEvidenceSnapshot): number {
   if (segment.speaker.kind !== "named") return 0;
-  return (segment.provenance.uiExactMs[segment.speaker.feishuUserId] ?? 0) / duration;
+  return evidence.assertedMs / evidence.duration;
 }
 
 function requireMatchingAlignment(alignment: MediaTimelineAlignment | null, sessionId: bigint): MediaTimelineAlignment {
