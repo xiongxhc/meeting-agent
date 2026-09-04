@@ -170,6 +170,7 @@ export type SessionCoordinator = {
     recording: RecordingInput,
     reconciliationBridgeSessionId?: string,
     reconciliationTerminalAtMs?: number,
+    reconciliationTerminalSource?: "bridge_observed" | "local_clock",
   ): SessionRow;
 
   /** The persisted recording for an occurrence, or null if it never finalized
@@ -177,7 +178,7 @@ export type SessionCoordinator = {
   recording(occurrenceId: string): RecordingRow | null;
   beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string): void;
   setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
-  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs?: number): void;
+  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs?: number, terminalSource?: "bridge_observed" | "local_clock"): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   reconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;
@@ -330,12 +331,14 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     recording: RecordingInput,
     reconciliationBridgeSessionId?: string,
     reconciliationTerminalAtMs?: number,
+    reconciliationTerminalSource?: "bridge_observed" | "local_clock",
     ): SessionRow {
       return store.finalizeSession({
         transition: transitionFor(occurrenceId, outcome),
         recording,
         ...(reconciliationBridgeSessionId === undefined ? {} : { reconciliationBridgeSessionId }),
         ...(reconciliationTerminalAtMs === undefined ? {} : { reconciliationTerminalAtMs }),
+        ...(reconciliationTerminalSource === undefined ? {} : { reconciliationTerminalSource }),
       }).session;
     },
 
@@ -350,8 +353,8 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void {
       store.setReconciliationRuntimeSession(occurrenceId, bridgeSessionId, runtimeSessionId);
     },
-    completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs = clock.now()): void {
-      store.completeReconciliationGeneration(occurrenceId, bridgeSessionId, terminalAtMs);
+    completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs = clock.now(), terminalSource = "local_clock"): void {
+      store.completeReconciliationGeneration(occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
     },
     appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void {
       store.appendReconciliationBridgeEvent(occurrenceId, event);

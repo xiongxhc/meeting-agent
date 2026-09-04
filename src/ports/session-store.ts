@@ -152,6 +152,7 @@ export type ReconciliationEvidenceRow = {
   readonly incompleteReason: "event_limit_exceeded" | "live_text_limit_exceeded" | null;
   readonly expiresAtMs: number | null;
   readonly terminalAtMs: number | null;
+  readonly terminalSource: "bridge_observed" | "local_clock" | null;
   readonly bridgeEvents: readonly ReconciliationBridgeEventRow[];
   readonly liveSegments: readonly ReconciliationLiveSegmentRow[];
 };
@@ -187,6 +188,7 @@ export type FinalizeSessionInput = {
   readonly reconciliationBridgeSessionId?: string;
   /** Observed bridge terminal instant when available; never generation start. */
   readonly reconciliationTerminalAtMs?: number;
+  readonly reconciliationTerminalSource?: "bridge_observed" | "local_clock";
 };
 
 export type FinalizeSessionResult = {
@@ -298,7 +300,7 @@ export type SessionStore = {
   getRecording(occurrenceId: string): RecordingRow | null;
   beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, createdAtMs: number): void;
   setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
-  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number): void;
+  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number, terminalSource: "bridge_observed" | "local_clock"): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   getReconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;

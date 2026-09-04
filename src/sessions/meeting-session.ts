@@ -327,6 +327,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let speaking: SpeakingState = "enabled";
   let speakingAbortReason: string | null = null;
   let runtimeSessionId: bigint | null = null;
+  let reconciliationGenerationStarted = false;
   let bridgeConnected = true;
   let mediaConnected = false;
   let reconnectAttempts = 0;
@@ -680,7 +681,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         return;
 
       case "left":
-        await terminate(event.reason, Date.parse(event.observedAt));
+        await terminate(event.reason, Date.parse(event.observedAt), "bridge_observed");
         return;
 
       case "media_connected":
@@ -866,7 +867,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * declares -- `bridge_failure` included. bridge-session/v1 has no re-open,
    * so resuming a meeting means a NEW session against a NEW lease, which is
    * the coordinator's business, not this session's. */
-  async function terminate(reason: "ended" | "removed" | "bridge_failure", terminalAtMs?: number): Promise<void> {
+  async function terminate(
+    reason: "ended" | "removed" | "bridge_failure",
+    terminalAtMs?: number,
+    terminalSource: "bridge_observed" | "local_clock" = "local_clock",
+  ): Promise<void> {
     if (terminalReason !== null) return;
     terminalReason = reason;
     phase = "ended";
@@ -890,9 +895,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         );
         // This bridge generation is over even when recovery will create a
         // fresh one; its local wording must not remain a live generation.
-        coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs);
+        coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
       } else {
-        applyTerminalTransition(reason, terminalAtMs);
+        applyTerminalTransition(reason, terminalAtMs, terminalSource);
       }
     } finally {
       // In a `finally`, because a finalization that throws must not leave the
@@ -901,6 +906,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // losing the subscriptions on top of it would make the session
       // "structurally deaf after a left" false in exactly the branch where it
       // matters most.
+      if (reconciliationGenerationStarted) {
+        try {
+          coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
+        } catch (error) {
+          routingErrors.push({ source: "join_cleanup", error });
+        }
+      }
       await closeRuntime();
       releaseLease(reason === "bridge_failure" ? "bridge_failure" : "left");
       unsubscribe();
@@ -920,27 +932,34 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * goes in alone -- the session really did end, and refusing to record that
    * because the recording was lost would strand the occurrence on top of
    * losing the audio. */
-  function applyTerminalTransition(reason: "ended" | "removed" | "bridge_failure", terminalAtMs?: number): void {
-    const state = coordinator.get(identity.occurrenceId)?.state ?? null;
-    if (state === null || state === "notified" || state === "failed") return;
+  function applyTerminalTransition(
+    reason: "ended" | "removed" | "bridge_failure",
+    terminalAtMs?: number,
+    terminalSource: "bridge_observed" | "local_clock" = "local_clock",
+  ): void {
+    try {
+      const state = coordinator.get(identity.occurrenceId)?.state ?? null;
+      if (state === null || state === "notified" || state === "failed") return;
 
-    const outcome: TerminalOutcome =
-      reason === "bridge_failure"
-        ? { kind: "fail", terminalReason: "bridge_failure" }
-        : state === "listening"
-          ? { kind: "advance", toState: "finalizing" }
-          : { kind: "fail", terminalReason: reason };
+      const outcome: TerminalOutcome =
+        reason === "bridge_failure"
+          ? { kind: "fail", terminalReason: "bridge_failure" }
+          : state === "listening"
+            ? { kind: "advance", toState: "finalizing" }
+            : { kind: "fail", terminalReason: reason };
 
-    if (recording !== null) {
-      coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), bridgeSessionId, terminalAtMs);
-      return;
+      if (recording !== null) {
+        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), bridgeSessionId, terminalAtMs, terminalSource);
+        return;
+      }
+      if (outcome.kind === "fail") {
+        coordinator.fail(identity.occurrenceId, outcome.terminalReason);
+      } else {
+        coordinator.advance(identity.occurrenceId, outcome.toState);
+      }
+    } finally {
+      coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
     }
-    if (outcome.kind === "fail") {
-      coordinator.fail(identity.occurrenceId, outcome.terminalReason);
-    } else {
-      coordinator.advance(identity.occurrenceId, outcome.toState);
-    }
-    coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs);
   }
 
   /**
@@ -1028,6 +1047,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // swallowed here so the original error is what join() rethrows.
       routingErrors.push({ source: "join_cleanup", error });
     } finally {
+      if (reconciliationGenerationStarted) {
+        try {
+          coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
+        } catch (error) {
+          routingErrors.push({ source: "join_cleanup", error });
+        }
+      }
       // Same reason as terminate()'s finally: a cleanup that throws must not
       // leave the session subscribed to two planes it has already declared
       // itself terminal for.
@@ -1088,6 +1114,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       });
       leaseId = lease.leaseId;
       coordinator.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
+      reconciliationGenerationStarted = true;
 
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });

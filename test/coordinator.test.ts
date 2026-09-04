@@ -172,7 +172,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 10);
+      assert.equal(store.schemaVersion, 11);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -184,6 +184,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 8, name: "008_reconciliation_evidence.sql", appliedAtMs: BASE_MS },
         { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
         { version: 10, name: "010_reconciliation_evidence_hardening.sql", appliedAtMs: BASE_MS },
+        { version: 11, name: "011_reconciliation_provenance_and_terminal.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -228,7 +229,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 10);
+      assert.equal(second.schemaVersion, 11);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -242,6 +243,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 8, name: "008_reconciliation_evidence.sql", appliedAtMs: BASE_MS },
         { version: 9, name: "009_reconciliation_generations.sql", appliedAtMs: BASE_MS },
         { version: 10, name: "010_reconciliation_evidence_hardening.sql", appliedAtMs: BASE_MS },
+        { version: 11, name: "011_reconciliation_provenance_and_terminal.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -270,7 +272,7 @@ test("reconciliation evidence survives reopening with exact bigint identity, env
     try {
       assert.deepEqual(second.getReconciliationEvidence(id.occurrenceId, null), {
         occurrenceId: id.occurrenceId, generationId: `${Buffer.from(id.occurrenceId).toString("hex")}:${Buffer.from("bridge_1").toString("hex")}`, runtimeSessionId: 9_007_199_254_740_993n,
-        alignment: null, alignmentStatus: "unavailable_current_sdk", captureComplete: true, incompleteReason: null, terminalAtMs: null, expiresAtMs: null,
+        alignment: null, alignmentStatus: "unavailable_current_sdk", captureComplete: true, incompleteReason: null, terminalAtMs: null, terminalSource: null, expiresAtMs: null,
         bridgeEvents: [
           { bridgeSessionId: "bridge_1", sequence: 7, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", observedAtMs: Date.parse("2026-09-02T14:00:00Z"), type: "participant_joined", feishuUserId: "ou_a", displayName: "Synthetic", confidence: null },
           { bridgeSessionId: "bridge_1", sequence: 8, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00.500Z", observedAtMs: Date.parse("2026-09-02T14:00:00.500Z"), type: "active_speaker", feishuUserId: "ou_a", displayName: null, confidence: "ui_exact" },
@@ -321,9 +323,9 @@ test("expired bounded reconciliation evidence purges generation children atomica
     store.appendReconciliationLiveSegment(id.occurrenceId, { bridgeSessionId: "bridge_expired", segmentId: "seg", text: "bounded scratch", startedAt: "2026-09-02T14:00:00Z", endedAt: "2026-09-02T14:00:01Z" });
     // Only a terminal lifecycle timestamp makes recovery scratch eligible.
     const raw = new Database(h.dbPath);
-    raw.prepare("UPDATE reconciliation_generations SET terminal_at_ms = ?, expires_at_ms = ? WHERE occurrence_id = ?").run(BASE_MS, BASE_MS + 1, id.occurrenceId);
+    raw.prepare("UPDATE reconciliation_generations SET terminal_at_ms = ?, terminal_source = 'local_clock', expires_at_ms = ? WHERE occurrence_id = ?").run(BASE_MS, BASE_MS + 14 * 24 * 60 * 60 * 1000, id.occurrenceId);
     raw.close();
-    assert.equal(store.purgeExpiredReconciliationEvidence(BASE_MS + 1), 1);
+    assert.equal(store.purgeExpiredReconciliationEvidence(BASE_MS + 14 * 24 * 60 * 60 * 1000), 1);
     assert.equal(store.getReconciliationEvidence(id.occurrenceId, null), null);
     assert.deepEqual(store.foreignKeyCheck(), []);
     store.close();
@@ -356,14 +358,35 @@ test("reconciliation evidence rejects impossible UTC instants, empty identities,
     const raw = new Database(h.dbPath);
     try {
       const generation = raw.prepare("SELECT generation_id FROM reconciliation_generations WHERE occurrence_id = ?").get(id.occurrenceId) as { generation_id: string };
-      const event = raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, 'semantic_bridge', ?, 'bridge-session/v1', ?, 1756821600000, ?, ?, ?, ?)");
-      assert.throws(() => event.run(generation.generation_id, 1, "2026-02-31T14:00:00Z", "participant_joined", "ou_a", "Ada", null));
-      assert.throws(() => event.run(generation.generation_id, 2, "2026-09-02T14:00:00Z", "participant_joined", "", "Ada", null));
-      assert.throws(() => event.run(generation.generation_id, 3, "2026-09-02T14:00:00Z", "active_speaker", "ou_a", "Ada", "ui_exact"));
-      assert.throws(() => event.run(generation.generation_id, 0, "2026-09-02T14:00:00Z", "participant_left", "ou_a", null, null));
-      assert.throws(() => event.run(generation.generation_id, 4, "2026-09-02T14:00:00+00:00", "participant_left", "ou_a", null, null));
-      const live = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'reverse', 'wording', '2026-09-02T14:00:01Z', 1756821601000, '2026-09-02T14:00:00Z', 1756821600000)");
-      assert.throws(() => live.run(generation.generation_id));
+      const event = raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, 'semantic_bridge', ?, 'bridge-session/v1', ?, ?, ?, ?, ?, ?)");
+      assert.throws(() => event.run(generation.generation_id, 1, "2026-02-31T14:00:00Z", Date.parse("2026-02-31T14:00:00Z"), "participant_joined", "ou_a", "Ada", null));
+      assert.throws(() => event.run(generation.generation_id, 2, "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "participant_joined", "", "Ada", null));
+      assert.throws(() => event.run(generation.generation_id, 3, "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "active_speaker", "ou_a", "Ada", "ui_exact"));
+      assert.throws(() => event.run(generation.generation_id, 0, "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "participant_left", "ou_a", null, null));
+      assert.throws(() => event.run(generation.generation_id, 4, "2026-09-02T14:00:00+00:00", Date.parse("2026-09-02T14:00:00+00:00"), "participant_left", "ou_a", null, null));
+      assert.throws(() => event.run(generation.generation_id, 5, "2026-09-02T14:00:00.12Z", Date.parse("2026-09-02T14:00:00.12Z"), "participant_left", "ou_a", null, null));
+      const live = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'reverse', 'wording', '2026-09-02T14:00:01Z', ?, '2026-09-02T14:00:00Z', ?)");
+      assert.throws(() => live.run(generation.generation_id, Date.parse("2026-09-02T14:00:01Z"), Date.parse("2026-09-02T14:00:00Z")));
+    } finally { raw.close(); store.close(); }
+  } finally { h.cleanup(); }
+});
+
+test("raw reconciliation rows cannot disagree between retained UTC provenance and numeric ordering instants", () => {
+  const h = harness();
+  try {
+    const id = identity(101);
+    const store = h.open();
+    store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+    store.beginReconciliationGeneration(id.occurrenceId, "provenance_bridge", BASE_MS);
+    const raw = new Database(h.dbPath);
+    try {
+      const generation = raw.prepare("SELECT generation_id FROM reconciliation_generations WHERE occurrence_id = ?").get(id.occurrenceId) as { generation_id: string };
+      const event = raw.prepare("INSERT INTO reconciliation_bridge_events (generation_id, bridge_session_id, sequence, schema, observed_at, observed_at_ms, type, feishu_user_id, display_name, confidence) VALUES (?, 'provenance_bridge', ?, 'bridge-session/v1', ?, ?, 'participant_joined', 'ou_a', 'Ada', NULL)");
+      assert.throws(() => event.run(generation.generation_id, 1, "2026-09-02T14:00:00Z", 0));
+      event.run(generation.generation_id, 2, "2026-09-02T14:00:00.123Z", Date.parse("2026-09-02T14:00:00.123Z"));
+      const live = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, ?, 'wording', ?, ?, ?, ?)");
+      assert.throws(() => live.run(generation.generation_id, "bad", "2026-09-02T14:00:00Z", 0, "2026-09-02T14:00:00.001Z", 1));
+      live.run(generation.generation_id, "good", "2026-09-02T14:00:00Z", Date.parse("2026-09-02T14:00:00Z"), "2026-09-02T14:00:00.123Z", Date.parse("2026-09-02T14:00:00.123Z"));
     } finally { raw.close(); store.close(); }
   } finally { h.cleanup(); }
 });
@@ -379,9 +402,9 @@ test("the database atomically marks capture incomplete when direct evidence woul
     const secondConnection = new Database(h.dbPath);
     try {
       const generation = raw.prepare("SELECT generation_id FROM reconciliation_generations WHERE occurrence_id = ?").get(id.occurrenceId) as { generation_id: string };
-      const insert = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, ?, 'wording', '2026-09-02T14:00:00Z', 1756821600000, '2026-09-02T14:00:01Z', 1756821601000)");
+      const insert = raw.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, ?, 'wording', '2026-09-02T14:00:00Z', 1788357600000, '2026-09-02T14:00:01Z', 1788357601000)");
       for (let index = 0; index < 255; index += 1) insert.run(generation.generation_id, `segment_${index}`);
-      secondConnection.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'segment_255', 'wording', '2026-09-02T14:00:00Z', 1756821600000, '2026-09-02T14:00:01Z', 1756821601000)").run(generation.generation_id);
+      secondConnection.prepare("INSERT INTO reconciliation_live_segments (generation_id, segment_id, text, started_at, started_at_ms, ended_at, ended_at_ms) VALUES (?, 'segment_255', 'wording', '2026-09-02T14:00:00Z', 1788357600000, '2026-09-02T14:00:01Z', 1788357601000)").run(generation.generation_id);
       assert.throws(() => insert.run(generation.generation_id, "segment_overflow"));
       assert.deepEqual(store.getReconciliationEvidence(id.occurrenceId, null)?.incompleteReason, "event_limit_exceeded");
       assert.equal((raw.prepare("SELECT count(*) AS count FROM reconciliation_live_segments WHERE generation_id = ?").get(generation.generation_id) as { count: number }).count, 256);
@@ -398,6 +421,23 @@ test("a live reconciliation generation is never purge-eligible merely because it
     store.beginReconciliationGeneration(id.occurrenceId, "live_bridge", BASE_MS);
     assert.equal(store.purgeExpiredReconciliationEvidence(BASE_MS + 365 * 24 * 60 * 60 * 1000), 0);
     assert.notEqual(store.getReconciliationEvidence(id.occurrenceId, null), null);
+    store.close();
+  } finally { h.cleanup(); }
+});
+
+test("terminalizing an evidence generation is idempotent and cannot move its retention deadline", () => {
+  const h = harness();
+  try {
+    const id = identity(102);
+    const store = h.open();
+    store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+    store.beginReconciliationGeneration(id.occurrenceId, "idempotent_bridge", BASE_MS);
+    store.completeReconciliationGeneration(id.occurrenceId, "idempotent_bridge", BASE_MS, "local_clock");
+    store.completeReconciliationGeneration(id.occurrenceId, "idempotent_bridge", BASE_MS + 1, "local_clock");
+    const evidence = store.getReconciliationEvidence(id.occurrenceId, null);
+    assert.equal(evidence?.terminalAtMs, BASE_MS);
+    assert.equal(evidence?.terminalSource, "local_clock");
+    assert.equal(evidence?.expiresAtMs, BASE_MS + 14 * 24 * 60 * 60 * 1000);
     store.close();
   } finally { h.cleanup(); }
 });
@@ -442,7 +482,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 10);
+      assert.equal(store.schemaVersion, 11);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);

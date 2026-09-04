@@ -89,6 +89,7 @@ const IDENTITY: MeetingIdentity = buildMeetingIdentity({
 // ---------------------------------------------------------------------------
 
 type Harness = {
+  readonly dbPath: string;
   readonly bridge: FakeBridge;
   readonly runtime: FakeRuntime;
   readonly coordinator: SessionCoordinator;
@@ -109,7 +110,8 @@ type HarnessOptions = {
 
 function harness(options: HarnessOptions = {}): Harness {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-agent-session-"));
-  const store = openSessionStore({ filename: path.join(dir, "orchestration.db"), nowMs: BASE_MS });
+  const dbPath = path.join(dir, "orchestration.db");
+  const store = openSessionStore({ filename: dbPath, nowMs: BASE_MS });
   const clock = fakeClock(BASE_MS);
   const coordinator = createCoordinator({
     store,
@@ -136,6 +138,7 @@ function harness(options: HarnessOptions = {}): Harness {
   });
 
   return {
+    dbPath,
     bridge,
     runtime,
     coordinator,
@@ -1355,6 +1358,7 @@ test("active_speaker observations and finalized segments are retained as provisi
       captureComplete: true,
       incompleteReason: null,
       terminalAtMs: null,
+      terminalSource: null,
       expiresAtMs: null,
       bridgeEvents: [
         { bridgeSessionId: BRIDGE_SESSION_ID, sequence: 2, schema: "bridge-session/v1", observedAt: "2026-09-02T14:00:00Z", observedAtMs: Date.parse("2026-09-02T14:00:00Z"), type: "active_speaker", feishuUserId: "ou_synthetic_1", displayName: null, confidence: "ui_exact" },
@@ -1797,6 +1801,25 @@ for (const { label, build } of JOIN_FAILURES) {
   });
 }
 
+test("a locally failed join terminalizes its durable evidence once and makes it purgeable only after fourteen days", async () => {
+  const h = harness({ runtime: fakeRuntime({ startVoiceSessionError: new Error("synthetic startup failure") }) });
+  try {
+    await assert.rejects(() => h.session.join());
+    const evidence = h.coordinator.reconciliationEvidence(IDENTITY.occurrenceId, null);
+    assert.equal(evidence?.terminalAtMs, BASE_MS);
+    assert.equal(evidence?.terminalSource, "local_clock");
+    assert.equal(evidence?.expiresAtMs, BASE_MS + 14 * 24 * 60 * 60 * 1000);
+    const reopened = openSessionStore({ filename: h.dbPath, nowMs: BASE_MS });
+    try {
+      assert.equal(reopened.purgeExpiredReconciliationEvidence(BASE_MS + 14 * 24 * 60 * 60 * 1000 - 1), 0);
+      assert.notEqual(reopened.getReconciliationEvidence(IDENTITY.occurrenceId, null), null);
+      assert.equal(reopened.purgeExpiredReconciliationEvidence(BASE_MS + 14 * 24 * 60 * 60 * 1000), 1);
+      assert.equal(reopened.getReconciliationEvidence(IDENTITY.occurrenceId, null), null);
+      assert.deepEqual(reopened.foreignKeyCheck(), []);
+    } finally { reopened.close(); }
+  } finally { await h.cleanup(); }
+});
+
 test("the connect_media contract rejection keeps its own, more specific terminal reason", async () => {
   const h = harness({
     runtime: fakeRuntime({ handle: { media: {
@@ -2037,6 +2060,10 @@ test("the terminal transition and the recording are ONE transaction", async () =
       "neither half may land without the other",
     );
     assert.equal(h.session.state().routingErrors.length, 1);
+    const evidence = h.coordinator.reconciliationEvidence(IDENTITY.occurrenceId, null);
+    assert.equal(evidence?.terminalAtMs, Date.parse("2026-09-02T14:00:00Z"));
+    assert.equal(evidence?.terminalSource, "bridge_observed");
+    assert.equal(evidence?.expiresAtMs, Date.parse("2026-09-02T14:00:00Z") + 14 * 24 * 60 * 60 * 1000);
   } finally {
     await h.cleanup();
   }
