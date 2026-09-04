@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { isDate } from "node:util/types";
 
 import {
   addMillisecondsToUtcInstant,
@@ -399,6 +400,15 @@ test("builder rejects class-instance evidence before Runtime processing", async 
 test("builder rejects exotic built-in evidence before Runtime processing", async () => {
   const exotic = new Date(0) as unknown as Record<string, number>;
   Object.defineProperty(exotic, "ou_ada", { value: 8_000, enumerable: true });
+  await assertUiExactMsRejected(exotic);
+});
+
+test("builder rejects intrinsically branded Date evidence after its prototype is reassigned", async () => {
+  const exotic = new Date(0) as unknown as Record<string, number>;
+  Object.setPrototypeOf(exotic, Object.prototype);
+  Object.defineProperty(exotic, "ou_ada", { value: 8_000, enumerable: true });
+  assert.equal(Object.getPrototypeOf(exotic), Object.prototype);
+  assert.equal(isDate(exotic), true);
   await assertUiExactMsRejected(exotic);
 });
 

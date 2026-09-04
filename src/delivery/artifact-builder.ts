@@ -2,7 +2,7 @@
 // creates no files and performs no delivery: Task 9 owns the outbox/bundle.
 
 import { createHash } from "node:crypto";
-import { isProxy } from "node:util/types";
+import * as intrinsicTypes from "node:util/types";
 import { z } from "zod";
 
 import {
@@ -21,6 +21,9 @@ import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 
 const text = z.string().min(1).max(20_000);
 const evidence = z.array(z.string().min(1).max(200)).min(1).max(100);
+const intrinsicObjectChecks = Object.values(intrinsicTypes).filter(
+  (candidate): candidate is (value: unknown) => boolean => typeof candidate === "function",
+);
 
 const textSynthesis = z.object({
   summary: text,
@@ -297,7 +300,7 @@ function validateReconciledEvidence(segment: ReconciledSegment): ReconciledEvide
 
 function snapshotUiExactMs(uiExactMs: Readonly<Record<string, number>>): ReadonlyMap<string, number> {
   try {
-    if (typeof uiExactMs !== "object" || uiExactMs === null || Array.isArray(uiExactMs) || isProxy(uiExactMs)) {
+    if (typeof uiExactMs !== "object" || uiExactMs === null || Array.isArray(uiExactMs) || intrinsicObjectChecks.some((check) => check(uiExactMs))) {
       throw new Error("unsupported evidence record");
     }
     const prototype = Object.getPrototypeOf(uiExactMs);
