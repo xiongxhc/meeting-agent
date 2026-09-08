@@ -222,11 +222,13 @@ export type DeliveryRow = {
   readonly transcriptComplete: boolean;
   readonly retryCount: number;
   readonly nextRetryAtMs: number;
-  readonly retryReason: "receipt_unavailable" | null;
+  readonly retryReason: "receipt_unavailable" | "recovery_unavailable" | null;
   readonly publishedAtMs: number | null;
   readonly deletedAtMs: number | null;
   readonly publicationUrl: string | null;
   readonly vaultCommit: string | null;
+  readonly recoveryArtifact: string | null;
+  readonly stageToken: string | null;
 };
 
 export type ColumnDescription = { readonly name: string; readonly type: string };

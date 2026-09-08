@@ -3,11 +3,13 @@
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
-import type { TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
+import { parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const MAX_RECOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 export type DeliveryRow = {
   readonly occurrenceId: string;
@@ -19,11 +21,15 @@ export type DeliveryRow = {
   readonly transcriptComplete: boolean;
   readonly retryCount: number;
   readonly nextRetryAtMs: number;
-  readonly retryReason: "receipt_unavailable" | null;
+  readonly retryReason: "receipt_unavailable" | "recovery_unavailable" | null;
   readonly publishedAtMs: number | null;
   readonly deletedAtMs: number | null;
   readonly publicationUrl: string | null;
   readonly vaultCommit: string | null;
+  /** Exact canonical bytes retained only until this occurrence is deleted. */
+  readonly recoveryArtifact: string | null;
+  /** Durable capability that owns the private pre-READY stage. */
+  readonly stageToken: string | null;
 };
 
 /** R68's storage seam: the SQLite adapter is the production implementation. */
@@ -52,9 +58,11 @@ export function createOutboxWorker(options: {
   /** Returns a deterministic [0, 1] value in tests. */
   readonly random: () => number;
   readonly session: { state(occurrenceId: string): string | null; publish(occurrenceId: string): void };
-  readonly reconciliationEvidence?: { purgeExpiredReconciliationEvidence(nowMs: number): number };
+  readonly reconciliationEvidence: { purgeExpiredReconciliationEvidence(nowMs: number): number };
   readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed") => void;
 }): OutboxWorker {
+  if (options.reconciliationEvidence === undefined) throw new Error("reconciliation purge dependency is required");
+  const recordingOwners = new Map<string, string>();
   return {
     enqueue(input): string {
       const existing = options.journal.pending().find((row) => row.occurrenceId === input.artifact.occurrence_id && row.revision === input.artifact.revision);
@@ -63,6 +71,10 @@ export function createOutboxWorker(options: {
       }
       const bundlePath = path.join(path.resolve(options.outboxDir), occurrencePathSegment(input.artifact.occurrence_id as `${string}@${string}`), String(input.artifact.revision));
       if (existing === undefined) {
+        const owner = recordingOwners.get(path.resolve(input.recordingPath));
+        if (owner !== undefined && owner !== input.artifact.occurrence_id) throw new Error("recording is owned by another occurrence");
+        if (Buffer.byteLength(input.serializedArtifact, "utf8") > MAX_RECOVERY_ARTIFACT_BYTES) throw new Error("recovery artifact exceeds retention bound");
+        const stageToken = randomUUID().replaceAll("-", "");
         // The journal intent precedes the filesystem visibility commit. A
         // save failure therefore cannot strand a READY bundle undiscoverable
         // to polling, retry, or deadline cleanup after restart.
@@ -81,8 +93,13 @@ export function createOutboxWorker(options: {
           deletedAtMs: null,
           publicationUrl: null,
           vaultCommit: null,
+          recoveryArtifact: input.serializedArtifact,
+          stageToken,
         });
+        recordingOwners.set(path.resolve(input.recordingPath), input.artifact.occurrence_id);
       }
+      const row = existing ?? options.journal.pending().find((candidate) => candidate.occurrenceId === input.artifact.occurrence_id && candidate.revision === input.artifact.revision);
+      if (row === undefined) throw new Error("delivery journal did not retain pending intent");
       const written = writeMeetingBundle({
         recordingsDir: options.recordingsDir,
         outboxDir: options.outboxDir,
@@ -90,6 +107,7 @@ export function createOutboxWorker(options: {
         serializedArtifact: input.serializedArtifact,
         artifactHash: input.artifactHash,
         recordingPath: input.recordingPath,
+        ...(row.stageToken === null ? {} : { stageToken: row.stageToken }),
       });
       if (written !== bundlePath) throw new Error("outbox writer returned a non-canonical bundle path");
       return bundlePath;
@@ -97,14 +115,14 @@ export function createOutboxWorker(options: {
 
     reconcile(): void {
       const now = options.clock.now();
-      try { options.reconciliationEvidence?.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
+      try { options.reconciliationEvidence.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
       for (const current of options.journal.pending()) {
         if (current.deletedAtMs !== null) continue;
         if (now >= current.endedAtMs + RETENTION_MS) {
-          deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: current.occurrenceId, revision: current.revision, recordingPath: current.recordingPath, bundlePath: current.bundlePath });
-          options.journal.update({ ...current, deletedAtMs: now, retryReason: null });
+          deleteOccurrenceEvidence(options, current, now);
           continue;
         }
+        if (!recoverBundle(options, current)) continue;
         const state = options.session.state(current.occurrenceId);
         if (current.publishedAtMs !== null) {
           if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now);
@@ -156,13 +174,45 @@ function deleteOccurrenceEvidence(
   now: number,
 ): void {
   for (const row of options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId)) {
-    deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: row.occurrenceId, revision: row.revision, recordingPath: row.recordingPath, bundlePath: row.bundlePath });
+    deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: row.occurrenceId, revision: row.revision, recordingPath: row.recordingPath, bundlePath: row.bundlePath, ...(row.stageToken === null ? {} : { stageToken: row.stageToken }) });
     options.journal.update({
       ...row,
       ...(row.revision === accepted.revision ? { publishedAtMs: accepted.publishedAtMs, publicationUrl: accepted.publicationUrl, vaultCommit: accepted.vaultCommit } : {}),
       deletedAtMs: now,
       retryReason: null,
+      recoveryArtifact: null,
     });
+  }
+}
+
+function recoverBundle(
+  options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
+  row: DeliveryRow,
+): boolean {
+  if (row.recoveryArtifact === null || row.stageToken === null) {
+    options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    return false;
+  }
+  try {
+    const expected = path.join(path.resolve(options.outboxDir), occurrencePathSegment(row.occurrenceId as `${string}@${string}`), String(row.revision));
+    if (row.bundlePath !== expected) throw new Error("recovery bundle path differs from durable journal");
+    const artifact = parseTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
+    const artifactHash = row.artifactHash;
+    const written = writeMeetingBundle({
+      recordingsDir: options.recordingsDir,
+      outboxDir: options.outboxDir,
+      artifact,
+      serializedArtifact: row.recoveryArtifact,
+      artifactHash,
+      recordingPath: row.recordingPath,
+      stageToken: row.stageToken,
+    });
+    if (written !== row.bundlePath) throw new Error("recovered bundle path differs from durable journal");
+    return true;
+  } catch (error) {
+    if ((error as Error).message === "recovery bundle path differs from durable journal") throw error;
+    options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    return false;
   }
 }
 

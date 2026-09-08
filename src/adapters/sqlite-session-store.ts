@@ -497,24 +497,37 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
 // ---------------------------------------------------------------------------
 
 function savePendingDelivery(db: Database.Database, row: DeliveryRow): void {
-  withConstraintTranslation(() => db.prepare(
+  const save = db.transaction(() => {
+    const recording = db.prepare("SELECT encrypted_path FROM recordings WHERE occurrence_id = ?").get(row.occurrenceId) as { encrypted_path: string | null } | undefined;
+    if (recording?.encrypted_path !== row.recordingPath) {
+      throw new OrchestrationError("constraint_violation", "delivery recording is not the finalized occurrence recording");
+    }
+    db.prepare("INSERT OR IGNORE INTO delivery_recording_owners (recording_path, occurrence_id) VALUES (?, ?)").run(row.recordingPath, row.occurrenceId);
+    const owner = db.prepare("SELECT occurrence_id FROM delivery_recording_owners WHERE recording_path = ?").get(row.recordingPath) as { occurrence_id: string } | undefined;
+    if (owner?.occurrence_id !== row.occurrenceId) {
+      throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
+    }
+    withConstraintTranslation(() => db.prepare(
     `INSERT INTO delivery_journal
        (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
         transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-        deleted_at_ms, publication_url, vault_commit)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(row.occurrenceId, row.revision, row.artifactHash, row.recordingPath, row.bundlePath,
     row.endedAtMs, row.transcriptComplete ? 1 : 0, row.retryCount, row.nextRetryAtMs,
-    row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit));
+    row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit,
+    row.recoveryArtifact, row.stageToken));
+  });
+  save();
 }
 
 function pendingDeliveries(db: Database.Database): DeliveryRow[] {
   const rows = db.prepare(
     `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
             transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-            deleted_at_ms, publication_url, vault_commit
+            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token
        FROM delivery_journal WHERE deleted_at_ms IS NULL ORDER BY next_retry_at_ms, occurrence_id, revision`,
-  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null }>;
+  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null }>;
   return rows.map((row) => ({
     occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
     recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
@@ -522,16 +535,19 @@ function pendingDeliveries(db: Database.Database): DeliveryRow[] {
     nextRetryAtMs: row.next_retry_at_ms, retryReason: row.retry_reason,
     publishedAtMs: row.published_at_ms, deletedAtMs: row.deleted_at_ms,
     publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
+    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token,
   }));
 }
 
 function updateDelivery(db: Database.Database, row: DeliveryRow): void {
   const changed = withConstraintTranslation(() => db.prepare(
     `UPDATE delivery_journal SET retry_count = ?, next_retry_at_ms = ?, retry_reason = ?,
-       published_at_ms = ?, deleted_at_ms = ?, publication_url = ?, vault_commit = ?
+       published_at_ms = ?, deleted_at_ms = ?, publication_url = ?, vault_commit = ?,
+       recovery_artifact = ?, stage_token = ?
      WHERE occurrence_id = ? AND revision = ? AND artifact_hash = ?`,
   ).run(row.retryCount, row.nextRetryAtMs, row.retryReason, row.publishedAtMs, row.deletedAtMs,
-    row.publicationUrl, row.vaultCommit, row.occurrenceId, row.revision, row.artifactHash).changes);
+    row.publicationUrl, row.vaultCommit, row.recoveryArtifact, row.stageToken,
+    row.occurrenceId, row.revision, row.artifactHash).changes);
   if (changed !== 1) throw new OrchestrationError("constraint_violation", "delivery journal row is unknown or immutable fields changed");
 }
 

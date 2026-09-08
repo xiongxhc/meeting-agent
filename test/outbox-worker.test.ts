@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -15,6 +15,7 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 
 const FIXTURES = new URL("../fixtures/contracts/", import.meta.url);
 const SHA = (bytes: Uint8Array) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+const NOOP_PURGE = { purgeExpiredReconciliationEvidence: () => 0 };
 
 function harness(): { root: string; recordings: string; outbox: string; receipts: string; cleanup(): void } {
   const root = mkdtempSync(path.join(tmpdir(), "meeting-outbox-test-"));
@@ -147,7 +148,7 @@ test("worker retries with injected bounded jitter and publishes only after a mat
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
       clock: { now: () => now }, random: () => 0.5,
-      session: { state: () => state, publish: () => { state = "published"; } },
+      session: { state: () => state, publish: () => { state = "published"; } }, reconciliationEvidence: NOOP_PURGE,
     });
     worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
     worker.reconcile();
@@ -182,7 +183,7 @@ test("worker deletes only a complete-receipt bundle or evidence due at the exact
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
       clock: { now: () => now }, random: () => 0,
-      session: { state: () => "awaiting_teammem", publish: () => undefined },
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE,
     });
     const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
     const receiptFile = path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`);
@@ -297,17 +298,31 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
     endedAtMs: Date.parse(artifact.ended_at), transcriptComplete: false, retryCount: 2,
     nextRetryAtMs: now + 4_000, retryReason: "receipt_unavailable", publishedAtMs: null,
     deletedAtMs: null, publicationUrl: null, vaultCommit: null,
+    recoveryArtifact: null, stageToken: null,
   };
   const first = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now });
   try {
     first.createSession({ occurrenceId: artifact.occurrence_id, providerMeetingId: artifact.provider_meeting_id, occurrenceStartedAt: artifact.started_at, nowMs: now });
+    first.finalizeSession({
+      transition: { occurrenceId: artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: now },
+      recording: { handle: "a".repeat(32), encryptedPath: row.recordingPath, sha256: "a".repeat(64), durationMs: 1, format: "opus", keyId: "key", gaps: [], runtimeGaps: [] },
+    });
     first.savePending(row);
+    first.savePending({ ...row, revision: row.revision + 1, artifactHash: `sha256:${"b".repeat(64)}`, bundlePath: `${row.bundlePath}-next` });
+    const otherOccurrence = "vc:second@2026-09-02T14:00:00Z";
+    first.createSession({ occurrenceId: otherOccurrence, providerMeetingId: "vc:second", occurrenceStartedAt: artifact.started_at, nowMs: now });
+    first.finalizeSession({
+      transition: { occurrenceId: otherOccurrence, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: now },
+      recording: { handle: "b".repeat(32), encryptedPath: row.recordingPath, sha256: "b".repeat(64), durationMs: 1, format: "opus", keyId: "key", gaps: [], runtimeGaps: [] },
+    });
+    assert.throws(() => first.savePending({ ...row, occurrenceId: otherOccurrence, artifactHash: `sha256:${"c".repeat(64)}`, bundlePath: `${row.bundlePath}-other` }), /another occurrence/i);
   } finally {
     first.close();
   }
   const second = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now + 1 });
   try {
-    assert.deepEqual(second.pending(), [row]);
+    assert.equal(second.pending().length, 2);
+    assert.deepEqual(second.pending().find((pending) => pending.revision === row.revision), row);
     const published: DeliveryRow = { ...row, retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) };
     second.update(published);
   } finally {
@@ -315,7 +330,8 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
   }
   const third = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now + 3 });
   try {
-    assert.deepEqual(third.pending(), [{ ...row, retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) }]);
+    assert.equal(third.pending().length, 2);
+    assert.deepEqual(third.pending().find((pending) => pending.revision === row.revision), { ...row, retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) });
   } finally {
     third.close();
     h.cleanup();
@@ -333,7 +349,7 @@ test("a corrupted journal row cannot delete a sibling outbox directory", () => {
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
       clock: { now: () => now }, random: () => 0,
-      session: { state: () => "awaiting_teammem", publish: () => undefined },
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE,
     });
     const ownBundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
     const sibling = path.join(h.outbox, "unrelated_20260902T140000Z", "1");
@@ -371,7 +387,7 @@ writeMeetingBundle({...input, fault: (step) => { if (step === "after_audio_write
 
     const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
     deleteDeliveredEvidence({ recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id, revision: artifact.revision, recordingPath: source, bundlePath: bundle });
-    assert.deepEqual(readdirSync(occurrence).filter((name) => name.startsWith(`.${artifact.revision}.staging-`)), []);
+    assert.equal(existsSync(occurrence), false, "atomic occurrence detach clears canonical and private evidence together");
   } finally { h.cleanup(); }
 });
 
@@ -428,7 +444,7 @@ test("persists delivery intent before exposing READY when the journal save fails
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     journal.failSave = true;
-    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: () => undefined } });
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE });
     assert.throws(() => worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source }), /journal/);
     assert.equal(existsSync(path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision), "READY")), false);
     assert.deepEqual(journal.pending(), []);
@@ -452,7 +468,7 @@ test("a complete higher revision deletes every retained copy for its occurrence 
     writeFileSync(newSource, first.bytes);
     const journal = new FakeJournal();
     let state = "awaiting_teammem";
-    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1234 }, random: () => 0, session: { state: () => state, publish: () => { state = "published"; } } });
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1234 }, random: () => 0, session: { state: () => state, publish: () => { state = "published"; } }, reconciliationEvidence: NOOP_PURGE });
     const oldBundle = worker.enqueue({ artifact: oldArtifact, serializedArtifact: canonicalArtifactJson(oldArtifact), artifactHash: canonicalArtifactHash(oldArtifact), recordingPath: oldSource });
     const newHash = canonicalArtifactHash(newArtifact);
     const newBundle = worker.enqueue({ artifact: newArtifact, serializedArtifact: canonicalArtifactJson(newArtifact), artifactHash: newHash, recordingPath: newSource });
@@ -471,7 +487,7 @@ test("matching receipts do nothing in every state except awaiting_teammem or pub
       const source = path.join(h.recordings, "final.enc");
       writeFileSync(source, bytes);
       const journal = new FakeJournal();
-      const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 2 }, random: () => 0, session: { state: () => state, publish: () => assert.fail("illegal state transition") } });
+      const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 2 }, random: () => 0, session: { state: () => state, publish: () => assert.fail("illegal state transition") }, reconciliationEvidence: NOOP_PURGE });
       const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
       writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
       worker.reconcile();
@@ -511,7 +527,7 @@ test("a malformed receipt for one occurrence cannot block a valid second occurre
     writeFileSync(secondSource, first.bytes);
     const journal = new FakeJournal();
     const published: string[] = [];
-    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 5 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: (id) => published.push(id) } });
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 5 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: (id) => published.push(id) }, reconciliationEvidence: NOOP_PURGE });
     worker.enqueue({ artifact: first.artifact, serializedArtifact: first.serialized, artifactHash: first.hash, recordingPath: firstSource });
     worker.enqueue({ artifact: second, serializedArtifact: canonicalArtifactJson(second), artifactHash: secondHash, recordingPath: secondSource });
     writeFileSync(path.join(h.receipts, `${occurrencePathSegment(first.artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify({ ...publishedReceipt(first.artifact, first.hash), markdown_path: "\ud800" })}\n`);
@@ -553,4 +569,144 @@ test("new outbox and occurrence names are fsynced through their parents before R
     assert.ok(calls.indexOf(h.outbox) >= 0);
     assert.ok(calls.lastIndexOf(occurrence) > calls.indexOf(h.outbox));
   } finally { h.cleanup(); }
+});
+
+test("reconcile reconstructs a durable delivery and removes its stage even when OWNER names a live reused PID", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "final.enc");
+    writeFileSync(source, bytes);
+    const journal = new FakeJournal();
+    let now = 1;
+    const worker = createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+      clock: { now: () => now }, random: () => 0,
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE,
+    });
+    const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+    rmSync(bundle, { recursive: true });
+    const occurrence = path.dirname(bundle);
+    const stage = path.join(occurrence, `.${artifact.revision}.staging-reused-pid`);
+    mkdirSync(stage);
+    writeFileSync(path.join(stage, "OWNER"), String(process.pid));
+    writeFileSync(path.join(stage, "audio.enc"), bytes);
+
+    worker.reconcile();
+    assert.equal(existsSync(path.join(bundle, "READY")), true, "durable journal input must recreate the missing READY bundle");
+    now = journal.pending()[0]!.nextRetryAtMs;
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
+    worker.reconcile();
+    assert.equal(existsSync(source), false);
+    assert.equal(existsSync(stage), false, "PID reuse is not ownership of a delivery stage");
+  } finally { h.cleanup(); }
+});
+
+test("a recording path must be a direct child of the configured recordings root", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const nested = path.join(h.recordings, "nested");
+    mkdirSync(nested);
+    const source = path.join(nested, "final.enc");
+    writeFileSync(source, bytes);
+    assert.throws(() => writeMeetingBundle({
+      recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source,
+    }), /direct child|recording/i);
+  } finally { h.cleanup(); }
+});
+
+test("repeated direct-child symlink swaps never delete an outside recording sentinel", () => {
+  const h = harness();
+  let toggler: ReturnType<typeof spawn> | undefined;
+  try {
+    const { artifact } = artifactAndAudio();
+    const source = path.join(h.recordings, "race.enc");
+    const outside = path.join(h.root, "outside.enc");
+    writeFileSync(outside, "outside sentinel");
+    const script = `const fs=require('node:fs'); const [source,outside]=process.argv.slice(1); setInterval(()=>{ try { fs.rmSync(source,{force:true}); fs.writeFileSync(source,'owned'); fs.rmSync(source,{force:true}); fs.symlinkSync(outside,source); } catch {} },0);`;
+    toggler = spawn(process.execPath, ["-e", script, source, outside], { stdio: "ignore" });
+    const bundle = path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision));
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      mkdirSync(bundle, { recursive: true });
+      try {
+        deleteDeliveredEvidence({ recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id, revision: artifact.revision, recordingPath: source, bundlePath: bundle });
+      } catch { /* symlink/absence is a safe refusal; the sentinel is the assertion. */ }
+    }
+    assert.equal(readFileSync(outside, "utf8"), "outside sentinel");
+  } finally {
+    toggler?.kill();
+    h.cleanup();
+  }
+});
+
+test("one encrypted recording cannot be claimed by two occurrences", () => {
+  const h = harness();
+  try {
+    const first = artifactAndAudio();
+    const secondRaw = structuredClone(first.artifact) as typeof first.artifact;
+    secondRaw.occurrence_id = "vc:second@2026-09-02T14:00:00Z";
+    secondRaw.provider_meeting_id = "vc:second";
+    const second = parseTeamMemMeetingArtifact(secondRaw);
+    const source = path.join(h.recordings, "final.enc");
+    writeFileSync(source, first.bytes);
+    const worker = createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: new FakeJournal(),
+      clock: { now: () => 1 }, random: () => 0,
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE,
+    });
+    worker.enqueue({ artifact: first.artifact, serializedArtifact: first.serialized, artifactHash: first.hash, recordingPath: source });
+    assert.throws(() => worker.enqueue({
+      artifact: second, serializedArtifact: canonicalArtifactJson(second), artifactHash: canonicalArtifactHash(second), recordingPath: source,
+    }), /recording.*owner|owned|claim/i);
+  } finally { h.cleanup(); }
+});
+
+test("a worker without the mandatory reconciliation purge is rejected at construction", () => {
+  const h = harness();
+  try {
+    assert.throws(() => createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: new FakeJournal(),
+      clock: { now: () => 1 }, random: () => 0,
+      session: { state: () => null, publish: () => undefined },
+    } as unknown as Parameters<typeof createOutboxWorker>[0]), /reconciliation.*purge|required/i);
+  } finally { h.cleanup(); }
+});
+
+test("a reopened worker recovers every durable-intent crash cut and later deletes its evidence", () => {
+  for (const cut of ["before_stage", "after_audio_write", "after_staging_fsync", "after_rename", "before_ready_write"] as const) {
+    const h = harness();
+    try {
+      const { artifact, bytes, serialized, hash } = artifactAndAudio();
+      const source = path.join(h.recordings, "final.enc");
+      writeFileSync(source, bytes);
+      const journal = new FakeJournal();
+      const bundlePath = path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision));
+      journal.savePending({
+        occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: hash, recordingPath: source, bundlePath,
+        endedAtMs: Date.parse(artifact.ended_at), transcriptComplete: true, retryCount: 0, nextRetryAtMs: 1, retryReason: null,
+        publishedAtMs: null, deletedAtMs: null, publicationUrl: null, vaultCommit: null, recoveryArtifact: serialized, stageToken: "b".repeat(32),
+      });
+      const child = path.join(h.root, "crash-after-intent.ts");
+      if (cut === "before_stage") writeFileSync(child, "process.exit(77);\n");
+      else writeFileSync(child, `import { writeMeetingBundle } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};
+const input = JSON.parse(process.argv[2]);
+writeMeetingBundle({...input, fault: (step) => { if (step === ${JSON.stringify(cut)}) process.exit(77); }});\n`);
+      const result = spawnSync(process.execPath, [child, JSON.stringify({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, stageToken: "b".repeat(32) })]);
+      assert.equal(result.status, 77, cut);
+      let now = 1;
+      const worker = createOutboxWorker({
+        outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+        clock: { now: () => now }, random: () => 0, reconciliationEvidence: NOOP_PURGE,
+        session: { state: () => "awaiting_teammem", publish: () => undefined },
+      });
+      worker.reconcile();
+      assert.deepEqual(readdirSync(bundlePath).sort(), ["READY", "audio.enc", "manifest.json", "meeting.json"], cut);
+      now = journal.pending()[0]!.nextRetryAtMs;
+      writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
+      worker.reconcile();
+      assert.equal(existsSync(source), false, cut);
+      assert.equal(existsSync(bundlePath), false, cut);
+    } finally { h.cleanup(); }
+  }
 });
