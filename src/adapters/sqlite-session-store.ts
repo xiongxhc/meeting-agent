@@ -38,6 +38,7 @@ import {
   type ReconciliationLiveSegmentRow,
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
+  type DeliveryRow,
   type MigrationRow,
   type SessionRow,
   type SessionState,
@@ -103,6 +104,9 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     purgeExpiredReconciliationEvidence: (nowMs) => purgeExpiredReconciliationEvidence(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
+    savePending: (row) => savePendingDelivery(db, row),
+    pending: () => pendingDeliveries(db),
+    update: (row) => updateDelivery(db, row),
 
     acquireLease: (input) => acquireLease(db, input),
     releaseLease: (occurrenceId, leaseId, reason, nowMs) =>
@@ -485,6 +489,50 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
     ),
     runtimeGaps,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Delivery journal (Task 9). This is intentionally an additive local ledger:
+// it never contains TeamMem data or becomes visible in the handoff directory.
+// ---------------------------------------------------------------------------
+
+function savePendingDelivery(db: Database.Database, row: DeliveryRow): void {
+  withConstraintTranslation(() => db.prepare(
+    `INSERT INTO delivery_journal
+       (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
+        transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
+        deleted_at_ms, publication_url, vault_commit)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(row.occurrenceId, row.revision, row.artifactHash, row.recordingPath, row.bundlePath,
+    row.endedAtMs, row.transcriptComplete ? 1 : 0, row.retryCount, row.nextRetryAtMs,
+    row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit));
+}
+
+function pendingDeliveries(db: Database.Database): DeliveryRow[] {
+  const rows = db.prepare(
+    `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
+            transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
+            deleted_at_ms, publication_url, vault_commit
+       FROM delivery_journal WHERE deleted_at_ms IS NULL ORDER BY next_retry_at_ms, occurrence_id, revision`,
+  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null }>;
+  return rows.map((row) => ({
+    occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
+    recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
+    transcriptComplete: row.transcript_complete === 1, retryCount: row.retry_count,
+    nextRetryAtMs: row.next_retry_at_ms, retryReason: row.retry_reason,
+    publishedAtMs: row.published_at_ms, deletedAtMs: row.deleted_at_ms,
+    publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
+  }));
+}
+
+function updateDelivery(db: Database.Database, row: DeliveryRow): void {
+  const changed = withConstraintTranslation(() => db.prepare(
+    `UPDATE delivery_journal SET retry_count = ?, next_retry_at_ms = ?, retry_reason = ?,
+       published_at_ms = ?, deleted_at_ms = ?, publication_url = ?, vault_commit = ?
+     WHERE occurrence_id = ? AND revision = ? AND artifact_hash = ?`,
+  ).run(row.retryCount, row.nextRetryAtMs, row.retryReason, row.publishedAtMs, row.deletedAtMs,
+    row.publicationUrl, row.vaultCommit, row.occurrenceId, row.revision, row.artifactHash).changes);
+  if (changed !== 1) throw new OrchestrationError("constraint_violation", "delivery journal row is unknown or immutable fields changed");
 }
 
 const RECONCILIATION_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;

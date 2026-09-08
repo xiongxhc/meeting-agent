@@ -210,6 +210,25 @@ export type MigrationRow = {
   readonly appliedAtMs: number;
 };
 
+/** Task 9's local control-plane record. It contains no transcript or audio
+ * bytes: those are confined to the encrypted recording and four-file bundle. */
+export type DeliveryRow = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly artifactHash: string;
+  readonly recordingPath: string;
+  readonly bundlePath: string;
+  readonly endedAtMs: number;
+  readonly transcriptComplete: boolean;
+  readonly retryCount: number;
+  readonly nextRetryAtMs: number;
+  readonly retryReason: "receipt_unavailable" | null;
+  readonly publishedAtMs: number | null;
+  readonly deletedAtMs: number | null;
+  readonly publicationUrl: string | null;
+  readonly vaultCommit: string | null;
+};
+
 export type ColumnDescription = { readonly name: string; readonly type: string };
 export type TableSchema = {
   readonly name: string;
@@ -315,6 +334,10 @@ export type SessionStore = {
     readonly recording: RecordingInput | null;
   }): BridgeRecoveryResult;
   getBridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
+
+  savePending(row: DeliveryRow): void;
+  pending(): readonly DeliveryRow[];
+  update(row: DeliveryRow): void;
 
   acquireLease(input: AcquireLeaseInput): LeaseRow;
   releaseLease(
