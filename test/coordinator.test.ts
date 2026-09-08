@@ -20,7 +20,7 @@
 // Nothing here touches a live TeamMem installation.
 
 import assert from "node:assert/strict";
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -37,6 +37,7 @@ import { buildMeetingIdentity, type MeetingIdentity } from "../src/domain/meetin
 import { occurrencePathSegment } from "../src/domain/occurrence-id.ts";
 import {
   OrchestrationError,
+  type DeliveryRow,
   type LeaseRow,
   type SessionRow,
   type SessionState,
@@ -143,6 +144,27 @@ function identity(seq: number, startedAt = "2026-09-02T14:00:00Z"): MeetingIdent
     title: "Fake Occurrence",
     organizer: null,
   });
+}
+
+function deliveryRow(id: MeetingIdentity, recordingPath: string, revision = 3): DeliveryRow {
+  return {
+    occurrenceId: id.occurrenceId,
+    revision,
+    artifactHash: `sha256:${String(revision % 10).repeat(64)}`,
+    recordingPath,
+    bundlePath: path.join(path.dirname(recordingPath), "outbox", occurrencePathSegment(id.occurrenceId), String(revision)),
+    endedAtMs: BASE_MS,
+    transcriptComplete: true,
+    retryCount: 0,
+    nextRetryAtMs: BASE_MS,
+    retryReason: null,
+    publishedAtMs: null,
+    deletedAtMs: null,
+    publicationUrl: null,
+    vaultCommit: null,
+    recoveryArtifact: null,
+    stageToken: null,
+  };
 }
 
 function isOrchestrationError(code: string): (error: unknown) => boolean {
@@ -478,6 +500,148 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
         h.cleanup();
       }
     }
+  }
+});
+
+for (const claimOrder of ["owner-first", "challenger-first"] as const) {
+  test(`an observed recording owner refreshes after atomic path replacement (${claimOrder})`, () => {
+    const h = harness();
+    const recordings = path.join(path.dirname(h.dbPath), "recordings");
+    mkdirSync(recordings);
+    const owner = identity(claimOrder === "owner-first" ? 901 : 902);
+    const challenger = identity(claimOrder === "owner-first" ? 903 : 904);
+    const ownerHandle = "a".repeat(32);
+    const challengerHandle = "b".repeat(32);
+    const ownerCanonical = path.join(recordings, `${ownerHandle}.crsr`);
+    const ownerAlias = `${recordings}/./${ownerHandle}.crsr`;
+    const challengerPath = path.join(recordings, `${challengerHandle}.crsr`);
+    const replacement = path.join(recordings, ".replacement");
+    writeFileSync(ownerCanonical, "first encrypted inode");
+    const firstIdentity = statSync(ownerCanonical);
+    const store = h.open();
+    try {
+      for (const [id, handle, encryptedPath] of [[owner, ownerHandle, ownerAlias], [challenger, challengerHandle, challengerPath]] as const) {
+        store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+        store.finalizeSession({
+          transition: { occurrenceId: id.occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: BASE_MS },
+          recording: { handle, encryptedPath, sha256: handle[0]!.repeat(64), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+        });
+      }
+      const revision3 = deliveryRow(owner, ownerAlias);
+      store.savePending(revision3);
+      writeFileSync(replacement, "second encrypted inode");
+      renameSync(replacement, ownerCanonical);
+      linkSync(ownerCanonical, challengerPath);
+      const secondIdentity = statSync(ownerCanonical);
+      assert.notEqual(secondIdentity.ino, firstIdentity.ino);
+      assert.equal(statSync(challengerPath).ino, secondIdentity.ino);
+
+      const ownerClaim = () => store.savePending(deliveryRow(owner, ownerAlias, 4));
+      const challengerClaim = () => store.savePending(deliveryRow(challenger, challengerPath));
+      if (claimOrder === "owner-first") {
+        ownerClaim();
+        assert.throws(challengerClaim, /another occurrence/i);
+      } else {
+        assert.throws(challengerClaim, /another occurrence/i);
+        const afterRejectedClaim = new Database(h.dbPath, { readonly: true });
+        try {
+          assert.equal(afterRejectedClaim.prepare(
+            "SELECT physical_identity FROM delivery_recording_owners_v17 WHERE canonical_path = ?",
+          ).pluck().get(ownerCanonical), `inode:${secondIdentity.dev}:${secondIdentity.ino}`);
+        } finally { afterRejectedClaim.close(); }
+        ownerClaim();
+      }
+      store.savePending(deliveryRow(owner, ownerAlias, 5));
+      const storedRevision3 = store.pending().find((row) => row.occurrenceId === owner.occurrenceId && row.revision === 3)!;
+      store.update({ ...storedRevision3, deletedAtMs: BASE_MS + 1, recoveryArtifact: null });
+
+      const inspect = new Database(h.dbPath, { readonly: true });
+      try {
+        assert.deepEqual(inspect.prepare(
+          "SELECT canonical_path, physical_identity, occurrence_id, owner_state FROM delivery_recording_owners_v17 WHERE canonical_path = ?",
+        ).get(ownerCanonical), {
+          canonical_path: ownerCanonical,
+          physical_identity: `inode:${secondIdentity.dev}:${secondIdentity.ino}`,
+          occurrence_id: owner.occurrenceId,
+          owner_state: "observed",
+        });
+      } finally { inspect.close(); }
+      for (const pending of store.pending().filter((row) => row.occurrenceId === owner.occurrenceId)) {
+        store.update({ ...pending, deletedAtMs: BASE_MS + 1, recoveryArtifact: null });
+      }
+    } finally { store.close(); }
+
+    const reopened = h.open(BASE_MS + 2);
+    try {
+      assert.throws(() => reopened.savePending(deliveryRow(challenger, challengerPath)), /another occurrence/i);
+      assert.equal(reopened.pending().filter((row) => row.occurrenceId === owner.occurrenceId).length, 0);
+
+      const existingOwner = identity(claimOrder === "owner-first" ? 906 : 907);
+      const existingHandle = "d".repeat(32);
+      const existingPath = path.join(recordings, `${existingHandle}.crsr`);
+      writeFileSync(existingPath, "third encrypted inode");
+      reopened.createSession({ occurrenceId: existingOwner.occurrenceId, providerMeetingId: existingOwner.providerMeetingId, occurrenceStartedAt: existingOwner.occurrenceStartedAt, nowMs: BASE_MS });
+      reopened.finalizeSession({
+        transition: { occurrenceId: existingOwner.occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: BASE_MS },
+        recording: { handle: existingHandle, encryptedPath: existingPath, sha256: "d".repeat(64), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+      });
+      reopened.savePending(deliveryRow(existingOwner, existingPath));
+      linkSync(existingPath, replacement);
+      renameSync(replacement, ownerCanonical);
+      assert.throws(() => reopened.savePending(deliveryRow(owner, ownerAlias, 6)), /another occurrence/i);
+      assert.deepEqual(reopened.foreignKeyCheck(), []);
+    } finally {
+      reopened.close();
+      h.cleanup();
+    }
+  });
+}
+
+test("an observed recording claim fails closed when its source changes during identity verification", () => {
+  const h = harness();
+  const recordings = path.join(path.dirname(h.dbPath), "recordings");
+  mkdirSync(recordings);
+  const id = identity(905);
+  const handle = "c".repeat(32);
+  const recordingPath = path.join(recordings, `${handle}.crsr`);
+  const replacement = path.join(recordings, ".replacement");
+  const replacementAgain = path.join(recordings, ".replacement-again");
+  writeFileSync(recordingPath, "first encrypted inode");
+  let armed = false;
+  let replaced = false;
+  const store = openSessionStore({
+    filename: h.dbPath,
+    nowMs: BASE_MS,
+    deliveryIdentityCheckpoint: (candidate: string) => {
+      if (!armed || replaced || candidate !== recordingPath) return;
+      renameSync(replacementAgain, recordingPath);
+      replaced = true;
+    },
+  });
+  try {
+    store.createSession({ occurrenceId: id.occurrenceId, providerMeetingId: id.providerMeetingId, occurrenceStartedAt: id.occurrenceStartedAt, nowMs: BASE_MS });
+    store.finalizeSession({
+      transition: { occurrenceId: id.occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: BASE_MS },
+      recording: { handle, encryptedPath: recordingPath, sha256: "c".repeat(64), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+    });
+    store.savePending(deliveryRow(id, recordingPath));
+    const original = statSync(recordingPath);
+    writeFileSync(replacement, "second encrypted inode");
+    renameSync(replacement, recordingPath);
+    writeFileSync(replacementAgain, "third encrypted inode");
+    armed = true;
+    assert.throws(() => store.savePending(deliveryRow(id, recordingPath, 4)), /changed|identity|retry/i);
+    assert.equal(replaced, true);
+    const inspect = new Database(h.dbPath, { readonly: true });
+    try {
+      assert.equal(inspect.prepare(
+        "SELECT physical_identity FROM delivery_recording_owners_v17 WHERE canonical_path = ?",
+      ).pluck().get(recordingPath), `inode:${original.dev}:${original.ino}`);
+    } finally { inspect.close(); }
+    assert.equal(store.pending().some((row) => row.revision === 4), false);
+  } finally {
+    store.close();
+    h.cleanup();
   }
 });
 

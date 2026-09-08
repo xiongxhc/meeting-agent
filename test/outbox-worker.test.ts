@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -1026,3 +1026,102 @@ test("restart after a real process death immediately after occurrence detach lea
     assert.equal(existsSync(detached), false);
   } finally { h.cleanup(); }
 });
+
+for (const interruption of [
+  "session_transition",
+  "publication_update",
+  "filesystem_cleanup",
+  "deletion_update_before_commit",
+  "deletion_update_after_commit",
+] as const) {
+  test(`accepted publication evidence converges monotonically after ${interruption} interruption`, () => {
+    const h = harness();
+    try {
+      const { artifact, bytes, serialized, hash } = artifactAndAudio();
+      const source = runtimeRecordingPath(h);
+      writeFileSync(source, bytes);
+      const journal = new FakeJournal();
+      const now = Date.parse("2026-09-02T14:00:00Z");
+      let state = "awaiting_teammem";
+      let publishCalls = 0;
+      let interrupted = false;
+      let movedOutbox: string | null = null;
+      const originalUpdate = journal.update.bind(journal);
+      journal.update = (row) => {
+        const publicationWrite = row.publishedAtMs !== null && row.deletedAtMs === null;
+        const deletionWrite = row.deletedAtMs !== null;
+        if (!interrupted && interruption === "publication_update" && publicationWrite) {
+          originalUpdate(row);
+          interrupted = true;
+          throw new Error("publication update interrupted after durable commit");
+        }
+        if (!interrupted && interruption === "filesystem_cleanup" && publicationWrite) {
+          originalUpdate(row);
+          movedOutbox = `${h.outbox}.saved`;
+          renameSync(h.outbox, movedOutbox);
+          const outside = path.join(h.root, "outside");
+          mkdirSync(outside);
+          symlinkSync(outside, h.outbox);
+          interrupted = true;
+          return;
+        }
+        if (!interrupted && interruption === "deletion_update_before_commit" && deletionWrite) {
+          interrupted = true;
+          throw new Error("deletion update interrupted before durable commit");
+        }
+        if (!interrupted && interruption === "deletion_update_after_commit" && deletionWrite) {
+          originalUpdate(row);
+          interrupted = true;
+          throw new Error("deletion update interrupted after durable commit");
+        }
+        originalUpdate(row);
+      };
+      const worker = createOutboxWorker({
+        outboxDir: h.outbox,
+        receiptsDir: h.receipts,
+        recordingsDir: h.recordings,
+        journal,
+        clock: { now: () => now },
+        random: () => 0,
+        session: {
+          state: () => state,
+          publish: () => {
+            publishCalls += 1;
+            state = "published";
+            if (!interrupted && interruption === "session_transition") {
+              interrupted = true;
+              throw new Error("session transition interrupted after durable commit");
+            }
+          },
+        },
+        reconciliationEvidence: NOOP_PURGE,
+      });
+      const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+      writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
+
+      worker.reconcile();
+      if (movedOutbox !== null) {
+        unlinkSync(h.outbox);
+        renameSync(movedOutbox, h.outbox);
+      }
+      const afterInterruption = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;
+      assert.equal(interrupted, true);
+      assert.notEqual(afterInterruption.retryReason, "recovery_unavailable");
+      if (interruption === "session_transition") assert.equal(afterInterruption.publishedAtMs, null);
+      else assert.equal(afterInterruption.publishedAtMs, now);
+
+      worker.reconcile();
+      const converged = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;
+      assert.equal(state, "published");
+      assert.equal(publishCalls, 1, "published replay must not attempt a second transition");
+      assert.equal(converged.publishedAtMs, now);
+      assert.equal(converged.publicationUrl, publishedReceipt(artifact, hash).markdown_url);
+      assert.equal(converged.vaultCommit, "a".repeat(40));
+      assert.equal(converged.deletedAtMs, now);
+      assert.equal(converged.retryReason, null);
+      assert.equal(converged.recoveryArtifact, null);
+      assert.equal(existsSync(source), false);
+      assert.equal(existsSync(bundle), false);
+    } finally { h.cleanup(); }
+  });
+}

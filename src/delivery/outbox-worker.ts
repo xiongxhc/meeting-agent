@@ -121,6 +121,7 @@ export function createOutboxWorker(options: {
       const now = options.clock.now();
       try { options.reconciliationEvidence.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
       for (const current of options.journal.pending()) {
+        let publicationAccepted = current.publishedAtMs !== null;
         try {
           if (current.deletedAtMs !== null) continue;
           if (now >= current.endedAtMs + RETENTION_MS) {
@@ -128,12 +129,12 @@ export function createOutboxWorker(options: {
             continue;
           }
           if (current.retryReason === "recovery_unavailable") continue;
-          if (!recoverBundle(options, current)) continue;
           const state = options.session.state(current.occurrenceId);
           if (current.publishedAtMs !== null) {
             if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
             continue;
           }
+          if (!recoverBundle(options, current)) continue;
           if (now < current.nextRetryAtMs) continue;
           const receipt = readPublicationReceipt({
             receiptsDir: options.receiptsDir,
@@ -155,6 +156,7 @@ export function createOutboxWorker(options: {
           // orchestration state. Only the legal edge and an interrupted replay
           // are allowed to record it or release encrypted evidence.
           if (state !== "awaiting_teammem" && state !== "published") continue;
+          publicationAccepted = true;
           if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
           const published: DeliveryRow = {
             ...current,
@@ -171,8 +173,9 @@ export function createOutboxWorker(options: {
           }
         } catch {
           // A malformed legacy row is terminal and isolated. Classify a row
-          // that was not already terminal, but never let it abort siblings.
-          if (current.retryReason !== "recovery_unavailable") {
+          // that failed before publication acceptance, but never let it abort
+          // siblings or overwrite monotonic publication/deletion evidence.
+          if (!publicationAccepted && current.retryReason !== "recovery_unavailable") {
             try { options.journal.update({ ...current, retryReason: "recovery_unavailable" }); } catch { /* keep the row isolated even if it cannot be updated */ }
           }
         }

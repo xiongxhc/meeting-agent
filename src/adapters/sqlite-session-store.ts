@@ -68,6 +68,9 @@ export type OpenSessionStoreOptions = {
    * method on SessionStore takes its own explicit `nowMs`. Defaults to
    * `Date.now()`. */
   readonly nowMs?: number;
+  /** Test-only checkpoint between two observations of a durable recording
+   * path. Production callers leave this unset. */
+  readonly deliveryIdentityCheckpoint?: (canonicalPath: string) => void;
 };
 
 const DEFAULT_MIGRATIONS_DIR = path.resolve(import.meta.dirname, "..", "..", "migrations");
@@ -105,7 +108,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     purgeExpiredReconciliationEvidence: (nowMs) => purgeExpiredReconciliationEvidence(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
-    savePending: (row) => savePendingDelivery(db, row),
+    savePending: (row) => savePendingDelivery(db, row, options.deliveryIdentityCheckpoint),
     pending: () => pendingDeliveries(db),
     update: (row) => updateDelivery(db, row),
 
@@ -497,14 +500,24 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
 // it never contains TeamMem data or becomes visible in the handoff directory.
 // ---------------------------------------------------------------------------
 
-function savePendingDelivery(db: Database.Database, row: DeliveryRow): void {
+function savePendingDelivery(
+  db: Database.Database,
+  row: DeliveryRow,
+  identityCheckpoint?: (canonicalPath: string) => void,
+): void {
   const save = db.transaction(() => {
     const recording = db.prepare("SELECT handle, encrypted_path FROM recordings WHERE occurrence_id = ?").get(row.occurrenceId) as { handle: string; encrypted_path: string | null } | undefined;
     if (recording === undefined || path.resolve(recording.encrypted_path ?? "") !== path.resolve(row.recordingPath)) {
       throw new OrchestrationError("constraint_violation", "delivery recording is not the finalized occurrence recording");
     }
-    const binding = deliveryRecordingBinding(recording.handle, recording.encrypted_path ?? "");
-    if (!claimDeliveryRecordingOwner(db, row.occurrenceId, binding)) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
+    const binding = claimDeliveryRecordingOwner(
+      db,
+      row.occurrenceId,
+      recording.handle,
+      recording.encrypted_path ?? "",
+      identityCheckpoint,
+    );
+    if (binding === null) return false;
     withConstraintTranslation(() => db.prepare(
     `INSERT INTO delivery_journal
        (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
@@ -515,8 +528,9 @@ function savePendingDelivery(db: Database.Database, row: DeliveryRow): void {
     row.endedAtMs, row.transcriptComplete ? 1 : 0, row.retryCount, row.nextRetryAtMs,
     row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit,
     row.recoveryArtifact, row.stageToken, binding.handle));
+    return true;
   });
-  save();
+  if (!save()) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
 }
 
 function pendingDeliveries(db: Database.Database): DeliveryRow[] {
@@ -566,8 +580,40 @@ function deliveryRecordingBinding(handle: string, encryptedPath: string): Delive
   }
 }
 
-function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string, binding: DeliveryRecordingBinding): boolean {
-  if (binding.physicalIdentity !== null) refreshDeliveryRecordingReservations(db);
+function stableDeliveryRecordingBinding(
+  handle: string,
+  encryptedPath: string,
+  identityCheckpoint?: (canonicalPath: string) => void,
+): DeliveryRecordingBinding {
+  const before = deliveryRecordingBinding(handle, encryptedPath);
+  identityCheckpoint?.(before.canonicalPath);
+  const after = deliveryRecordingBinding(handle, encryptedPath);
+  if (before.canonicalPath !== after.canonicalPath || before.physicalIdentity !== after.physicalIdentity) {
+    throw new OrchestrationError("constraint_violation", "delivery recording identity changed during verification; retry");
+  }
+  return after;
+}
+
+function assertDeliveryRecordingBindingUnchanged(
+  handle: string,
+  encryptedPath: string,
+  expected: DeliveryRecordingBinding,
+): void {
+  const current = deliveryRecordingBinding(handle, encryptedPath);
+  if (current.canonicalPath !== expected.canonicalPath || current.physicalIdentity !== expected.physicalIdentity) {
+    throw new OrchestrationError("constraint_violation", "delivery recording identity changed during verification; retry");
+  }
+}
+
+function claimDeliveryRecordingOwner(
+  db: Database.Database,
+  occurrenceId: string,
+  handle: string,
+  encryptedPath: string,
+  identityCheckpoint?: (canonicalPath: string) => void,
+): DeliveryRecordingBinding | null {
+  refreshDeliveryRecordingOwners(db, identityCheckpoint);
+  const binding = stableDeliveryRecordingBinding(handle, encryptedPath, identityCheckpoint);
   const canonicalOwner = db.prepare(
     "SELECT occurrence_id, owner_state FROM delivery_recording_owners_v17 WHERE canonical_path = ?",
   ).get(binding.canonicalPath) as { occurrence_id: string; owner_state: "observed" | "reserved" | "invalid" } | undefined;
@@ -575,18 +621,23 @@ function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string
     "SELECT occurrence_id FROM delivery_recording_owners_v17 WHERE physical_identity = ?",
   ).get(binding.physicalIdentity) as { occurrence_id: string } | undefined;
   if ((canonicalOwner !== undefined && canonicalOwner.occurrence_id !== occurrenceId)
-    || (physicalOwner !== undefined && physicalOwner.occurrence_id !== occurrenceId)) return false;
+    || (physicalOwner !== undefined && physicalOwner.occurrence_id !== occurrenceId)) return null;
   if (canonicalOwner !== undefined) {
-    if (binding.physicalIdentity !== null && canonicalOwner.owner_state === "reserved" && physicalOwner === undefined) {
+    if (binding.physicalIdentity !== null && physicalOwner === undefined) {
       db.prepare(
         `UPDATE delivery_recording_owners_v17
             SET physical_identity = ?, owner_state = 'observed', failure_reason = NULL
-          WHERE canonical_path = ? AND owner_state = 'reserved'`,
+          WHERE canonical_path = ? AND owner_state != 'invalid'`,
       ).run(binding.physicalIdentity, binding.canonicalPath);
     }
-    return canonicalOwner.owner_state !== "invalid";
+    if (canonicalOwner.owner_state === "invalid") return null;
+    assertDeliveryRecordingBindingUnchanged(handle, encryptedPath, binding);
+    return binding;
   }
-  if (physicalOwner !== undefined) return true;
+  if (physicalOwner !== undefined) {
+    assertDeliveryRecordingBindingUnchanged(handle, encryptedPath, binding);
+    return binding;
+  }
   db.prepare(
     `INSERT INTO delivery_recording_owners_v17
        (canonical_path, physical_identity, occurrence_id, recording_handle, owner_state, failure_reason)
@@ -599,35 +650,41 @@ function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string
     binding.physicalIdentity === null ? "reserved" : "observed",
     binding.physicalIdentity === null ? "source_missing" : null,
   );
-  return true;
+  assertDeliveryRecordingBindingUnchanged(handle, encryptedPath, binding);
+  return binding;
 }
 
-function refreshDeliveryRecordingReservations(db: Database.Database): void {
-  const reservations = db.prepare(
+function refreshDeliveryRecordingOwners(
+  db: Database.Database,
+  identityCheckpoint?: (canonicalPath: string) => void,
+): void {
+  const owners = db.prepare(
     `SELECT canonical_path, occurrence_id, recording_handle
        FROM delivery_recording_owners_v17
-      WHERE owner_state = 'reserved'
+      WHERE owner_state IN ('observed', 'reserved')
       ORDER BY rowid`,
   ).all() as Array<{ canonical_path: string; occurrence_id: string; recording_handle: string }>;
-  for (const reservation of reservations) {
+  for (const owner of owners) {
     let binding: DeliveryRecordingBinding;
     try {
-      binding = deliveryRecordingBinding(reservation.recording_handle, reservation.canonical_path);
-    } catch {
-      // A still-missing or newly unsafe legacy reservation cannot claim a
-      // physical file, but it must not block an unrelated valid occurrence.
+      binding = stableDeliveryRecordingBinding(owner.recording_handle, owner.canonical_path, identityCheckpoint);
+    } catch (error) {
+      if (error instanceof OrchestrationError && error.message.includes("changed during verification")) throw error;
+      // A missing or newly unsafe durable owner cannot claim a new physical
+      // file, but its retained path/identity must remain fail-closed.
       continue;
     }
     if (binding.physicalIdentity === null) continue;
-    const owner = db.prepare(
-      "SELECT occurrence_id FROM delivery_recording_owners_v17 WHERE physical_identity = ?",
-    ).get(binding.physicalIdentity) as { occurrence_id: string } | undefined;
-    if (owner !== undefined) continue;
+    const physicalOwner = db.prepare(
+      "SELECT canonical_path FROM delivery_recording_owners_v17 WHERE physical_identity = ?",
+    ).get(binding.physicalIdentity) as { canonical_path: string } | undefined;
+    if (physicalOwner !== undefined && physicalOwner.canonical_path !== owner.canonical_path) continue;
     db.prepare(
       `UPDATE delivery_recording_owners_v17
           SET physical_identity = ?, owner_state = 'observed', failure_reason = NULL
-        WHERE canonical_path = ? AND owner_state = 'reserved'`,
-    ).run(binding.physicalIdentity, reservation.canonical_path);
+        WHERE canonical_path = ? AND owner_state IN ('observed', 'reserved')`,
+    ).run(binding.physicalIdentity, owner.canonical_path);
+    assertDeliveryRecordingBindingUnchanged(owner.recording_handle, owner.canonical_path, binding);
   }
 }
 
@@ -645,8 +702,8 @@ function repairDeliveryRecordingOwners(db: Database.Database): void {
   const repair = db.transaction(() => {
     for (const row of rows) {
       try {
-        const binding = deliveryRecordingBinding(row.handle, row.encrypted_path);
-        if (!claimDeliveryRecordingOwner(db, row.occurrence_id, binding)) {
+        const binding = claimDeliveryRecordingOwner(db, row.occurrence_id, row.handle, row.encrypted_path);
+        if (binding === null) {
           db.prepare("UPDATE delivery_journal SET retry_reason = 'recovery_unavailable' WHERE rowid = ?").run(row.journal_rowid);
           continue;
         }
