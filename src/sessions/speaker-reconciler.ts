@@ -54,6 +54,7 @@
 // warnings (a conflicted cluster, a straddling segment) are on the record but
 // are not incompleteness: re-running the reconciliation would not change them.
 
+import { createOwnedUiExactMs } from "../domain/attribution-evidence.ts";
 import { reduceAttendance, type AttendanceInterval } from "../domain/participants.ts";
 import {
   INCOMPLETE_TRANSCRIPT_CODES,
@@ -177,7 +178,7 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
         wording: unit.wording,
         liveSegmentIds: unit.liveSegmentIds,
         reason,
-        uiExactMs,
+        uiExactMs: createOwnedUiExactMs(Object.entries(uiExactMs)),
         ambiguousMs,
         unobservedMs,
       },
@@ -186,8 +187,8 @@ export function reconcileTranscript(input: ReconcileTranscriptInput): Reconciled
 
   const attendees = [...new Set(input.attendance.map((interval) => interval.feishuUserId))].sort();
   const observedSpeaking = new Set<string>();
-  for (const segment of segments) {
-    for (const [id, ms] of Object.entries(segment.provenance.uiExactMs)) {
+  for (const segment of attributed) {
+    for (const [id, ms] of Object.entries(segment.uiExactMs)) {
       if (ms > 0 && !named.has(id) && attendees.includes(id)) observedSpeaking.add(id);
     }
   }

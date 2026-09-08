@@ -147,6 +147,15 @@ test("exact UI overlap names the segment, with the evidence on the record", () =
   assert.deepEqual(result.silentAttendees, [BETA, GAMMA]);
 });
 
+test("Task 7 freezes the attribution evidence token it emits", () => {
+  const segment = only(reconcileTranscript(input({
+    liveSegments: [live("seg_owned", 10_000, 20_000, "owned evidence")],
+    evidence: [exact(12_000, ALPHA)],
+  })));
+  assert.deepEqual(segment.provenance.uiExactMs, { [ALPHA]: 8_000 });
+  assert.equal(Object.isFrozen(segment.provenance.uiExactMs), true);
+});
+
 test("a UI switch mid-segment is conflicting evidence and resolves to ambiguous", () => {
   const result = reconcileTranscript(
     input({

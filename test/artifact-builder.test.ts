@@ -15,12 +15,17 @@ import {
   buildTeamMemMeetingArtifact,
   createArtifactRevisionGuard,
 } from "../src/delivery/artifact-builder.ts";
+import {
+  createOwnedUiExactMs,
+  getOwnedUiExactMsSnapshot,
+} from "../src/domain/attribution-evidence.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import type { OccurrenceId } from "../src/domain/occurrence-id.ts";
 import { shortOccurrenceId } from "../src/domain/occurrence-id.ts";
 import type { AttendanceInterval } from "../src/domain/participants.ts";
 import type { ReconciledTranscript } from "../src/domain/transcript.ts";
 import type { ConversationRuntimePort, ProcessTextRequest } from "../src/ports/conversation-runtime.ts";
+import { reconcileTranscript } from "../src/sessions/speaker-reconciler.ts";
 
 const FIXTURES = new URL("../fixtures/contracts/", import.meta.url);
 
@@ -60,7 +65,7 @@ const reconciled: ReconciledTranscript = {
       text: "Atlas is ready and Ada owns the release note.",
       speaker: { kind: "named", feishuUserId: "ou_ada" },
       cluster: "cluster_1",
-      provenance: { wording: "reconciled", liveSegmentIds: ["live_001"], reason: "ui_aligned", uiExactMs: { ou_ada: 10_000 }, ambiguousMs: 0, unobservedMs: 0 },
+      provenance: { wording: "reconciled", liveSegmentIds: ["live_001"], reason: "ui_aligned", uiExactMs: createOwnedUiExactMs([["ou_ada", 10_000]]), ambiguousMs: 0, unobservedMs: 0 },
     },
     {
       segmentId: "seg_002",
@@ -69,7 +74,7 @@ const reconciled: ReconciledTranscript = {
       text: "An anonymous question followed.",
       speaker: { kind: "anonymous", label: "speaker_01" },
       cluster: "cluster_2",
-      provenance: { wording: "live", liveSegmentIds: ["live_002"], reason: "no_signal", uiExactMs: {}, ambiguousMs: 0, unobservedMs: 4_000 },
+      provenance: { wording: "live", liveSegmentIds: ["live_002"], reason: "no_signal", uiExactMs: createOwnedUiExactMs([]), ambiguousMs: 0, unobservedMs: 4_000 },
     },
   ],
 };
@@ -115,6 +120,29 @@ function buildInput(runtime: Pick<ConversationRuntimePort, "processText">, revis
   };
 }
 
+function task7NamedTranscript(): ReconciledTranscript {
+  return reconcileTranscript({
+    attendance,
+    liveSegments: [{
+      segmentId: "seg_001",
+      text: "Atlas is ready and Ada owns the release note.",
+      final: true,
+      startedAt: "2026-09-02T14:00:05Z",
+      endedAt: "2026-09-02T14:00:15Z",
+    }],
+    evidence: [{
+      bridgeSessionId: "bridge_owned",
+      sequence: 1,
+      observedAt: "2026-09-02T14:00:07Z",
+      confidence: "ui_exact",
+      feishuUserId: "ou_ada",
+    }],
+    reconciliation: { unavailable: "synthetic post-meeting fallback" },
+    alignment: reconciled.alignment,
+    endedAt: "2026-09-02T14:10:00Z",
+  });
+}
+
 async function assertUiExactMsRejected(uiExactMs: unknown, ambiguousMs = 0): Promise<void> {
   const runtime = runtimeReturning(synthesis);
   const transcript = {
@@ -123,7 +151,7 @@ async function assertUiExactMsRejected(uiExactMs: unknown, ambiguousMs = 0): Pro
       ...reconciled.segments[0]!,
       provenance: {
         ...reconciled.segments[0]!.provenance,
-        uiExactMs: uiExactMs as Readonly<Record<string, number>>,
+        uiExactMs: uiExactMs as ReconciledTranscript["segments"][number]["provenance"]["uiExactMs"],
         ambiguousMs,
         unobservedMs: 0,
       },
@@ -135,6 +163,41 @@ async function assertUiExactMsRejected(uiExactMs: unknown, ambiguousMs = 0): Pro
   );
   assert.equal(runtime.calls.length, 0);
 }
+
+test("owned evidence copies source entries, freezes every layer, and rejects duplicate keys", () => {
+  const source: Array<[string, number]> = [["ou_ada", 8_000]];
+  const token = createOwnedUiExactMs(source);
+  const snapshot = getOwnedUiExactMsSnapshot(token);
+  assert.ok(snapshot);
+  assert.notEqual(snapshot[0], source[0]);
+  assert.equal(Object.getPrototypeOf(token), Object.prototype);
+  assert.deepEqual(Reflect.ownKeys(token), ["ou_ada"]);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(token, "ou_ada"), {
+    value: 8_000,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  assert.equal(Object.isFrozen(token), true);
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot[0]), true);
+
+  source[0]![0] = "ou_mutated";
+  source[0]![1] = Number.NaN;
+  source.push(["ou_added", 1]);
+  assert.deepEqual(token, { ou_ada: 8_000 });
+  assert.deepEqual(snapshot, [["ou_ada", 8_000]]);
+  assert.throws(
+    () => createOwnedUiExactMs([["duplicate", 1], ["duplicate", 2]]),
+    /duplicate attribution evidence key/,
+  );
+});
+
+test("owned attribution helpers are absent from the public package root", async () => {
+  const publicApi = await import("../src/application.ts");
+  assert.equal("createOwnedUiExactMs" in publicApi, false);
+  assert.equal("getOwnedUiExactMsSnapshot" in publicApi, false);
+});
 
 test("canonical fixtures validate byte-for-byte, use Python canonical bytes/hashes, and preserve cross-language short occurrence ids", () => {
   assert.equal(digest("minimal"), "3ae8e2fb6a65a32586b8baf06d743c2f8b935ef0a8d9f72cf5de7c3fa507d06a");
@@ -275,20 +338,49 @@ test("builder serializes named confidence from the asserted identity only", asyn
     alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
     segments: [{
       ...reconciled.segments[0]!,
-      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 } },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", 8_000], ["ou_competitor", 500]]) },
     }],
   };
   const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis).runtime, 1, { transcript }));
   assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
 });
 
-test("builder rejects non-finite, negative, and over-duration reconciliation evidence before Runtime processing", async () => {
-  for (const evidence of [Infinity, Number.NaN, -1, 10_001]) {
+test("builder rejects an unowned plain attribution record before Runtime", async () => {
+  await assertUiExactMsRejected({ ou_ada: 8_000 });
+});
+
+test("builder rejects a prototype-reassigned WeakRef while its intrinsic slot remains", async () => {
+  const referent = {};
+  const exotic = new WeakRef(referent) as unknown as Record<string, number>;
+  Object.setPrototypeOf(exotic, Object.prototype);
+  Object.defineProperty(exotic, "ou_ada", { value: 8_000, enumerable: true });
+  assert.equal(WeakRef.prototype.deref.call(exotic), referent);
+  await assertUiExactMsRejected(exotic);
+});
+
+test("spreading Task 7 evidence loses its trusted identity", async () => {
+  const transcript = task7NamedTranscript();
+  const runtime = runtimeReturning(synthesis);
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript }));
+  assert.equal(runtime.calls.length, 1);
+  assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
+
+  const token = transcript.segments[0]!.provenance.uiExactMs;
+  await assertUiExactMsRejected({ ...token });
+});
+
+test("structured-cloning Task 7 evidence loses its trusted identity", async () => {
+  const token = task7NamedTranscript().segments[0]!.provenance.uiExactMs;
+  await assertUiExactMsRejected(structuredClone(token));
+});
+
+test("builder rejects non-finite, fractional, negative, and over-duration owned evidence before Runtime processing", async () => {
+  for (const evidence of [Infinity, Number.NaN, 1.5, -1, 10_001]) {
     const runtime = runtimeReturning(synthesis);
     const transcript = {
       ...reconciled,
       alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
-      segments: [{ ...reconciled.segments[0]!, provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: evidence, ou_competitor: 1 } } }],
+      segments: [{ ...reconciled.segments[0]!, provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", evidence], ["ou_competitor", 1]]) } }],
     };
     await assert.rejects(
       buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript })),
@@ -322,10 +414,10 @@ test("builder rejects malformed ambiguous and unobserved provenance components b
 
 test("builder rejects overfull mutually exclusive attribution evidence and unsupported named claims before Runtime processing", async () => {
   const invalidProvenance = [
-    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 3_000 } },
-    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 }, ambiguousMs: 1_000, unobservedMs: 1_000 },
-    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_competitor: 500 } },
-    { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 0 } },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", 8_000], ["ou_competitor", 3_000]]) },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", 8_000], ["ou_competitor", 500]]), ambiguousMs: 1_000, unobservedMs: 1_000 },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_competitor", 500]]) },
+    { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", 0]]) },
   ];
   for (const provenance of invalidProvenance) {
     const runtime = runtimeReturning(synthesis);
@@ -415,6 +507,18 @@ test("builder rejects intrinsically branded Date evidence after its prototype is
 test("builder translates evidence reflection failures to the generic error before Runtime", async () => {
   let reflections = 0;
   const hostile = new Proxy({ ou_ada: 8_000 }, {
+    get() {
+      reflections += 1;
+      throw new Error("private get sentinel");
+    },
+    getPrototypeOf() {
+      reflections += 1;
+      throw new Error("private prototype sentinel");
+    },
+    ownKeys() {
+      reflections += 1;
+      throw new Error("private keys sentinel");
+    },
     getOwnPropertyDescriptor() {
       reflections += 1;
       throw new Error("private reflection sentinel");
@@ -424,39 +528,48 @@ test("builder translates evidence reflection failures to the generic error befor
   assert.equal(reflections, 0);
 });
 
-test("builder accepts ordinary and null-prototype own enumerable data evidence records", async () => {
-  const ordinary = { ou_ada: 8_000, ou_competitor: 500 };
+test("builder rejects null-prototype and frozen same-shape evidence forgeries", async () => {
   const nullPrototype = Object.create(null) as Record<string, number>;
   Object.defineProperties(nullPrototype, {
     ou_ada: { value: 8_000, enumerable: true },
     ou_competitor: { value: 500, enumerable: true },
   });
-  for (const uiExactMs of [ordinary, nullPrototype]) {
-    const runtime = runtimeReturning(synthesis);
-    const transcript = {
-      ...reconciled,
-      segments: [{
-        ...reconciled.segments[0]!,
-        provenance: { ...reconciled.segments[0]!.provenance, uiExactMs, ambiguousMs: 1_000, unobservedMs: 500 },
-      }],
-    };
-    const built = await buildTeamMemMeetingArtifact(buildInput(runtime.runtime, 1, { transcript }));
-    assert.equal(runtime.calls.length, 1);
-    assert.equal(built.artifact.transcript[0]!.attribution_confidence, 0.8);
+  for (const forgery of [nullPrototype, Object.freeze({ ou_ada: 8_000, ou_competitor: 500 })]) {
+    await assertUiExactMsRejected(forgery);
   }
 });
 
+test("builder rejects a proxy around genuine Task 7 evidence without invoking traps", async () => {
+  let traps = 0;
+  const token = task7NamedTranscript().segments[0]!.provenance.uiExactMs;
+  const proxied = new Proxy(token, {
+    get() {
+      traps += 1;
+      throw new Error("private genuine-token trap");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("private genuine-token trap");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("private genuine-token trap");
+    },
+  });
+  await assertUiExactMsRejected(proxied);
+  assert.equal(traps, 0);
+});
+
 test("builder preserves legitimate anonymous and ambiguous mutually-exclusive evidence", async () => {
-  const nullPrototype = Object.create(null) as Record<string, number>;
   const cases = [
     {
       speaker: { kind: "anonymous" as const, label: "speaker_01" },
-      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: {}, ambiguousMs: 0, unobservedMs: 10_000 },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([]), ambiguousMs: 0, unobservedMs: 10_000 },
       artifactKind: "anonymous",
     },
     {
       speaker: { kind: "ambiguous" as const },
-      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: nullPrototype, ambiguousMs: 10_000, unobservedMs: 0 },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([]), ambiguousMs: 10_000, unobservedMs: 0 },
       artifactKind: "ambiguous",
     },
   ];
@@ -479,7 +592,7 @@ test("builder accepts an attribution evidence aggregate exactly equal to the seg
     alignment: { kind: "durable_runtime_anchor" as const, mediaOriginAt: "2026-09-02T14:00:00Z", runtimeSessionId: 42n },
     segments: [{
       ...reconciled.segments[0]!,
-      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: { ou_ada: 8_000, ou_competitor: 500 }, ambiguousMs: 1_000, unobservedMs: 500 },
+      provenance: { ...reconciled.segments[0]!.provenance, uiExactMs: createOwnedUiExactMs([["ou_ada", 8_000], ["ou_competitor", 500]]), ambiguousMs: 1_000, unobservedMs: 500 },
     }],
   };
   const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(synthesis).runtime, 1, { transcript }));

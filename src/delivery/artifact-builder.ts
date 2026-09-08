@@ -2,7 +2,6 @@
 // creates no files and performs no delivery: Task 9 owns the outbox/bundle.
 
 import { createHash } from "node:crypto";
-import * as intrinsicTypes from "node:util/types";
 import { z } from "zod";
 
 import {
@@ -16,14 +15,12 @@ import {
 } from "../contracts/teammem-meeting-v1.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { AttendanceInterval } from "../domain/participants.ts";
+import { getOwnedUiExactMsSnapshot } from "../domain/attribution-evidence.ts";
 import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, TranscriptWarning } from "../domain/transcript.ts";
 import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 
 const text = z.string().min(1).max(20_000);
 const evidence = z.array(z.string().min(1).max(200)).min(1).max(100);
-const intrinsicObjectChecks = Object.values(intrinsicTypes).filter(
-  (candidate): candidate is (value: unknown) => boolean => typeof candidate === "function",
-);
 
 const textSynthesis = z.object({
   summary: text,
@@ -275,7 +272,9 @@ function validateReconciledEvidence(segment: ReconciledSegment): ReconciledEvide
   }
   const duration = segment.endedAtMs - segment.startedAtMs;
   if (duration <= 0) throw new Error("reconciled attribution evidence is invalid");
-  const uiExactMs = snapshotUiExactMs(segment.provenance.uiExactMs);
+  const snapshot = getOwnedUiExactMsSnapshot(segment.provenance.uiExactMs);
+  if (snapshot === null) throw new Error("reconciled attribution evidence is invalid");
+  const uiExactMs = new Map(snapshot);
   const components = [
     ...uiExactMs.values(),
     segment.provenance.ambiguousMs,
@@ -296,28 +295,6 @@ function validateReconciledEvidence(segment: ReconciledSegment): ReconciledEvide
     if (assertedMs <= 0) throw new Error("reconciled attribution evidence is invalid");
   }
   return { duration, assertedMs };
-}
-
-function snapshotUiExactMs(uiExactMs: Readonly<Record<string, number>>): ReadonlyMap<string, number> {
-  try {
-    if (typeof uiExactMs !== "object" || uiExactMs === null || Array.isArray(uiExactMs) || intrinsicObjectChecks.some((check) => check(uiExactMs))) {
-      throw new Error("unsupported evidence record");
-    }
-    const prototype = Object.getPrototypeOf(uiExactMs);
-    if (prototype !== Object.prototype && prototype !== null) throw new Error("unsupported evidence record");
-    const snapshot = new Map<string, number>();
-    for (const key of Reflect.ownKeys(uiExactMs)) {
-      if (typeof key !== "string") throw new Error("unsupported evidence record");
-      const descriptor = Object.getOwnPropertyDescriptor(uiExactMs, key);
-      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
-        throw new Error("unsupported evidence record");
-      }
-      snapshot.set(key, descriptor.value as number);
-    }
-    return snapshot;
-  } catch {
-    throw new Error("reconciled attribution evidence is invalid");
-  }
 }
 
 function attributionConfidence(segment: ReconciledSegment, evidence: ReconciledEvidenceSnapshot): number {

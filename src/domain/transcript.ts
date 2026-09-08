@@ -25,6 +25,8 @@
 // monitor; a transcript that is not complete is one whose encrypted audio
 // must not be deleted yet.
 
+import type { OwnedUiExactMs } from "./attribution-evidence.ts";
+
 /** One bridge observation of the Feishu active-speaker UI, on the wall
  * clock. Two shapes, never a third: the bridge validator rejects an
  * `ambiguous` observation that names anyone, and this type cannot express
@@ -80,7 +82,7 @@ export type SegmentProvenance = {
   readonly reason: AttributionReason;
   /** Milliseconds of this segment during which the UI showed exactly this
    * person's tile lit, per person observed. */
-  readonly uiExactMs: Readonly<Record<string, number>>;
+  readonly uiExactMs: OwnedUiExactMs;
   /** Milliseconds under a bridge `ambiguous` observation. */
   readonly ambiguousMs: number;
   /** Milliseconds before the first observation of the meeting -- no state at
