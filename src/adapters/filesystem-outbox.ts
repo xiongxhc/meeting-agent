@@ -311,6 +311,9 @@ function removeIncompleteDestination(destination: string): void {
 
 function removeRegularOwnedFile(root: string, filename: string, tombstone: string, fault?: (step: DeleteFaultPoint) => void): void {
   const target = path.resolve(filename);
+  // The original path is absent after a successful detach. Replay the exact
+  // journal-derived tombstone before treating that absence as completion.
+  removeExactTombstone(root, tombstone);
   try {
     assertPathUnderRoot(root, target, true);
     const stat = lstatSync(target);
@@ -381,20 +384,32 @@ function removeDetached(tombstone: string): void {
 /** Private stages are owned by a durable journal capability. PID liveness is
  * deliberately irrelevant: a restarted worker can finish the same stage. */
 function removeAbandonedStages(root: string, occurrenceDir: string, revision: number, expectedToken: string | undefined, suffix: string, fault?: (step: DeleteFaultPoint) => void): void {
+  if (expectedToken === undefined) return;
   try { assertPathUnderRoot(root, occurrenceDir, true); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  const prefix = `.${revision}.staging-`;
-  for (const name of readdirSync(occurrenceDir)) {
-    if (!name.startsWith(prefix)) continue;
-    const stage = path.join(occurrenceDir, name);
-    assertPathUnderRoot(root, stage, true);
-    const stat = lstatSync(stage);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete unsafe staging directory");
-    if (!stageOwnerMatches(stage, expectedToken)) continue;
-    detachAndRemove(occurrenceDir, stage, `.stage-delete-${suffix}`, fault, "after_stage_detach");
+  const tombstone = `.stage-delete-${suffix}`;
+  removeExactTombstone(occurrenceDir, tombstone);
+  const stage = path.join(occurrenceDir, `.${revision}.staging-${expectedToken}`);
+  if (!existsSync(stage)) return;
+  assertPathUnderRoot(root, stage, true);
+  const stat = lstatSync(stage);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete unsafe staging directory");
+  if (!stageOwnerMatches(stage, expectedToken)) return;
+  detachAndRemove(occurrenceDir, stage, tombstone, fault, "after_stage_detach");
+}
+
+function removeExactTombstone(root: string, tombstoneName: string): void {
+  const tombstone = path.join(root, tombstoneName);
+  assertPathUnderRoot(root, tombstone, false);
+  try {
+    lstatSync(tombstone);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
+  removeDetached(tombstone);
 }
 
 function requireRecordingHandle(recordingPath: string, persistedHandle?: string): string {

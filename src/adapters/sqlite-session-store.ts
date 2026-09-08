@@ -549,7 +549,7 @@ function updateDelivery(db: Database.Database, row: DeliveryRow): void {
   if (changed !== 1) throw new OrchestrationError("constraint_violation", "delivery journal row is unknown or immutable fields changed");
 }
 
-type DeliveryRecordingBinding = { readonly canonicalPath: string; readonly physicalIdentity: string; readonly handle: string };
+type DeliveryRecordingBinding = { readonly canonicalPath: string; readonly physicalIdentity: string | null; readonly handle: string };
 
 function deliveryRecordingBinding(handle: string, encryptedPath: string): DeliveryRecordingBinding {
   const canonicalPath = path.resolve(encryptedPath);
@@ -562,20 +562,73 @@ function deliveryRecordingBinding(handle: string, encryptedPath: string): Delive
     return { canonicalPath, physicalIdentity: `inode:${stat.dev}:${stat.ino}`, handle };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return { canonicalPath, physicalIdentity: `path:${canonicalPath}`, handle };
+    return { canonicalPath, physicalIdentity: null, handle };
   }
 }
 
 function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string, binding: DeliveryRecordingBinding): boolean {
+  if (binding.physicalIdentity !== null) refreshDeliveryRecordingReservations(db);
+  const canonicalOwner = db.prepare(
+    "SELECT occurrence_id, owner_state FROM delivery_recording_owners_v17 WHERE canonical_path = ?",
+  ).get(binding.canonicalPath) as { occurrence_id: string; owner_state: "observed" | "reserved" | "invalid" } | undefined;
+  const physicalOwner = binding.physicalIdentity === null ? undefined : db.prepare(
+    "SELECT occurrence_id FROM delivery_recording_owners_v17 WHERE physical_identity = ?",
+  ).get(binding.physicalIdentity) as { occurrence_id: string } | undefined;
+  if ((canonicalOwner !== undefined && canonicalOwner.occurrence_id !== occurrenceId)
+    || (physicalOwner !== undefined && physicalOwner.occurrence_id !== occurrenceId)) return false;
+  if (canonicalOwner !== undefined) {
+    if (binding.physicalIdentity !== null && canonicalOwner.owner_state === "reserved" && physicalOwner === undefined) {
+      db.prepare(
+        `UPDATE delivery_recording_owners_v17
+            SET physical_identity = ?, owner_state = 'observed', failure_reason = NULL
+          WHERE canonical_path = ? AND owner_state = 'reserved'`,
+      ).run(binding.physicalIdentity, binding.canonicalPath);
+    }
+    return canonicalOwner.owner_state !== "invalid";
+  }
+  if (physicalOwner !== undefined) return true;
   db.prepare(
-    `INSERT OR IGNORE INTO delivery_recording_owners_v16
-       (canonical_path, physical_identity, occurrence_id, recording_handle, failure_reason)
-     VALUES (?, ?, ?, ?, NULL)`,
-  ).run(binding.canonicalPath, binding.physicalIdentity, occurrenceId, binding.handle);
-  const owner = db.prepare(
-    "SELECT occurrence_id FROM delivery_recording_owners_v16 WHERE canonical_path = ? OR physical_identity = ?",
-  ).get(binding.canonicalPath, binding.physicalIdentity) as { occurrence_id: string } | undefined;
-  return owner?.occurrence_id === occurrenceId;
+    `INSERT INTO delivery_recording_owners_v17
+       (canonical_path, physical_identity, occurrence_id, recording_handle, owner_state, failure_reason)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    binding.canonicalPath,
+    binding.physicalIdentity,
+    occurrenceId,
+    binding.handle,
+    binding.physicalIdentity === null ? "reserved" : "observed",
+    binding.physicalIdentity === null ? "source_missing" : null,
+  );
+  return true;
+}
+
+function refreshDeliveryRecordingReservations(db: Database.Database): void {
+  const reservations = db.prepare(
+    `SELECT canonical_path, occurrence_id, recording_handle
+       FROM delivery_recording_owners_v17
+      WHERE owner_state = 'reserved'
+      ORDER BY rowid`,
+  ).all() as Array<{ canonical_path: string; occurrence_id: string; recording_handle: string }>;
+  for (const reservation of reservations) {
+    let binding: DeliveryRecordingBinding;
+    try {
+      binding = deliveryRecordingBinding(reservation.recording_handle, reservation.canonical_path);
+    } catch {
+      // A still-missing or newly unsafe legacy reservation cannot claim a
+      // physical file, but it must not block an unrelated valid occurrence.
+      continue;
+    }
+    if (binding.physicalIdentity === null) continue;
+    const owner = db.prepare(
+      "SELECT occurrence_id FROM delivery_recording_owners_v17 WHERE physical_identity = ?",
+    ).get(binding.physicalIdentity) as { occurrence_id: string } | undefined;
+    if (owner !== undefined) continue;
+    db.prepare(
+      `UPDATE delivery_recording_owners_v17
+          SET physical_identity = ?, owner_state = 'observed', failure_reason = NULL
+        WHERE canonical_path = ? AND owner_state = 'reserved'`,
+    ).run(binding.physicalIdentity, reservation.canonical_path);
+  }
 }
 
 /** SQL migrations cannot resolve filesystem aliases or inspect inode identity.
@@ -583,7 +636,7 @@ function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string
  * wins; every conflicting or malformed row becomes durably fail-closed and
  * can never silently hand the physical source to a later occurrence. */
 function repairDeliveryRecordingOwners(db: Database.Database): void {
-  if (currentSchemaVersion(db) < 16) return;
+  if (currentSchemaVersion(db) < 17) return;
   const rows = db.prepare(
     `SELECT j.rowid AS journal_rowid, j.occurrence_id, r.handle, r.encrypted_path
        FROM delivery_journal j JOIN recordings r ON r.occurrence_id = j.occurrence_id
@@ -597,15 +650,19 @@ function repairDeliveryRecordingOwners(db: Database.Database): void {
           db.prepare("UPDATE delivery_journal SET retry_reason = 'recovery_unavailable' WHERE rowid = ?").run(row.journal_rowid);
           continue;
         }
-        db.prepare("UPDATE delivery_journal SET recording_path = ?, recording_handle = ? WHERE rowid = ?")
-          .run(binding.canonicalPath, binding.handle, row.journal_rowid);
+        db.prepare(
+          `UPDATE delivery_journal
+              SET recording_path = ?, recording_handle = ?,
+                  retry_reason = CASE WHEN ? IS NULL THEN 'recovery_unavailable' ELSE retry_reason END
+            WHERE rowid = ?`,
+        ).run(binding.canonicalPath, binding.handle, binding.physicalIdentity, row.journal_rowid);
       } catch {
         const canonicalPath = path.resolve(row.encrypted_path);
         db.prepare(
-          `INSERT OR IGNORE INTO delivery_recording_owners_v16
-             (canonical_path, physical_identity, occurrence_id, recording_handle, failure_reason)
-           VALUES (?, ?, ?, NULL, 'invalid_runtime_recording_binding')`,
-        ).run(canonicalPath, `path:${canonicalPath}`, row.occurrence_id);
+          `INSERT OR IGNORE INTO delivery_recording_owners_v17
+             (canonical_path, physical_identity, occurrence_id, recording_handle, owner_state, failure_reason)
+           VALUES (?, NULL, ?, NULL, 'invalid', 'invalid_runtime_recording_binding')`,
+        ).run(canonicalPath, row.occurrence_id);
         db.prepare("UPDATE delivery_journal SET recording_path = ?, retry_reason = 'recovery_unavailable' WHERE rowid = ?")
           .run(canonicalPath, row.journal_rowid);
       }

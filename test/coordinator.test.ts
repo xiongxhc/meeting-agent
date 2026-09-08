@@ -20,7 +20,7 @@
 // Nothing here touches a live TeamMem installation.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -209,7 +209,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 16);
+      assert.equal(store.schemaVersion, 17);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -227,6 +227,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 14, name: "014_delivery_recovery.sql", appliedAtMs: BASE_MS },
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
         { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
+        { version: 17, name: "017_delivery_recording_reservations.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -271,7 +272,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 16);
+      assert.equal(second.schemaVersion, 17);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -291,6 +292,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 14, name: "014_delivery_recovery.sql", appliedAtMs: BASE_MS },
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
         { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
+        { version: 17, name: "017_delivery_recording_reservations.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -298,6 +300,184 @@ test("reopening an existing database does not re-apply the migrations", () => {
     }
   } finally {
     h.cleanup();
+  }
+});
+
+test("schema 13 and 14 missing recording owners fail closed and reserve later physical identity", () => {
+  for (const legacyVersion of [13, 14]) {
+    for (const createFromReservedPath of [true, false]) {
+      const h = harness();
+      const recordings = path.join(path.dirname(h.dbPath), "recordings");
+      mkdirSync(recordings);
+      const reservedHandle = "a".repeat(32);
+      const laterHandle = "b".repeat(32);
+      const unrelatedHandle = "c".repeat(32);
+      const reservedPath = `${recordings}/./${reservedHandle}.crsr`;
+      const laterPath = path.join(recordings, `${laterHandle}.crsr`);
+      const unrelatedPath = path.join(recordings, `${unrelatedHandle}.crsr`);
+      const reserved = identity(130 + legacyVersion + (createFromReservedPath ? 0 : 20));
+      const later = identity(230 + legacyVersion + (createFromReservedPath ? 0 : 20));
+      const unrelated = identity(330 + legacyVersion + (createFromReservedPath ? 0 : 20));
+      const artifactHash = `sha256:${"a".repeat(64)}`;
+      try {
+        const raw = new Database(h.dbPath);
+        try {
+          migrateFixtureThrough(raw, legacyVersion);
+          seedRawSession(raw, reserved);
+          raw.prepare("UPDATE sessions SET state = 'awaiting_teammem' WHERE occurrence_id = ?")
+            .run(reserved.occurrenceId);
+          raw.prepare(
+            `INSERT INTO recordings
+               (occurrence_id, handle, sha256, duration_ms, finalized_at_ms, encrypted_path, format, key_id)
+             VALUES (?, ?, ?, 1, ?, ?, 'opus', 'fake-key')`,
+          ).run(reserved.occurrenceId, reservedHandle, "a".repeat(64), BASE_MS, reservedPath);
+          const recoveryColumns = legacyVersion >= 14 ? ", recovery_artifact, stage_token" : "";
+          const recoveryValues = legacyVersion >= 14 ? ", NULL, NULL" : "";
+          raw.prepare(
+            `INSERT INTO delivery_journal
+               (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
+                transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
+                deleted_at_ms, publication_url, vault_commit${recoveryColumns})
+             VALUES (?, 3, ?, ?, ?, ?, 1, 7, ?, 'receipt_unavailable', ?, NULL, ?, ?${recoveryValues})`,
+          ).run(
+            reserved.occurrenceId,
+            artifactHash,
+            reservedPath,
+            path.join(path.dirname(h.dbPath), "outbox", occurrencePathSegment(reserved.occurrenceId), "3"),
+            BASE_MS,
+            BASE_MS + 99,
+            BASE_MS + 1,
+            "https://example.test/vault/-/blob/" + "d".repeat(40) + "/Meetings/reserved.md",
+            "d".repeat(40),
+          );
+        } finally {
+          raw.close();
+        }
+
+        const store = h.open(BASE_MS + 2);
+        try {
+          assert.equal(store.schemaVersion, 17);
+          assert.deepEqual(store.foreignKeyCheck(), []);
+          const migrated = store.pending().find((row) => row.occurrenceId === reserved.occurrenceId)!;
+          assert.equal(migrated.retryReason, "recovery_unavailable");
+          assert.equal(migrated.recordingPath, path.resolve(reservedPath));
+          assert.equal(migrated.recordingHandle, reservedHandle);
+          assert.equal(migrated.retryCount, 7);
+          assert.equal(migrated.nextRetryAtMs, BASE_MS + 99);
+          assert.equal(migrated.publishedAtMs, BASE_MS + 1);
+          assert.equal(migrated.vaultCommit, "d".repeat(40));
+
+          const inspectReservation = new Database(h.dbPath, { readonly: true });
+          try {
+            assert.deepEqual(inspectReservation.prepare(
+              `SELECT canonical_path, physical_identity, occurrence_id, recording_handle, owner_state, failure_reason
+                 FROM delivery_recording_owners_v17 WHERE canonical_path = ?`,
+            ).get(path.resolve(reservedPath)), {
+              canonical_path: path.resolve(reservedPath),
+              physical_identity: null,
+              occurrence_id: reserved.occurrenceId,
+              recording_handle: reservedHandle,
+              owner_state: "reserved",
+              failure_reason: "source_missing",
+            });
+          } finally {
+            inspectReservation.close();
+          }
+
+          writeFileSync(unrelatedPath, "unrelated encrypted bytes");
+          store.createSession({ occurrenceId: unrelated.occurrenceId, providerMeetingId: unrelated.providerMeetingId, occurrenceStartedAt: unrelated.occurrenceStartedAt, nowMs: BASE_MS });
+          store.finalizeSession({
+            transition: { occurrenceId: unrelated.occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: BASE_MS },
+            recording: { handle: unrelatedHandle, encryptedPath: unrelatedPath, sha256: "c".repeat(64), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+          });
+          assert.doesNotThrow(() => store.savePending({
+            ...migrated,
+            occurrenceId: unrelated.occurrenceId,
+            recordingPath: unrelatedPath,
+            bundlePath: path.join(path.dirname(h.dbPath), "outbox", occurrencePathSegment(unrelated.occurrenceId), "3"),
+            artifactHash: `sha256:${"c".repeat(64)}`,
+            retryCount: 0,
+            retryReason: null,
+            publishedAtMs: null,
+            publicationUrl: null,
+            vaultCommit: null,
+            recordingHandle: unrelatedHandle,
+          }));
+
+          if (createFromReservedPath) {
+            writeFileSync(path.resolve(reservedPath), "shared encrypted bytes");
+            linkSync(path.resolve(reservedPath), laterPath);
+          } else {
+            writeFileSync(laterPath, "shared encrypted bytes");
+            linkSync(laterPath, path.resolve(reservedPath));
+          }
+          const reservedStat = statSync(path.resolve(reservedPath));
+          const laterStat = statSync(laterPath);
+          assert.equal(reservedStat.dev, laterStat.dev);
+          assert.equal(reservedStat.ino, laterStat.ino);
+
+          assert.doesNotThrow(() => store.savePending({
+            ...migrated,
+            revision: 4,
+            artifactHash: `sha256:${"e".repeat(64)}`,
+            bundlePath: path.join(path.dirname(h.dbPath), "outbox", occurrencePathSegment(reserved.occurrenceId), "4"),
+            retryCount: 0,
+            retryReason: null,
+            publishedAtMs: null,
+            publicationUrl: null,
+            vaultCommit: null,
+          }));
+
+          const inspectObservedOwner = new Database(h.dbPath, { readonly: true });
+          try {
+            assert.deepEqual(inspectObservedOwner.prepare(
+              `SELECT physical_identity, owner_state, failure_reason
+                 FROM delivery_recording_owners_v17 WHERE canonical_path = ?`,
+            ).get(path.resolve(reservedPath)), {
+              physical_identity: `inode:${reservedStat.dev}:${reservedStat.ino}`,
+              owner_state: "observed",
+              failure_reason: null,
+            });
+          } finally {
+            inspectObservedOwner.close();
+          }
+
+          store.createSession({ occurrenceId: later.occurrenceId, providerMeetingId: later.providerMeetingId, occurrenceStartedAt: later.occurrenceStartedAt, nowMs: BASE_MS });
+          store.finalizeSession({
+            transition: { occurrenceId: later.occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: BASE_MS },
+            recording: { handle: laterHandle, encryptedPath: laterPath, sha256: "b".repeat(64), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+          });
+          assert.throws(() => store.savePending({
+            ...migrated,
+            occurrenceId: later.occurrenceId,
+            recordingPath: laterPath,
+            bundlePath: path.join(path.dirname(h.dbPath), "outbox", occurrencePathSegment(later.occurrenceId), "3"),
+            artifactHash: `sha256:${"b".repeat(64)}`,
+            retryCount: 0,
+            retryReason: null,
+            publishedAtMs: null,
+            publicationUrl: null,
+            vaultCommit: null,
+            recordingHandle: laterHandle,
+          }), /another occurrence/i);
+        } finally {
+          store.close();
+        }
+
+        const reopened = h.open(BASE_MS + 3);
+        try {
+          assert.equal(reopened.schemaVersion, 17);
+          assert.deepEqual(reopened.foreignKeyCheck(), []);
+          assert.equal(reopened.pending().filter((row) => row.occurrenceId === reserved.occurrenceId).length, 2);
+          assert.equal(reopened.pending().filter((row) => row.occurrenceId === unrelated.occurrenceId).length, 1);
+          assert.equal(reopened.pending().some((row) => row.occurrenceId === later.occurrenceId), false);
+        } finally {
+          reopened.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    }
   }
 });
 
@@ -471,7 +651,7 @@ test("a schema-10 terminal recording generation upgrades with honest legacy prov
     }
 
     const upgraded = h.open(BASE_MS + 1);
-    assert.equal(upgraded.schemaVersion, 16);
+    assert.equal(upgraded.schemaVersion, 17);
     upgraded.close();
 
     const reopened = h.open(BASE_MS + 2);
@@ -572,7 +752,7 @@ test("a schema-11 database upgrades to the current constraints without losing re
 
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 16);
+      assert.equal(store.schemaVersion, 17);
       const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
       assert.equal(evidence?.runtimeSessionId, 45n);
       assert.equal(evidence?.terminalSource, "bridge_observed");
@@ -718,7 +898,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 16);
+      assert.equal(store.schemaVersion, 17);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);

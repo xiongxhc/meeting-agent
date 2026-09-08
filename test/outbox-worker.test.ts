@@ -304,6 +304,7 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
     deletedAtMs: null, publicationUrl: null, vaultCommit: null,
     recoveryArtifact: null, stageToken: null,
   };
+  writeFileSync(row.recordingPath, "synthetic encrypted journal source");
   const first = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now });
   try {
     first.createSession({ occurrenceId: artifact.occurrence_id, providerMeetingId: artifact.provider_meeting_id, occurrenceStartedAt: artifact.started_at, nowMs: now });
@@ -363,7 +364,8 @@ test("a corrupted journal row cannot delete a sibling outbox directory", () => {
       ...journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!, bundlePath: sibling, transcriptComplete: true,
     });
     writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
-    assert.throws(() => worker.reconcile(), /bundle|occurrence|delete/i);
+    assert.doesNotThrow(() => worker.reconcile());
+    assert.equal(journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)?.retryReason, "recovery_unavailable");
     assert.equal(readFileSync(path.join(sibling, "sentinel"), "utf8"), "do not delete");
     assert.equal(statSync(ownBundle).isDirectory(), true);
     assert.equal(statSync(source).isFile(), true);
@@ -382,7 +384,8 @@ test("a real process exit leaves an owned stage which restart cleanup removes wi
     writeFileSync(child, `import { writeMeetingBundle } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};
 const input = JSON.parse(process.argv[2]);
 writeMeetingBundle({...input, fault: (step) => { if (step === "after_audio_write") process.exit(77); }});\n`);
-    const result = spawnSync(process.execPath, [child, JSON.stringify({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source })]);
+    const stageToken = "a".repeat(32);
+    const result = spawnSync(process.execPath, [child, JSON.stringify({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, stageToken })]);
     assert.equal(result.status, 77);
     const occurrence = path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId));
     const stages = readdirSync(occurrence).filter((name) => name.startsWith(`.${artifact.revision}.staging-`));
@@ -390,7 +393,7 @@ writeMeetingBundle({...input, fault: (step) => { if (step === "after_audio_write
     assert.equal(existsSync(path.join(occurrence, stages[0]!, "audio.enc")), true);
 
     const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
-    deleteDeliveredEvidence({ recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id, revision: artifact.revision, recordingPath: source, bundlePath: bundle });
+    deleteDeliveredEvidence({ recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id, revision: artifact.revision, recordingPath: source, bundlePath: bundle, stageToken });
     assert.equal(existsSync(occurrence), false, "atomic occurrence detach clears canonical and private evidence together");
   } finally { h.cleanup(); }
 });
@@ -794,6 +797,194 @@ test("terminal recovery_unavailable rows do not update again before the retentio
     assert.equal(updates, 0);
     assert.equal(existsSync(source), true);
   } finally { h.cleanup(); }
+});
+
+test("recording and stage tombstones replay after real detach deaths without touching other tokens", () => {
+  for (const cut of ["after_recording_detach", "after_stage_detach"] as const) {
+    const h = harness();
+    try {
+      const { artifact, bytes, serialized, hash } = artifactAndAudio();
+      const handle = "a".repeat(32);
+      const token = "1".repeat(32);
+      const otherToken = "2".repeat(32);
+      const source = path.join(h.recordings, `${handle}.crsr`);
+      writeFileSync(source, bytes);
+      const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+      const occurrence = path.dirname(bundle);
+      const ownedStage = path.join(occurrence, `.${artifact.revision}.staging-${token}`);
+      mkdirSync(ownedStage);
+      writeFileSync(path.join(ownedStage, "OWNER"), token);
+      writeFileSync(path.join(ownedStage, "audio.enc"), bytes);
+      const otherStage = path.join(occurrence, `.${artifact.revision}.staging-${otherToken}`);
+      mkdirSync(otherStage);
+      writeFileSync(path.join(otherStage, "OWNER"), otherToken);
+      writeFileSync(path.join(otherStage, "keep"), "other stage");
+      const otherRecordingTombstone = path.join(h.recordings, `.recording-delete-${otherToken}-${handle}-${artifact.revision}`);
+      writeFileSync(otherRecordingTombstone, "other recording tombstone");
+      const otherStageTombstone = path.join(occurrence, `.stage-delete-${otherToken}-${handle}-${artifact.revision}`);
+      mkdirSync(otherStageTombstone);
+      writeFileSync(path.join(otherStageTombstone, "keep"), "other stage tombstone");
+
+      const child = path.join(h.root, `kill-${cut}.ts`);
+      writeFileSync(child, `import { deleteDeliveredEvidence } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};\nconst input = JSON.parse(process.argv[2]);\ndeleteDeliveredEvidence({...input, fault: (step) => { if (step === ${JSON.stringify(cut)}) process.kill(process.pid, "SIGKILL"); }});\n`);
+      const result = spawnSync(process.execPath, [child, JSON.stringify({
+        recordingsDir: h.recordings,
+        outboxDir: h.outbox,
+        occurrenceId: artifact.occurrence_id,
+        revision: artifact.revision,
+        recordingPath: source,
+        bundlePath: bundle,
+        stageToken: token,
+        recordingHandle: handle,
+      })]);
+      assert.equal(result.signal, "SIGKILL", cut);
+      const detached = cut === "after_recording_detach"
+        ? path.join(h.recordings, `.recording-delete-${token}-${handle}-${artifact.revision}`)
+        : path.join(occurrence, `.stage-delete-${token}-${handle}-${artifact.revision}`);
+      assert.equal(existsSync(detached), true, cut);
+
+      const deadline = Date.parse(artifact.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+      const journal = new FakeJournal();
+      journal.savePending({
+        occurrenceId: artifact.occurrence_id,
+        revision: artifact.revision,
+        artifactHash: hash,
+        recordingPath: source,
+        bundlePath: bundle,
+        endedAtMs: Date.parse(artifact.ended_at),
+        transcriptComplete: true,
+        retryCount: 0,
+        nextRetryAtMs: deadline,
+        retryReason: "recovery_unavailable",
+        publishedAtMs: null,
+        deletedAtMs: null,
+        publicationUrl: null,
+        vaultCommit: null,
+        recoveryArtifact: null,
+        stageToken: token,
+        recordingHandle: handle,
+      });
+      let updates = 0;
+      const originalUpdate = journal.update.bind(journal);
+      journal.update = (row) => { updates += 1; originalUpdate(row); };
+      const worker = createOutboxWorker({
+        outboxDir: h.outbox,
+        receiptsDir: h.receipts,
+        recordingsDir: h.recordings,
+        journal,
+        clock: { now: () => deadline },
+        random: () => 0,
+        session: { state: () => "awaiting_teammem", publish: () => assert.fail("terminal recovery must not publish") },
+        reconciliationEvidence: NOOP_PURGE,
+      });
+      worker.reconcile();
+      const deleted = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;
+      assert.equal(existsSync(detached), false, cut);
+      assert.equal(deleted.deletedAtMs, deadline, cut);
+      assert.equal(deleted.retryReason, "recovery_unavailable", cut);
+      assert.equal(existsSync(otherStage), true, cut);
+      assert.equal(existsSync(otherRecordingTombstone), true, cut);
+      assert.equal(existsSync(otherStageTombstone), true, cut);
+      assert.equal(updates, 1, cut);
+      worker.reconcile();
+      assert.equal(updates, 1, `${cut} replay must be update-free`);
+    } finally {
+      h.cleanup();
+    }
+  }
+});
+
+test("deadline cleanup preserves terminal recovery reason and isolates an unrepairable legacy row", () => {
+  const h = harness();
+  try {
+    const first = artifactAndAudio();
+    const secondRaw = structuredClone(first.artifact) as typeof first.artifact;
+    secondRaw.occurrence_id = "vc:terminal-second@2026-09-02T14:00:00Z";
+    secondRaw.provider_meeting_id = "vc:terminal-second";
+    const second = parseTeamMemMeetingArtifact(secondRaw);
+    const secondSerialized = canonicalArtifactJson(second);
+    const secondHash = canonicalArtifactHash(second);
+    const secondHandle = "b".repeat(32);
+    const secondSource = path.join(h.recordings, `${secondHandle}.crsr`);
+    writeFileSync(secondSource, first.bytes);
+    const secondBundle = writeMeetingBundle({
+      recordingsDir: h.recordings,
+      outboxDir: h.outbox,
+      artifact: second,
+      serializedArtifact: secondSerialized,
+      artifactHash: secondHash,
+      recordingPath: secondSource,
+      recordingHandle: secondHandle,
+    });
+    const deadline = Date.parse(second.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+    const journal = new FakeJournal();
+    journal.savePending({
+      occurrenceId: first.artifact.occurrence_id,
+      revision: first.artifact.revision,
+      artifactHash: first.hash,
+      recordingPath: path.join(h.recordings, "wrong-name.crsr"),
+      bundlePath: path.join(h.outbox, occurrencePathSegment(first.artifact.occurrence_id as OccurrenceId), String(first.artifact.revision)),
+      endedAtMs: Date.parse(first.artifact.ended_at),
+      transcriptComplete: true,
+      retryCount: 0,
+      nextRetryAtMs: deadline,
+      retryReason: "recovery_unavailable",
+      publishedAtMs: null,
+      deletedAtMs: null,
+      publicationUrl: null,
+      vaultCommit: null,
+      recoveryArtifact: null,
+      stageToken: null,
+      recordingHandle: null,
+    });
+    journal.savePending({
+      occurrenceId: second.occurrence_id,
+      revision: second.revision,
+      artifactHash: secondHash,
+      recordingPath: secondSource,
+      bundlePath: secondBundle,
+      endedAtMs: Date.parse(second.ended_at),
+      transcriptComplete: true,
+      retryCount: 0,
+      nextRetryAtMs: deadline,
+      retryReason: "recovery_unavailable",
+      publishedAtMs: null,
+      deletedAtMs: null,
+      publicationUrl: null,
+      vaultCommit: null,
+      recoveryArtifact: null,
+      stageToken: "b".repeat(32),
+      recordingHandle: secondHandle,
+    });
+    let updates = 0;
+    const originalUpdate = journal.update.bind(journal);
+    journal.update = (row) => { updates += 1; originalUpdate(row); };
+    const worker = createOutboxWorker({
+      outboxDir: h.outbox,
+      receiptsDir: h.receipts,
+      recordingsDir: h.recordings,
+      journal,
+      clock: { now: () => deadline },
+      random: () => 0,
+      session: { state: () => "awaiting_teammem", publish: () => assert.fail("terminal recovery must not publish") },
+      reconciliationEvidence: NOOP_PURGE,
+    });
+
+    assert.doesNotThrow(() => worker.reconcile());
+    const invalid = journal.rows.get(`${first.artifact.occurrence_id}:${first.artifact.revision}`)!;
+    const deleted = journal.rows.get(`${second.occurrence_id}:${second.revision}`)!;
+    assert.equal(invalid.retryReason, "recovery_unavailable");
+    assert.equal(invalid.deletedAtMs, null);
+    assert.equal(deleted.retryReason, "recovery_unavailable");
+    assert.equal(deleted.deletedAtMs, deadline);
+    assert.equal(existsSync(secondSource), false);
+    assert.equal(existsSync(secondBundle), false);
+    assert.equal(updates, 1);
+    worker.reconcile();
+    assert.equal(updates, 1, "terminal deletion replay is update-free");
+  } finally {
+    h.cleanup();
+  }
 });
 
 test("restart after a real process death immediately after occurrence detach leaves the current random tombstone", async () => {

@@ -121,52 +121,60 @@ export function createOutboxWorker(options: {
       const now = options.clock.now();
       try { options.reconciliationEvidence.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
       for (const current of options.journal.pending()) {
-        if (current.deletedAtMs !== null) continue;
-        if (now >= current.endedAtMs + RETENTION_MS) {
-          deleteOccurrenceEvidence(options, current, now, [current]);
-          continue;
-        }
-        if (current.retryReason === "recovery_unavailable") continue;
-        if (!recoverBundle(options, current)) continue;
-        const state = options.session.state(current.occurrenceId);
-        if (current.publishedAtMs !== null) {
-          if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
-          continue;
-        }
-        if (now < current.nextRetryAtMs) continue;
-        const receipt = readPublicationReceipt({
-          receiptsDir: options.receiptsDir,
-          occurrenceId: current.occurrenceId,
-          revision: current.revision,
-          artifactHash: current.artifactHash,
-        });
-        if (receipt === null) {
-          const retryCount = current.retryCount + 1;
-          options.journal.update({
-            ...current,
-            retryCount,
-            retryReason: "receipt_unavailable",
-            nextRetryAtMs: now + retryDelayMs(retryCount, options.random),
+        try {
+          if (current.deletedAtMs !== null) continue;
+          if (now >= current.endedAtMs + RETENTION_MS) {
+            deleteOccurrenceEvidence(options, current, now, [current]);
+            continue;
+          }
+          if (current.retryReason === "recovery_unavailable") continue;
+          if (!recoverBundle(options, current)) continue;
+          const state = options.session.state(current.occurrenceId);
+          if (current.publishedAtMs !== null) {
+            if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
+            continue;
+          }
+          if (now < current.nextRetryAtMs) continue;
+          const receipt = readPublicationReceipt({
+            receiptsDir: options.receiptsDir,
+            occurrenceId: current.occurrenceId,
+            revision: current.revision,
+            artifactHash: current.artifactHash,
           });
-          continue;
-        }
-        // A receipt is evidence, not authorization to mutate an arbitrary
-        // orchestration state. Only the legal edge and an interrupted replay
-        // are allowed to record it or release encrypted evidence.
-        if (state !== "awaiting_teammem" && state !== "published") continue;
-        if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
-        const published: DeliveryRow = {
-          ...current,
-          publishedAtMs: now,
-          publicationUrl: receipt.markdown_url,
-          vaultCommit: receipt.vault_commit,
-          retryReason: null,
-        };
-        if (current.transcriptComplete) {
-          options.journal.update(published);
-          deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
-        } else {
-          options.journal.update(published);
+          if (receipt === null) {
+            const retryCount = current.retryCount + 1;
+            options.journal.update({
+              ...current,
+              retryCount,
+              retryReason: "receipt_unavailable",
+              nextRetryAtMs: now + retryDelayMs(retryCount, options.random),
+            });
+            continue;
+          }
+          // A receipt is evidence, not authorization to mutate an arbitrary
+          // orchestration state. Only the legal edge and an interrupted replay
+          // are allowed to record it or release encrypted evidence.
+          if (state !== "awaiting_teammem" && state !== "published") continue;
+          if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
+          const published: DeliveryRow = {
+            ...current,
+            publishedAtMs: now,
+            publicationUrl: receipt.markdown_url,
+            vaultCommit: receipt.vault_commit,
+            retryReason: null,
+          };
+          if (current.transcriptComplete) {
+            options.journal.update(published);
+            deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
+          } else {
+            options.journal.update(published);
+          }
+        } catch {
+          // A malformed legacy row is terminal and isolated. Classify a row
+          // that was not already terminal, but never let it abort siblings.
+          if (current.retryReason !== "recovery_unavailable") {
+            try { options.journal.update({ ...current, retryReason: "recovery_unavailable" }); } catch { /* keep the row isolated even if it cannot be updated */ }
+          }
         }
       }
     },
@@ -188,7 +196,7 @@ function deleteOccurrenceEvidence(
       ...row,
       ...(row.revision === accepted.revision ? { publishedAtMs: accepted.publishedAtMs, publicationUrl: accepted.publicationUrl, vaultCommit: accepted.vaultCommit } : {}),
       deletedAtMs: now,
-      retryReason: null,
+      retryReason: row.retryReason === "recovery_unavailable" ? "recovery_unavailable" : null,
       recoveryArtifact: null,
     });
   }
