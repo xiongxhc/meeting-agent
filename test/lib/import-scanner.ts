@@ -573,7 +573,7 @@ export function findOpaqueConstructs(
 export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string>>> = {
   "src/application.ts": new Set(["mkdir", "mkdirSync"]),
   "src/adapters/filesystem-outbox.ts": new Set([
-    "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "writeFile", "writeFileSync",
+    "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "rmdirSync", "writeFile", "writeFileSync",
   ]),
 };
 

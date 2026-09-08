@@ -13,6 +13,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -34,6 +35,8 @@ export type WriteMeetingBundleInput = {
   readonly artifactHash: string;
   /** The exact finalized recording path persisted by the coordinator. */
   readonly recordingPath: string;
+  /** Persisted Runtime handle for production callers. */
+  readonly recordingHandle?: string | null;
   /** Durable delivery capability from the local journal. Never reaches READY. */
   readonly stageToken?: string;
   /** Test-only crash seam. Production callers do not provide this. */
@@ -51,6 +54,8 @@ export type OutboxFaultPoint =
   | "before_ready_write" | "after_ready_write"
   | "before_bundle_fsync" | "after_bundle_fsync";
 
+export type DeleteFaultPoint = "after_recording_detach" | "after_bundle_detach" | "after_stage_detach";
+
 /** Writes a complete ready bundle, or leaves no TeamMem-visible partial bundle. */
 export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
   const artifact = parseTeamMemMeetingArtifact(input.artifact);
@@ -63,7 +68,7 @@ export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
   const outbox = safeDirectory(input.outboxDir, true, "outbox");
   if (outboxCreated) fsyncDirectory(path.dirname(outbox), input);
   const recordings = safeDirectory(input.recordingsDir, false, "recordings");
-  const audio = readVerifiedRecording(recordings, input.recordingPath, artifact);
+  const audio = readVerifiedRecording(recordings, input.recordingPath, artifact, input.recordingHandle ?? undefined);
   const segment = occurrencePathSegment(artifact.occurrence_id as OccurrenceId);
   const revision = String(artifact.revision);
   const occurrenceDir = path.join(outbox, segment);
@@ -141,13 +146,24 @@ export function deleteDeliveredEvidence(input: {
   readonly recordingPath: string;
   readonly bundlePath: string;
   readonly stageToken?: string;
+  readonly recordingHandle?: string | null;
+  /** The worker decides source eligibility from all owned journal rows. */
+  readonly deleteRecording?: boolean;
+  /** Test-only process-cut seam, invoked after atomic detach before removal. */
+  readonly fault?: (step: DeleteFaultPoint) => void;
 }): void {
   const outbox = safeDirectory(input.outboxDir, false, "outbox");
   const expected = path.join(outbox, occurrencePathSegment(input.occurrenceId as OccurrenceId), String(input.revision));
   if (path.resolve(input.bundlePath) !== expected) throw new Error("refusing to delete a bundle outside its occurrence and revision");
-  removeRegularOwnedFile(safeDirectory(input.recordingsDir, false, "recordings"), input.recordingPath);
-  removeOwnedOccurrence(outbox, path.dirname(expected));
-  removeAbandonedStages(outbox, path.dirname(expected), input.revision, input.stageToken);
+  const handle = requireRecordingHandle(input.recordingPath, input.recordingHandle ?? undefined);
+  const token = input.stageToken ?? "0".repeat(32);
+  const suffix = `${token}-${handle}-${input.revision}`;
+  if (input.deleteRecording !== false) {
+    removeRegularOwnedFile(safeDirectory(input.recordingsDir, false, "recordings"), input.recordingPath, `.recording-delete-${suffix}`, input.fault);
+  }
+  removeOwnedBundle(outbox, expected, `.bundle-delete-${suffix}`, input.fault);
+  removeAbandonedStages(outbox, path.dirname(expected), input.revision, input.stageToken, suffix, input.fault);
+  removeEmptyOccurrence(outbox, path.dirname(expected));
 }
 
 function safeDirectory(directory: string, create: boolean, label: string): string {
@@ -190,10 +206,11 @@ function assertPathUnderRoot(root: string, target: string, requireTarget: boolea
   }
 }
 
-function readVerifiedRecording(recordings: string, recordingPath: string, artifact: TeamMemMeetingArtifact): Buffer {
+function readVerifiedRecording(recordings: string, recordingPath: string, artifact: TeamMemMeetingArtifact, persistedHandle?: string): Buffer {
   const target = path.resolve(recordingPath);
   assertPathUnderRoot(recordings, target, true);
   if (path.dirname(target) !== recordings) throw new Error("recording must be a direct child of the configured recordings root");
+  requireRecordingHandle(target, persistedHandle);
   const stat = lstatSync(target);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("recording must be a regular non-symlink file");
   const bytes = readFileSync(target);
@@ -292,7 +309,7 @@ function removeIncompleteDestination(destination: string): void {
   detachAndRemove(path.dirname(destination), destination, "incomplete");
 }
 
-function removeRegularOwnedFile(root: string, filename: string): void {
+function removeRegularOwnedFile(root: string, filename: string, tombstone: string, fault?: (step: DeleteFaultPoint) => void): void {
   const target = path.resolve(filename);
   try {
     assertPathUnderRoot(root, target, true);
@@ -303,29 +320,57 @@ function removeRegularOwnedFile(root: string, filename: string): void {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  detachAndRemove(root, target, "recording");
+  detachAndRemove(root, target, tombstone, fault, "after_recording_detach");
 }
 
-function removeOwnedOccurrence(root: string, occurrence: string): void {
-  const target = path.resolve(occurrence);
+function removeOwnedBundle(root: string, bundle: string, tombstone: string, fault?: (step: DeleteFaultPoint) => void): void {
+  const target = path.resolve(bundle);
+  const detached = path.join(path.dirname(target), tombstone);
+  if (!existsSync(target)) {
+    if (existsSync(detached)) detachAndRemove(path.dirname(target), target, tombstone, fault, "after_bundle_detach");
+    return;
+  }
   try {
     assertPathUnderRoot(root, target, true);
     const stat = lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete non-directory occurrence");
-    if (path.dirname(target) !== root) throw new Error("refusing to delete nested occurrence directory");
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete non-directory bundle");
+    assertPathUnderRoot(root, path.dirname(target), true);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(detached)) return;
     throw error;
   }
-  detachAndRemove(root, target, "occurrence");
+  detachAndRemove(path.dirname(target), target, tombstone, fault, "after_bundle_detach");
 }
 
-function detachAndRemove(root: string, target: string, label: string): void {
-  const tombstone = path.join(root, `.${label}-delete-${randomUUID()}`);
-  try { renameSync(target, tombstone); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+function removeEmptyOccurrence(root: string, occurrence: string): void {
+  try {
+    assertPathUnderRoot(root, occurrence, true);
+    if (path.dirname(occurrence) !== root || !lstatSync(occurrence).isDirectory()) return;
+    // rmdir is intentionally non-recursive: a concurrent or unowned stage
+    // keeps its parent and is never detached by another token's cleanup.
+    rmdirSync(occurrence);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTEMPTY") return;
     throw error;
   }
+}
+
+function detachAndRemove(root: string, target: string, tombstoneName: string, fault?: (step: DeleteFaultPoint) => void, step?: DeleteFaultPoint): void {
+  const tombstone = path.join(root, tombstoneName);
+  assertPathUnderRoot(root, tombstone, false);
+  if (!existsSync(target) && existsSync(tombstone)) {
+    removeDetached(tombstone);
+    return;
+  }
+  try { renameSync(target, tombstone); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(tombstone)) return;
+    throw error;
+  }
+  if (step !== undefined) fault?.(step);
+  removeDetached(tombstone);
+}
+
+function removeDetached(tombstone: string): void {
   const detached = lstatSync(tombstone);
   if (detached.isSymbolicLink()) rmSync(tombstone);
   else if (detached.isFile()) rmSync(tombstone);
@@ -335,7 +380,7 @@ function detachAndRemove(root: string, target: string, label: string): void {
 
 /** Private stages are owned by a durable journal capability. PID liveness is
  * deliberately irrelevant: a restarted worker can finish the same stage. */
-function removeAbandonedStages(root: string, occurrenceDir: string, revision: number, expectedToken?: string): void {
+function removeAbandonedStages(root: string, occurrenceDir: string, revision: number, expectedToken: string | undefined, suffix: string, fault?: (step: DeleteFaultPoint) => void): void {
   try { assertPathUnderRoot(root, occurrenceDir, true); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
@@ -348,8 +393,17 @@ function removeAbandonedStages(root: string, occurrenceDir: string, revision: nu
     const stat = lstatSync(stage);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete unsafe staging directory");
     if (!stageOwnerMatches(stage, expectedToken)) continue;
-    detachAndRemove(occurrenceDir, stage, "stage");
+    detachAndRemove(occurrenceDir, stage, `.stage-delete-${suffix}`, fault, "after_stage_detach");
   }
+}
+
+function requireRecordingHandle(recordingPath: string, persistedHandle?: string): string {
+  const fromName = /^([0-9a-f]{32})\.crsr$/.exec(path.basename(recordingPath))?.[1];
+  if (fromName === undefined) throw new Error("recording basename must be a 32-lowercase-hex Runtime handle plus .crsr");
+  if (persistedHandle !== undefined && (!/^[0-9a-f]{32}$/.test(persistedHandle) || persistedHandle !== fromName)) {
+    throw new Error("recording basename does not match persisted Runtime handle");
+  }
+  return fromName;
 }
 
 function stageOwnerMatches(stage: string, expectedToken?: string): boolean {

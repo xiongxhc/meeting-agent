@@ -18,7 +18,7 @@
 
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
@@ -78,6 +78,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
   db.pragma("foreign_keys = ON"); // better-sqlite3 does NOT enable this by default; must be set per connection.
 
   applyMigrations(db, migrationsDir, options.nowMs ?? Date.now());
+  repairDeliveryRecordingOwners(db);
 
   return {
     get schemaVersion() {
@@ -498,25 +499,22 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
 
 function savePendingDelivery(db: Database.Database, row: DeliveryRow): void {
   const save = db.transaction(() => {
-    const recording = db.prepare("SELECT encrypted_path FROM recordings WHERE occurrence_id = ?").get(row.occurrenceId) as { encrypted_path: string | null } | undefined;
-    if (recording?.encrypted_path !== row.recordingPath) {
+    const recording = db.prepare("SELECT handle, encrypted_path FROM recordings WHERE occurrence_id = ?").get(row.occurrenceId) as { handle: string; encrypted_path: string | null } | undefined;
+    if (recording === undefined || path.resolve(recording.encrypted_path ?? "") !== path.resolve(row.recordingPath)) {
       throw new OrchestrationError("constraint_violation", "delivery recording is not the finalized occurrence recording");
     }
-    db.prepare("INSERT OR IGNORE INTO delivery_recording_owners (recording_path, occurrence_id) VALUES (?, ?)").run(row.recordingPath, row.occurrenceId);
-    const owner = db.prepare("SELECT occurrence_id FROM delivery_recording_owners WHERE recording_path = ?").get(row.recordingPath) as { occurrence_id: string } | undefined;
-    if (owner?.occurrence_id !== row.occurrenceId) {
-      throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
-    }
+    const binding = deliveryRecordingBinding(recording.handle, recording.encrypted_path ?? "");
+    if (!claimDeliveryRecordingOwner(db, row.occurrenceId, binding)) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
     withConstraintTranslation(() => db.prepare(
     `INSERT INTO delivery_journal
        (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
         transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-        deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(row.occurrenceId, row.revision, row.artifactHash, row.recordingPath, row.bundlePath,
     row.endedAtMs, row.transcriptComplete ? 1 : 0, row.retryCount, row.nextRetryAtMs,
     row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit,
-    row.recoveryArtifact, row.stageToken));
+    row.recoveryArtifact, row.stageToken, binding.handle));
   });
   save();
 }
@@ -525,9 +523,9 @@ function pendingDeliveries(db: Database.Database): DeliveryRow[] {
   const rows = db.prepare(
     `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
             transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token
+            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle
        FROM delivery_journal WHERE deleted_at_ms IS NULL ORDER BY next_retry_at_ms, occurrence_id, revision`,
-  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null }>;
+  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null }>;
   return rows.map((row) => ({
     occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
     recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
@@ -535,7 +533,7 @@ function pendingDeliveries(db: Database.Database): DeliveryRow[] {
     nextRetryAtMs: row.next_retry_at_ms, retryReason: row.retry_reason,
     publishedAtMs: row.published_at_ms, deletedAtMs: row.deleted_at_ms,
     publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
-    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token,
+    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token, recordingHandle: row.recording_handle,
   }));
 }
 
@@ -543,12 +541,77 @@ function updateDelivery(db: Database.Database, row: DeliveryRow): void {
   const changed = withConstraintTranslation(() => db.prepare(
     `UPDATE delivery_journal SET retry_count = ?, next_retry_at_ms = ?, retry_reason = ?,
        published_at_ms = ?, deleted_at_ms = ?, publication_url = ?, vault_commit = ?,
-       recovery_artifact = ?, stage_token = ?
+       recovery_artifact = ?, stage_token = ?, recording_handle = ?
      WHERE occurrence_id = ? AND revision = ? AND artifact_hash = ?`,
   ).run(row.retryCount, row.nextRetryAtMs, row.retryReason, row.publishedAtMs, row.deletedAtMs,
     row.publicationUrl, row.vaultCommit, row.recoveryArtifact, row.stageToken,
-    row.occurrenceId, row.revision, row.artifactHash).changes);
+    row.recordingHandle ?? null, row.occurrenceId, row.revision, row.artifactHash).changes);
   if (changed !== 1) throw new OrchestrationError("constraint_violation", "delivery journal row is unknown or immutable fields changed");
+}
+
+type DeliveryRecordingBinding = { readonly canonicalPath: string; readonly physicalIdentity: string; readonly handle: string };
+
+function deliveryRecordingBinding(handle: string, encryptedPath: string): DeliveryRecordingBinding {
+  const canonicalPath = path.resolve(encryptedPath);
+  if (!/^[0-9a-f]{32}$/.test(handle) || path.basename(canonicalPath) !== `${handle}.crsr`) {
+    throw new OrchestrationError("constraint_violation", "delivery recording does not match its persisted Runtime handle");
+  }
+  try {
+    const stat = lstatSync(canonicalPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new OrchestrationError("constraint_violation", "delivery recording is not a regular Runtime child");
+    return { canonicalPath, physicalIdentity: `inode:${stat.dev}:${stat.ino}`, handle };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { canonicalPath, physicalIdentity: `path:${canonicalPath}`, handle };
+  }
+}
+
+function claimDeliveryRecordingOwner(db: Database.Database, occurrenceId: string, binding: DeliveryRecordingBinding): boolean {
+  db.prepare(
+    `INSERT OR IGNORE INTO delivery_recording_owners_v16
+       (canonical_path, physical_identity, occurrence_id, recording_handle, failure_reason)
+     VALUES (?, ?, ?, ?, NULL)`,
+  ).run(binding.canonicalPath, binding.physicalIdentity, occurrenceId, binding.handle);
+  const owner = db.prepare(
+    "SELECT occurrence_id FROM delivery_recording_owners_v16 WHERE canonical_path = ? OR physical_identity = ?",
+  ).get(binding.canonicalPath, binding.physicalIdentity) as { occurrence_id: string } | undefined;
+  return owner?.occurrence_id === occurrenceId;
+}
+
+/** SQL migrations cannot resolve filesystem aliases or inspect inode identity.
+ * Repair legacy schemas deterministically at reopen: the first retained owner
+ * wins; every conflicting or malformed row becomes durably fail-closed and
+ * can never silently hand the physical source to a later occurrence. */
+function repairDeliveryRecordingOwners(db: Database.Database): void {
+  if (currentSchemaVersion(db) < 16) return;
+  const rows = db.prepare(
+    `SELECT j.rowid AS journal_rowid, j.occurrence_id, r.handle, r.encrypted_path
+       FROM delivery_journal j JOIN recordings r ON r.occurrence_id = j.occurrence_id
+      ORDER BY j.rowid`,
+  ).all() as Array<{ journal_rowid: number; occurrence_id: string; handle: string; encrypted_path: string }>;
+  const repair = db.transaction(() => {
+    for (const row of rows) {
+      try {
+        const binding = deliveryRecordingBinding(row.handle, row.encrypted_path);
+        if (!claimDeliveryRecordingOwner(db, row.occurrence_id, binding)) {
+          db.prepare("UPDATE delivery_journal SET retry_reason = 'recovery_unavailable' WHERE rowid = ?").run(row.journal_rowid);
+          continue;
+        }
+        db.prepare("UPDATE delivery_journal SET recording_path = ?, recording_handle = ? WHERE rowid = ?")
+          .run(binding.canonicalPath, binding.handle, row.journal_rowid);
+      } catch {
+        const canonicalPath = path.resolve(row.encrypted_path);
+        db.prepare(
+          `INSERT OR IGNORE INTO delivery_recording_owners_v16
+             (canonical_path, physical_identity, occurrence_id, recording_handle, failure_reason)
+           VALUES (?, ?, ?, NULL, 'invalid_runtime_recording_binding')`,
+        ).run(canonicalPath, `path:${canonicalPath}`, row.occurrence_id);
+        db.prepare("UPDATE delivery_journal SET recording_path = ?, retry_reason = 'recovery_unavailable' WHERE rowid = ?")
+          .run(canonicalPath, row.journal_rowid);
+      }
+    }
+  });
+  repair();
 }
 
 const RECONCILIATION_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;

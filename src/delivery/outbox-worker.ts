@@ -30,6 +30,8 @@ export type DeliveryRow = {
   readonly recoveryArtifact: string | null;
   /** Durable capability that owns the private pre-READY stage. */
   readonly stageToken: string | null;
+  /** Persisted Runtime handle binding the direct-child encrypted recording. */
+  readonly recordingHandle?: string | null;
 };
 
 /** R68's storage seam: the SQLite adapter is the production implementation. */
@@ -95,6 +97,7 @@ export function createOutboxWorker(options: {
           vaultCommit: null,
           recoveryArtifact: input.serializedArtifact,
           stageToken,
+          recordingHandle: recordingHandleFromPath(input.recordingPath),
         });
         recordingOwners.set(path.resolve(input.recordingPath), input.artifact.occurrence_id);
       }
@@ -107,6 +110,7 @@ export function createOutboxWorker(options: {
         serializedArtifact: input.serializedArtifact,
         artifactHash: input.artifactHash,
         recordingPath: input.recordingPath,
+        ...(row.recordingHandle === null || row.recordingHandle === undefined ? {} : { recordingHandle: row.recordingHandle }),
         ...(row.stageToken === null ? {} : { stageToken: row.stageToken }),
       });
       if (written !== bundlePath) throw new Error("outbox writer returned a non-canonical bundle path");
@@ -119,13 +123,14 @@ export function createOutboxWorker(options: {
       for (const current of options.journal.pending()) {
         if (current.deletedAtMs !== null) continue;
         if (now >= current.endedAtMs + RETENTION_MS) {
-          deleteOccurrenceEvidence(options, current, now);
+          deleteOccurrenceEvidence(options, current, now, [current]);
           continue;
         }
+        if (current.retryReason === "recovery_unavailable") continue;
         if (!recoverBundle(options, current)) continue;
         const state = options.session.state(current.occurrenceId);
         if (current.publishedAtMs !== null) {
-          if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now);
+          if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
           continue;
         }
         if (now < current.nextRetryAtMs) continue;
@@ -159,7 +164,7 @@ export function createOutboxWorker(options: {
         };
         if (current.transcriptComplete) {
           options.journal.update(published);
-          deleteOccurrenceEvidence(options, published, now);
+          deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
         } else {
           options.journal.update(published);
         }
@@ -172,9 +177,13 @@ function deleteOccurrenceEvidence(
   options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
   accepted: DeliveryRow,
   now: number,
+  rows: readonly DeliveryRow[],
 ): void {
-  for (const row of options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId)) {
-    deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: row.occurrenceId, revision: row.revision, recordingPath: row.recordingPath, bundlePath: row.bundlePath, ...(row.stageToken === null ? {} : { stageToken: row.stageToken }) });
+  const owned = options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId);
+  const selected = new Set(rows.map((row) => `${row.occurrenceId}:${row.revision}`));
+  const deleteRecording = owned.every((row) => selected.has(`${row.occurrenceId}:${row.revision}`));
+  for (const row of rows) {
+    deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: row.occurrenceId, revision: row.revision, recordingPath: row.recordingPath, bundlePath: row.bundlePath, deleteRecording, ...(row.stageToken === null ? {} : { stageToken: row.stageToken }), ...(row.recordingHandle === null || row.recordingHandle === undefined ? {} : { recordingHandle: row.recordingHandle }) });
     options.journal.update({
       ...row,
       ...(row.revision === accepted.revision ? { publishedAtMs: accepted.publishedAtMs, publicationUrl: accepted.publicationUrl, vaultCommit: accepted.vaultCommit } : {}),
@@ -205,6 +214,7 @@ function recoverBundle(
       serializedArtifact: row.recoveryArtifact,
       artifactHash,
       recordingPath: row.recordingPath,
+      ...(row.recordingHandle === null || row.recordingHandle === undefined ? {} : { recordingHandle: row.recordingHandle }),
       stageToken: row.stageToken,
     });
     if (written !== row.bundlePath) throw new Error("recovered bundle path differs from durable journal");
@@ -214,6 +224,14 @@ function recoverBundle(
     options.journal.update({ ...row, retryReason: "recovery_unavailable" });
     return false;
   }
+}
+
+function eligibleRows(options: Pick<Parameters<typeof createOutboxWorker>[0], "journal">, accepted: DeliveryRow): readonly DeliveryRow[] {
+  return options.journal.pending().filter((row) => row.occurrenceId === accepted.occurrenceId && row.revision <= accepted.revision);
+}
+
+function recordingHandleFromPath(recordingPath: string): string | null {
+  return /^([0-9a-f]{32})\.crsr$/.exec(path.basename(recordingPath))?.[1] ?? null;
 }
 
 /** 1–60 seconds, full jitter around an exponential cap; no wall clock reads. */

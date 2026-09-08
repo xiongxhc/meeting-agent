@@ -229,6 +229,7 @@ export type DeliveryRow = {
   readonly vaultCommit: string | null;
   readonly recoveryArtifact: string | null;
   readonly stageToken: string | null;
+  readonly recordingHandle?: string | null;
 };
 
 export type ColumnDescription = { readonly name: string; readonly type: string };

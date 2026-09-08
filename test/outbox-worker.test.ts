@@ -27,6 +27,10 @@ function harness(): { root: string; recordings: string; outbox: string; receipts
   return { root, recordings, outbox, receipts, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
+function runtimeRecordingPath(h: ReturnType<typeof harness>, digit = "a"): string {
+  return path.join(h.recordings, `${digit.repeat(32)}.crsr`);
+}
+
 function artifactAndAudio(): { artifact: ReturnType<typeof parseTeamMemMeetingArtifact>; bytes: Buffer; serialized: string; hash: string } {
   const artifact = structuredClone(JSON.parse(readFileSync(new URL("teammem-meeting-v1.complete.json", FIXTURES), "utf8"))) as Record<string, unknown>;
   const bytes = Buffer.from("synthetic encrypted audio bytes; never a container header", "utf8");
@@ -67,7 +71,7 @@ test("writes the exact four-file TeamMem bundle atomically from a verified encry
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes, { mode: 0o600 });
 
     const bundle = writeMeetingBundle({
@@ -99,7 +103,7 @@ test("refuses untrusted audio paths and mismatched audio or artifact integrity c
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     for (const input of [
       { recordingPath: path.join(h.root, "outside.enc") },
@@ -140,7 +144,7 @@ test("worker retries with injected bounded jitter and publishes only after a mat
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     let state = "awaiting_teammem";
@@ -176,7 +180,7 @@ test("worker deletes only a complete-receipt bundle or evidence due at the exact
     const bytes = built.bytes;
     const serialized = canonicalArtifactJson(artifact);
     const hash = canonicalArtifactHash(artifact);
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     const now = Date.parse("2026-09-02T14:00:00Z");
@@ -197,7 +201,7 @@ test("worker deletes only a complete-receipt bundle or evidence due at the exact
     complete.revision = artifact.revision + 1;
     const completeHash = canonicalArtifactHash(complete);
     const completeSerialized = canonicalArtifactJson(complete);
-    const completeSource = path.join(h.recordings, "complete.enc");
+    const completeSource = runtimeRecordingPath(h, "b");
     writeFileSync(completeSource, bytes);
     const completeBundle = worker.enqueue({ artifact: complete, serializedArtifact: completeSerialized, artifactHash: completeHash, recordingPath: completeSource });
     writeFileSync(receiptFile, `${JSON.stringify(publishedReceipt(complete, completeHash))}\n`);
@@ -223,7 +227,7 @@ test("every injected outbox crash boundary recovers on restart without exposing 
     const h = harness();
     try {
       const { artifact, bytes, serialized, hash } = artifactAndAudio();
-      const source = path.join(h.recordings, "final.enc");
+      const source = runtimeRecordingPath(h);
       writeFileSync(source, bytes);
       const input = {
         recordingsDir: h.recordings, outboxDir: h.outbox, artifact,
@@ -294,7 +298,7 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
   const { artifact, hash } = artifactAndAudio();
   const row: DeliveryRow = {
     occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: hash,
-    recordingPath: path.join(h.recordings, "final.enc"), bundlePath: path.join(h.outbox, "segment", String(artifact.revision)),
+    recordingPath: runtimeRecordingPath(h), bundlePath: path.join(h.outbox, "segment", String(artifact.revision)),
     endedAtMs: Date.parse(artifact.ended_at), transcriptComplete: false, retryCount: 2,
     nextRetryAtMs: now + 4_000, retryReason: "receipt_unavailable", publishedAtMs: null,
     deletedAtMs: null, publicationUrl: null, vaultCommit: null,
@@ -315,14 +319,14 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
       transition: { occurrenceId: otherOccurrence, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: now },
       recording: { handle: "b".repeat(32), encryptedPath: row.recordingPath, sha256: "b".repeat(64), durationMs: 1, format: "opus", keyId: "key", gaps: [], runtimeGaps: [] },
     });
-    assert.throws(() => first.savePending({ ...row, occurrenceId: otherOccurrence, artifactHash: `sha256:${"c".repeat(64)}`, bundlePath: `${row.bundlePath}-other` }), /another occurrence/i);
+    assert.throws(() => first.savePending({ ...row, occurrenceId: otherOccurrence, artifactHash: `sha256:${"c".repeat(64)}`, bundlePath: `${row.bundlePath}-other` }), /another occurrence|Runtime handle/i);
   } finally {
     first.close();
   }
   const second = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now + 1 });
   try {
     assert.equal(second.pending().length, 2);
-    assert.deepEqual(second.pending().find((pending) => pending.revision === row.revision), row);
+    assert.deepEqual(second.pending().find((pending) => pending.revision === row.revision), { ...row, recordingHandle: "a".repeat(32) });
     const published: DeliveryRow = { ...row, retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) };
     second.update(published);
   } finally {
@@ -331,7 +335,7 @@ test("the SQLite delivery journal survives reopen with redacted retry and public
   const third = openSessionStore({ filename: path.join(h.root, "orchestration.db"), nowMs: now + 3 });
   try {
     assert.equal(third.pending().length, 2);
-    assert.deepEqual(third.pending().find((pending) => pending.revision === row.revision), { ...row, retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) });
+    assert.deepEqual(third.pending().find((pending) => pending.revision === row.revision), { ...row, recordingHandle: "a".repeat(32), retryReason: null, publishedAtMs: now + 2, publicationUrl: "https://example.test/-/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Meetings/note.md", vaultCommit: "a".repeat(40) });
   } finally {
     third.close();
     h.cleanup();
@@ -342,7 +346,7 @@ test("a corrupted journal row cannot delete a sibling outbox directory", () => {
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     const now = Date.parse("2026-09-02T14:00:00Z");
@@ -372,7 +376,7 @@ test("a real process exit leaves an owned stage which restart cleanup removes wi
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const child = path.join(h.root, "crash-writer.ts");
     writeFileSync(child, `import { writeMeetingBundle } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};
@@ -412,7 +416,7 @@ test("intermediate recording and outbox symlinks cannot escape deletion roots", 
       revision: artifact.revision,
       recordingPath: path.join(nested, "victim.enc"),
       bundlePath: path.join(h.outbox, segment, String(artifact.revision)),
-    }), /symlink|outside|containment/i);
+    }), /symlink|outside|containment|basename/i);
     assert.equal(readFileSync(victim, "utf8"), "outside bytes");
     assert.equal(statSync(outsideBundle).isDirectory(), true);
   } finally { h.cleanup(); }
@@ -428,7 +432,7 @@ test("refuses every plaintext container magic before READY without copying it", 
       const raw = structuredClone(built.artifact) as typeof built.artifact;
       raw.audio = { ...raw.audio, bytes: bytes.length, sha256: SHA(bytes) };
       const artifact = parseTeamMemMeetingArtifact(raw);
-      const source = path.join(h.recordings, "final.enc");
+      const source = runtimeRecordingPath(h);
       writeFileSync(source, bytes);
       assert.throws(() => writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: canonicalArtifactHash(artifact), recordingPath: source }), /plaintext|encrypted/i);
       assert.equal(existsSync(path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision), "audio.enc")), false);
@@ -440,7 +444,7 @@ test("persists delivery intent before exposing READY when the journal save fails
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     journal.failSave = true;
@@ -458,13 +462,13 @@ test("a complete higher revision deletes every retained copy for its occurrence 
     const incomplete = structuredClone(first.artifact) as typeof first.artifact;
     incomplete.transcript_complete = false;
     const oldArtifact = parseTeamMemMeetingArtifact(incomplete);
-    const oldSource = path.join(h.recordings, "old.enc");
+    const oldSource = runtimeRecordingPath(h, "b");
     writeFileSync(oldSource, first.bytes);
     const complete = structuredClone(oldArtifact) as typeof oldArtifact;
     complete.transcript_complete = true;
     complete.revision += 1;
     const newArtifact = parseTeamMemMeetingArtifact(complete);
-    const newSource = path.join(h.recordings, "new.enc");
+    const newSource = runtimeRecordingPath(h, "c");
     writeFileSync(newSource, first.bytes);
     const journal = new FakeJournal();
     let state = "awaiting_teammem";
@@ -484,7 +488,7 @@ test("matching receipts do nothing in every state except awaiting_teammem or pub
     const h = harness();
     try {
       const { artifact, bytes, serialized, hash } = artifactAndAudio();
-      const source = path.join(h.recordings, "final.enc");
+      const source = runtimeRecordingPath(h);
       writeFileSync(source, bytes);
       const journal = new FakeJournal();
       const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 2 }, random: () => 0, session: { state: () => state, publish: () => assert.fail("illegal state transition") }, reconciliationEvidence: NOOP_PURGE });
@@ -521,8 +525,8 @@ test("a malformed receipt for one occurrence cannot block a valid second occurre
     secondRaw.provider_meeting_id = "vc:second";
     const second = parseTeamMemMeetingArtifact(secondRaw);
     const secondHash = canonicalArtifactHash(second);
-    const firstSource = path.join(h.recordings, "first.enc");
-    const secondSource = path.join(h.recordings, "second.enc");
+    const firstSource = runtimeRecordingPath(h, "b");
+    const secondSource = runtimeRecordingPath(h, "c");
     writeFileSync(firstSource, first.bytes);
     writeFileSync(secondSource, first.bytes);
     const journal = new FakeJournal();
@@ -560,7 +564,7 @@ test("new outbox and occurrence names are fsynced through their parents before R
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const calls: string[] = [];
     const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, directoryFsync: (directory) => calls.push(path.resolve(directory)) });
@@ -571,11 +575,11 @@ test("new outbox and occurrence names are fsynced through their parents before R
   } finally { h.cleanup(); }
 });
 
-test("reconcile reconstructs a durable delivery and removes its stage even when OWNER names a live reused PID", () => {
+test("reconcile reconstructs a durable delivery and removes its stage by durable token", () => {
   const h = harness();
   try {
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
     let now = 1;
@@ -587,9 +591,10 @@ test("reconcile reconstructs a durable delivery and removes its stage even when 
     const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
     rmSync(bundle, { recursive: true });
     const occurrence = path.dirname(bundle);
-    const stage = path.join(occurrence, `.${artifact.revision}.staging-reused-pid`);
+    const stageToken = journal.pending()[0]!.stageToken!;
+    const stage = path.join(occurrence, `.${artifact.revision}.staging-${stageToken}`);
     mkdirSync(stage);
-    writeFileSync(path.join(stage, "OWNER"), String(process.pid));
+    writeFileSync(path.join(stage, "OWNER"), stageToken);
     writeFileSync(path.join(stage, "audio.enc"), bytes);
 
     worker.reconcile();
@@ -598,7 +603,7 @@ test("reconcile reconstructs a durable delivery and removes its stage even when 
     writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
     worker.reconcile();
     assert.equal(existsSync(source), false);
-    assert.equal(existsSync(stage), false, "PID reuse is not ownership of a delivery stage");
+    assert.equal(existsSync(stage), false, "the durable journal token owns its abandoned stage");
   } finally { h.cleanup(); }
 });
 
@@ -621,7 +626,7 @@ test("repeated direct-child symlink swaps never delete an outside recording sent
   let toggler: ReturnType<typeof spawn> | undefined;
   try {
     const { artifact } = artifactAndAudio();
-    const source = path.join(h.recordings, "race.enc");
+    const source = runtimeRecordingPath(h, "b");
     const outside = path.join(h.root, "outside.enc");
     writeFileSync(outside, "outside sentinel");
     const script = `const fs=require('node:fs'); const [source,outside]=process.argv.slice(1); setInterval(()=>{ try { fs.rmSync(source,{force:true}); fs.writeFileSync(source,'owned'); fs.rmSync(source,{force:true}); fs.symlinkSync(outside,source); } catch {} },0);`;
@@ -648,7 +653,7 @@ test("one encrypted recording cannot be claimed by two occurrences", () => {
     secondRaw.occurrence_id = "vc:second@2026-09-02T14:00:00Z";
     secondRaw.provider_meeting_id = "vc:second";
     const second = parseTeamMemMeetingArtifact(secondRaw);
-    const source = path.join(h.recordings, "final.enc");
+    const source = runtimeRecordingPath(h);
     writeFileSync(source, first.bytes);
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: new FakeJournal(),
@@ -678,7 +683,7 @@ test("a reopened worker recovers every durable-intent crash cut and later delete
     const h = harness();
     try {
       const { artifact, bytes, serialized, hash } = artifactAndAudio();
-      const source = path.join(h.recordings, "final.enc");
+      const source = runtimeRecordingPath(h);
       writeFileSync(source, bytes);
       const journal = new FakeJournal();
       const bundlePath = path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision));
@@ -709,4 +714,124 @@ writeMeetingBundle({...input, fault: (step) => { if (step === ${JSON.stringify(c
       assert.equal(existsSync(bundlePath), false, cut);
     } finally { h.cleanup(); }
   }
+});
+
+test("READY refuses a recording whose direct-child Runtime handle does not match its basename", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const handle = "a".repeat(32);
+    const source = path.join(h.recordings, "wrong-name.crsr");
+    writeFileSync(source, bytes);
+
+    assert.throws(() => writeMeetingBundle({
+      recordingsDir: h.recordings,
+      outboxDir: h.outbox,
+      artifact,
+      serializedArtifact: serialized,
+      artifactHash: hash,
+      recordingPath: source,
+      recordingHandle: handle,
+    } as Parameters<typeof writeMeetingBundle>[0]), /handle|basename|recording/i);
+    assert.equal(existsSync(path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision), "READY")), false);
+  } finally { h.cleanup(); }
+});
+
+test("cleanup of one revision preserves a newer stage owned by another token", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "a".repeat(32) + ".crsr");
+    writeFileSync(source, bytes);
+    const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+    const occurrence = path.dirname(bundle);
+    const nextStage = path.join(occurrence, `.${artifact.revision + 1}.staging-${"b".repeat(32)}`);
+    mkdirSync(nextStage);
+    writeFileSync(path.join(nextStage, "OWNER"), "b".repeat(32));
+
+    deleteDeliveredEvidence({
+      recordingsDir: h.recordings,
+      outboxDir: h.outbox,
+      occurrenceId: artifact.occurrence_id,
+      revision: artifact.revision,
+      recordingPath: source,
+      bundlePath: bundle,
+      stageToken: "a".repeat(32),
+    });
+
+    assert.equal(existsSync(nextStage), true);
+    assert.equal(existsSync(occurrence), true);
+  } finally { h.cleanup(); }
+});
+
+test("terminal recovery_unavailable rows do not update again before the retention deadline", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "a".repeat(32) + ".crsr");
+    writeFileSync(source, bytes);
+    const journal = new FakeJournal();
+    const now = Date.parse("2026-09-02T14:00:00Z");
+    journal.savePending({
+      occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: hash,
+      recordingPath: source, bundlePath: path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision)),
+      endedAtMs: Date.parse(artifact.ended_at), transcriptComplete: true, retryCount: 0, nextRetryAtMs: now,
+      retryReason: "recovery_unavailable", publishedAtMs: null, deletedAtMs: null, publicationUrl: null,
+      vaultCommit: null, recoveryArtifact: null, stageToken: null,
+    });
+    let updates = 0;
+    const originalUpdate = journal.update.bind(journal);
+    journal.update = (row) => { updates += 1; originalUpdate(row); };
+    const worker = createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+      clock: { now: () => now }, random: () => 0,
+      session: { state: () => "awaiting_teammem", publish: () => assert.fail("terminal row must not publish") },
+      reconciliationEvidence: NOOP_PURGE,
+    });
+
+    worker.reconcile();
+    worker.reconcile();
+    assert.equal(updates, 0);
+    assert.equal(existsSync(source), true);
+  } finally { h.cleanup(); }
+});
+
+test("restart after a real process death immediately after occurrence detach leaves the current random tombstone", async () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "a".repeat(32) + ".crsr");
+    writeFileSync(source, bytes);
+    const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+    const privateDir = path.join(path.dirname(bundle), "private");
+    mkdirSync(privateDir);
+    // 10k is enough to hold recursive removal open on the supported local
+    // filesystem; the test needs the rename/removal cut, not a huge fixture.
+    for (let index = 0; index < 10_000; index += 1) writeFileSync(path.join(privateDir, String(index)), bytes);
+    const child = path.join(h.root, "kill-after-detach.ts");
+    writeFileSync(child, `import { deleteDeliveredEvidence } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};\nconst input = JSON.parse(process.argv[2]);\ndeleteDeliveredEvidence({...input, fault: (step) => { if (step === "after_bundle_detach") process.kill(process.pid, "SIGKILL"); }});\n`);
+    const childProcess = spawn(process.execPath, [child, JSON.stringify({
+      recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id,
+      revision: artifact.revision, recordingPath: source, bundlePath: bundle, stageToken: "a".repeat(32),
+    })]);
+    await new Promise<void>((resolve) => childProcess.once("exit", () => resolve()));
+    const detached = path.join(path.dirname(bundle), `.bundle-delete-${"a".repeat(32)}-${"a".repeat(32)}-${artifact.revision}`);
+    assert.equal(existsSync(detached), true);
+    assert.deepEqual(readdirSync(path.dirname(bundle)).filter((entry) => entry.startsWith(".bundle-delete-")), [path.basename(detached)]);
+
+    const journal = new FakeJournal();
+    const deadline = Date.parse(artifact.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+    journal.savePending({
+      occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: hash,
+      recordingPath: source, bundlePath: bundle, endedAtMs: Date.parse(artifact.ended_at), transcriptComplete: true,
+      retryCount: 0, nextRetryAtMs: deadline, retryReason: "recovery_unavailable", publishedAtMs: null,
+      deletedAtMs: null, publicationUrl: null, vaultCommit: null, recoveryArtifact: null, stageToken: "a".repeat(32),
+    });
+    createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+      clock: { now: () => deadline }, random: () => 0,
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE,
+    }).reconcile();
+    assert.equal(existsSync(detached), false);
+  } finally { h.cleanup(); }
 });

@@ -209,7 +209,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 15);
+      assert.equal(store.schemaVersion, 16);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -226,6 +226,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 13, name: "013_delivery_journal.sql", appliedAtMs: BASE_MS },
         { version: 14, name: "014_delivery_recovery.sql", appliedAtMs: BASE_MS },
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
+        { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -270,7 +271,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 15);
+      assert.equal(second.schemaVersion, 16);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -289,6 +290,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 13, name: "013_delivery_journal.sql", appliedAtMs: BASE_MS },
         { version: 14, name: "014_delivery_recovery.sql", appliedAtMs: BASE_MS },
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
+        { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -469,7 +471,7 @@ test("a schema-10 terminal recording generation upgrades with honest legacy prov
     }
 
     const upgraded = h.open(BASE_MS + 1);
-    assert.equal(upgraded.schemaVersion, 15);
+    assert.equal(upgraded.schemaVersion, 16);
     upgraded.close();
 
     const reopened = h.open(BASE_MS + 2);
@@ -570,7 +572,7 @@ test("a schema-11 database upgrades to the current constraints without losing re
 
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 15);
+      assert.equal(store.schemaVersion, 16);
       const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
       assert.equal(evidence?.runtimeSessionId, 45n);
       assert.equal(evidence?.terminalSource, "bridge_observed");
@@ -716,7 +718,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 15);
+      assert.equal(store.schemaVersion, 16);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);
