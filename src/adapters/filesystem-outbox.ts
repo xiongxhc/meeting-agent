@@ -23,6 +23,7 @@ import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-i
 
 const NAMES = ["meeting.json", "audio.enc", "manifest.json", "READY"] as const;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
+const OWNER = "OWNER";
 
 export type WriteMeetingBundleInput = {
   readonly recordingsDir: string;
@@ -35,6 +36,8 @@ export type WriteMeetingBundleInput = {
   readonly recordingPath: string;
   /** Test-only crash seam. Production callers do not provide this. */
   readonly fault?: (step: OutboxFaultPoint) => void;
+  /** Test-only directory durability probe. */
+  readonly directoryFsync?: (directory: string) => void;
 };
 
 export type OutboxFaultPoint =
@@ -54,18 +57,24 @@ export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
   if (input.serializedArtifact !== canonical || input.artifactHash !== canonicalHash) {
     throw new Error("artifact bytes or hash are not Task 8 canonical output");
   }
+  const outboxCreated = !existsSync(path.resolve(input.outboxDir));
   const outbox = safeDirectory(input.outboxDir, true, "outbox");
+  if (outboxCreated) fsyncDirectory(path.dirname(outbox), input);
   const recordings = safeDirectory(input.recordingsDir, false, "recordings");
   const audio = readVerifiedRecording(recordings, input.recordingPath, artifact);
   const segment = occurrencePathSegment(artifact.occurrence_id as OccurrenceId);
   const revision = String(artifact.revision);
   const occurrenceDir = path.join(outbox, segment);
+  assertPathUnderRoot(outbox, occurrenceDir, false);
+  const occurrenceCreated = !existsSync(occurrenceDir);
   mkdirSync(occurrenceDir, { recursive: true, mode: 0o700 });
-  requireDirectoryNotLink(occurrenceDir, "outbox occurrence directory");
+  assertPathUnderRoot(outbox, occurrenceDir, true);
+  if (occurrenceCreated) fsyncDirectory(outbox, input);
   const destination = path.join(occurrenceDir, revision);
   const manifest = canonicalManifest(artifact, canonicalHash, audio);
 
   if (existsSync(destination)) {
+    assertPathUnderRoot(outbox, destination, true);
     if (existsSync(path.join(destination, "READY"))) {
       verifyExistingBundle(destination, canonical, canonicalHash, audio, manifest);
       return destination;
@@ -74,7 +83,10 @@ export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
   }
 
   const staging = path.join(occurrenceDir, `.${revision}.staging-${randomUUID()}`);
+  assertPathUnderRoot(outbox, staging, false);
   mkdirSync(staging, { mode: 0o700 });
+  writeDurable(path.join(staging, OWNER), Buffer.from(String(process.pid), "ascii"));
+  fsyncDirectory(occurrenceDir, input);
   try {
     checkpoint(input, "before_meeting_write");
     writeDurable(path.join(staging, "meeting.json"), Buffer.from(canonical, "utf8"));
@@ -86,21 +98,23 @@ export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
     writeDurable(path.join(staging, "manifest.json"), Buffer.from(manifest, "utf8"));
     checkpoint(input, "after_manifest_write");
     checkpoint(input, "before_staging_fsync");
-    fsyncDirectory(staging);
+    fsyncDirectory(staging, input);
     checkpoint(input, "after_staging_fsync");
     checkpoint(input, "before_rename");
+    rmSync(path.join(staging, OWNER));
+    fsyncDirectory(staging, input);
     renameSync(staging, destination);
     checkpoint(input, "after_rename");
-    fsyncDirectory(occurrenceDir);
+    fsyncDirectory(occurrenceDir, input);
     // READY is deliberately last: a consumer treats its existence as the
     // visibility commit for the directory above.
     checkpoint(input, "before_ready_write");
     writeDurable(path.join(destination, "READY"), Buffer.alloc(0));
     checkpoint(input, "after_ready_write");
     checkpoint(input, "before_bundle_fsync");
-    fsyncDirectory(destination);
+    fsyncDirectory(destination, input);
     checkpoint(input, "after_bundle_fsync");
-    fsyncDirectory(occurrenceDir);
+    fsyncDirectory(occurrenceDir, input);
     return destination;
   } catch (error) {
     // Staging is private.  It is safe to discard only our uniquely owned
@@ -124,11 +138,13 @@ export function deleteDeliveredEvidence(input: {
   readonly recordingPath: string;
   readonly bundlePath: string;
 }): void {
-  const outbox = path.resolve(input.outboxDir);
+  const outbox = safeDirectory(input.outboxDir, false, "outbox");
   const expected = path.join(outbox, occurrencePathSegment(input.occurrenceId as OccurrenceId), String(input.revision));
   if (path.resolve(input.bundlePath) !== expected) throw new Error("refusing to delete a bundle outside its occurrence and revision");
-  removeRegularOwnedFile(path.resolve(input.recordingsDir), input.recordingPath);
+  assertPathUnderRoot(outbox, expected, false);
+  removeRegularOwnedFile(safeDirectory(input.recordingsDir, false, "recordings"), input.recordingPath);
   removeOwnedBundle(outbox, expected);
+  removeAbandonedStages(outbox, path.dirname(expected), input.revision);
 }
 
 function safeDirectory(directory: string, create: boolean, label: string): string {
@@ -148,16 +164,49 @@ function isInside(root: string, target: string): boolean {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
+/** Lexical containment follows symlinked parents. Validate every extant path
+ * component below the configured root before a read, write, or removal. */
+function assertPathUnderRoot(root: string, target: string, requireTarget: boolean): void {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  requireDirectoryNotLink(resolvedRoot, "configured root");
+  if (!isInside(resolvedRoot, resolvedTarget)) throw new Error("path escapes configured root");
+  const parts = path.relative(resolvedRoot, resolvedTarget).split(path.sep);
+  let current = resolvedRoot;
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]!);
+    const final = index === parts.length - 1;
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink()) throw new Error("path contains a symlink");
+      if (!final && !stat.isDirectory()) throw new Error("path has a non-directory ancestor");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && (!final || !requireTarget)) return;
+      throw error;
+    }
+  }
+}
+
 function readVerifiedRecording(recordings: string, recordingPath: string, artifact: TeamMemMeetingArtifact): Buffer {
   const target = path.resolve(recordingPath);
-  if (!isInside(recordings, target)) throw new Error("recording path escapes recordings root");
+  assertPathUnderRoot(recordings, target, true);
   const stat = lstatSync(target);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("recording must be a regular non-symlink file");
   const bytes = readFileSync(target);
+  if (looksLikePlaintextAudio(bytes)) throw new Error("recording appears to be plaintext audio, not encrypted bytes");
   if (bytes.length !== artifact.audio.bytes) throw new Error("recording byte count does not match artifact");
   const digest = sha256(bytes);
   if (digest !== artifact.audio.sha256) throw new Error("recording hash does not match artifact");
   return bytes;
+}
+
+function looksLikePlaintextAudio(bytes: Buffer): boolean {
+  return bytes.subarray(0, 4).equals(Buffer.from("RIFF"))
+    || bytes.subarray(0, 4).equals(Buffer.from("OggS"))
+    || bytes.subarray(0, 4).equals(Buffer.from("fLaC"))
+    || bytes.subarray(0, 3).equals(Buffer.from("ID3"))
+    || bytes.subarray(4, 8).equals(Buffer.from("ftyp"))
+    || (bytes[0] === 0xff && bytes[1] !== undefined && bytes[1] >= 0xe0);
 }
 
 function canonicalManifest(artifact: TeamMemMeetingArtifact, artifactHash: string, audio: Buffer): string {
@@ -185,7 +234,8 @@ function writeDurable(filename: string, content: Buffer): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function fsyncDirectory(directory: string): void {
+function fsyncDirectory(directory: string, input?: Pick<WriteMeetingBundleInput, "directoryFsync">): void {
+  input?.directoryFsync?.(path.resolve(directory));
   const fd = openSync(directory, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
@@ -225,8 +275,8 @@ function removeIncompleteDestination(destination: string): void {
 
 function removeRegularOwnedFile(root: string, filename: string): void {
   const target = path.resolve(filename);
-  if (!isInside(root, target)) throw new Error("refusing to delete recording outside configured root");
   try {
+    assertPathUnderRoot(root, target, true);
     const stat = lstatSync(target);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("refusing to delete non-regular recording");
   } catch (error) {
@@ -238,8 +288,8 @@ function removeRegularOwnedFile(root: string, filename: string): void {
 
 function removeOwnedBundle(root: string, bundle: string): void {
   const target = path.resolve(bundle);
-  if (!isInside(root, target)) throw new Error("refusing to delete bundle outside configured root");
   try {
+    assertPathUnderRoot(root, target, true);
     const stat = lstatSync(target);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete non-directory bundle");
   } catch (error) {
@@ -247,4 +297,39 @@ function removeOwnedBundle(root: string, bundle: string): void {
     throw error;
   }
   rmSync(target, { recursive: true });
+}
+
+/** Private staging carries its creator PID until just before atomic rename.
+ * A dead process leaves recoverable encrypted bytes; a live owner is skipped
+ * so receipt/deadline cleanup cannot erase a concurrent writer. */
+function removeAbandonedStages(root: string, occurrenceDir: string, revision: number): void {
+  try { assertPathUnderRoot(root, occurrenceDir, true); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const prefix = `.${revision}.staging-`;
+  for (const name of readdirSync(occurrenceDir)) {
+    if (!name.startsWith(prefix)) continue;
+    const stage = path.join(occurrenceDir, name);
+    assertPathUnderRoot(root, stage, true);
+    const stat = lstatSync(stage);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("refusing to delete unsafe staging directory");
+    if (stageOwnerIsLive(stage)) continue;
+    rmSync(stage, { recursive: true });
+  }
+}
+
+function stageOwnerIsLive(stage: string): boolean {
+  const owner = path.join(stage, OWNER);
+  try {
+    const stat = lstatSync(owner);
+    if (stat.isSymbolicLink() || !stat.isFile()) return false;
+    const raw = readFileSync(owner, "ascii");
+    const pid = Number.parseInt(raw, 10);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || String(pid) !== raw) return false;
+    try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }

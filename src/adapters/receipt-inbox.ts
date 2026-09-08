@@ -30,22 +30,18 @@ export type ReadPublicationReceiptInput = {
 };
 
 export function readPublicationReceipt(input: ReadPublicationReceiptInput): PublicationReceipt | null {
-  const filename = path.join(path.resolve(input.receiptsDir), `${occurrencePathSegment(input.occurrenceId as `${string}@${string}`)}.json`);
-  let raw: Buffer;
   try {
+    const filename = path.join(path.resolve(input.receiptsDir), `${occurrencePathSegment(input.occurrenceId as `${string}@${string}`)}.json`);
     const stat = lstatSync(filename);
     if (stat.isSymbolicLink() || !stat.isFile()) return null;
-    raw = readFileSync(filename);
-  } catch {
-    return null;
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw.toString("utf8")); } catch { return null; }
-  if (!isReceipt(parsed)) return null;
-  const canonical = `${JSON.stringify(sortedReceipt(parsed))}\n`;
-  if (!raw.equals(Buffer.from(canonical, "utf8"))) return null;
-  if (parsed.occurrence_id !== input.occurrenceId || parsed.revision !== input.revision || parsed.artifact_hash !== input.artifactHash) return null;
-  return parsed;
+    const raw = readFileSync(filename);
+    const parsed: unknown = JSON.parse(raw.toString("utf8"));
+    if (!isReceipt(parsed)) return null;
+    const canonical = `${JSON.stringify(sortedReceipt(parsed))}\n`;
+    if (!raw.equals(Buffer.from(canonical, "utf8"))) return null;
+    if (parsed.occurrence_id !== input.occurrenceId || parsed.revision !== input.revision || parsed.artifact_hash !== input.artifactHash) return null;
+    return parsed;
+  } catch { return null; }
 }
 
 function isReceipt(value: unknown): value is PublicationReceipt {
@@ -64,7 +60,7 @@ function sortedReceipt(receipt: PublicationReceipt): Record<string, unknown> {
 }
 
 function safeMarkdownPath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.startsWith("/") || value.includes("\\") || hasControlCharacter(value)) return false;
+  if (typeof value !== "string" || !isUnicodeScalarString(value) || value.length === 0 || value.startsWith("/") || value.includes("\\") || hasControlCharacter(value)) return false;
   return value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 
@@ -81,9 +77,22 @@ function producerQuote(value: string): string {
 }
 
 function validCommitUrl(raw: string, commit: string, markdownPath: string): boolean {
+  if (!isUnicodeScalarString(raw)) return false;
   let url: URL;
   try { url = new URL(raw); } catch { return false; }
   if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return false;
   const suffix = `/-/blob/${commit}/${markdownPath.split("/").map(producerQuote).join("/")}`;
   return url.pathname.endsWith(suffix) && url.pathname.slice(0, -suffix.length).length > 0;
+}
+
+function isUnicodeScalarString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+  }
+  return true;
 }

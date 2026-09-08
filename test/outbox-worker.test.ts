@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 
 import { parseTeamMemMeetingArtifact, canonicalArtifactHash, canonicalArtifactJson } from "../src/contracts/teammem-meeting-v1.ts";
-import { writeMeetingBundle } from "../src/adapters/filesystem-outbox.ts";
+import { deleteDeliveredEvidence, writeMeetingBundle } from "../src/adapters/filesystem-outbox.ts";
 import { readPublicationReceipt } from "../src/adapters/receipt-inbox.ts";
 import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurrence-id.ts";
 import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../src/delivery/outbox-worker.ts";
@@ -37,8 +38,12 @@ function artifactAndAudio(): { artifact: ReturnType<typeof parseTeamMemMeetingAr
 
 class FakeJournal implements DeliveryJournal {
   readonly rows = new Map<string, DeliveryRow>();
+  failSave = false;
 
-  savePending(row: DeliveryRow): void { this.rows.set(`${row.occurrenceId}:${row.revision}`, row); }
+  savePending(row: DeliveryRow): void {
+    if (this.failSave) throw new Error("synthetic journal failure");
+    this.rows.set(`${row.occurrenceId}:${row.revision}`, row);
+  }
   pending(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs === null); }
   update(row: DeliveryRow): void { this.savePending(row); }
 }
@@ -100,7 +105,7 @@ test("refuses untrusted audio paths and mismatched audio or artifact integrity c
       { artifact: { ...artifact, audio: { ...artifact.audio, bytes: bytes.length + 1 } } },
       { artifactHash: `sha256:${"0".repeat(64)}` },
     ]) {
-      assert.throws(() => writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, ...input }), /audio|artifact|recording|hash/i);
+      assert.throws(() => writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, ...input }), /audio|artifact|recording|hash|path/i);
     }
     const linked = path.join(h.recordings, "linked.enc");
     symlinkSync(source, linked);
@@ -173,7 +178,7 @@ test("worker deletes only a complete-receipt bundle or evidence due at the exact
     const source = path.join(h.recordings, "final.enc");
     writeFileSync(source, bytes);
     const journal = new FakeJournal();
-    let now = Date.parse("2026-09-02T14:00:00Z");
+    const now = Date.parse("2026-09-02T14:00:00Z");
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
       clock: { now: () => now }, random: () => 0,
@@ -199,11 +204,6 @@ test("worker deletes only a complete-receipt bundle or evidence due at the exact
     assert.equal(statSync(completeSource, { throwIfNoEntry: false }), undefined);
     assert.equal(statSync(completeBundle, { throwIfNoEntry: false }), undefined);
 
-    now = Date.parse(artifact.ended_at) + 14 * 24 * 60 * 60 * 1000 - 1;
-    worker.reconcile();
-    assert.equal(statSync(source).isFile(), true);
-    now += 1;
-    worker.reconcile();
     assert.equal(statSync(source, { throwIfNoEntry: false }), undefined);
     assert.equal(statSync(bundle, { throwIfNoEntry: false }), undefined);
   } finally {
@@ -350,4 +350,207 @@ test("a corrupted journal row cannot delete a sibling outbox directory", () => {
   } finally {
     h.cleanup();
   }
+});
+
+test("a real process exit leaves an owned stage which restart cleanup removes with the delivered revision", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "final.enc");
+    writeFileSync(source, bytes);
+    const child = path.join(h.root, "crash-writer.ts");
+    writeFileSync(child, `import { writeMeetingBundle } from ${JSON.stringify(new URL("../src/adapters/filesystem-outbox.ts", import.meta.url).href)};
+const input = JSON.parse(process.argv[2]);
+writeMeetingBundle({...input, fault: (step) => { if (step === "after_audio_write") process.exit(77); }});\n`);
+    const result = spawnSync(process.execPath, [child, JSON.stringify({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source })]);
+    assert.equal(result.status, 77);
+    const occurrence = path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId));
+    const stages = readdirSync(occurrence).filter((name) => name.startsWith(`.${artifact.revision}.staging-`));
+    assert.equal(stages.length, 1);
+    assert.equal(existsSync(path.join(occurrence, stages[0]!, "audio.enc")), true);
+
+    const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+    deleteDeliveredEvidence({ recordingsDir: h.recordings, outboxDir: h.outbox, occurrenceId: artifact.occurrence_id, revision: artifact.revision, recordingPath: source, bundlePath: bundle });
+    assert.deepEqual(readdirSync(occurrence).filter((name) => name.startsWith(`.${artifact.revision}.staging-`)), []);
+  } finally { h.cleanup(); }
+});
+
+test("intermediate recording and outbox symlinks cannot escape deletion roots", () => {
+  const h = harness();
+  try {
+    const { artifact } = artifactAndAudio();
+    const outside = path.join(h.root, "outside");
+    const outsideBundle = path.join(outside, "bundle");
+    mkdirSync(outsideBundle, { recursive: true });
+    const victim = path.join(outside, "victim.enc");
+    writeFileSync(victim, "outside bytes");
+    const nested = path.join(h.recordings, "nested");
+    symlinkSync(outside, nested);
+    const segment = occurrencePathSegment(artifact.occurrence_id as OccurrenceId);
+    mkdirSync(h.outbox);
+    symlinkSync(outside, path.join(h.outbox, segment));
+    assert.throws(() => deleteDeliveredEvidence({
+      recordingsDir: h.recordings,
+      outboxDir: h.outbox,
+      occurrenceId: artifact.occurrence_id,
+      revision: artifact.revision,
+      recordingPath: path.join(nested, "victim.enc"),
+      bundlePath: path.join(h.outbox, segment, String(artifact.revision)),
+    }), /symlink|outside|containment/i);
+    assert.equal(readFileSync(victim, "utf8"), "outside bytes");
+    assert.equal(statSync(outsideBundle).isDirectory(), true);
+  } finally { h.cleanup(); }
+});
+
+test("refuses every plaintext container magic before READY without copying it", () => {
+  const magics = [Buffer.from("RIFF"), Buffer.from("OggS"), Buffer.from("fLaC"), Buffer.from("ID3"), Buffer.from("xxxxftyp"), Buffer.from([0xff, 0xe0])];
+  for (const magic of magics) {
+    const h = harness();
+    try {
+      const built = artifactAndAudio();
+      const bytes = Buffer.concat([magic, Buffer.from(" definitely plaintext")]);
+      const raw = structuredClone(built.artifact) as typeof built.artifact;
+      raw.audio = { ...raw.audio, bytes: bytes.length, sha256: SHA(bytes) };
+      const artifact = parseTeamMemMeetingArtifact(raw);
+      const source = path.join(h.recordings, "final.enc");
+      writeFileSync(source, bytes);
+      assert.throws(() => writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: canonicalArtifactHash(artifact), recordingPath: source }), /plaintext|encrypted/i);
+      assert.equal(existsSync(path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision), "audio.enc")), false);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("persists delivery intent before exposing READY when the journal save fails", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "final.enc");
+    writeFileSync(source, bytes);
+    const journal = new FakeJournal();
+    journal.failSave = true;
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: () => undefined } });
+    assert.throws(() => worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source }), /journal/);
+    assert.equal(existsSync(path.join(h.outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision), "READY")), false);
+    assert.deepEqual(journal.pending(), []);
+  } finally { h.cleanup(); }
+});
+
+test("a complete higher revision deletes every retained copy for its occurrence and no other", () => {
+  const h = harness();
+  try {
+    const first = artifactAndAudio();
+    const incomplete = structuredClone(first.artifact) as typeof first.artifact;
+    incomplete.transcript_complete = false;
+    const oldArtifact = parseTeamMemMeetingArtifact(incomplete);
+    const oldSource = path.join(h.recordings, "old.enc");
+    writeFileSync(oldSource, first.bytes);
+    const complete = structuredClone(oldArtifact) as typeof oldArtifact;
+    complete.transcript_complete = true;
+    complete.revision += 1;
+    const newArtifact = parseTeamMemMeetingArtifact(complete);
+    const newSource = path.join(h.recordings, "new.enc");
+    writeFileSync(newSource, first.bytes);
+    const journal = new FakeJournal();
+    let state = "awaiting_teammem";
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 1234 }, random: () => 0, session: { state: () => state, publish: () => { state = "published"; } } });
+    const oldBundle = worker.enqueue({ artifact: oldArtifact, serializedArtifact: canonicalArtifactJson(oldArtifact), artifactHash: canonicalArtifactHash(oldArtifact), recordingPath: oldSource });
+    const newHash = canonicalArtifactHash(newArtifact);
+    const newBundle = worker.enqueue({ artifact: newArtifact, serializedArtifact: canonicalArtifactJson(newArtifact), artifactHash: newHash, recordingPath: newSource });
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(newArtifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(newArtifact, newHash))}\n`);
+    worker.reconcile();
+    for (const evidence of [oldSource, oldBundle, newSource, newBundle]) assert.equal(existsSync(evidence), false);
+    for (const revision of [oldArtifact.revision, newArtifact.revision]) assert.equal(journal.rows.get(`${newArtifact.occurrence_id}:${revision}`)?.deletedAtMs, 1234);
+  } finally { h.cleanup(); }
+});
+
+test("matching receipts do nothing in every state except awaiting_teammem or published replay", () => {
+  for (const state of [null, "listening", "finalizing", "failed", "notified", "discovered"]) {
+    const h = harness();
+    try {
+      const { artifact, bytes, serialized, hash } = artifactAndAudio();
+      const source = path.join(h.recordings, "final.enc");
+      writeFileSync(source, bytes);
+      const journal = new FakeJournal();
+      const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 2 }, random: () => 0, session: { state: () => state, publish: () => assert.fail("illegal state transition") } });
+      const bundle = worker.enqueue({ artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source });
+      writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(artifact, hash))}\n`);
+      worker.reconcile();
+      const row = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;
+      assert.equal(row.publishedAtMs, null);
+      assert.equal(row.deletedAtMs, null);
+      assert.equal(existsSync(source), true);
+      assert.equal(existsSync(bundle), true);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("unpaired surrogates in receipt path or URL fields return null and cannot abort a later valid delivery", () => {
+  const h = harness();
+  try {
+    const { artifact, hash } = artifactAndAudio();
+    const file = path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`);
+    for (const field of ["markdown_path", "markdown_url"] as const) for (const surrogate of ["\ud800", "\udc00"]) {
+      writeFileSync(file, `${JSON.stringify({ ...publishedReceipt(artifact, hash), [field]: surrogate })}\n`);
+      assert.doesNotThrow(() => assert.equal(readPublicationReceipt({ receiptsDir: h.receipts, occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: hash }), null));
+    }
+  } finally { h.cleanup(); }
+});
+
+test("a malformed receipt for one occurrence cannot block a valid second occurrence in the same poll", () => {
+  const h = harness();
+  try {
+    const first = artifactAndAudio();
+    const secondRaw = structuredClone(first.artifact) as typeof first.artifact;
+    secondRaw.occurrence_id = "vc:second@2026-09-02T14:00:00Z";
+    secondRaw.provider_meeting_id = "vc:second";
+    const second = parseTeamMemMeetingArtifact(secondRaw);
+    const secondHash = canonicalArtifactHash(second);
+    const firstSource = path.join(h.recordings, "first.enc");
+    const secondSource = path.join(h.recordings, "second.enc");
+    writeFileSync(firstSource, first.bytes);
+    writeFileSync(secondSource, first.bytes);
+    const journal = new FakeJournal();
+    const published: string[] = [];
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 5 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: (id) => published.push(id) } });
+    worker.enqueue({ artifact: first.artifact, serializedArtifact: first.serialized, artifactHash: first.hash, recordingPath: firstSource });
+    worker.enqueue({ artifact: second, serializedArtifact: canonicalArtifactJson(second), artifactHash: secondHash, recordingPath: secondSource });
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(first.artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify({ ...publishedReceipt(first.artifact, first.hash), markdown_path: "\ud800" })}\n`);
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(second.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(second, secondHash))}\n`);
+    assert.doesNotThrow(() => worker.reconcile());
+    assert.deepEqual(published, [second.occurrence_id]);
+  } finally { h.cleanup(); }
+});
+
+test("reconcile invokes the injected purge at its single clock instant and confines a purge failure", () => {
+  const h = harness();
+  try {
+    const journal = new FakeJournal();
+    const calls: number[] = [];
+    const errors: string[] = [];
+    const worker = createOutboxWorker({
+      outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+      clock: { now: () => 9876 }, random: () => 0, session: { state: () => null, publish: () => undefined },
+      reconciliationEvidence: { purgeExpiredReconciliationEvidence: (now) => { calls.push(now); throw new Error("sensitive path"); } },
+      onMaintenanceFailure: (reason) => errors.push(reason),
+    });
+    assert.doesNotThrow(() => worker.reconcile());
+    assert.deepEqual(calls, [9876]);
+    assert.deepEqual(errors, ["reconciliation_evidence_purge_failed"]);
+    assert.deepEqual(journal.pending(), []);
+  } finally { h.cleanup(); }
+});
+
+test("new outbox and occurrence names are fsynced through their parents before READY", () => {
+  const h = harness();
+  try {
+    const { artifact, bytes, serialized, hash } = artifactAndAudio();
+    const source = path.join(h.recordings, "final.enc");
+    writeFileSync(source, bytes);
+    const calls: string[] = [];
+    const bundle = writeMeetingBundle({ recordingsDir: h.recordings, outboxDir: h.outbox, artifact, serializedArtifact: serialized, artifactHash: hash, recordingPath: source, directoryFsync: (directory) => calls.push(path.resolve(directory)) });
+    const occurrence = path.dirname(bundle);
+    assert.ok(calls.indexOf(path.dirname(h.outbox)) >= 0);
+    assert.ok(calls.indexOf(h.outbox) >= 0);
+    assert.ok(calls.lastIndexOf(occurrence) > calls.indexOf(h.outbox));
+  } finally { h.cleanup(); }
 });

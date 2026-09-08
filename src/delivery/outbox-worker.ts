@@ -4,6 +4,8 @@
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
 import type { TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
+import { occurrencePathSegment } from "../domain/occurrence-id.ts";
+import path from "node:path";
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -50,10 +52,38 @@ export function createOutboxWorker(options: {
   /** Returns a deterministic [0, 1] value in tests. */
   readonly random: () => number;
   readonly session: { state(occurrenceId: string): string | null; publish(occurrenceId: string): void };
+  readonly reconciliationEvidence?: { purgeExpiredReconciliationEvidence(nowMs: number): number };
+  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed") => void;
 }): OutboxWorker {
   return {
     enqueue(input): string {
-      const bundlePath = writeMeetingBundle({
+      const existing = options.journal.pending().find((row) => row.occurrenceId === input.artifact.occurrence_id && row.revision === input.artifact.revision);
+      if (existing !== undefined) {
+        if (existing.artifactHash !== input.artifactHash) throw new Error("artifact revision is immutable: conflicting content");
+      }
+      const bundlePath = path.join(path.resolve(options.outboxDir), occurrencePathSegment(input.artifact.occurrence_id as `${string}@${string}`), String(input.artifact.revision));
+      if (existing === undefined) {
+        // The journal intent precedes the filesystem visibility commit. A
+        // save failure therefore cannot strand a READY bundle undiscoverable
+        // to polling, retry, or deadline cleanup after restart.
+        options.journal.savePending({
+          occurrenceId: input.artifact.occurrence_id,
+          revision: input.artifact.revision,
+          artifactHash: input.artifactHash,
+          recordingPath: input.recordingPath,
+          bundlePath,
+          endedAtMs: Date.parse(input.artifact.ended_at),
+          transcriptComplete: input.artifact.transcript_complete,
+          retryCount: 0,
+          nextRetryAtMs: options.clock.now(),
+          retryReason: null,
+          publishedAtMs: null,
+          deletedAtMs: null,
+          publicationUrl: null,
+          vaultCommit: null,
+        });
+      }
+      const written = writeMeetingBundle({
         recordingsDir: options.recordingsDir,
         outboxDir: options.outboxDir,
         artifact: input.artifact,
@@ -61,32 +91,13 @@ export function createOutboxWorker(options: {
         artifactHash: input.artifactHash,
         recordingPath: input.recordingPath,
       });
-      const existing = options.journal.pending().find((row) => row.occurrenceId === input.artifact.occurrence_id && row.revision === input.artifact.revision);
-      if (existing !== undefined) {
-        if (existing.artifactHash !== input.artifactHash) throw new Error("artifact revision is immutable: conflicting content");
-        return existing.bundlePath;
-      }
-      options.journal.savePending({
-        occurrenceId: input.artifact.occurrence_id,
-        revision: input.artifact.revision,
-        artifactHash: input.artifactHash,
-        recordingPath: input.recordingPath,
-        bundlePath,
-        endedAtMs: Date.parse(input.artifact.ended_at),
-        transcriptComplete: input.artifact.transcript_complete,
-        retryCount: 0,
-        nextRetryAtMs: options.clock.now(),
-        retryReason: null,
-        publishedAtMs: null,
-        deletedAtMs: null,
-        publicationUrl: null,
-        vaultCommit: null,
-      });
+      if (written !== bundlePath) throw new Error("outbox writer returned a non-canonical bundle path");
       return bundlePath;
     },
 
     reconcile(): void {
       const now = options.clock.now();
+      try { options.reconciliationEvidence?.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
       for (const current of options.journal.pending()) {
         if (current.deletedAtMs !== null) continue;
         if (now >= current.endedAtMs + RETENTION_MS) {
@@ -94,7 +105,11 @@ export function createOutboxWorker(options: {
           options.journal.update({ ...current, deletedAtMs: now, retryReason: null });
           continue;
         }
-        if (current.publishedAtMs !== null) continue;
+        const state = options.session.state(current.occurrenceId);
+        if (current.publishedAtMs !== null) {
+          if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now);
+          continue;
+        }
         if (now < current.nextRetryAtMs) continue;
         const receipt = readPublicationReceipt({
           receiptsDir: options.receiptsDir,
@@ -112,10 +127,11 @@ export function createOutboxWorker(options: {
           });
           continue;
         }
-        // The coordinator graph admits only this edge.  Replays after a crash
-        // see published and remain idempotent rather than attempting a second
-        // transition.
-        if (options.session.state(current.occurrenceId) === "awaiting_teammem") options.session.publish(current.occurrenceId);
+        // A receipt is evidence, not authorization to mutate an arbitrary
+        // orchestration state. Only the legal edge and an interrupted replay
+        // are allowed to record it or release encrypted evidence.
+        if (state !== "awaiting_teammem" && state !== "published") continue;
+        if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
         const published: DeliveryRow = {
           ...current,
           publishedAtMs: now,
@@ -124,14 +140,30 @@ export function createOutboxWorker(options: {
           retryReason: null,
         };
         if (current.transcriptComplete) {
-          deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: published.occurrenceId, revision: published.revision, recordingPath: published.recordingPath, bundlePath: published.bundlePath });
-          options.journal.update({ ...published, deletedAtMs: now });
+          options.journal.update(published);
+          deleteOccurrenceEvidence(options, published, now);
         } else {
           options.journal.update(published);
         }
       }
     },
   };
+}
+
+function deleteOccurrenceEvidence(
+  options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
+  accepted: DeliveryRow,
+  now: number,
+): void {
+  for (const row of options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId)) {
+    deleteDeliveredEvidence({ recordingsDir: options.recordingsDir, outboxDir: options.outboxDir, occurrenceId: row.occurrenceId, revision: row.revision, recordingPath: row.recordingPath, bundlePath: row.bundlePath });
+    options.journal.update({
+      ...row,
+      ...(row.revision === accepted.revision ? { publishedAtMs: accepted.publishedAtMs, publicationUrl: accepted.publicationUrl, vaultCommit: accepted.vaultCommit } : {}),
+      deletedAtMs: now,
+      retryReason: null,
+    });
+  }
 }
 
 /** 1–60 seconds, full jitter around an exponential cap; no wall clock reads. */
