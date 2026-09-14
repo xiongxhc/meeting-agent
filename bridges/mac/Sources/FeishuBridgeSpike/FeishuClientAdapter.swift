@@ -76,8 +76,7 @@ public final class FeishuClientAdapter {
         guard let tree = driver.snapshot(waitingUpTo: 0) else {
             return .failed(reason: "client_not_observable")
         }
-        guard !tree.hasPossibleMatch(labels.identifiers.meetingWindow, labels),
-              tree.hasCompleteDepartureLocators(labels.identifiers.meetingWindow, labels, matchedRoles: []) else {
+        guard hasPositiveIdleContainer(tree) else {
             return .failed(reason: "client_not_idle")
         }
         guard let field = tree.locate(labels.identifiers.joinMeetingNumberField, labels),
@@ -107,6 +106,14 @@ public final class FeishuClientAdapter {
         guard shown == meetingNo else { return .rejected(reason: "joined_meeting_number_mismatch") }
 
         return .joined(meetingOccurrenceId: meetingOccurrenceId)
+    }
+
+    private func hasPositiveIdleContainer(_ tree: AccessibilityNode) -> Bool {
+        // Reachable controls in a flattened application/group are not idle proof.
+        // Join needs a positive container; departure's absence policy is separate.
+        tree.firstDescendant { ["AXWindow", "AXSheet", "AXDialog"].contains($0.role) } != nil
+            && !tree.hasPossibleMatch(labels.identifiers.meetingWindow, labels)
+            && tree.hasCompleteDepartureLocators(labels.identifiers.meetingWindow, labels, matchedRoles: [])
     }
 
     public func leave() -> LeaveOutcome {

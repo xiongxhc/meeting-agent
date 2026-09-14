@@ -165,6 +165,22 @@ final class BridgeProcessOutcomeTests: XCTestCase {
             }
         }
     }
+
+    func testNativeProjectionRequiresPositiveIdleContainerBeforeJoinAction() {
+        for (role, empty, admitted) in [("AXApplication", true, false), ("AXApplication", false, false),
+            ("AXWindow", false, true), ("AXSheet", false, true), ("AXDialog", false, true)] {
+            let backend = IdleProofAXBackend()
+            backend.root = NativeAXAttributes(role: role, identifier: "synthetic.home", title: "synthetic home")
+            backend.emptyIdleChildren = empty
+            let driver = AXAccessibilityDriver(backend: backend, clock: FakeDeadlineClock(), cancellation: BridgeCancellation())
+            let adapter = FeishuClientAdapter(driver: driver, joinDeadline: 0.1)
+            XCTAssertEqual(adapter.join(meetingOccurrenceId: "meeting", meetingNo: "900000001"),
+                admitted ? .joined(meetingOccurrenceId: "meeting") : .failed(reason: "client_not_idle"))
+            XCTAssertEqual(backend.inner.number, admitted ? "900000001" : "")
+            XCTAssertEqual(backend.inner.joinPressCount, admitted ? 1 : 0)
+            XCTAssertEqual(adapter.joinActionIssued, admitted)
+        }
+    }
 }
 
 private final class ClosingFailureSink: BridgeEvidenceSink {
@@ -184,10 +200,13 @@ private final class InvalidControlInput: BridgeInputSource {
 private final class IdleProofAXBackend: AXNativeBackend {
     let inner = JoiningAXBackend()
     var root = NativeAXAttributes(role: "AXWindow")
+    var emptyIdleChildren = false
     func isApplicationValid() -> Bool { true }
     func beginSnapshot() -> String? { "root" }
     func attributes(_ handle: String) -> NativeAXAttributes? { handle == "root" && !inner.joined ? root : inner.attributes(handle) }
-    func children(_ handle: String, limit: Int) -> [String]? { inner.children(handle, limit: limit) }
+    func children(_ handle: String, limit: Int) -> [String]? {
+        handle == "root" && !inner.joined && emptyIdleChildren ? [] : inner.children(handle, limit: limit)
+    }
     func press(_ handle: String) -> Bool { inner.press(handle) }
     func setValue(_ value: String, handle: String) -> Bool { inner.setValue(value, handle: handle) }
 }

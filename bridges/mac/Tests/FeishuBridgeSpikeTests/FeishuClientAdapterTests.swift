@@ -18,6 +18,18 @@ final class FeishuClientAdapterTests: XCTestCase {
 
     // MARK: - join
 
+    func testJoinPreflightRejectsCandidateFreeTreeEvenWithReachableControls() {
+        let controls = FakeTree.idleWithJoinSurface().children
+        for children in [controls, [AccessibilityNode(role: "AXGroup", children: controls)]] {
+            let tree = AccessibilityNode(role: "AXApplication", identifier: "synthetic.app", title: "synthetic app", children: children)
+            let (adapter, driver) = self.adapter([tree, FakeTree.inMeeting(meetingNo: "900000001")])
+            XCTAssertEqual(adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001"), .failed(reason: "client_not_idle"))
+            XCTAssertTrue(driver.typed.isEmpty)
+            XCTAssertTrue(driver.pressed.isEmpty)
+            XCTAssertFalse(adapter.joinActionIssued)
+        }
+    }
+
     func testJoinPreflightRejectsExistingOrUnreadableMeetingBeforeAnyUIWrite() {
         for possible in [FakeTree.inMeeting(), AccessibilityNode(role: "AXWindow"), AccessibilityNode(role: "AXSheet")] {
             let tree = AccessibilityNode(role: "AXApplication", children: [FakeTree.idleWithJoinSurface(), possible])
@@ -108,6 +120,7 @@ final class FeishuClientAdapterTests: XCTestCase {
         let (adapter, driver) = self.adapter([duplicate, FakeTree.inMeeting()])
         XCTAssertEqual(adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001"),
                        .failed(reason: "join_controls_not_reachable"))
+        XCTAssertTrue(driver.typed.isEmpty)
         XCTAssertTrue(driver.pressed.isEmpty)
     }
 
