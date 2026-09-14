@@ -21,6 +21,12 @@ import { createMeetingSession, type MeetingSession } from "./sessions/meeting-se
 // names from `meeting-agent`, not from an implementation file.
 export { ConfigError, RedactedSecret, describeConfig, loadConfig, type MeetingAgentConfig } from "./config.ts";
 export { createChildBridgeSlot, type ChildBridgeOptions } from "./adapters/child-bridge-process.ts";
+export { createFeishuInviteIngress } from "./adapters/feishu-invite-ingress.ts";
+export { createFeishuOrganizerMetadata } from "./adapters/feishu-organizer-metadata.ts";
+export { createFeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
+export { createInviteDiscovery } from "./sessions/invite-discovery.ts";
+export type { FeishuScope, NormalizedInvite, InviteOccurrence } from "./ports/feishu-ingress.ts";
+export type { OrganizerReferenceEntry, OrganizerResolution } from "./ports/feishu.ts";
 export type { BridgeProcessSlot, OwnedBridgeProcess, BridgeShutdownResult } from "./ports/bridge-process.ts";
 
 export type MeetingAgentCompositionAdapters = {

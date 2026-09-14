@@ -23,12 +23,15 @@
     "@eslint/js": "^9.37.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.9.1",
+    "@types/ws": "8.5.10",
     "ajv": "^8.20.0",
     "eslint": "^9.37.0",
     "typescript": "~5.9.3",
-    "typescript-eslint": "^8.46.0"
+    "typescript-eslint": "^8.46.0",
+    "ws": "8.21.3"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.74.0",
     "better-sqlite3": "^13.0.3",
     "zod": "^4.5.4"
   }

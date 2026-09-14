@@ -393,6 +393,13 @@ export type AcquireLeaseInput = {
  * an injected clock.
  */
 export type SessionStore = {
+  acceptInvite(invite: import("./feishu-ingress.ts").NormalizedInvite, nowMs: number): "accepted" | "replay" | "existing_occurrence";
+  getInviteOccurrence(occurrenceId: string): import("./feishu-ingress.ts").InviteOccurrence | null;
+  listInviteOccurrences(after?: string, limit?: number): readonly import("./feishu-ingress.ts").InviteOccurrence[];
+  claimInviteMetadata(nowMs: number): import("./feishu-ingress.ts").InviteClaim | null;
+  failInviteClaim(claim: import("./feishu-ingress.ts").InviteClaim, result: Extract<import("./feishu.ts").OrganizerResolution, {status: "blocked"}>, nowMs: number, retryDelayMs: number): void;
+  completeInviteClaim(claim: import("./feishu-ingress.ts").InviteClaim, result: Extract<import("./feishu.ts").OrganizerResolution, {status: "resolved"}>, nowMs: number): void;
+  retryInviteMetadata(occurrenceId: string, operator: string, nowMs: number): "pending" | "already_pending" | "counter_exhausted";
   claimPhysicalClient(binding: CustodyBinding, nowMs: number): PhysicalCustodyRow;
   listPhysicalCustody(): readonly PhysicalCustodyRow[];
   recordPhysicalOutcome(binding: CustodyBinding, result: BridgeShutdownResult, nowMs: number): void;

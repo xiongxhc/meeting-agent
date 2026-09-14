@@ -8,6 +8,11 @@ Feasibility spike stage. The frozen bridge contract and both halves of the
 Feishu bridge exist and are tested; nothing has yet been run against a real
 Feishu client, and no feasibility measurement has been recorded.
 
+The engine also includes real SDK-backed invitation intake and durable organizer
+discovery, verified against local HTTP/WebSocket peers and SQLite only. See
+[invitation discovery](docs/feishu-invite-ingress.md) for explicit configuration,
+shutdown ownership, operator commands and remaining human prerequisites.
+
 ```
 protocols/          bridge-session/v1 JSON Schema — the normative contract
 fixtures/contracts/ the frozen contract bytes both languages test against

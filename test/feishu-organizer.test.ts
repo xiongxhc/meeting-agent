@@ -1,173 +1,86 @@
-// Organizer resolution tests, written before src/ports/feishu.ts exists
-// (TDD). The organizer is the meeting's CREATOR: the reservation's
-// reserve_user_id (looked up by meeting number), or the calendar event
-// organizer. It is NEVER host_user, participants[].is_host, is_cohost, the
-// person who invited the agent, an attendee, or company rank. An instant
-// meeting has no reservation and no calendar event, so it resolves to null.
-//
-// Several tests here are structural, not just behavioral: they build probe
-// records with a Proxy that throws if a forbidden field is ever read, so a
-// future change that starts consulting host_user/is_host/is_cohost fails
-// immediately rather than merely "usually" passing.
-
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { RedactedSecret } from "../src/config.ts";
+import { createFeishuOrganizerMetadata } from "../src/adapters/feishu-organizer-metadata.ts";
+import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
+import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
+import { scope, envelope, httpPeer } from "./lib/feishu-fixtures.ts";
+import { Agent } from "node:http";
+import { createFeishuSocketOwner } from "../src/adapters/feishu-sdk-connection.ts";
 
-import {
-  resolveOrganizer,
-  type FeishuCalendarEventRecord,
-  type FeishuOrganizerLookup,
-  type FeishuReservationRecord,
-} from "../src/ports/feishu.ts";
-
-/** Wraps `record` so that reading any key in `forbiddenKeys` throws instead
- * of returning a value. Reading any other key passes through untouched. Used
- * to prove structurally -- not just behaviorally -- that the resolver never
- * touches a given field, even when the field is present on the raw record. */
-function forbidGuard<T extends object>(record: T, forbiddenKeys: readonly (keyof T)[]): T {
-  return new Proxy(record, {
-    get(target, prop, receiver) {
-      if (forbiddenKeys.includes(prop as keyof T)) {
-        throw new Error(`organizer resolution must never read forbidden field "${String(prop)}"`);
+test("real SDK reservation reads require exact active occurrence before reserve/contact; never bot join", async () => {
+  for (const mode of ["ok", "mismatch", "denied", "missing_id", "missing_display"] as const) {
+    const calls: string[] = [];
+    const peer = await httpPeer((req,res) => {
+      const url = new URL(req.url!, "http://fixture"); calls.push(url.pathname);
+      res.setHeader("content-type","application/json");
+      if (url.pathname.endsWith("/tenant_access_token/internal")) { res.end(JSON.stringify({code:0,tenant_access_token:"synthetic-token",expire:7200})); return; }
+      assert.equal(req.method,"GET"); assert.equal(url.searchParams.get("user_id_type"),"open_id");
+      if (mode === "denied") { res.writeHead(403); res.end("{}"); return; }
+      if (url.pathname.endsWith("/get_active_meeting")) {
+        assert.equal(url.searchParams.get("with_participants"),"false");
+        res.end(JSON.stringify({code:0,data:{meeting:{id:mode === "mismatch" ? "wrong":"9007199254740993",meeting_no:"900000001",start_time:"1788357600"}}}));
+      } else if (url.pathname.endsWith("/reserves/reserve")) res.end(JSON.stringify({code:0,data:{reserve:{id:"reserve",meeting_no:"900000001",reserve_user_id:mode === "missing_id" ? undefined:"ou_creator",host_user:{id:"ou_host"}}}}));
+      else if (url.pathname.endsWith("/users/ou_creator")) res.end(JSON.stringify({code:0,data:{user:{open_id:"ou_creator",name:mode === "missing_display" ? undefined:"Creator"}}}));
+      else { res.writeHead(404); res.end("{}"); }
+    });
+    const http = createFeishuSdkHttp({ request: peer.request, connection:createFeishuSocketOwner(Agent) });
+    const store = openSessionStore({filename:":memory:"}); store.acceptInvite(normalizeInvite(envelope(),scope),1);
+    const adapter = createFeishuOrganizerMetadata({ ...scope, appSecret:new RedactedSecret("synthetic-secret"), http,
+      references:[{...scope,meetingNo:"900000001",reference:{kind:"reservation",reserveId:"reserve"}}] });
+    try {
+      const result = await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal);
+      if (mode === "ok") {
+        assert.equal(result.status,"resolved"); if (result.status === "resolved") { assert.equal(result.organizer.id,"ou_creator"); assert.equal(result.organizer.idType,"open_id"); }
+        assert.deepEqual(calls.filter((p)=>!p.includes("/auth/")),["/open-apis/vc/v1/reserves/reserve/get_active_meeting","/open-apis/vc/v1/reserves/reserve","/open-apis/contact/v3/users/ou_creator"]);
+      } else {
+        assert.equal(result.status,"blocked");
+        if (mode === "mismatch" || mode === "denied") assert.equal(calls.filter((p)=>!p.includes("/auth/")).length,1);
       }
-      return Reflect.get(target, prop, receiver);
-    },
-  });
-}
-
-function lookupWith(
-  reservation: FeishuReservationRecord | null,
-  calendarEvent: FeishuCalendarEventRecord | null,
-): FeishuOrganizerLookup {
-  return {
-    findReservation: async () => reservation,
-    findCalendarEvent: async () => calendarEvent,
-  };
-}
-
-test("organizer resolves from the reservation's reserve_user_id when a reservation exists", async () => {
-  const reservation: FeishuReservationRecord = {
-    meetingNo: "123-456-789",
-    reserveUserId: "ou_ada",
-    reserveUserDisplayName: "Ada Chen",
-  };
-  const organizer = await resolveOrganizer("123-456-789", lookupWith(reservation, null));
-  assert.deepEqual(organizer, { feishuUserId: "ou_ada", displayName: "Ada Chen", source: "reservation" });
+      assert.ok(calls.every((p)=>!p.includes("/bots/")));
+    } finally { await http.close(); store.close(); await peer.close(); }
+  }
 });
 
-test("organizer falls back to the calendar event organizer when there is no reservation", async () => {
-  const calendarEvent: FeishuCalendarEventRecord = {
-    meetingNo: "123-456-789",
-    organizerId: "ou_dana",
-    organizerDisplayName: "Dana Whitfield",
-  };
-  const organizer = await resolveOrganizer("123-456-789", lookupWith(null, calendarEvent));
-  assert.deepEqual(organizer, { feishuUserId: "ou_dana", displayName: "Dana Whitfield", source: "calendar_event" });
+test("missing reference is blocked, never instant, and never performs HTTP", async () => {
+  const http = createFeishuSdkHttp({request:async()=>{throw new Error("must_not_call");}});
+  const adapter = createFeishuOrganizerMetadata({...scope,appSecret:new RedactedSecret("synthetic"),http,references:[]});
+  const store = openSessionStore({filename:":memory:"}); store.acceptInvite(normalizeInvite(envelope(),scope),1);
+  try { assert.deepEqual(await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal),{status:"blocked",reason:"reference_missing",retryable:false}); }
+  finally { await http.close(); store.close(); }
 });
 
-test("reservation takes priority over a calendar event when both exist", async () => {
-  const reservation: FeishuReservationRecord = {
-    meetingNo: "1",
-    reserveUserId: "ou_reservation",
-    reserveUserDisplayName: "Reservation Creator",
-  };
-  const calendarEvent: FeishuCalendarEventRecord = {
-    meetingNo: "1",
-    organizerId: "ou_calendar",
-    organizerDisplayName: "Calendar Organizer",
-  };
-  const organizer = await resolveOrganizer("1", lookupWith(reservation, calendarEvent));
-  assert.equal(organizer?.source, "reservation");
-  assert.equal(organizer?.feishuUserId, "ou_reservation");
+test("owned SDK HTTP timeout aborts actual socket work and close waits for settlement", async () => {
+  let disconnected!:()=>void; const disconnection = new Promise<void>((resolve)=>{disconnected=resolve;});
+  const peer = await httpPeer((req)=>{ req.on("close",disconnected); });
+  const http = createFeishuSdkHttp({request:peer.request,timeoutMs:30,connection:createFeishuSocketOwner(Agent)});
+  try {
+    await assert.rejects(http.instance.get("https://open.feishu.cn/synthetic"), /feishu_http_timeout/);
+    await disconnection; assert.equal(http.activeCount,0);
+    await http.close(); await assert.rejects(http.instance.get("https://open.feishu.cn/synthetic"),/feishu_http_closed/);
+  } finally { await http.close(); await peer.close(); }
 });
 
-test("an instant meeting (no reservation, no calendar event) resolves organizer to null", async () => {
-  const organizer = await resolveOrganizer("999", lookupWith(null, null));
-  assert.equal(organizer, null);
-});
-
-test("structural: resolveOrganizer never reads hostUser, isHost, or isCohost off a reservation record, even when present", async () => {
-  const raw: FeishuReservationRecord = {
-    meetingNo: "1",
-    reserveUserId: "ou_ada",
-    reserveUserDisplayName: "Ada Chen",
-    hostUser: { id: "ou_someone_else" },
-  };
-  const guarded = forbidGuard(raw, ["hostUser"]);
-  const organizer = await resolveOrganizer("1", lookupWith(guarded, null));
-  assert.deepEqual(organizer, { feishuUserId: "ou_ada", displayName: "Ada Chen", source: "reservation" });
-});
-
-test("structural: resolveOrganizer never reads hostUser off a calendar event record, even when present", async () => {
-  const raw: FeishuCalendarEventRecord = {
-    meetingNo: "1",
-    organizerId: "ou_dana",
-    organizerDisplayName: "Dana Whitfield",
-    hostUser: { id: "ou_someone_else" },
-  };
-  const guarded = forbidGuard(raw, ["hostUser"]);
-  const organizer = await resolveOrganizer("1", lookupWith(null, guarded));
-  assert.deepEqual(organizer, { feishuUserId: "ou_dana", displayName: "Dana Whitfield", source: "calendar_event" });
-});
-
-test("inviter differing from the reservation creator: the person who invited the agent is never used as organizer", async () => {
-  // The port surface gives the resolver no parameter through which an
-  // "inviter" could even be supplied -- resolveOrganizer takes only a
-  // meeting number and the lookup. This test pins that the reservation's
-  // reserve_user_id wins regardless of who is recorded as having invited
-  // the agent to the meeting on an adjacent, unrelated field.
-  const raw = {
-    meetingNo: "1",
-    reserveUserId: "ou_reservation_creator",
-    reserveUserDisplayName: "Reservation Creator",
-    invitedByUserId: "ou_inviter", // not part of FeishuReservationRecord; never read
-  } as FeishuReservationRecord & { invitedByUserId: string };
-  const guarded = forbidGuard(raw, ["invitedByUserId"]);
-  const organizer = await resolveOrganizer("1", lookupWith(guarded, null));
-  assert.equal(organizer?.feishuUserId, "ou_reservation_creator");
-  assert.notEqual(organizer?.feishuUserId, "ou_inviter");
-});
-
-test("host transfer across the meeting's lifetime never changes the resolved organizer", async () => {
-  const reservation: FeishuReservationRecord = {
-    meetingNo: "1",
-    reserveUserId: "ou_ada",
-    reserveUserDisplayName: "Ada Chen",
-  };
-  // Simulate the host changing partway through the meeting by varying only
-  // the (never-read) hostUser field across two resolution calls; the
-  // reservation itself is untouched.
-  const beforeTransfer = forbidGuard({ ...reservation, hostUser: { id: "ou_ada" } }, ["hostUser"]);
-  const afterTransfer = forbidGuard({ ...reservation, hostUser: { id: "ou_bo" } }, ["hostUser"]);
-
-  const organizerBefore = await resolveOrganizer("1", lookupWith(beforeTransfer, null));
-  const organizerAfter = await resolveOrganizer("1", lookupWith(afterTransfer, null));
-
-  assert.deepEqual(organizerBefore, organizerAfter);
-  assert.equal(organizerAfter?.feishuUserId, "ou_ada");
-});
-
-test("structural: resolveOrganizer never touches a meeting record's host_user or participants[].is_host/is_cohost fields", async () => {
-  // Broader structural probe covering the raw meeting-record shape itself
-  // (as opposed to the reservation/calendar-event records), for the case
-  // where a future caller passes the whole meeting object through.
-  const rawMeeting = {
-    meetingNo: "1",
-    hostUser: { id: "ou_host" },
-    participants: [{ feishuUserId: "ou_a", displayName: "Ada Chen", isHost: true, isCohost: false }],
-  };
-  const guardedMeeting = forbidGuard(rawMeeting, ["hostUser", "participants"]);
-
-  // resolveOrganizer must resolve purely from the reservation/calendar-event
-  // lookup; touching the guarded meeting object at all (even just to read
-  // meetingNo back off it, which is allowed) must never reach into the
-  // forbidden fields.
-  const meetingNo = guardedMeeting.meetingNo;
-  const reservation: FeishuReservationRecord = {
-    meetingNo,
-    reserveUserId: "ou_ada",
-    reserveUserDisplayName: "Ada Chen",
-  };
-  const organizer = await resolveOrganizer(meetingNo, lookupWith(reservation, null));
-  assert.equal(organizer?.feishuUserId, "ou_ada");
+test("calendar GET requires exact occurrence/event and actual organizer, not host/recurrence guesses",async()=>{
+  for(const mode of ["ok","wrong_event","recurrence","conflict","missing_display"]){
+    const peer=await httpPeer((req,res)=>{
+      const url=new URL(req.url!,"http://fixture");res.setHeader("content-type","application/json");
+      if(url.pathname.includes("/auth/")){res.end(JSON.stringify({code:0,tenant_access_token:"synthetic",expire:7200}));return;}
+      assert.equal(req.method,"GET");assert.equal(url.pathname,"/open-apis/calendar/v4/calendars/calendar/events/event");assert.equal(url.searchParams.get("user_id_type"),"open_id");
+      res.end(JSON.stringify({code:0,data:{event:{event_id:mode==="wrong_event"?"wrong":"event",start_time:{timestamp:"1788357000"},end_time:{timestamp:"1788361200"},
+        recurrence:mode==="recurrence"?"FREQ=DAILY":"",event_organizer:{user_id:"ou_calendar",display_name:mode==="missing_display"?undefined:"Calendar creator"},
+        host_user:{id:"ou_host"},attendees:[{id:"ou_inviter",is_organizer:true}]}}}));
+    });
+    const store=openSessionStore({filename:":memory:"}),invite=normalizeInvite(envelope(),scope);store.acceptInvite(invite,1);
+    const http=createFeishuSdkHttp({request:peer.request,connection:createFeishuSocketOwner(Agent)});
+    const adapter=createFeishuOrganizerMetadata({...scope,appSecret:new RedactedSecret("synthetic"),http,references:[{...scope,meetingNo:invite.meetingNo,reference:{
+      kind:"calendar_event",calendarId:"calendar",eventId:"event",occurrenceId:invite.occurrenceId,providerMeetingId:invite.providerMeetingId,
+      occurrenceStartedAt:invite.occurrenceStartedAt,...(mode==="conflict"?{vcOrganizerOpenId:"ou_other"}:{})}}]});
+    try{
+      const result=await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal);
+      assert.equal(result.status,mode==="ok"?"resolved":"blocked");
+      if(result.status === "resolved"){assert.equal(result.organizer.id,"ou_calendar");assert.equal(result.organizer.source,"calendar_event");}
+    }finally{await http.close();store.close();await peer.close();}
+  }
 });

@@ -45,6 +45,24 @@ import {
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 const SRC_ROOT = path.join(REPO_ROOT, "src");
 
+test("SDK value aliases, reexports and dynamic imports are confined to exact Feishu owners",()=>{
+  withTempDir((root)=>{
+    const forms=['import { Client as Renamed } from "@larksuiteoapi/node-sdk";',
+      'export { WSClient as Socket } from "@larksuiteoapi/node-sdk";',
+      'const load=()=>import("@larksuiteoapi/node-sdk");',
+      'import "@larksuiteoapi/node-sdk";', 'import { WebSocket as Renamed } from "ws";'];
+    mkdirSync(path.join(root,"src"),{recursive:true});
+    for(const [index,form] of forms.entries())writeFileSync(path.join(root,"src",`bad${index}.ts`),form);
+    assert.equal(findForbiddenRuntimeBoundaryAccess(scanProductionTree(path.join(root,"src")),root).length,5);
+    mkdirSync(path.join(root,"src/adapters"),{recursive:true});
+    writeFileSync(path.join(root,"src/adapters/feishu-invite-ingress.ts"),forms[0]!);
+    writeFileSync(path.join(root,"src/types.ts"),'import type { Client } from "@larksuiteoapi/node-sdk";');
+    assert.equal(findForbiddenRuntimeBoundaryAccess(scanProductionTree(path.join(root,"src")),root).length,5);
+    writeFileSync(path.join(root,"src/adapters/feishu-api.ts"),forms[0]!);
+    assert.equal(findForbiddenRuntimeBoundaryAccess(scanProductionTree(path.join(root,"src")),root).length,6);
+  });
+});
+
 function withTempDir(run: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(os.tmpdir(), "boundary-scan-"));
   try {

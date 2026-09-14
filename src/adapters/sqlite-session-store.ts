@@ -17,6 +17,9 @@
 // stores audio and is not a Team Vault/output path.
 
 import Database from "better-sqlite3";
+import { validateNormalizedInvite, boundedInviteString, type NormalizedInvite, type InviteOccurrence, type InviteClaim } from "../ports/feishu-ingress.ts";
+import type { OrganizerResolution } from "../ports/feishu.ts";
+import { validateOrganizerReferenceKeys } from "../ports/feishu.ts";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -92,6 +95,13 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
   repairDeliveryRecordingOwners(db);
 
   return {
+    acceptInvite: (invite, nowMs) => acceptInvite(db, invite, nowMs),
+    getInviteOccurrence: (id) => getInviteOccurrence(db, id),
+    listInviteOccurrences: (after = "", limit = 64) => listInviteOccurrences(db, after, limit),
+    claimInviteMetadata: (nowMs) => claimInviteMetadata(db, nowMs),
+    failInviteClaim: (claim, result, nowMs, retryDelayMs) => failInviteClaim(db, claim, result, nowMs, retryDelayMs),
+    completeInviteClaim: (claim, result, nowMs) => completeInviteClaim(db, claim, result, nowMs),
+    retryInviteMetadata: (id, operator, nowMs) => retryInviteMetadata(db, id, operator, nowMs),
     claimPhysicalClient: (binding, nowMs) => claimPhysicalClient(db, binding, nowMs),
     listPhysicalCustody: () => listPhysicalCustody(db),
     recordPhysicalOutcome: (binding, result, nowMs) => recordPhysicalOutcome(db, binding, result, nowMs),
@@ -140,6 +150,149 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
       db.close();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Durable Feishu invite discovery (no network or launch inside transactions)
+// ---------------------------------------------------------------------------
+
+const INVITE_SELECT = `SELECT occurrence_id AS occurrenceId, region, tenant_key AS tenantKey, app_id AS appId,
+  provider_meeting_id AS providerMeetingId, meeting_no AS meetingNo, occurrence_started_at AS occurrenceStartedAt, title, state,
+  accepted_at_ms AS acceptedAtMs, last_observed_at_ms AS lastObservedAtMs,
+  first_attempt_at_ms AS firstAttemptAtMs, last_attempt_at_ms AS lastAttemptAtMs, generation_started_at_ms AS generationStartedAtMs,
+  next_attempt_at_ms AS nextAttemptAtMs, total_attempts AS totalAttempts, generation_attempts AS generationAttempts,
+  retry_generation AS retryGeneration, operator_retry_count AS operatorRetryCount, last_operator AS lastOperator,
+  last_operator_retry_at_ms AS lastOperatorRetryAtMs, last_blocked_reason AS lastBlockedReason, last_blocked_at_ms AS lastBlockedAtMs,
+  claim_token AS claimToken, claim_expires_at_ms AS claimExpiresAtMs, admitted_at_ms AS admittedAtMs,
+  organizer_source AS source, organizer_open_id AS id, organizer_display_name AS displayName, reference_json AS referenceJson
+  FROM feishu_invite_occurrences`;
+type InviteRaw = Omit<InviteOccurrence, "organizer" | "reference"> & {
+  source: "reservation" | "calendar_event" | null; id: string | null; displayName: string | null; referenceJson: string | null;
+};
+function inviteRow(raw: InviteRaw): InviteOccurrence {
+  const { source, id, displayName, referenceJson, ...row } = raw;
+  return { ...row, organizer: source === null ? null : { region: row.region, tenantKey: row.tenantKey, appId: row.appId,
+    idType: "open_id", source, id: id!, displayName: displayName! }, reference: referenceJson === null ? null : JSON.parse(referenceJson) };
+}
+function getInviteOccurrence(db: Database.Database, id: string): InviteOccurrence | null {
+  const raw = db.prepare(INVITE_SELECT + " WHERE occurrence_id=?").get(id) as InviteRaw | undefined;
+  return raw ? inviteRow(raw) : null;
+}
+function listInviteOccurrences(db: Database.Database, after: string, limit: number): readonly InviteOccurrence[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 256) throw new Error("invalid_invite_limit");
+  return (db.prepare(INVITE_SELECT + " WHERE occurrence_id>? ORDER BY occurrence_id LIMIT ?").all(after, limit) as InviteRaw[]).map(inviteRow);
+}
+function inviteTime(now: number): void {
+  if (!Number.isSafeInteger(now) || now < 0 || now > Number.MAX_SAFE_INTEGER - 600_000) throw new Error("invalid_invite_time");
+}
+function acceptInvite(db: Database.Database, v: NormalizedInvite, now: number): "accepted" | "replay" | "existing_occurrence" {
+  validateNormalizedInvite(v); inviteTime(now);
+  return db.transaction(() => {
+    const event = db.prepare("SELECT normalized_sha256 AS hash FROM feishu_invite_events WHERE region=? AND tenant_key=? AND app_id=? AND event_id=?")
+      .get(v.region, v.tenantKey, v.appId, v.eventId) as {hash: string} | undefined;
+    if (event) { if (event.hash !== v.normalizedSha256) throw new Error("invite_conflict"); return "replay" as const; }
+    const old = getInviteOccurrence(db, v.occurrenceId);
+    if (old) {
+      if (["region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt"].some((key) =>
+        old[key as keyof InviteOccurrence] !== v[key as keyof NormalizedInvite])) throw new Error("invite_conflict");
+    } else {
+      const count = db.prepare("SELECT count(*) AS n FROM feishu_invite_occurrences WHERE state IN ('pending_metadata','metadata_blocked')").get() as {n:number};
+      if (count.n >= 256) throw new Error("invite_capacity");
+      db.prepare(`INSERT INTO feishu_invite_occurrences(occurrence_id,region,tenant_key,app_id,provider_meeting_id,meeting_no,
+        occurrence_started_at,title,state,accepted_at_ms,last_observed_at_ms,next_attempt_at_ms) VALUES(?,?,?,?,?,?,?,?,'pending_metadata',?,?,?)`)
+        .run(v.occurrenceId,v.region,v.tenantKey,v.appId,v.providerMeetingId,v.meetingNo,v.occurrenceStartedAt,v.title,now,now,now);
+    }
+    db.prepare(`INSERT INTO feishu_invite_events(region,tenant_key,app_id,event_id,occurrence_id,envelope_schema,event_type,create_time,
+      provider_meeting_id,meeting_no,topic,start_seconds,end_seconds,invite_seconds,call_id,normalized_sha256,normalized_bytes,accepted_at_ms)
+      VALUES(?,?,?,?,?,'2.0','vc.bot.meeting_invited_v1',?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(v.region,v.tenantKey,v.appId,v.eventId,v.occurrenceId,v.createTime,v.providerMeetingId,v.meetingNo,v.title,v.startSeconds,
+        v.endSeconds,v.inviteSeconds,v.callId,v.normalizedSha256,v.normalizedBytes,now);
+    db.prepare("UPDATE feishu_invite_occurrences SET last_observed_at_ms=max(last_observed_at_ms,?) WHERE occurrence_id=?").run(now,v.occurrenceId);
+    return old ? "existing_occurrence" as const : "accepted" as const;
+  }).immediate();
+}
+function blockInvite(db: Database.Database, id: string, reason: string, now: number): void {
+  db.prepare(`UPDATE feishu_invite_occurrences SET state='metadata_blocked',last_blocked_reason=?,last_blocked_at_ms=?,
+    claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=?`).run(reason,now,id);
+}
+function claimInviteMetadata(db: Database.Database, now: number): InviteClaim | null {
+  inviteTime(now);
+  return db.transaction(() => {
+    const candidates = db.prepare(INVITE_SELECT + " WHERE state='pending_metadata' AND (claim_token IS NULL OR claim_expires_at_ms<=?) ORDER BY next_attempt_at_ms,occurrence_id LIMIT 256").all(now) as InviteRaw[];
+    for (const raw of candidates) {
+      const row = inviteRow(raw);
+      if (now < Math.max(row.acceptedAtMs,row.lastAttemptAtMs ?? 0,row.lastOperatorRetryAtMs ?? 0)) { blockInvite(db,row.occurrenceId,"clock_regression",now); continue; }
+      if (row.totalAttempts >= 1_000_000) { blockInvite(db,row.occurrenceId,"counter_exhausted",now); continue; }
+      if (row.generationAttempts >= 8 || (row.generationStartedAtMs !== null && now >= row.generationStartedAtMs + 600_000)) {
+        blockInvite(db,row.occurrenceId,"retry_exhausted",now); continue;
+      }
+      if (now < row.nextAttemptAtMs) continue;
+      const token = randomUUID().replaceAll("-", "");
+      db.prepare(`UPDATE feishu_invite_occurrences SET claim_token=?,claim_expires_at_ms=?,total_attempts=total_attempts+1,
+        generation_attempts=generation_attempts+1,first_attempt_at_ms=coalesce(first_attempt_at_ms,?),last_attempt_at_ms=?,
+        generation_started_at_ms=coalesce(generation_started_at_ms,?) WHERE occurrence_id=?`).run(token,now+30_000,now,now,now,row.occurrenceId);
+      return getInviteOccurrence(db,row.occurrenceId) as InviteClaim;
+    }
+    return null;
+  }).immediate();
+}
+function fencedInvite(db: Database.Database, claim: InviteClaim, now: number): InviteOccurrence {
+  inviteTime(now);
+  const row = getInviteOccurrence(db,claim.occurrenceId);
+  if (!row || row.state !== "pending_metadata" || row.claimToken !== claim.claimToken || row.claimExpiresAtMs! <= now) throw new Error("invite_claim_fenced");
+  return row;
+}
+function failInviteClaim(db: Database.Database, claim: InviteClaim, result: Extract<OrganizerResolution,{status:"blocked"}>, now: number, delay: number): void {
+  if (!Number.isSafeInteger(delay) || delay < 1000 || delay > 60_000) throw new Error("invalid_invite_retry_delay");
+  db.transaction(() => {
+    const row = fencedInvite(db,claim,now);
+    const regression = now < row.lastAttemptAtMs!;
+    const exhausted = row.generationAttempts >= 8 || now + delay >= row.generationStartedAtMs! + 600_000;
+    if (regression || !result.retryable || exhausted) blockInvite(db,row.occurrenceId,regression ? "clock_regression" : exhausted ? "retry_exhausted" : result.reason,now);
+    else db.prepare(`UPDATE feishu_invite_occurrences SET claim_token=NULL,claim_expires_at_ms=NULL,next_attempt_at_ms=?,last_blocked_reason=?,last_blocked_at_ms=? WHERE occurrence_id=?`)
+      .run(now+delay,result.reason,now,row.occurrenceId);
+  }).immediate();
+}
+function completeInviteClaim(db: Database.Database, claim: InviteClaim, result: Extract<OrganizerResolution,{status:"resolved"}>, now: number): void {
+  db.transaction(() => {
+    const row = fencedInvite(db,claim,now), organizer = result.organizer;
+    if (now < row.lastAttemptAtMs!) { blockInvite(db,row.occurrenceId,"clock_regression",now); return; }
+    if (organizer.region !== row.region || organizer.tenantKey !== row.tenantKey || organizer.appId !== row.appId || organizer.idType !== "open_id" ||
+        !["reservation","calendar_event"].includes(organizer.source) || organizer.source !== result.reference.kind) throw new Error("invalid_invite_organizer");
+    boundedInviteString(organizer.id); boundedInviteString(organizer.displayName,4096);
+    validateOrganizerReferenceKeys(result.reference);
+    if(result.reference.kind === "reservation") boundedInviteString(result.reference.reserveId);
+    else {
+      boundedInviteString(result.reference.calendarId);boundedInviteString(result.reference.eventId);
+      if(result.reference.occurrenceId !== row.occurrenceId || result.reference.providerMeetingId !== row.providerMeetingId ||
+          result.reference.occurrenceStartedAt !== row.occurrenceStartedAt) throw new Error("invalid_invite_reference");
+    }
+    const reference = JSON.stringify(result.reference);
+    if (Buffer.byteLength(reference)>8192) throw new Error("invalid_invite_reference");
+    const session = getSession(db,row.occurrenceId);
+    if (session && (session.providerMeetingId !== row.providerMeetingId || session.occurrenceStartedAt !== row.occurrenceStartedAt)) throw new Error("invite_conflict");
+    if (!session) createSession(db,{occurrenceId:row.occurrenceId,providerMeetingId:row.providerMeetingId,occurrenceStartedAt:row.occurrenceStartedAt,nowMs:now});
+    db.prepare(`UPDATE feishu_invite_occurrences SET state=?,organizer_source=?,organizer_id_type='open_id',organizer_open_id=?,organizer_display_name=?,
+      reference_kind=?,reference_json=?,admitted_at_ms=?,claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=?`)
+      .run(session ? "existing_session":"admitted",organizer.source,organizer.id,organizer.displayName,result.reference.kind,reference,now,row.occurrenceId);
+  }).immediate();
+}
+function retryInviteMetadata(db: Database.Database, id: string, operator: string, now: number): "pending" | "already_pending" | "counter_exhausted" {
+  inviteTime(now);
+  if (!/^[A-Za-z0-9._@-]{1,128}$/.test(operator)) throw new Error("invalid_invite_operator");
+  return db.transaction(() => {
+    const row = getInviteOccurrence(db,id);
+    if (!row || getSession(db,id) || now < Math.max(row.lastAttemptAtMs ?? 0,row.lastOperatorRetryAtMs ?? 0,row.acceptedAtMs)) throw new Error("invite_retry_fenced");
+    if (row.state === "pending_metadata") return "already_pending" as const;
+    if (row.state !== "metadata_blocked" || row.claimToken !== null) throw new Error("invite_retry_fenced");
+    if (row.retryGeneration >= 1_000_000 || row.operatorRetryCount >= 1_000_000 || row.totalAttempts >= 1_000_000) {
+      blockInvite(db,id,"counter_exhausted",now); return "counter_exhausted" as const;
+    }
+    db.prepare(`UPDATE feishu_invite_occurrences SET state='pending_metadata',generation_attempts=0,generation_started_at_ms=NULL,
+      retry_generation=retry_generation+1,operator_retry_count=operator_retry_count+1,last_operator=?,last_operator_retry_at_ms=?,next_attempt_at_ms=? WHERE occurrence_id=?`)
+      .run(operator,now,now,id);
+    return "pending" as const;
+  }).immediate();
 }
 
 // ---------------------------------------------------------------------------

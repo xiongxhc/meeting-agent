@@ -4,6 +4,21 @@ Steps that need a human (real accounts, live services, or repo hosting
 decisions) and were deliberately not attempted by the agent. Grouped by plan
 task.
 
+## Task 11e: real invitation and organizer access
+
+- [ ] Verify the explicit Feishu/Lark region, app/tenant and long-connection event
+  entitlement, then subscribe to `vc.bot.meeting_invited_v1` in the chosen app.
+- [ ] Obtain the actual reservation ID from creation metadata, and verify active
+  meeting, reservation and Contact permissions/data ranges in official API
+  Explorer. Calendar references additionally need exact source occurrence binding.
+- [ ] In an authorized isolated run, verify actual event delivery, exact occurrence
+  match and creator `open_id`/display. Missing evidence must remain blocked.
+- [ ] Separately confirm the dedicated desktop account's invitation behavior.
+  The app bot is not that desktop identity; no API join supplies raw media.
+
+See [invitation discovery](feishu-invite-ingress.md). SDK loopback/SQLite tests are
+not live Feishu acceptance. `main.ts` composition and native media remain separate.
+
 ## Task 11c: physical-client provisioning and manual recovery
 
 - [ ] Provision a stable private `physicalClientId` for each dedicated desktop

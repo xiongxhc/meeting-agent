@@ -95,6 +95,7 @@ const WRITE_LIKE_METHOD_NAMES = new Set([
 ]);
 
 const NETWORK_MODULES = new Set([
+  "@larksuiteoapi/node-sdk", "ws",
   "node:http",
   "node:https",
   "http",
@@ -191,6 +192,7 @@ function visit(
     const arg = node.arguments[0];
     if (arg && ts.isStringLiteralLike(arg)) {
       result.imports.push({ file, specifier: arg.text });
+      if (NETWORK_MODULES.has(arg.text)) result.runtimeBoundaryCalls.push({file,capability:`dynamic-import:${arg.text}`,snippet:snippetOf(node,sourceFile)});
     } else {
       result.opaqueConstructs.push({
         file,
@@ -258,6 +260,7 @@ function recordImportCapabilities(
   if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
     const specifier = node.moduleSpecifier.text;
     const clause = node.importClause;
+    if (!clause && NETWORK_MODULES.has(specifier)) result.runtimeBoundaryCalls.push({file,capability:`import:${specifier}`,snippet:snippetOf(node,sourceFile)});
     if (!clause || clause.isTypeOnly) return;
     const bindings = clause.namedBindings;
     const valueImports = bindings && ts.isNamedImports(bindings)
@@ -580,6 +583,10 @@ export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string
 
 /** Direct HTTP is an adapter capability, never an endpoint-text exception. */
 export const NETWORK_CAPABILITY_OWNERS = new Set([
+  "src/adapters/feishu-sdk-http.ts",
+  "src/adapters/feishu-sdk-connection.ts",
+  "src/adapters/feishu-invite-ingress.ts",
+  "src/adapters/feishu-organizer-metadata.ts",
   "src/adapters/conversation-runtime-client.ts",
   "src/adapters/feishu-api.ts",
 ]);
@@ -607,6 +614,13 @@ export function findForbiddenFilesystemWriteCapabilities(result: ScanResult, rep
 export function findForbiddenRuntimeBoundaryAccess(result: ScanResult, repoRoot?: string): Violation[] {
   const violations: Violation[] = [];
   for (const call of result.runtimeBoundaryCalls) {
+    const relative = repoRoot === undefined ? "" : normalizeRelative(path.relative(repoRoot,call.file));
+    if (call.capability.endsWith(":@larksuiteoapi/node-sdk") && !["src/adapters/feishu-sdk-http.ts","src/adapters/feishu-invite-ingress.ts","src/adapters/feishu-organizer-metadata.ts"].includes(relative)) {
+      violations.push({file:call.file,specifier:call.capability,rule:"SDK value capability outside exact Feishu adapter"}); continue;
+    }
+    if (call.capability.endsWith(":ws")) {
+      violations.push({file:call.file,specifier:call.capability,rule:"direct WebSocket is test-only"}); continue;
+    }
     if (!allowsNetworkCapability(call.file, repoRoot)) {
       violations.push({ file: call.file, specifier: call.capability, rule: "direct network capability outside designated adapter" });
     }
