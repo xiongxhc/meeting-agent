@@ -19,6 +19,9 @@ public final class BridgeProcess {
     private let sink: any BridgeEvidenceSink
     private let output: (Data) throws -> Void
     private let maxCommands: Int
+    private let custody: BridgeCustodyBinding?
+    private var evidenceFailed = false
+    public private(set) var shutdownResult: BridgeCleanupStatus?
     private var recorder: BridgeRecorder?
     private var observer: AccessibilityObserver?
     private var reducer: SessionObservationReducer?
@@ -35,10 +38,11 @@ public final class BridgeProcess {
 
     public init(driver: any AccessibilityDriver, labels: FeishuUiLabels,
                 clock: any BridgeClock, sink: any BridgeEvidenceSink, maxCommands: Int = 256,
-                joinDeadline: TimeInterval = 60, actionDeadline: TimeInterval = 5,
+                joinDeadline: TimeInterval = 60, actionDeadline: TimeInterval = 5, custody: BridgeCustodyBinding? = nil,
                 output: @escaping (Data) throws -> Void) {
         self.driver = driver; self.labels = labels; self.clock = clock; self.sink = sink
         self.output = output; self.maxCommands = maxCommands
+        self.custody = custody
         adapter = FeishuClientAdapter(driver: driver, labels: labels, joinDeadline: joinDeadline, actionDeadline: actionDeadline)
         cleanupAdapter = FeishuClientAdapter(driver: driver, labels: labels, actionDeadline: min(actionDeadline, 1))
     }
@@ -63,13 +67,14 @@ public final class BridgeProcess {
                   number.utf8.count == 9, number.allSatisfy({ $0.isASCII && $0.isNumber }) else {
                 throw BridgeProcessError.ownershipConflict
             }
+            if let custody, custody.bridgeSessionId != message.sessionId || custody.occurrenceId != occurrence { throw BridgeProcessError.ownershipConflict }
             owner = (message.sessionId, occurrence, lease)
             recorder = BridgeRecorder(sessionId: message.sessionId, clock: clock, sink: sink, retainRecords: false)
             observer = AccessibilityObserver(labels: labels, identity: UnknownUiIdentity())
             reducer = SessionObservationReducer(sessionId: message.sessionId, identity: UnknownUiIdentity(), chatControl: UnavailableChat())
         }
         guard recorder?.record(command: message) == true else {
-            stopped = true; throw BridgeProcessError.evidenceUnavailable
+            evidenceFailed = true; stopped = true; throw BridgeProcessError.evidenceUnavailable
         }
         // Reserve before any side effect. A failure cannot be retried under a new ID.
         results[message.commandId] = (digest, .failed, "command_incomplete")
@@ -126,7 +131,7 @@ public final class BridgeProcess {
     private func emit(_ event: BridgeEvent, at observedAt: String? = nil, publish: Bool = true) throws {
         guard let owner, sequence < Int.max else { throw BridgeProcessError.stateLimit }
         let message = BridgeEventMessage(sessionId: owner.session, sequence: sequence + 1, observedAt: observedAt ?? clock.now(), event: event)
-        guard recorder?.record(event: message) == true else { stopped = true; throw BridgeProcessError.evidenceUnavailable }
+        guard recorder?.record(event: message) == true else { evidenceFailed = true; stopped = true; throw BridgeProcessError.evidenceUnavailable }
         sequence += 1
         guard publish else { return }
         if case .left = event {
@@ -139,7 +144,7 @@ public final class BridgeProcess {
         catch { stopped = true; throw BridgeProcessError.outputUnavailable }
     }
 
-    public func shutdown(allowUIActions: Bool = true) throws {
+    public func shutdown(allowUIActions: Bool = true, inputReapFailed: Bool = false) throws {
         guard !shutdownCompleted else { return }
         shutdownCompleted = true
         stopped = true
@@ -147,7 +152,7 @@ public final class BridgeProcess {
         if allowUIActions, let owner, !departureConfirmed, joined || adapter.departureUnconfirmed {
             let command = BridgeCommandMessage(sessionId: owner.session, commandId: "shutdown-" + UUID().uuidString, command: .leave(reason: .coordinatorStop))
             do {
-                guard recorder?.record(command: command) == true else { throw BridgeProcessError.evidenceUnavailable }
+                guard !evidenceFailed, recorder?.record(command: command) == true else { evidenceFailed = true; throw BridgeProcessError.evidenceUnavailable }
                 switch cleanupAdapter.leave() {
                 case .left:
                     joined = false; departureConfirmed = true
@@ -159,7 +164,13 @@ public final class BridgeProcess {
                 }
             } catch { failure = error }
         }
-        do { try sink.close() } catch { failure = failure ?? error }
+        do { try sink.close() } catch { evidenceFailed = true; failure = failure ?? error }
+        if inputReapFailed { shutdownResult = .unconfirmed("input_reap_failed") }
+        else if !adapter.joinActionIssued { shutdownResult = .noAction }
+        else if evidenceFailed { shutdownResult = .unconfirmed("evidence_unavailable") }
+        else if failure != nil { shutdownResult = .unconfirmed("cleanup_failed") }
+        else if departureConfirmed { shutdownResult = .confirmed }
+        else { shutdownResult = .unconfirmed("departure_not_observed") }
         if let failure { throw failure }
     }
 }

@@ -9,6 +9,17 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { createMeetingAgentApplication } from "../src/application.ts";
 import { fakeBridge, fakeClock, fakeRuntime } from "./lib/session-fakes.ts";
+import type { BridgeProcessSlot } from "../src/ports/bridge-process.ts";
+
+function fakeSlot(bridge: ReturnType<typeof fakeBridge>, bridgeId = "bridge"): BridgeProcessSlot {
+  return { physicalClientId: bridgeId, bridgeId, async launch(binding) {
+    const event = bridge.event.bind(bridge);
+    bridge.event = (payload) => ({ ...event(payload), sessionId: binding.bridgeSessionId });
+    return { bridge, async shutdown() { return { reaped: true, exitDiagnostic: null, failure: null, outcome: {
+      schema: "bridge-process-outcome/v1", ...binding, outcome: "departure_confirmed", reason: "departure_observed", observedAt: "2026-09-02T14:01:00.000Z",
+    } }; } };
+  } };
+}
 
 function deferredVoid(): { readonly promise: Promise<void>; resolve(): void } {
   let resolvePromise!: () => void;
@@ -43,7 +54,7 @@ test("the supported application composition constructs isolated sessions from in
       bridgeLeaseTtlMs: 30_000,
       maxConcurrentSessions: 2,
       adapters: {
-        bridgeFor: () => ({ bridge, bridgeId: "synthetic-mac-bridge", bridgeSessionId: "application-bridge-session" }),
+        bridgeSlots: [fakeSlot(bridge)], bridgeIdFor: () => "bridge",
         runtimeFor: () => runtime,
       },
     });
@@ -55,7 +66,7 @@ test("the supported application composition constructs isolated sessions from in
         title: "Synthetic application composition",
         organizer: null,
       });
-      const session = application.createSession(identity);
+      const session = await application.createSession(identity);
       await session.join();
       bridge.emit(bridge.event({ type: "joined", meetingOccurrenceId: identity.occurrenceId }));
       await session.settled();
@@ -99,15 +110,15 @@ test("the public composition retains configuration exports and closes owned sess
     };
     const bridge = fakeBridge("application-close-bridge");
     const runtime = fakeRuntime();
-    const app = createMeetingAgentApplication({ config, adapters: { bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-close-bridge" }), runtimeFor: () => runtime } });
-    const session = app.createSession(buildMeetingIdentity({ providerMeetingId: "close", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "close", organizer: null }));
+    const app = createMeetingAgentApplication({ config, adapters: { bridgeSlots: [fakeSlot(bridge)], bridgeIdFor: () => "bridge", runtimeFor: () => runtime } });
+    const session = await app.createSession(buildMeetingIdentity({ providerMeetingId: "close", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "close", organizer: null }));
     await session.join();
     await app.close();
     await session.settled();
     assert.equal(bridge.subscriberCount(), 0);
     assert.equal(runtime.subscriberCount(), 0);
     assert.equal(runtime.callsOf("close").length, 1);
-    assert.throws(() => app.createSession(buildMeetingIdentity({ providerMeetingId: "later", meetingNo: "2", occurrenceStartedAt: "2026-09-02T14:01:00Z", title: "later", organizer: null })), /closed/);
+    await assert.rejects(app.createSession(buildMeetingIdentity({ providerMeetingId: "later", meetingNo: "2", occurrenceStartedAt: "2026-09-02T14:01:00Z", title: "later", organizer: null })), /closed/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -131,12 +142,12 @@ test("application close waits for a stalled join to cancel and clean up before r
     const app = createMeetingAgentApplication({
       config,
       adapters: {
-        bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-stalled-join" }),
+        bridgeSlots: [fakeSlot(bridge)], bridgeIdFor: () => "bridge",
         runtimeFor: () => runtime,
       },
     });
     const identity = buildMeetingIdentity({ providerMeetingId: "stalled", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "stalled", organizer: null });
-    const session = app.createSession(identity);
+    const session = await app.createSession(identity);
     const joinPromise = session.join();
     await flushMacrotask();
 
@@ -191,13 +202,13 @@ test("terminal cleanup retains a session until its stalled connect_media send se
     const app = createMeetingAgentApplication({
       config,
       adapters: {
-        bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-terminal-join-race" }),
+        bridgeSlots: [fakeSlot(bridge)], bridgeIdFor: () => "bridge",
         runtimeFor: () => runtime,
       },
     });
     try {
       const identity = buildMeetingIdentity({ providerMeetingId: "terminal-race", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "terminal race", organizer: null });
-      const session = app.createSession(identity);
+      const session = await app.createSession(identity);
       joinPromise = session.join();
       await flushMacrotask();
       assert.equal(connectMediaStarted, true, "the join must be stalled inside connect_media");
@@ -274,13 +285,13 @@ test("duplicate join rejection preserves the first stalled join for application 
     const app = createMeetingAgentApplication({
       config,
       adapters: {
-        bridgeFor: () => ({ bridge, bridgeId: "bridge", bridgeSessionId: "application-duplicate-join-race" }),
+        bridgeSlots: [fakeSlot(bridge)], bridgeIdFor: () => "bridge",
         runtimeFor: () => runtime,
       },
     });
     try {
       const identity = buildMeetingIdentity({ providerMeetingId: "duplicate-race", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "duplicate race", organizer: null });
-      const session = app.createSession(identity);
+      const session = await app.createSession(identity);
       firstJoinPromise = session.join();
       await flushMacrotask();
       assert.equal(firstJoinSendStarted, true, "the first join must be stalled inside its send");
@@ -345,18 +356,18 @@ test("completed and explicitly disposed sessions leave application tracking imme
     const app = createMeetingAgentApplication({
       config,
       adapters: {
-        bridgeFor: () => {
+        bridgeSlots: [{ physicalClientId: "bridge", bridgeId: "bridge", async launch(binding) {
           generation += 1;
           const id = `retention-${generation}`;
           const bridge = fakeBridge(id);
           bridges.set(id, bridge);
-          return { bridge, bridgeId: `bridge-${generation}`, bridgeSessionId: id };
-        },
+          return fakeSlot(bridge).launch(binding);
+        } }], bridgeIdFor: () => "bridge",
         runtimeFor: () => fakeRuntime(),
       },
     });
     const completedIdentity = buildMeetingIdentity({ providerMeetingId: "completed", meetingNo: "1", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "completed", organizer: null });
-    const completed = app.createSession(completedIdentity);
+    const completed = await app.createSession(completedIdentity);
     assert.equal(app.liveSessionCount(), 1);
     await completed.join();
     const completedBridge = bridges.get("retention-1")!;
@@ -366,7 +377,7 @@ test("completed and explicitly disposed sessions leave application tracking imme
     assert.equal(app.liveSessionCount(), 0);
 
     const disposedIdentity = buildMeetingIdentity({ providerMeetingId: "disposed", meetingNo: "2", occurrenceStartedAt: "2026-09-02T14:01:00Z", title: "disposed", organizer: null });
-    const disposed = app.createSession(disposedIdentity);
+    const disposed = await app.createSession(disposedIdentity);
     assert.equal(app.liveSessionCount(), 1);
     await disposed.dispose();
     assert.equal(app.liveSessionCount(), 0);

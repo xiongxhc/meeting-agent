@@ -268,8 +268,55 @@ The application process factory must close/cancel and await this generation,
 then forbid reuse of the physical client until departure is confirmed or the
 operator resolves it. Current TypeScript `meeting-session.ts` releases its
 durable lease on `bridge_failure`; that is not physical-client cleanup. Its
-application-level shutdown/recovery integration is a subsequent scope. Never
+application-level custody integration is described below. Never
 silently recycle a still-joined desktop client just because a new lease exists.
+
+### Owned child and durable custody (Task 11c)
+
+The TypeScript application now accepts explicit `bridgeSlots` and a pure
+`bridgeIdFor` selector; `createSession` is async. It mints generation/session IDs,
+claims migration019 custody durably, then invokes `slot.launch(binding)`.
+`createChildBridgeSlot` supplies the actual local process adapter: absolute
+executable/static-config paths, optional bounded argv (no shell), a private0700
+temporary directory and create-new0600 config/v2. The operator's config/v1 is
+never modified. Only HOME/USER/LOGNAME/PATH/TMPDIR/LANG/LC_ALL/LC_CTYPE are copied
+to the child; no provider keys, credential references, NODE_OPTIONS or DYLD_*
+variables are inherited. Temporary configuration is removed only after reap.
+
+Config/v2 requires the exact claimed `custody` binding and inherited descriptor3.
+It rejects inspection mode and validates the dedicated writer before native
+backend construction. That pipe emits one bounded private outcome, independently
+of cancelled stdout, then EOF. See [the normative contract](../../docs/bridge-process-outcome-v1.md).
+Config/v1 remains manual control-only and cannot satisfy application custody.
+Before any join value write/press, a readable complete tree must exclude a
+possible active meeting; unknown/malformed candidate-window locators fail closed.
+
+Shutdown closes stdin, waits10s cooperatively (configurable1–30s), then allows
+SIGTERM1s and SIGKILL/reap2s, using monotonic deadlines. It never kills Feishu or
+a process it did not spawn. Output is bounded; queued sends are settled on close.
+Application close starts child cleanup alongside session disposal, including
+pending launch/construction failures, and waits for custody persistence before
+closing its owned store. Only one exact valid outcome plus EOF and successful
+cooperative owned reap may clear custody. An ordinary nonsignal nonzero exit is
+retained separately as `exitDiagnostic: "nonzero_exit"`: it neither proves nor
+vetoes departure. Signal/forced/protocol/cleanup/reap failures still quarantine.
+Public left/lease expiry/exit never suffice.
+
+After a parent crash loses confirmation, the slot remains quarantined. A human
+must first stop the old controller/owned bridge generation so it cannot issue
+future actions, then inspect that exact client; these commands never perform inspection:
+
+```sh
+node dist/src/operator.js physical-client-status --db /absolute/orchestration.db
+node dist/src/operator.js physical-client-clear --db /absolute/orchestration.db --slot CONFIGURED_SLOT --generation EXACT_32_LOWERHEX --operator OPERATOR_LABEL --assert-inspected-idle
+```
+
+Clear is an audited exact-generation CAS; no wildcard/TTL/startup clear exists.
+Stable slot labels identify provisioned clients/accounts, not PID or build.
+Renaming one is an audited provisioning action, never a recovery shortcut.
+Other configured slots continue independently. All automated proof uses temporary
+SQLite DBs and synthetic children/native backends, not the desktop. Media remains
+unavailable; this is not full-meeting acceptance.
 
 Capture/render primitives are compiled and hardware-free tested, but are not
 composed into this executable. Authenticated Runtime media and measured

@@ -105,6 +105,18 @@ const ENV_KEYS = {
 
 const PINNED_RUNTIME_PROFILE: RuntimeProfile = "online";
 
+/** A physical slot label is provisioning identity, never inferred from a PID. */
+export function validateBridgeSlots(slots: readonly { readonly physicalClientId: string; readonly bridgeId: string }[]): void {
+  const physical = new Set<string>(), logical = new Set<string>();
+  for (const slot of slots) {
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(slot.physicalClientId) || [".", ".."].includes(slot.physicalClientId) ||
+        typeof slot.bridgeId !== "string" || slot.bridgeId.length === 0 || physical.has(slot.physicalClientId) || logical.has(slot.bridgeId)) {
+      throw new ConfigError("bridgeSlots", "invalid or duplicate slot binding");
+    }
+    physical.add(slot.physicalClientId); logical.add(slot.bridgeId);
+  }
+}
+
 export function loadConfig(options: LoadConfigOptions = {}): MeetingAgentConfig {
   const env = options.env ?? process.env;
 

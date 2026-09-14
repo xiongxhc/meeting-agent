@@ -527,6 +527,20 @@ test("designated Runtime and Feishu adapters own direct network capability, and 
   });
 });
 
+test("private child config writes and stdin do not grant general filesystem or provider capabilities", () => {
+  withTempDir((dir) => {
+    const adapters = path.join(dir, "src", "adapters"); mkdirSync(adapters, { recursive: true });
+    const owner = path.join(adapters, "child-bridge-process.ts");
+    writeFileSync(owner, 'import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from "node:fs"; child.stdin!.write("control");');
+    assert.deepEqual(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir), []);
+    writeFileSync(owner, 'import { write } from "node:fs"; write(1, "bad"); export const key = process.env.OPENAI_API_KEY;');
+    assert.ok(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir).length > 0);
+    assert.ok(findForbiddenRuntimeBoundaryAccess(scanProductionTree(dir), dir).length > 0);
+    writeFileSync(path.join(adapters, "team-vault-index.ts"), 'import { writeFileSync } from "node:fs"; child.stdin!.write("bad");');
+    assert.ok(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir).some((value) => value.file.endsWith("team-vault-index.ts")));
+  });
+});
+
 test("application mkdir and filesystem outbox are explicit write owners, while the Vault index remains read-only", () => {
   withTempDir((dir) => {
     const adapters = path.join(dir, "src", "adapters");

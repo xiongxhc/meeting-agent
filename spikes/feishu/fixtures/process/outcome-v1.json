@@ -1,0 +1,1 @@
+{"schema":"bridge-process-outcome/v1","physicalClientId":"synthetic-mac-slot","physicalGenerationId":"0123456789abcdef0123456789abcdef","occurrenceId":"synthetic-meeting@2026-09-02T14:00:00Z","bridgeSessionId":"synthetic-bridge-session","outcome":"departure_confirmed","reason":"departure_observed","observedAt":"2026-09-02T14:01:00.000Z"}

@@ -20,6 +20,9 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { validateCustodyBinding, parseBridgeProcessOutcome, sameCustodyBinding, type CustodyBinding } from "../contracts/bridge-process-outcome-v1.ts";
+import type { BridgeShutdownResult } from "../ports/bridge-process.ts";
+import type { PhysicalCustodyRow, PhysicalClientClear } from "../ports/session-store.ts";
 
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
 import {
@@ -89,6 +92,10 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
   repairDeliveryRecordingOwners(db);
 
   return {
+    claimPhysicalClient: (binding, nowMs) => claimPhysicalClient(db, binding, nowMs),
+    listPhysicalCustody: () => listPhysicalCustody(db),
+    recordPhysicalOutcome: (binding, result, nowMs) => recordPhysicalOutcome(db, binding, result, nowMs),
+    clearPhysicalClient: (input) => clearPhysicalClient(db, input),
     get schemaVersion() {
       return currentSchemaVersion(db);
     },
@@ -133,6 +140,64 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
       db.close();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Physical client custody
+// ---------------------------------------------------------------------------
+
+function custodyTime(nowMs: number): void {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("invalid_custody_audit_time");
+}
+function listPhysicalCustody(db: Database.Database, binding?: CustodyBinding): PhysicalCustodyRow[] {
+  const rows = db.prepare(`SELECT physical_client_id AS physicalClientId, physical_generation_id AS physicalGenerationId,
+    occurrence_id AS occurrenceId, bridge_session_id AS bridgeSessionId, state, claimed_at_ms AS claimedAtMs,
+    outcome_json AS outcomeJson, outcome_failure AS outcomeFailure, exit_diagnostic AS exitDiagnostic, outcome_recorded_at_ms AS outcomeRecordedAtMs,
+    cleared_at_ms AS clearedAtMs, clear_reason AS clearReason, clear_operator AS clearOperator
+    FROM physical_client_custody ${binding === undefined ? "" : "WHERE physical_client_id = ? AND physical_generation_id = ?"}
+    ORDER BY claimed_at_ms, physical_client_id`).all(...(binding === undefined ? [] : [binding.physicalClientId, binding.physicalGenerationId])) as (Omit<PhysicalCustodyRow, "outcome"> & { outcomeJson: string | null })[];
+  return rows.map(({ outcomeJson, ...row }) => ({ ...row, outcome: outcomeJson === null ? null : parseBridgeProcessOutcome(JSON.parse(outcomeJson)) }));
+}
+function claimPhysicalClient(db: Database.Database, value: CustodyBinding, nowMs: number): PhysicalCustodyRow {
+  const binding = validateCustodyBinding(value); custodyTime(nowMs);
+  return db.transaction(() => {
+    const old = listPhysicalCustody(db, binding)[0];
+    if (old) {
+      if (!sameCustodyBinding(old, binding)) throw new Error("physical_client_binding_conflict");
+      return old;
+    }
+    if (db.prepare("SELECT 1 FROM physical_client_custody WHERE physical_client_id = ? AND state = 'quarantined'").get(binding.physicalClientId)) throw new Error("physical_client_quarantined");
+    db.prepare(`INSERT INTO physical_client_custody (physical_client_id, physical_generation_id, occurrence_id, bridge_session_id, state, claimed_at_ms)
+      VALUES (?, ?, ?, ?, 'quarantined', ?)`).run(binding.physicalClientId, binding.physicalGenerationId, binding.occurrenceId, binding.bridgeSessionId, nowMs);
+    return listPhysicalCustody(db, binding)[0]!;
+  }).immediate();
+}
+function recordPhysicalOutcome(db: Database.Database, value: CustodyBinding, result: BridgeShutdownResult, nowMs: number): void {
+  const binding = validateCustodyBinding(value); custodyTime(nowMs);
+  const outcome = result.outcome === null ? null : parseBridgeProcessOutcome(result.outcome);
+  if (outcome !== null && !sameCustodyBinding(outcome, binding)) throw new Error("physical_client_binding_conflict");
+  if (typeof result.reaped !== "boolean" || result.failure !== null && !["launch_failed", "protocol_failed", "outcome_missing", "child_failed", "reap_failed", "cleanup_failed"].includes(result.failure)) throw new Error("invalid_custody_result");
+  if (result.exitDiagnostic !== null && result.exitDiagnostic !== "nonzero_exit") throw new Error("invalid_custody_result");
+  const failure = result.failure ?? (!result.reaped ? "reap_failed" : outcome === null ? "outcome_missing" : null);
+  db.transaction(() => {
+    const old = listPhysicalCustody(db, binding)[0];
+    if (old && !sameCustodyBinding(old, binding)) throw new Error("physical_client_binding_conflict");
+    if (!old || old.state !== "quarantined" || old.outcomeRecordedAtMs !== null) throw new Error("physical_client_outcome_fenced");
+    const clear = result.reaped && failure === null && outcome !== null && outcome.outcome !== "departure_unconfirmed";
+    db.prepare(`UPDATE physical_client_custody SET outcome_json = ?, outcome_failure = ?, exit_diagnostic = ?, outcome_recorded_at_ms = ?,
+      state = ?, cleared_at_ms = ?, clear_reason = ? WHERE physical_client_id = ? AND physical_generation_id = ? AND state = 'quarantined'`)
+      .run(outcome === null ? null : JSON.stringify(outcome), failure, result.exitDiagnostic, nowMs, clear ? "cleared" : "quarantined", clear ? nowMs : null,
+        clear ? outcome.reason : null, binding.physicalClientId, binding.physicalGenerationId);
+  }).immediate();
+}
+function clearPhysicalClient(db: Database.Database, input: PhysicalClientClear): void {
+  const binding = validateCustodyBinding({ physicalClientId: input.physicalClientId, physicalGenerationId: input.physicalGenerationId, occurrenceId: input.occurrenceId, bridgeSessionId: input.bridgeSessionId });
+  custodyTime(input.nowMs);
+  if (input.assertInspectedIdle !== true || typeof input.operator !== "string" || !/^[A-Za-z0-9._@-]{1,128}$/.test(input.operator)) throw new Error("invalid_custody_operator_assertion");
+  const result = db.prepare(`UPDATE physical_client_custody SET state = 'cleared', cleared_at_ms = ?, clear_reason = 'operator_inspected_idle', clear_operator = ?
+    WHERE physical_client_id = ? AND physical_generation_id = ? AND occurrence_id = ? AND bridge_session_id = ? AND state = 'quarantined'`)
+    .run(input.nowMs, input.operator, binding.physicalClientId, binding.physicalGenerationId, binding.occurrenceId, binding.bridgeSessionId);
+  if (result.changes !== 1) throw new Error("physical_client_clear_fenced");
 }
 
 // ---------------------------------------------------------------------------

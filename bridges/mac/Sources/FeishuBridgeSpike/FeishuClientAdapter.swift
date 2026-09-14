@@ -52,6 +52,7 @@ public final class FeishuClientAdapter {
     private let actionDeadline: TimeInterval
     private var disclosureAttempted = false
     public private(set) var departureUnconfirmed = false
+    public private(set) var joinActionIssued = false
 
     /// - Parameters:
     ///   - joinDeadline: how long to let the client take to show the meeting
@@ -75,6 +76,10 @@ public final class FeishuClientAdapter {
         guard let tree = driver.snapshot(waitingUpTo: 0) else {
             return .failed(reason: "client_not_observable")
         }
+        guard !tree.hasPossibleMatch(labels.identifiers.meetingWindow, labels),
+              tree.hasCompleteDepartureLocators(labels.identifiers.meetingWindow, labels, matchedRoles: []) else {
+            return .failed(reason: "client_not_idle")
+        }
         guard let field = tree.locate(labels.identifiers.joinMeetingNumberField, labels),
             let button = tree.locate(labels.identifiers.joinButton, labels)
         else {
@@ -84,6 +89,7 @@ public final class FeishuClientAdapter {
             return .failed(reason: "meeting_number_not_accepted")
         }
         guard button.isEnabled else { return .failed(reason: "join_control_not_actionable") }
+        joinActionIssued = true
         departureUnconfirmed = true // A native action timeout may still have joined.
         guard driver.press(button) else {
             return .failed(reason: "join_control_not_actionable")

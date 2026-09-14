@@ -1,0 +1,42 @@
+{
+  "schema": "feishu-bridge-config/v2",
+  "pid": 123,
+  "bundlePath": "/Applications/Synthetic.app",
+  "bundleIdentifier": "test.synthetic",
+  "bundleVersion": "synthetic-1",
+  "locale": "en-US",
+  "evidenceRoot": "/tmp/synthetic-evidence",
+  "observationIntervalMs": 100,
+  "joinDeadlineMs": 1000,
+  "actionDeadlineMs": 1000,
+  "axCallTimeoutMs": 100,
+  "custody": {
+    "physicalClientId": "synthetic-mac-slot",
+    "physicalGenerationId": "0123456789abcdef0123456789abcdef",
+    "occurrenceId": "synthetic-meeting@2026-09-02T14:00:00Z",
+    "bridgeSessionId": "synthetic-bridge-session"
+  },
+  "selectors": {
+    "build": "synthetic-1",
+    "locale": "en-US",
+    "measured": true,
+    "identifiers": {
+      "appWindow": "synthetic.app-window",
+      "joinMeetingNumberField": "synthetic.number-field",
+      "joinButton": "synthetic.join",
+      "meetingWindow": "synthetic.meeting-window",
+      "meetingEndedNotice": "synthetic.ended",
+      "meetingNumberLabel": "synthetic.meeting-number",
+      "leaveButton": "synthetic.leave",
+      "leaveConfirmButton": "synthetic.confirm-leave",
+      "chatToggle": "synthetic.chat-toggle",
+      "chatInput": "synthetic.chat-input",
+      "chatSendButton": "synthetic.chat-send",
+      "participantsPanel": "synthetic.participants",
+      "participantRowPrefix": "synthetic.participant-row-",
+      "speakerGrid": "synthetic.speakers",
+      "speakerTilePrefix": "synthetic.speaker-tile-"
+    },
+    "titles": {}
+  }
+}

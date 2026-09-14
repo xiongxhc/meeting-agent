@@ -41,6 +41,7 @@ public struct BridgeProcessConfiguration {
     public let actionDeadline: TimeInterval
     public let axCallTimeout: Float
     public let labels: FeishuUiLabels
+    public let custody: BridgeCustodyBinding?
 
     public static func arguments(_ args: [String]) throws -> Arguments {
         if args == ["--help"] { return .help }
@@ -62,7 +63,9 @@ public struct BridgeProcessConfiguration {
 
     public static func decode(_ data: Data, inspection: Bool) throws -> Self {
         guard data.count <= 65_536, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeProcessError.invalidInput }
-        let required: Set<String> = ["schema", "pid", "bundlePath", "bundleIdentifier", "bundleVersion", "locale", "evidenceRoot", "observationIntervalMs", "joinDeadlineMs", "actionDeadlineMs", "axCallTimeoutMs"]
+        let v2 = object["schema"] as? String == "feishu-bridge-config/v2"
+        var required: Set<String> = ["schema", "pid", "bundlePath", "bundleIdentifier", "bundleVersion", "locale", "evidenceRoot", "observationIntervalMs", "joinDeadlineMs", "actionDeadlineMs", "axCallTimeoutMs"]
+        if v2 { required.insert("custody") }
         guard required.isSubset(of: Set(object.keys)), Set(object.keys).isSubset(of: required.union(["selectors"])) else { throw BridgeProcessError.invalidInput }
         func string(_ key: String) throws -> String {
             guard let value = object[key] as? String, !value.isEmpty, value.utf8.count <= 1024, !value.contains("\0") else { throw BridgeProcessError.invalidInput }; return value
@@ -71,7 +74,13 @@ public struct BridgeProcessConfiguration {
             guard let value = object[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite,
                   value.doubleValue == Double(value.intValue), range.contains(value.intValue) else { throw BridgeProcessError.invalidInput }; return value.intValue
         }
-        guard try string("schema") == "feishu-bridge-config/v1" else { throw BridgeProcessError.invalidInput }
+        let schema = try string("schema")
+        guard v2 || schema == "feishu-bridge-config/v1", !(v2 && inspection) else { throw BridgeProcessError.invalidInput }
+        let custody: BridgeCustodyBinding?
+        if v2 {
+            guard let raw = object["custody"] as? [String: Any] else { throw BridgeProcessError.invalidInput }
+            custody = try BridgeCustodyBinding(object: raw)
+        } else { custody = nil }
         let path = try string("bundlePath"), root = try string("evidenceRoot"), build = try string("bundleVersion"), locale = try string("locale")
         guard path.hasPrefix("/"), path.hasSuffix(".app"), root.hasPrefix("/"), root != "/" else { throw BridgeProcessError.invalidInput }
         var labels = FeishuUiLabels.bundled
@@ -95,6 +104,6 @@ public struct BridgeProcessConfiguration {
                     observationInterval: Double(try integer("observationIntervalMs", 50...5000)) / 1000,
                     joinDeadline: Double(try integer("joinDeadlineMs", 100...120_000)) / 1000,
                     actionDeadline: Double(try integer("actionDeadlineMs", 100...10_000)) / 1000,
-                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels)
+                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels, custody: custody)
     }
 }

@@ -19,6 +19,7 @@ final class BridgeIOTests: XCTestCase {
             }
             XCTAssertTrue(sink.closed)
             XCTAssertEqual(cleanupReports, 1)
+            XCTAssertEqual(process.shutdownResult, .unconfirmed("input_reap_failed"))
             XCTAssertTrue(cancellation.isCancelled)
             XCTAssertEqual(driver.pressed.count, 1, "unreaped worker must not overlap a leave action")
             XCTAssertThrowsError(try process.accept(join), "failed reaping must permanently close the owner")

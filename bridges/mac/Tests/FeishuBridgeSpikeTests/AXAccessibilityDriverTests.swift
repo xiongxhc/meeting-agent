@@ -174,7 +174,7 @@ final class JoiningAXBackend: AXNativeBackend {
     func isApplicationValid() -> Bool { true }
     func attributes(_ handle: String) -> NativeAXAttributes? {
         switch handle {
-        case "root": return leavePressed ? afterLeave : NativeAXAttributes(role: "AXWindow", identifier: joined ? labels.meetingWindow : labels.appWindow)
+        case "root": return leavePressed ? afterLeave : NativeAXAttributes(role: "AXWindow", identifier: joined ? labels.meetingWindow : labels.appWindow, title: "synthetic readable window")
         case "field": return NativeAXAttributes(role: "AXTextField", identifier: labels.joinMeetingNumberField, value: number, enabled: true, canSetValue: true)
         case "join": return NativeAXAttributes(role: "AXButton", identifier: labels.joinButton, enabled: true, canPress: true)
         case "number": return NativeAXAttributes(role: "AXStaticText", identifier: labels.meetingNumberLabel, value: number)

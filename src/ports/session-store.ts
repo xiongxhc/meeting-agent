@@ -14,6 +14,22 @@
 // STATE explicit while staying structurally clear of the SQLite gate. No
 // SQLite driver, and no other database concern, lives here.
 
+import type { CustodyBinding, BridgeProcessOutcome } from "../contracts/bridge-process-outcome-v1.ts";
+import type { BridgeShutdownResult, BridgeProcessFailure } from "./bridge-process.ts";
+
+export type PhysicalCustodyRow = CustodyBinding & {
+  readonly state: "quarantined" | "cleared";
+  readonly claimedAtMs: number;
+  readonly outcome: BridgeProcessOutcome | null;
+  readonly outcomeFailure: BridgeProcessFailure | null;
+  readonly exitDiagnostic: "nonzero_exit" | null;
+  readonly outcomeRecordedAtMs: number | null;
+  readonly clearedAtMs: number | null;
+  readonly clearReason: string | null;
+  readonly clearOperator: string | null;
+};
+export type PhysicalClientClear = CustodyBinding & { readonly operator: string; readonly assertInspectedIdle: true; readonly nowMs: number };
+
 /** The orchestration state machine's states. The transition GRAPH (which
  * edges are legal) is owned by src/sessions/coordinator.ts -- this port only
  * declares the physical set of values a `state` column may hold. */
@@ -377,6 +393,10 @@ export type AcquireLeaseInput = {
  * an injected clock.
  */
 export type SessionStore = {
+  claimPhysicalClient(binding: CustodyBinding, nowMs: number): PhysicalCustodyRow;
+  listPhysicalCustody(): readonly PhysicalCustodyRow[];
+  recordPhysicalOutcome(binding: CustodyBinding, result: BridgeShutdownResult, nowMs: number): void;
+  clearPhysicalClient(input: PhysicalClientClear): void;
   readonly schemaVersion: number;
   appliedMigrations(): MigrationRow[];
   foreignKeysEnabled(): boolean;

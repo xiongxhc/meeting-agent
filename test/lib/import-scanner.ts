@@ -571,6 +571,7 @@ export function findOpaqueConstructs(
  * Team Vault module appears here, so its read-only git index cannot gain an
  * fs write capability by renaming a path variable. */
 export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "src/adapters/child-bridge-process.ts": new Set(["mkdtempSync", "writeFileSync", "unlinkSync", "rmdirSync"]),
   "src/application.ts": new Set(["mkdir", "mkdirSync"]),
   "src/adapters/filesystem-outbox.ts": new Set([
     "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "rmdirSync", "writeFile", "writeFileSync",
@@ -591,6 +592,7 @@ export function findForbiddenFilesystemWriteCapabilities(result: ScanResult, rep
     }
   }
   for (const call of result.writeLikeCalls) {
+    if (call.calleeText === "child.stdin!.write" && repoRoot !== undefined && normalizeRelative(path.relative(repoRoot, call.file)) === "src/adapters/child-bridge-process.ts") continue;
     if (!allowsWriteCapability(call.file, call.method, repoRoot)) {
       violations.push({ file: call.file, specifier: call.calleeText, rule: "filesystem write capability outside approved owner" });
     }

@@ -4,6 +4,28 @@ Steps that need a human (real accounts, live services, or repo hosting
 decisions) and were deliberately not attempted by the agent. Grouped by plan
 task.
 
+## Task 11c: physical-client provisioning and manual recovery
+
+- [ ] Provision a stable private `physicalClientId` for each dedicated desktop
+  account/client, with no duplicate logical bindings. Do not derive it from PID,
+  app build, occurrence or lease. A label change requires provisioning audit and
+  cannot erase an unresolved generation.
+- [ ] Confirm measured selectors support a positively readable inactive-client
+  preflight before any join action. Existing/unknown meeting windows must refuse.
+- [ ] In an authorized throwaway run, verify config/v2 and inherited fd3 outcomes,
+  parent shutdown, exact owned-child reap, and durable quarantine after forced
+  parent loss. No automated test here has touched the desktop or proved departure.
+- [ ] For a quarantined slot, stop the old controller/owned bridge generation so
+  it cannot issue future actions, then inspect/leave the actual client. Only then use
+  `physical-client-clear` with the exact generation, explicit
+  `--assert-inspected-idle` and bounded operator label. The CLI neither inspects
+  nor grants permission to clear; see `bridges/mac/README.md` for commands.
+  Process exit, lease TTL, public `left` and a renamed slot are not evidence.
+
+Media2, authenticated timed capture, identity mapping, routing and real-provider
+acceptance remain separate human/integration gates. `connect_media` stays
+`media_adapter_unavailable` in this scope.
+
 ## Plan 3 Task 10: verify organizer notification with a real Feishu tenant
 
 Task 10 is code-tested only. Its adapter is configured with an explicit

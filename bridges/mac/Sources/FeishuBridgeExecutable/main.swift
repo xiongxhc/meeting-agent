@@ -19,6 +19,8 @@ func inspect(_ node: AccessibilityNode) -> [String: Any] {
 func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     let cancellation = BridgeCancellation()
     signal(SIGPIPE, SIG_IGN)
+    let outcomeWriter = try configuration.custody == nil ? nil : BridgeOutcomeWriter()
+    defer { outcomeWriter?.close() }
     signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
     let signals = [SIGTERM, SIGINT].map { number in
         let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
@@ -43,12 +45,19 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     defer { try? sink.close() }
     let writer = try BridgeOutputWriter(fd: STDOUT_FILENO, cancellation: cancellation)
     let process = BridgeProcess(driver: driver, labels: configuration.labels, clock: clock, sink: sink,
-                                joinDeadline: configuration.joinDeadline, actionDeadline: configuration.actionDeadline,
+                                joinDeadline: configuration.joinDeadline, actionDeadline: configuration.actionDeadline, custody: configuration.custody,
                                 output: writer.write)
     let input = BridgeInputPump(fd: STDIN_FILENO, cancellation: cancellation)
-    try runBridgeControl(process: process, input: input, cancellation: cancellation, clock: clock,
+    var failure: Error?
+    do { try runBridgeControl(process: process, input: input, cancellation: cancellation, clock: clock,
                          observationInterval: configuration.observationInterval,
-                         cleanupFailed: { diagnostic("operator_cleanup_required_departure_unconfirmed") })
+                         cleanupFailed: { diagnostic("operator_cleanup_required_departure_unconfirmed") }) }
+    catch { failure = error }
+    if let binding = configuration.custody, let writer = outcomeWriter, let status = process.shutdownResult {
+        do { try writer.write(BridgeProcessOutcome(binding: binding, status: status, observedAt: clock.now())) }
+        catch { failure = failure ?? error }
+    }
+    if let failure { throw failure }
 }
 
 do {

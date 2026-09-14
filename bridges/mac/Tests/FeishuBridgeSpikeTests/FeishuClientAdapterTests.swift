@@ -18,6 +18,16 @@ final class FeishuClientAdapterTests: XCTestCase {
 
     // MARK: - join
 
+    func testJoinPreflightRejectsExistingOrUnreadableMeetingBeforeAnyUIWrite() {
+        for possible in [FakeTree.inMeeting(), AccessibilityNode(role: "AXWindow"), AccessibilityNode(role: "AXSheet")] {
+            let tree = AccessibilityNode(role: "AXApplication", children: [FakeTree.idleWithJoinSurface(), possible])
+            let (adapter, driver) = self.adapter([tree, FakeTree.inMeeting(meetingNo: "900000001")])
+            XCTAssertEqual(adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001"), .failed(reason: "client_not_idle"))
+            XCTAssertTrue(driver.typed.isEmpty)
+            XCTAssertTrue(driver.pressed.isEmpty)
+        }
+    }
+
     func testAmbiguousMeetingWindowsAreNotPositiveAbsenceAfterLeave() {
         let duplicate = AccessibilityNode(role: "AXApplication", children: [FakeTree.inMeeting(), FakeTree.inMeeting()])
         let (adapter, _) = self.adapter([FakeTree.inMeeting(), duplicate, duplicate])
@@ -94,7 +104,7 @@ final class FeishuClientAdapterTests: XCTestCase {
 
     func testDuplicateJoinControlsCannotChooseAnArbitraryFirstMatch() {
         let idle = FakeTree.idleWithJoinSurface()
-        let duplicate = AccessibilityNode(role: "AXWindow", children: idle.children + idle.children)
+        let duplicate = AccessibilityNode(role: idle.role, identifier: idle.identifier, title: idle.title, children: idle.children + idle.children)
         let (adapter, driver) = self.adapter([duplicate, FakeTree.inMeeting()])
         XCTAssertEqual(adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001"),
                        .failed(reason: "join_controls_not_reachable"))

@@ -115,7 +115,7 @@ public func runBridgeControl(process: BridgeProcess, input: any BridgeInputSourc
     guard input.finish(timeout: 1) else {
         // An unreaped worker must not overlap a fresh UI cleanup attempt. Still
         // close the owner/evidence and make the unconfirmed departure explicit.
-        do { try process.shutdown(allowUIActions: false) }
+        do { try process.shutdown(allowUIActions: false, inputReapFailed: true) }
         catch { failure = failure ?? error }
         cleanupFailed()
         throw failure ?? BridgeProcessError.closed
