@@ -5,9 +5,9 @@ tree, drives its controls, and emits the frozen `bridge-session/v1` event stream
 that `protocols/bridge-session-v1.schema.json` defines.
 
 **This package has never been run against a real Feishu client.** Every test
-runs against synthetic accessibility trees and synthetic marker bytes. Nothing
-here has measured anything about a real client, no audio sample has ever passed
-through it, and the accessibility identifiers it looks for are placeholders —
+runs against synthetic accessibility trees or memory-only synthetic audio.
+Native CPU conversion is tested, but no real captured audio has passed through
+the bridge and no real client has been measured. Bundled accessibility identifiers are placeholders —
 see "Placeholders" below. No latency, echo, or barge-in figure exists anywhere
 in this repository.
 
@@ -28,6 +28,10 @@ Sources/FeishuBridgeSpike/
   BridgeProcessConfiguration.swift strict private operator configuration
   FileEvidenceSink.swift      create-new incremental private persistence
   SystemBridgeClock.swift     system observation clock and monotonic deadlines
+  CapturedAudio.swift         bounded native sample copy and source-clock evidence
+  PcmCaptureConverter.swift   persistent CPU converter and piecewise sample maps
+  SystemAudioCapture.swift    bounded capture owner and lazy public SCK backend
+  AudioOutputRenderer.swift  explicit-device owner and lazy native playback
 Sources/FeishuBridgeExecutable/main.swift   executable composition/CLI
 Tests/FeishuBridgeSpikeTests/
   BridgeContractTests.swift        round-trips the frozen fixture from disk
@@ -267,16 +271,75 @@ durable lease on `bridge_failure`; that is not physical-client cleanup. Its
 application-level shutdown/recovery integration is a subsequent scope. Never
 silently recycle a still-joined desktop client just because a new lease exists.
 
-Real capture/render, authenticated Runtime media and a measured identity/highlight
-mapping remain separate work; see `docs/HUMAN-CHECKLIST.md` sections 3.0 and 4.0.
+Capture/render primitives are compiled and hardware-free tested, but are not
+composed into this executable. Authenticated Runtime media and measured
+identity/highlight mapping remain separate work; see the human checklist.
+
+## Independent native audio primitives (Task 11b)
+
+`SystemAudioCapture` is lazy. An authorized caller must supply exact display ID,
+PID, bundle path/ID/build and launch date. Start checks existing Screen Recording
+access without prompting and uses the app-including ScreenCaptureKit filter,
+audio-only output and exclusion of this process. No default/all-system fallback.
+Do not invoke native start for a dry run. The executable still returns
+`media_adapter_unavailable`; no CLI or control/media wire has been extended here.
+
+Accepted source PCM is Float32 or signed16LE, mono/stereo, planar/interleaved,
+at 24/44.1/48 kHz. Stereo is averaged, nonfinite floats rejected, and persistent
+`AVAudioConverter` normal priming produces saturating mono s16LE/24 kHz.
+Packets contain 480 actual samples; final 1–479-sample tails are not padded.
+Native inputs are bounded to 8192 frames/65536 bytes; input queue to 8 buffers
+and 250 ms; output to 10 packets/200 ms plus one reserved loss marker. Ledger
+and packet source maps are bounded to 64 entries. An unrepresentable second gap
+fails explicitly instead of silently asserting complete coverage.
+
+Capture PTS and represented end are converted through the same stream clock to
+CoreMedia host time before queueing. Callback arrival is not the origin. Exact
+rational source positions and source-buffer endpoints remain available. Packet
+host spans, when justified, are **piecewise nominal estimates**, not physical
+precision claims; source/filter support envelopes are different types and must
+not become packet endpoints. Physical uncertainty is always nil, never zero.
+Invalid clock/duration, filter edges or implausible native primeInfo preserve
+valid PCM but leave packet host timing absent. Same-rate 24 kHz primeInfo has
+returned out-of-bounds values in CPU tests; no zero-priming guess is made.
+Source discontinuity, drop and logical suspend/resume close the epoch.
+`suspendCapture` discards incoming samples and emits an unknown-duration gap;
+`resumeCapture` requires that boundary to be queued. It does not stop the stream.
+After sink backpressure, the consumer explicitly calls `resumeDelivery`.
+
+`AudioOutputRenderer` resolves only the configured output UID, rejects unknown
+devices and sets/read-backs the engine output unit's device before starting.
+It never changes global defaults, Feishu input or a virtual-driver route. The
+source remains mono24k even if the hardware mixer converts it. Ten pending
+packets plus two scheduled packets (at most40 ms natively) are retained. Only
+`dataPlayedBack` returns credit; duplicate/out-of-order/old callbacks cannot
+refill a generation. `cancel` advances generation and calls player.stop to
+unschedule buffers; explicit `resume(generation:)` follows confirmed flush.
+`stop` also stops/resets the engine. A failure/timeout cannot authorize resume.
+
+Start/stop budgets default to5 seconds and must be positive, finite and <=30.
+One instance owns one native lifecycle. Timeout returns `failedUnconfirmed`,
+not proof of stopped hardware; late ownership is fenced and cleanup retained.
+Keep the owner alive until cleanup is resolved and quarantine unconfirmed native
+ownership. A blocked OS call cannot be forcibly terminated safely by this port.
+Stop drains bounded accepted capture output; a blocked consumer must resume it
+or receive an unconfirmed outcome. Failure also remains in `failure` if a sink
+cannot accept the terminal marker. No payload/evidence/audio file is written.
+
+The older `AudioBridge` still has receipt-clock timing and void device-cancel
+limitations. New isolated primitive proofs do not fix that old integration.
+Later media2/bridge2 composition must consume the accepted Runtime timing
+contract and await confirmed native flush before acknowledging cancellation.
+No local playback result proves remote audibility, duplex/echo quality or the
+300 ms acoustic stop target. No output UID or BlackHole route was selected here.
 
 ## Permissions
 
 Running `swift test` needs nothing: no Feishu app, no Accessibility, Screen
 Recording or Microphone grant, no audio hardware, no network, no API keys. That
 is the point of keeping the driver, the device and the media endpoint behind
-protocols — and it is why neither AVFoundation nor CoreAudio is imported by the
-testable core.
+protocols. Native framework implementations are compiled but never started by
+tests; AVAudioConverter alone executes CPU-only synthetic conversion.
 
 Driving a real client will need the macOS **Accessibility** permission (to read
 element state and perform actions) and, once a real `AudioDevicePort` exists,

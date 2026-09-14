@@ -312,15 +312,25 @@ prerequisites before this matrix is attempted:
    of the task is that this connection is made by the bridge itself: if a run
    ever routes a frame through the TypeScript coordinator, the run is void and
    the architecture claim has been broken, not measured.
-2. **A real `AudioDevicePort`.** The package ships the protocol and a fake. A
-   real one wraps the macOS capture and render units, publishes the formats the
-   machine can actually carry in `supportedFormats`, drives `captureFrame` from
-   the capture callback and `renderTick` from the render callback. It needs the
-   **Microphone** permission, which nothing in this package has ever requested.
-3. **A real `MediaClock`.** `monotonicMilliseconds()` must come from a source
-   that cannot go backwards (`mach_absolute_time`, not `Date`). The bridge fails
-   the session with `media_clock_regressed` if it ever does, so a clock wired to
-   the wall clock will drop the media session on the first NTP correction.
+2. **Compose and validate the native primitives.** Task11b adds lazy
+   `SystemAudioCapture` and `AudioOutputRenderer`, tested with synthetic sample
+   buffers, actual CPU conversion and injected native backends only. Neither
+   real SCK nor a real audio engine/device was started. They are not wired into
+   `AudioBridge`/the executable; `connect_media` remains unavailable. Operator
+   must explicitly supply output UID and exact capture display/app generation,
+   grant **Screen Recording** manually, and verify app-only capture and duplex
+   routing in a test meeting. Accessibility alone does not grant audio capture.
+   This SCK path does not request microphone capture. No BlackHole decision,
+   driver install or route change is implied by supporting a configured UID.
+3. **Consume source-derived timing, not callback receipt.** Task11b converts
+   source PTS/end via the stream synchronization clock to CoreMedia host time
+   (`mach_absolute_time` basis). Later media2 integration must consume exact
+   sample positions and the accepted Runtime alignment contract. Nominal
+   piecewise estimates may have unknown physical uncertainty; nil is not zero.
+   Source/filter support envelopes are not packet spans. Unknown clock,
+   implausible priming, drops and suspension must remain explicit unmapped
+   coverage. Existing AudioBridge receipt-time timing is not repaired by these
+   isolated primitives; do not use it as complete capture alignment evidence.
 4. **A capture evidence writer.** The Gate asks for "a complete timestamped
    hour-long capture evidence file". `BridgeRecorder` already writes the
    `bridge-session/v1` event stream as timestamped JSONL and is what should
