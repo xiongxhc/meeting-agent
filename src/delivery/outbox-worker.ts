@@ -40,6 +40,9 @@ export type DeliveryRow = {
 export type DeliveryJournal = {
   savePending(row: DeliveryRow): void;
   pending(): readonly DeliveryRow[];
+  /** Audio is already deleted, but canonical metadata remains until an intent
+   * or honest terminal classification commits. */
+  recoverablePublications(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
   /** Publication evidence, legal state transition and notification intent
    * must commit as one operation before cleanup is allowed. */
@@ -126,23 +129,43 @@ export function createOutboxWorker(options: {
     reconcile(): void {
       const now = options.clock.now();
       try { options.reconciliationEvidence.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
-      for (const current of options.journal.pending()) {
+      for (const current of [...options.journal.pending(), ...options.journal.recoverablePublications()]) {
         let publicationAccepted = current.publishedAtMs !== null;
         try {
-          if (current.deletedAtMs !== null) continue;
-          if (now >= current.endedAtMs + RETENTION_MS) {
-            deleteOccurrenceEvidence(options, current, now, [current]);
-            continue;
-          }
           const state = options.session.state(current.occurrenceId);
-          if (current.publishedAtMs !== null) {
-            if ((state === "published" || state === "notified") && current.publicationUrl !== null && current.vaultCommit !== null) {
+          if (current.deletedAtMs !== null) {
+            if (current.publishedAtMs !== null && (state === "published" || state === "notified") && current.publicationUrl !== null && current.vaultCommit !== null) {
               options.journal.acceptPublication({
                 occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
                 publishedAtMs: current.publishedAtMs, publicationUrl: current.publicationUrl, vaultCommit: current.vaultCommit,
                 notification: notificationFromRecovery(current),
               });
+              options.journal.update({ ...current, recoveryArtifact: null });
             }
+            continue;
+          }
+          const retentionExpired = now >= current.endedAtMs + RETENTION_MS;
+          let retainRecoveryArtifact = false;
+          // A legacy accepted publication may still hold the only canonical
+          // organizer/title bytes. Persist their intent before deadline cleanup,
+          // but never extend governed retention when recovery cannot commit.
+          if (current.publishedAtMs !== null && (state === "published" || state === "notified") && current.publicationUrl !== null && current.vaultCommit !== null) {
+            try {
+              options.journal.acceptPublication({
+                occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
+                publishedAtMs: current.publishedAtMs, publicationUrl: current.publicationUrl, vaultCommit: current.vaultCommit,
+                notification: notificationFromRecovery(current),
+              });
+            } catch (error) {
+              if (!retentionExpired) throw error;
+              retainRecoveryArtifact = current.recoveryArtifact !== null;
+            }
+          }
+          if (retentionExpired) {
+            deleteOccurrenceEvidence(options, current, now, [current], retainRecoveryArtifact);
+            continue;
+          }
+          if (current.publishedAtMs !== null) {
             // Startup repair clears missing-source publication markers only
             // after a successful ownership claim. A remaining marker still
             // blocks cleanup of conflicting or malformed recording evidence.
@@ -241,6 +264,7 @@ function deleteOccurrenceEvidence(
   accepted: DeliveryRow,
   now: number,
   rows: readonly DeliveryRow[],
+  retainRecoveryArtifact = false,
 ): void {
   const owned = options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId);
   const selected = new Set(rows.map((row) => `${row.occurrenceId}:${row.revision}`));
@@ -252,7 +276,7 @@ function deleteOccurrenceEvidence(
       ...(row.revision === accepted.revision ? { publishedAtMs: accepted.publishedAtMs, publicationUrl: accepted.publicationUrl, vaultCommit: accepted.vaultCommit } : {}),
       deletedAtMs: now,
       retryReason: row.retryReason === "recovery_unavailable" ? "recovery_unavailable" : null,
-      recoveryArtifact: null,
+      recoveryArtifact: retainRecoveryArtifact ? row.recoveryArtifact : null,
     });
   }
 }

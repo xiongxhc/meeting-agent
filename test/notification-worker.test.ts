@@ -300,6 +300,27 @@ test("bounded retry schedule isolates a failing row from a successful sibling ac
   } finally { h.close(); }
 });
 
+test("retry delay stays bounded and finite retry failures become terminal", async () => {
+  const h = harness();
+  try {
+    accept(h.store);
+    let now = 20;
+    const sender = new ExpiringDedupSender();
+    sender.fail = "retryable";
+    const worker = createNotificationWorker({ store: h.store, sender, clock: { now: () => now }, random: () => 1, requestTimeoutMs: 5_000, claimTtlMs: 5_000, dedupSafetyMarginMs: 60_000, maxAttempts: 2 });
+    await worker.poll();
+    const once = h.store.notifications()[0]!;
+    assert.equal(once.state, "pending");
+    assert.ok(once.nextAttemptAtMs >= now + 1_000 && once.nextAttemptAtMs <= now + 60_000);
+    now = once.nextAttemptAtMs;
+    await worker.poll();
+    const exhausted = h.store.notifications()[0]!;
+    assert.equal(sender.calls.length, 2);
+    assert.equal(exhausted.state, "terminal");
+    assert.equal(exhausted.terminalReason, "notification_retry_exhausted");
+  } finally { h.close(); }
+});
+
 test("request UUID covers revision, artifact hash, URL and commit", () => {
   const base = { occurrenceId: OCCURRENCE, revision: 1, artifactHash: HASH, publicationUrl: URL, vaultCommit: COMMIT };
   const uuid = notificationRequestUuid(base);

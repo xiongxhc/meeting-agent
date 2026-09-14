@@ -60,6 +60,7 @@ class FakeJournal implements DeliveryJournal {
     this.rows.set(`${row.occurrenceId}:${row.revision}`, row);
   }
   pending(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs === null); }
+  recoverablePublications(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs !== null && row.publishedAtMs !== null && row.recoveryArtifact !== null); }
   update(row: DeliveryRow): void { this.savePending(row); }
   acceptPublication(input: AcceptPublicationInput): void {
     const row = this.rows.get(`${input.occurrenceId}:${input.revision}`);
@@ -184,6 +185,59 @@ test("publication and session transition roll back when durable notification int
   } finally { raw.close(); d.close(); h.cleanup(); }
 });
 
+test("schema-17 retained publication persists its intent before exact-deadline cleanup", () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const legacyMigrations = path.join(h.root, "migrations-17-deadline");
+  mkdirSync(legacyMigrations);
+  for (const name of readdirSync(MIGRATIONS).filter((candidate) => Number.parseInt(candidate, 10) <= 17)) {
+    copyFileSync(path.join(MIGRATIONS, name), path.join(legacyMigrations, name));
+  }
+  const filename = path.join(h.root, "legacy-deadline.db");
+  const source = runtimeRecordingPath(h);
+  writeFileSync(source, built.bytes);
+  let now = 1;
+  let store = openSessionStore({ filename, migrationsDir: legacyMigrations, nowMs: now });
+  try {
+    store.createSession({ occurrenceId: built.artifact.occurrence_id, providerMeetingId: built.artifact.provider_meeting_id, occurrenceStartedAt: built.artifact.started_at, nowMs: 1 });
+    store.finalizeSession({
+      transition: { occurrenceId: built.artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: 2 },
+      recording: { handle: "a".repeat(32), encryptedPath: source, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake", gaps: [], runtimeGaps: [] },
+    });
+    const worker = () => createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store, clock: { now: () => now }, random: () => 0, session: { state: (id) => store.getSession(id)?.state ?? null, publish: () => assert.fail("atomic store owns publication") }, reconciliationEvidence: store });
+    const bundle = worker().enqueue({ artifact: built.artifact, serializedArtifact: built.serialized, artifactHash: built.hash, recordingPath: source });
+    store.transition({ occurrenceId: built.artifact.occurrence_id, fromState: "awaiting_teammem", toState: "published", reason: "legacy", terminalReason: null, nowMs: 3 });
+    store.update({ ...store.pending()[0]!, publishedAtMs: 3, publicationUrl: publishedReceipt(built.artifact, built.hash).markdown_url as string, vaultCommit: "a".repeat(40) });
+    store.close();
+
+    now = Date.parse(built.artifact.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+    store = openSessionStore({ filename, nowMs: now });
+    assert.deepEqual(store.notifications(), []);
+    const raw = new Database(filename);
+    raw.exec("CREATE TRIGGER fail_notification BEFORE INSERT ON notification_intents BEGIN SELECT RAISE(ABORT, 'notification_insert_before_commit'); END");
+    worker().reconcile();
+    assert.deepEqual(store.notifications(), []);
+    assert.equal(existsSync(source), false, "encrypted source is deleted at the original deadline despite intent-store failure");
+    assert.equal(existsSync(bundle), false);
+    assert.deepEqual(raw.prepare("SELECT deleted_at_ms, recovery_artifact FROM delivery_journal").get(), { deleted_at_ms: now, recovery_artifact: built.serialized });
+    raw.exec("DROP TRIGGER fail_notification");
+    store.close();
+
+    now += 1;
+    store = openSessionStore({ filename, nowMs: now });
+    worker().reconcile();
+    assert.deepEqual(store.notifications().map((row) => [row.state, row.recipientId, row.title, row.terminalReason]), [
+      ["pending", built.artifact.organizer!.person_id, built.artifact.title, null],
+    ]);
+    assert.deepEqual(store.recoverablePublications(), []);
+    assert.equal(existsSync(source), false, "metadata recovery must not recreate or read encrypted audio");
+    assert.equal(existsSync(bundle), false);
+    try {
+      assert.deepEqual(raw.prepare("SELECT deleted_at_ms, recovery_artifact FROM delivery_journal").get(), { deleted_at_ms: now - 1, recovery_artifact: null });
+    } finally { raw.close(); }
+  } finally { store.close(); h.cleanup(); }
+});
+
 test("schema-17 publication with retained canonical metadata derives its intent before cleanup", () => {
   const h = harness();
   const built = artifactAndAudio();
@@ -202,7 +256,8 @@ test("schema-17 publication with retained canonical metadata derives its intent 
       transition: { occurrenceId: built.artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: 2 },
       recording: { handle: "a".repeat(32), encryptedPath: source, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake", gaps: [], runtimeGaps: [] },
     });
-    const worker = () => createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store, clock: { now: () => 10 }, random: () => 0, session: { state: (id) => store.getSession(id)?.state ?? null, publish: () => assert.fail("atomic store owns publication") }, reconciliationEvidence: store });
+    let now = 10;
+    const worker = () => createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store, clock: { now: () => now }, random: () => 0, session: { state: (id) => store.getSession(id)?.state ?? null, publish: () => assert.fail("atomic store owns publication") }, reconciliationEvidence: store });
     const bundle = worker().enqueue({ artifact: built.artifact, serializedArtifact: built.serialized, artifactHash: built.hash, recordingPath: source });
     store.transition({ occurrenceId: built.artifact.occurrence_id, fromState: "awaiting_teammem", toState: "published", reason: "legacy", terminalReason: null, nowMs: 3 });
     store.update({ ...store.pending()[0]!, publishedAtMs: 3, publicationUrl: publishedReceipt(built.artifact, built.hash).markdown_url as string, vaultCommit: "a".repeat(40) });
@@ -222,7 +277,8 @@ test("schema-17 publication with retained canonical metadata derives its intent 
     store.update({ ...malformedRow, publishedAtMs: 3, publicationUrl: publishedReceipt(malformedArtifact, malformedHash).markdown_url as string, vaultCommit: "a".repeat(40), recoveryArtifact: "{malformed" });
     store.close();
 
-    store = openSessionStore({ filename, nowMs: 4 });
+    now = Date.parse(built.artifact.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+    store = openSessionStore({ filename, nowMs: now });
     assert.deepEqual(store.notifications(), [], "retained canonical metadata must not be blanket-classified unavailable");
     const oldTask10 = new Database(filename);
     try {
@@ -241,12 +297,18 @@ test("schema-17 publication with retained canonical metadata derives its intent 
     ]);
     assert.equal(existsSync(source), false);
     assert.equal(existsSync(bundle), false);
+    const deleted = new Database(filename, { readonly: true });
+    try {
+      assert.deepEqual(deleted.prepare("SELECT COUNT(*) AS count FROM delivery_journal WHERE deleted_at_ms = ? AND recovery_artifact IS NULL").get(now), { count: 2 });
+    } finally { deleted.close(); }
   } finally { store.close(); h.cleanup(); }
 });
 
 test("real SQLite rejects negative receipts and sends nothing before authoritative publication", async () => {
   const h = harness();
-  const built = artifactAndAudio();
+  const first = artifactAndAudio();
+  const artifact = parseTeamMemMeetingArtifact({ ...first.artifact, revision: 2 });
+  const built = { ...first, artifact, serialized: canonicalArtifactJson(artifact), hash: canonicalArtifactHash(artifact) };
   const d = durableWorker(h, built);
   try {
     let sends = 0;
@@ -263,19 +325,23 @@ test("real SQLite rejects negative receipts and sends nothing before authoritati
 
     const receiptFile = path.join(h.receipts, `${occurrencePathSegment(built.artifact.occurrence_id as OccurrenceId)}.json`);
     const invalidReceipts = [
+      { ...publishedReceipt(built.artifact, built.hash), revision: built.artifact.revision - 1 },
       { ...publishedReceipt(built.artifact, built.hash), revision: built.artifact.revision + 1 },
       { ...publishedReceipt(built.artifact, built.hash), artifact_hash: `sha256:${"f".repeat(64)}` },
       { ...publishedReceipt(built.artifact, built.hash), status: "failed" },
     ];
     for (const receipt of invalidReceipts) {
+      const before = d.store().pending()[0]!;
+      d.advance(before.nextRetryAtMs);
       writeFileSync(receiptFile, `${JSON.stringify(receipt)}\n`);
+      assert.equal(readPublicationReceipt({ receiptsDir: h.receipts, occurrenceId: built.artifact.occurrence_id, revision: built.artifact.revision, artifactHash: built.hash }), null);
       d.worker().reconcile();
       assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
       assert.deepEqual(d.store().notifications(), []);
-      d.advance(d.store().pending()[0]!.nextRetryAtMs);
+      assert.equal(d.store().pending()[0]!.retryCount, before.retryCount + 1, "due invalid receipt must be consumed as unavailable");
+      await notificationWorker.poll();
+      assert.equal(sends, 0);
     }
-    await notificationWorker.poll();
-    assert.equal(sends, 0);
   } finally { d.close(); h.cleanup(); }
 });
 

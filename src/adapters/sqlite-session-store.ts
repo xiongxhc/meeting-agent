@@ -114,7 +114,8 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
     savePending: (row) => savePendingDelivery(db, row, options.deliveryIdentityCheckpoint),
-    pending: () => pendingDeliveries(db),
+    pending: () => deliveryRows(db, "active"),
+    recoverablePublications: () => deliveryRows(db, "deleted_with_recovery"),
     update: (row) => updateDelivery(db, row),
     acceptPublication: (input) => acceptPublication(db, input),
     notifications: () => notifications(db),
@@ -543,12 +544,15 @@ function savePendingDelivery(
   if (!save()) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
 }
 
-function pendingDeliveries(db: Database.Database): DeliveryRow[] {
+function deliveryRows(db: Database.Database, selection: "active" | "deleted_with_recovery"): DeliveryRow[] {
+  const predicate = selection === "active"
+    ? "deleted_at_ms IS NULL"
+    : "deleted_at_ms IS NOT NULL AND published_at_ms IS NOT NULL AND recovery_artifact IS NOT NULL";
   const rows = db.prepare(
     `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
             transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
             deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle
-       FROM delivery_journal WHERE deleted_at_ms IS NULL ORDER BY next_retry_at_ms, occurrence_id, revision`,
+       FROM delivery_journal WHERE ${predicate} ORDER BY next_retry_at_ms, occurrence_id, revision`,
   ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null }>;
   return rows.map((row) => ({
     occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,

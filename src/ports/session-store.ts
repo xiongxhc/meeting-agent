@@ -415,6 +415,7 @@ export type SessionStore = {
 
   savePending(row: DeliveryRow): void;
   pending(): readonly DeliveryRow[];
+  recoverablePublications(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
   acceptPublication(input: AcceptPublicationInput): void;
   notifications(): readonly NotificationRow[];
