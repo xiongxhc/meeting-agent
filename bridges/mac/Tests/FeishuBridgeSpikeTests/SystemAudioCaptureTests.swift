@@ -3,6 +3,60 @@ import CoreMedia
 @testable import FeishuBridgeSpike
 
 final class SystemAudioCaptureTests: XCTestCase, @unchecked Sendable {
+    func testNativeFailureBeforeStartCompletionReturnsFailureAndFencesLateSuccess() async throws {
+        let backend = SyntheticCaptureBackend(), events = CapturedDeliveries()
+        backend.delayStart = true; backend.delayStop = true
+        let queue = DispatchQueue(label: "synthetic.capture.failed-start")
+        let capture = SystemAudioCapture(backendFactory: { backend }, processingQueue: queue)
+        let start = Task { await capture.start(try captureRequest(), sink: events.accept) }
+        await waitForAudio { backend.startCount == 1 }
+        XCTAssertEqual(backend.startCount, 1)
+        backend.failNative(); backend.failNative()
+        let outcome = try await start.value
+        XCTAssertEqual(outcome, .failedUnconfirmed)
+        XCTAssertEqual(capture.failure, .nativeFailure)
+        await waitForAudio { backend.stopCount == 1 }
+        await audioBarrier(queue)
+        XCTAssertEqual(backend.stopCount, 1, "duplicate failure must not duplicate native cleanup")
+        XCTAssertEqual(events.failures, [.nativeFailure])
+        let stop = await capture.stop()
+        XCTAssertEqual(stop, .failedUnconfirmed, "pending native cleanup cannot confirm departure")
+        backend.completeStart()
+        XCTAssertNotEqual(capture.state, .running)
+        XCTAssertEqual(backend.stopCount, 1, "late success must not overlap the in-flight stop")
+        backend.completeStop()
+        await waitForAudio { backend.stopCount == 2 }
+        XCTAssertEqual(backend.stopCount, 2, "late success reserves one post-start native stop")
+        backend.completeStop()
+        await audioBarrier(queue)
+        backend.completeStart(); backend.failNative()
+        backend.emit(try syntheticAudio())
+        await audioBarrier(queue)
+        XCTAssertEqual(capture.state, .failedUnconfirmed)
+        XCTAssertEqual(capture.failure, .nativeFailure)
+        XCTAssertEqual(backend.stopCount, 2)
+        XCTAssertEqual(events.failures, [.nativeFailure])
+        XCTAssertTrue(events.packets.isEmpty, "late native success cannot resume sample admission")
+    }
+
+    func testCallerCancellationStillReturnsCancelledAndCleansUpLateStart() async throws {
+        let backend = SyntheticCaptureBackend(); backend.delayStart = true
+        let capture = SystemAudioCapture(backendFactory: { backend })
+        let start = Task { await capture.start(try captureRequest(), sink: { _ in .accepted }) }
+        await waitForAudio { backend.startCount == 1 }
+        XCTAssertEqual(backend.startCount, 1)
+        start.cancel()
+        let outcome = try await start.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertNil(capture.failure)
+        await waitForAudio { backend.stopCount == 1 }
+        backend.completeStart()
+        await waitForAudio { capture.state == .stopped }
+        XCTAssertEqual(capture.state, .stopped)
+        XCTAssertEqual(backend.stopCount, 2)
+        XCTAssertNil(capture.failure)
+    }
+
     func testInputDurationBoundAndUnrepresentableLossFailClosed() async throws {
         for discontinuousLoss in [false, true] {
             let backend = SyntheticCaptureBackend(), events = CapturedDeliveries()
@@ -132,6 +186,7 @@ final class CapturedDeliveries: @unchecked Sendable {
     func setBlocked(_ value: Bool) { lock.withLock { blocked = value } }
     var packets: [CapturedPcmPacket] { lock.withLock { values.compactMap { if case .packet(let packet) = $0 { packet } else { nil } } } }
     var losses: [CaptureLoss] { lock.withLock { values.compactMap { if case .discontinuity(let loss) = $0 { loss } else { nil } } } }
+    var failures: [AudioPrimitiveError] { lock.withLock { values.compactMap { if case .failed(let error) = $0 { error } else { nil } } } }
     func accept(_ event: CaptureDelivery) -> AudioAdmission { lock.withLock { if blocked { return .backpressured }; values.append(event); return .accepted } }
 }
 
@@ -146,12 +201,13 @@ final class SyntheticCaptureBackend: NativeAudioCaptureBackend, @unchecked Senda
     private var starts = 0, stops = 0
     private var started: (@Sendable (Bool) -> Void)?
     private var stopped: (@Sendable (Bool) -> Void)?
+    private var failed: (@Sendable () -> Void)?
     private var sample: (@Sendable (CMSampleBuffer, CMClock?) -> Void)?
     var startCount: Int { lock.lock(); defer { lock.unlock() }; return starts }
     var stopCount: Int { lock.lock(); defer { lock.unlock() }; return stops }
     func start(request: CaptureRequest, sample: @escaping @Sendable (CMSampleBuffer, CMClock?) -> Void,
                failed: @escaping @Sendable () -> Void, completion: @escaping @Sendable (Bool) -> Void) {
-        lock.lock(); starts += 1; self.sample = sample; started = completion; let delayed = delayStart; lock.unlock()
+        lock.lock(); starts += 1; self.sample = sample; self.failed = failed; started = completion; let delayed = delayStart; lock.unlock()
         if !delayed { completion(true) }
     }
     func stop(completion: @escaping @Sendable (Bool) -> Void) {
@@ -160,5 +216,6 @@ final class SyntheticCaptureBackend: NativeAudioCaptureBackend, @unchecked Senda
     }
     func completeStart(_ success: Bool = true) { lock.lock(); let callback = started; lock.unlock(); callback?(success) }
     func completeStop(_ success: Bool = true) { lock.lock(); let callback = stopped; lock.unlock(); callback?(success) }
+    func failNative() { lock.lock(); let callback = failed; lock.unlock(); callback?() }
     func emit(_ buffer: CMSampleBuffer) { lock.lock(); let callback = sample; lock.unlock(); callback?(buffer, CMClockGetHostTimeClock()) }
 }

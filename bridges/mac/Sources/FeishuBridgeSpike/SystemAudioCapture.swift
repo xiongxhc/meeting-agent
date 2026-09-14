@@ -158,8 +158,9 @@ public final class SystemAudioCapture: @unchecked Sendable {
         guard stopReply == nil else { lock.unlock(); reply(.failedUnconfirmed); return }
         status = .stopping; stopReply = reply
         let start = startReply; startReply = nil
+        let startOutcome: AudioStartOutcome = fault == nil ? .cancelled : .failedUnconfirmed
         let budget = request?.stopBudget ?? 5
-        lock.unlock(); start?(.cancelled)
+        lock.unlock(); start?(startOutcome)
         DispatchQueue.global().asyncAfter(deadline: .now() + budget) { [weak self] in
             guard let self else { return }
             let callback = self.lock.withLock { () -> (@Sendable (AudioStopOutcome) -> Void)? in
