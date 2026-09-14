@@ -232,6 +232,81 @@ export type DeliveryRow = {
   readonly recordingHandle?: string | null;
 };
 
+export type NotificationTerminalReason =
+  | "organizer_unresolved"
+  | "notification_inputs_unavailable"
+  | "notification_delivery_uncertain"
+  | "notification_retry_exhausted";
+
+export type NotificationIntent =
+  | {
+      readonly recipientId: string;
+      readonly title: string;
+      readonly messageText: string;
+      readonly requestUuid: string;
+    }
+  | { readonly terminalReason: "organizer_unresolved" | "notification_inputs_unavailable" };
+
+export type AcceptPublicationInput = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly artifactHash: string;
+  readonly publishedAtMs: number;
+  readonly publicationUrl: string;
+  readonly vaultCommit: string;
+  readonly notification: NotificationIntent;
+};
+
+export type NotificationRow = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly artifactHash: string;
+  readonly publicationUrl: string;
+  readonly vaultCommit: string;
+  readonly recipientId: string | null;
+  readonly title: string | null;
+  readonly messageText: string | null;
+  readonly requestUuid: string | null;
+  readonly state: "pending" | "claimed" | "sent" | "terminal";
+  readonly terminalReason: NotificationTerminalReason | null;
+  readonly firstAttemptAtMs: number | null;
+  readonly lastAttemptAtMs: number | null;
+  readonly attemptCount: number;
+  readonly nextAttemptAtMs: number;
+  readonly claimToken: string | null;
+  readonly claimExpiresAtMs: number | null;
+  readonly deliveryAmbiguous: boolean;
+  readonly providerMessageId: string | null;
+  readonly sentAtMs: number | null;
+};
+
+export type ClaimNotificationInput = {
+  readonly nowMs: number;
+  readonly claimToken: string;
+  readonly claimTtlMs: number;
+  readonly requestTimeoutMs: number;
+  readonly dedupWindowMs: number;
+  readonly dedupSafetyMarginMs: number;
+};
+
+export type FailNotificationInput = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly claimToken: string;
+  readonly nowMs: number;
+  readonly nextAttemptAtMs: number;
+  readonly ambiguous: boolean;
+  readonly terminalReason: "notification_delivery_uncertain" | "notification_retry_exhausted" | null;
+};
+
+export type CompleteNotificationInput = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly claimToken: string;
+  readonly providerMessageId: string;
+  readonly sentAtMs: number;
+};
+
 export type ColumnDescription = { readonly name: string; readonly type: string };
 export type TableSchema = {
   readonly name: string;
@@ -341,6 +416,11 @@ export type SessionStore = {
   savePending(row: DeliveryRow): void;
   pending(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
+  acceptPublication(input: AcceptPublicationInput): void;
+  notifications(): readonly NotificationRow[];
+  claimNotification(input: ClaimNotificationInput): NotificationRow | null;
+  failNotification(input: FailNotificationInput): void;
+  completeNotification(input: CompleteNotificationInput): void;
 
   acquireLease(input: AcquireLeaseInput): LeaseRow;
   releaseLease(

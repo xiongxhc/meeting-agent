@@ -231,7 +231,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 17);
+      assert.equal(store.schemaVersion, 18);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -250,6 +250,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
         { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
         { version: 17, name: "017_delivery_recording_reservations.sql", appliedAtMs: BASE_MS },
+        { version: 18, name: "018_notifications.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -294,7 +295,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 17);
+      assert.equal(second.schemaVersion, 18);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -315,6 +316,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 15, name: "015_delivery_recovery_reason.sql", appliedAtMs: BASE_MS },
         { version: 16, name: "016_delivery_recording_identity.sql", appliedAtMs: BASE_MS },
         { version: 17, name: "017_delivery_recording_reservations.sql", appliedAtMs: BASE_MS },
+        { version: 18, name: "018_notifications.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -378,7 +380,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const store = h.open(BASE_MS + 2);
         try {
-          assert.equal(store.schemaVersion, 17);
+          assert.equal(store.schemaVersion, 18);
           assert.deepEqual(store.foreignKeyCheck(), []);
           const migrated = store.pending().find((row) => row.occurrenceId === reserved.occurrenceId)!;
           assert.equal(migrated.retryReason, "recovery_unavailable");
@@ -388,6 +390,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
           assert.equal(migrated.nextRetryAtMs, BASE_MS + 99);
           assert.equal(migrated.publishedAtMs, BASE_MS + 1);
           assert.equal(migrated.vaultCommit, "d".repeat(40));
+          assert.deepEqual(store.notifications().map((row) => [row.revision, row.state, row.terminalReason]), [[3, "terminal", "notification_inputs_unavailable"]]);
 
           const inspectReservation = new Database(h.dbPath, { readonly: true });
           try {
@@ -488,7 +491,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const reopened = h.open(BASE_MS + 3);
         try {
-          assert.equal(reopened.schemaVersion, 17);
+          assert.equal(reopened.schemaVersion, 18);
           assert.deepEqual(reopened.foreignKeyCheck(), []);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === reserved.occurrenceId).length, 2);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === unrelated.occurrenceId).length, 1);
@@ -815,7 +818,7 @@ test("a schema-10 terminal recording generation upgrades with honest legacy prov
     }
 
     const upgraded = h.open(BASE_MS + 1);
-    assert.equal(upgraded.schemaVersion, 17);
+    assert.equal(upgraded.schemaVersion, 18);
     upgraded.close();
 
     const reopened = h.open(BASE_MS + 2);
@@ -916,7 +919,7 @@ test("a schema-11 database upgrades to the current constraints without losing re
 
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 17);
+      assert.equal(store.schemaVersion, 18);
       const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
       assert.equal(evidence?.runtimeSessionId, 45n);
       assert.equal(evidence?.terminalSource, "bridge_observed");
@@ -1062,7 +1065,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 17);
+      assert.equal(store.schemaVersion, 18);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);
@@ -1098,7 +1101,7 @@ test("the control tables exclude transcript/audio; local-only reconciliation wor
       const liveLedger = schema.find((table) => table.name === "reconciliation_live_segments");
       assert.ok(liveLedger !== undefined);
       assert.deepEqual(liveLedger.columns.map((column) => column.name), ["generation_id", "segment_id", "text", "started_at", "started_at_ms", "ended_at", "ended_at_ms"]);
-      for (const table of schema.filter((candidate) => !candidate.name.startsWith("reconciliation_") && candidate.name !== "delivery_journal")) {
+      for (const table of schema.filter((candidate) => !candidate.name.startsWith("reconciliation_") && candidate.name !== "delivery_journal" && candidate.name !== "notification_intents")) {
         assert.ok(!table.columns.some((column) => /transcript|text|audio/i.test(column.name)), `control table ${table.name} must not carry prose`);
       }
       const id = identity(1);

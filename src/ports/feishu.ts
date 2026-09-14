@@ -61,6 +61,17 @@ export type ResolvedOrganizer = {
   readonly source: OrganizerSource;
 };
 
+export type FeishuSendTextInput = {
+  readonly receiveId: string;
+  readonly text: string;
+  readonly uuid: string;
+  readonly timeoutMs: number;
+};
+
+export type FeishuMessageSender = {
+  sendText(input: FeishuSendTextInput): Promise<{ readonly messageId: string }>;
+};
+
 /**
  * Resolves the organizer for a meeting number: the reservation's creator if
  * a reservation exists, else the calendar event's organizer, else null (an

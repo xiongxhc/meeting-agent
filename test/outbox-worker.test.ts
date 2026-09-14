@@ -114,6 +114,7 @@ for (const legacyMarker of [false, true]) {
       assert.equal(d.store().pending()[0]!.publishedAtMs, acceptedAt);
       assert.equal(d.store().pending()[0]!.deletedAtMs, null);
       assert.equal(d.store().pending()[0]!.recoveryArtifact, built.serialized);
+      assert.deepEqual(d.store().notifications().map((row) => [row.revision, row.state, row.recipientId]), [[built.artifact.revision, "pending", built.artifact.organizer!.person_id]]);
       assert.equal(existsSync(d.source), false);
       assert.equal(existsSync(d.bundle), false);
       raw.exec("DROP TRIGGER fail_deletion");
@@ -141,6 +142,61 @@ for (const legacyMarker of [false, true]) {
     } finally { raw.close(); d.close(); h.cleanup(); }
   });
 }
+
+test("publication and session transition roll back when durable notification intent cannot commit", () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const d = durableWorker(h, built);
+  const raw = new Database(d.filename);
+  try {
+    d.worker().reconcile();
+    assert.equal(d.store().pending()[0]!.publishedAtMs, null);
+    assert.deepEqual(d.store().notifications(), []);
+    d.advance(d.store().pending()[0]!.nextRetryAtMs);
+    d.receipt();
+    raw.exec("CREATE TRIGGER fail_notification BEFORE INSERT ON notification_intents BEGIN SELECT RAISE(ABORT, 'notification_insert_before_commit'); END");
+    d.worker().reconcile();
+    assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
+    assert.equal(d.store().pending()[0]!.publishedAtMs, null);
+    assert.deepEqual(d.store().notifications(), []);
+    assert.equal(existsSync(d.source), true);
+    assert.equal(existsSync(d.bundle), true);
+    raw.exec("DROP TRIGGER fail_notification");
+    d.worker().reconcile();
+    assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "published");
+    assert.equal(d.store().notifications().length, 1);
+  } finally { raw.close(); d.close(); h.cleanup(); }
+});
+
+test("a complete higher revision accepted after notified cleans retained evidence without replaying published", () => {
+  const h = harness();
+  const first = artifactAndAudio();
+  const incomplete = parseTeamMemMeetingArtifact({ ...first.artifact, transcript_complete: false });
+  const incompleteSerialized = canonicalArtifactJson(incomplete);
+  const incompleteHash = canonicalArtifactHash(incomplete);
+  const d = durableWorker(h, { ...first, artifact: incomplete, serialized: incompleteSerialized, hash: incompleteHash });
+  try {
+    d.receipt();
+    d.worker().reconcile();
+    const claim = d.store().claimNotification({ nowMs: d.now(), claimToken: "f".repeat(32), claimTtlMs: 1_000, requestTimeoutMs: 100, dedupWindowMs: 3_600_000, dedupSafetyMarginMs: 60_000 })!;
+    d.store().completeNotification({ occurrenceId: incomplete.occurrence_id, revision: incomplete.revision, claimToken: claim.claimToken!, providerMessageId: "om_first", sentAtMs: d.now() });
+    assert.equal(d.store().getSession(incomplete.occurrence_id)?.state, "notified");
+
+    const complete = parseTeamMemMeetingArtifact({ ...incomplete, revision: incomplete.revision + 1, transcript_complete: true });
+    const completeSerialized = canonicalArtifactJson(complete);
+    const completeHash = canonicalArtifactHash(complete);
+    const completeBundle = d.worker().enqueue({ artifact: complete, serializedArtifact: completeSerialized, artifactHash: completeHash, recordingPath: d.source });
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(complete.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(complete, completeHash))}\n`);
+    d.worker().reconcile();
+
+    assert.equal(d.store().getSession(complete.occurrence_id)?.state, "notified");
+    assert.equal(d.store().listTransitions(complete.occurrence_id).filter((row) => row.toState === "published").length, 1);
+    assert.deepEqual(d.store().notifications().map((row) => [row.revision, row.state]), [[incomplete.revision, "sent"], [complete.revision, "pending"]]);
+    assert.deepEqual(d.store().pending(), []);
+    assert.equal(existsSync(d.source), false);
+    assert.equal(existsSync(completeBundle), false);
+  } finally { d.close(); h.cleanup(); }
+});
 
 test("SQLite reopen keeps an unpublished missing source fail-closed", () => {
   const h = harness();
@@ -643,8 +699,8 @@ test("a complete higher revision deletes every retained copy for its occurrence 
   } finally { h.cleanup(); }
 });
 
-test("matching receipts do nothing in every state except awaiting_teammem or published replay", () => {
-  for (const state of [null, "listening", "finalizing", "failed", "notified", "discovered"]) {
+test("matching receipts do nothing in every state except awaiting_teammem, published, or notified replay", () => {
+  for (const state of [null, "listening", "finalizing", "failed", "discovered"]) {
     const h = harness();
     try {
       const { artifact, bytes, serialized, hash } = artifactAndAudio();

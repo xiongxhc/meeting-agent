@@ -7,6 +7,8 @@ import { parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../con
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { notificationRequestUuid } from "./notification-worker.ts";
+import type { AcceptPublicationInput } from "../ports/session-store.ts";
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024;
@@ -39,6 +41,9 @@ export type DeliveryJournal = {
   savePending(row: DeliveryRow): void;
   pending(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
+  /** SQLite provides the atomic publication + notification transaction.
+   * Lightweight unit fakes may omit it and retain the pre-Task-10 path. */
+  acceptPublication?(input: AcceptPublicationInput): void;
 };
 
 export type OutboxWorker = {
@@ -133,11 +138,12 @@ export function createOutboxWorker(options: {
             // Startup repair clears missing-source publication markers only
             // after a successful ownership claim. A remaining marker still
             // blocks cleanup of conflicting or malformed recording evidence.
-            if (state === "published" && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
+            if ((state === "published" || state === "notified") && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
             continue;
           }
           if (current.retryReason === "recovery_unavailable") continue;
-          if (!recoverBundle(options, current)) continue;
+          const artifact = recoverBundle(options, current);
+          if (artifact === null) continue;
           if (now < current.nextRetryAtMs) continue;
           const receipt = readPublicationReceipt({
             receiptsDir: options.receiptsDir,
@@ -158,9 +164,8 @@ export function createOutboxWorker(options: {
           // A receipt is evidence, not authorization to mutate an arbitrary
           // orchestration state. Only the legal edge and an interrupted replay
           // are allowed to record it or release encrypted evidence.
-          if (state !== "awaiting_teammem" && state !== "published") continue;
+          if (state !== "awaiting_teammem" && state !== "published" && state !== "notified") continue;
           publicationAccepted = true;
-          if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
           const published: DeliveryRow = {
             ...current,
             publishedAtMs: now,
@@ -168,11 +173,26 @@ export function createOutboxWorker(options: {
             vaultCommit: receipt.vault_commit,
             retryReason: null,
           };
-          if (current.transcriptComplete) {
-            options.journal.update(published);
-            deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
+          if (options.journal.acceptPublication !== undefined) {
+            const notification = artifact.organizer === null
+              ? { terminalReason: "organizer_unresolved" as const }
+              : {
+                  recipientId: artifact.organizer.person_id,
+                  title: artifact.title,
+                  messageText: `Meeting notes: ${artifact.title}\n${receipt.markdown_url}`,
+                  requestUuid: notificationRequestUuid({ occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit }),
+                };
+            options.journal.acceptPublication({
+              occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
+              publishedAtMs: now, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit,
+              notification,
+            });
           } else {
+            if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
             options.journal.update(published);
+          }
+          if (current.transcriptComplete) {
+            deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
           }
         } catch {
           // A malformed legacy row is terminal and isolated. Classify a row
@@ -211,10 +231,10 @@ function deleteOccurrenceEvidence(
 function recoverBundle(
   options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
   row: DeliveryRow,
-): boolean {
+): TeamMemMeetingArtifact | null {
   if (row.recoveryArtifact === null || row.stageToken === null) {
     options.journal.update({ ...row, retryReason: "recovery_unavailable" });
-    return false;
+    return null;
   }
   try {
     const expected = path.join(path.resolve(options.outboxDir), occurrencePathSegment(row.occurrenceId as `${string}@${string}`), String(row.revision));
@@ -232,11 +252,11 @@ function recoverBundle(
       stageToken: row.stageToken,
     });
     if (written !== row.bundlePath) throw new Error("recovered bundle path differs from durable journal");
-    return true;
+    return artifact;
   } catch (error) {
     if ((error as Error).message === "recovery bundle path differs from durable journal") throw error;
     options.journal.update({ ...row, retryReason: "recovery_unavailable" });
-    return false;
+    return null;
   }
 }
 

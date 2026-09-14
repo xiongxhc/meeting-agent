@@ -4,6 +4,33 @@ Steps that need a human (real accounts, live services, or repo hosting
 decisions) and were deliberately not attempted by the agent. Grouped by plan
 task.
 
+## Plan 3 Task 10: verify organizer notification with a real Feishu tenant
+
+Task 10 is code-tested only. Its adapter is configured with an explicit
+`receive_id_type`; production composition must choose the type that matches the
+organizer creator ID returned by the supported reservation/calendar lookup. Do
+not substitute `host_user`, an inviter, an attendee, or display-name inference.
+
+- [ ] In an isolated test tenant, publish a synthetic meeting artifact whose
+  organizer is a dedicated test account, then verify that account receives one
+  text DM containing only the meeting title and commit-specific Markdown URL.
+- [ ] Replay the same accepted receipt and verify no second DM. Repeat with a
+  higher revision and verify exactly one new DM for that revision.
+- [ ] Confirm a null organizer creates the local terminal reason
+  `organizer_unresolved` and sends nothing.
+- [ ] Exercise a forced HTTP timeout and restart inside Feishu's documented
+  one-hour UUID deduplication window, then confirm the retry uses the same UUID.
+  Do not run a blind resend after the local conservative window: the expected
+  durable result is `notification_delivery_uncertain` for operator review.
+- [ ] Record Feishu tenant/app/client versions, configured identity type, UTC
+  time, redacted request UUID hash, provider message ID hash, and pass/fail. Do
+  not retain tokens, participant data, transcript, audio, raw provider errors,
+  or full message payloads in repository evidence.
+
+The local suite uses a finite-window fake and injected HTTP transport only. No
+live Feishu endpoint, organizer lookup endpoint, credential, or notification was
+used while implementing Task 10; application composition remains Task 11 work.
+
 ## Evidence handling before any live run
 
 Read `evidence/README.md` before writing a recorder file. `connect_media`
