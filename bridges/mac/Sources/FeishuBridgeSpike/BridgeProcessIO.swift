@@ -1,9 +1,18 @@
 import Foundation
 import Darwin
 
+/// Input lifecycle boundary: the owner must distinguish EOF from failed reaping.
+public protocol BridgeInputSource: AnyObject {
+    var reachedEOF: Bool { get }
+    var failed: Bool { get }
+    func start()
+    func next(wait: TimeInterval) -> Data?
+    func finish(timeout: TimeInterval) -> Bool
+}
+
 /// The only worker owns no UI or protocol state. At most sixteen 4 KiB chunks
 /// wait for the serialized owner; EOF cancels a pending native wait immediately.
-public final class BridgeInputPump: @unchecked Sendable {
+public final class BridgeInputPump: BridgeInputSource, @unchecked Sendable {
     private let fd: Int32
     private let cancellation: BridgeCancellation
     private let condition = NSCondition()
@@ -75,7 +84,7 @@ public final class BridgeInputPump: @unchecked Sendable {
 /// EOF discards unissued commands, but still validates buffered framing. The
 /// process factory keeps stdin open until results, then leaves/releases or
 /// requests cancellation. A new occurrence needs a new process generation.
-public func runBridgeControl(process: BridgeProcess, input: BridgeInputPump,
+public func runBridgeControl(process: BridgeProcess, input: any BridgeInputSource,
                              cancellation: BridgeCancellation, clock: any BridgeDeadlineClock,
                              observationInterval: TimeInterval,
                              cleanupFailed: () -> Void = {}) throws {
@@ -103,7 +112,14 @@ public func runBridgeControl(process: BridgeProcess, input: BridgeInputPump,
         }
         if input.failed { throw BridgeProcessError.invalidInput }
     } catch { failure = error }
-    guard input.finish(timeout: 1) else { throw BridgeProcessError.closed }
+    guard input.finish(timeout: 1) else {
+        // An unreaped worker must not overlap a fresh UI cleanup attempt. Still
+        // close the owner/evidence and make the unconfirmed departure explicit.
+        do { try process.shutdown(allowUIActions: false) }
+        catch { failure = failure ?? error }
+        cleanupFailed()
+        throw failure ?? BridgeProcessError.closed
+    }
     cancellation.beginCleanup()
     do { try process.shutdown() }
     catch { cleanupFailed(); failure = failure ?? error }

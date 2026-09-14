@@ -1,7 +1,34 @@
 import Foundation
 import CoreFoundation
+import Darwin
 
 public struct BridgeProcessConfiguration {
+    public static func read(path: String, inspection: Bool) throws -> Self {
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard fd >= 0 else { throw BridgeProcessError.invalidInput }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 65_536 else { throw BridgeProcessError.invalidInput }
+        return try decode(readData(fd: fd), inspection: inspection)
+    }
+
+    static func readData(fd: Int32, reader: (Int32, UnsafeMutableRawPointer?, Int) -> Int = Darwin.read) throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: 65_537)
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        return try bytes.withUnsafeMutableBytes { buffer in
+            var offset = 0
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                let count = reader(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count >= 0, count <= buffer.count - offset else { throw BridgeProcessError.invalidInput }
+                if count == 0 { return Data(buffer.prefix(offset)) }
+                offset += count
+                guard offset <= 65_536 else { throw BridgeProcessError.invalidInput }
+            }
+            throw BridgeProcessError.invalidInput
+        }
+    }
+
     public enum Arguments: Equatable { case help, run(path: String, inspection: Bool) }
     public let pid: Int32
     public let bundlePath: String

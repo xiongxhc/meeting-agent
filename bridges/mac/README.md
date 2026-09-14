@@ -213,6 +213,9 @@ controls use empty identifiers; join field/button, meeting window/number and
 leave button are mandatory. Nonempty identifiers are unique, at most512UTF8bytes;
 bundled placeholder values are refused. Unknown keys, credentials, mismatched
 metadata, malformed types and config over 64 KiB are refused before AX access.
+Configuration reads continue through short reads/EINTR to EOF, reject a 65,537th
+byte even if the file grew after its size check, and bound retries to one second
+(this does not preempt a filesystem syscall).
 Do not replace the bundled fixture labels with private measurements.
 
 ```sh
@@ -229,14 +232,22 @@ IDs, foreign sessions and exhausted bounds fail the generation visibly.
 
 One process generation owns one session/occurrence/lease. A successful leave
 requires a readable tree positively lacking any matching meeting window;
-duplicates and unreadable trees never prove absence. Release is terminal for
-new commands; exact cached replays remain answerable until the controller closes
+duplicates and unreadable trees never prove absence. Possible containers
+(`AXWindow`, `AXSheet`, `AXDialog`, and pre-leave matched container roles,
+including ambiguous matches) must expose readable nonempty identifiers;
+when meeting-window title fallbacks are configured, their titles must also be
+readable. Missing/malformed locator attributes leave departure unconfirmed.
+Unrelated leaf attributes and unused title/value channels are not requirements.
+Release is terminal for new commands; exact cached replays remain answerable until the controller closes
 stdin. No unrelated session can reuse that process. EOF/SIGTERM/SIGINT
 reap the input worker, stop polling and attempt one bounded **recorded** leave
 if joining may have occurred. Cleanup has two at-most 1-second transition waits,
 plus bounded native reads/call timeouts; stdout stalls fail after 1 second.
 Normal AX reads cap at 2 seconds plus the last bounded native attribute batch;
 each native call is capped by `axCallTimeoutMs` (10–250ms).
+If the input worker cannot be reaped within one second, no new UI cleanup may
+overlap it: the owner/evidence close, the original failure is retained, and the
+operator-cleanup-required diagnostic reports departure as unconfirmed.
 
 Evidence uses create-new 0600 files under 0700 roots, fsyncs each token-free command
 and event before output, and retains no in-memory record list. A sink failure

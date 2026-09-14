@@ -4,15 +4,19 @@ import ApplicationServices
 
 public struct NativeAXAttributes: Equatable {
     public let role: String
-    public let identifier: String?
-    public let title: String?
+    public var identifier: String? { identifierRead.text }
+    public var title: String? { titleRead.text }
+    public let identifierRead: AXStringRead, titleRead: AXStringRead
     public let value: String?
     public let enabled: Bool
     public let canPress: Bool
     public let canSetValue: Bool
     public init(role: String, identifier: String? = nil, title: String? = nil, value: String? = nil,
-                enabled: Bool = false, canPress: Bool = false, canSetValue: Bool = false) {
-        self.role = role; self.identifier = identifier; self.title = title; self.value = value
+                enabled: Bool = false, canPress: Bool = false, canSetValue: Bool = false,
+                identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil) {
+        self.role = role; self.value = value
+        self.identifierRead = identifierRead ?? AXStringRead(rawValue: identifier)
+        self.titleRead = titleRead ?? AXStringRead(rawValue: title)
         self.enabled = enabled; self.canPress = canPress; self.canSetValue = canSetValue
     }
 }
@@ -78,7 +82,8 @@ public final class AXAccessibilityDriver: AccessibilityDriver {
         let key = UUID().uuidString
         handles[key] = (handle, fields)
         return AccessibilityNode(role: fields.role, identifier: fields.identifier, title: fields.title,
-                                 value: fields.value, isEnabled: fields.enabled, children: nodes, nativeKey: key)
+                                 value: fields.value, isEnabled: fields.enabled, children: nodes, nativeKey: key,
+                                 identifierRead: fields.identifierRead, titleRead: fields.titleRead)
     }
 
     private func actionable(_ node: AccessibilityNode) -> (String, NativeAXAttributes)? {
@@ -145,9 +150,11 @@ public final class SystemAXBackend: AXNativeBackend {
         let canPress = AXUIElementCopyActionNames(element, &actions) == .success && (actions as? [String])?.contains(kAXPressAction) == true
         var settable = DarwinBoolean(false)
         let canSet = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success && settable.boolValue
-        let result = NativeAXAttributes(role: role, identifier: read(element, kAXIdentifierAttribute) as? String,
-                                  title: read(element, kAXTitleAttribute) as? String, value: read(element, kAXValueAttribute) as? String,
-                                  enabled: (read(element, kAXEnabledAttribute) as? Bool) == true, canPress: canPress, canSetValue: canSet)
+        let identifier = AXStringRead(rawValue: read(element, kAXIdentifierAttribute))
+        let title = AXStringRead(rawValue: read(element, kAXTitleAttribute))
+        let result = NativeAXAttributes(role: role, value: read(element, kAXValueAttribute) as? String,
+                                  enabled: (read(element, kAXEnabledAttribute) as? Bool) == true, canPress: canPress, canSetValue: canSet,
+                                  identifierRead: identifier, titleRead: title)
         return attributeReadFailed ? nil : result
     }
     public func children(_ handle: String, limit: Int) -> [String]? {

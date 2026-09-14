@@ -139,12 +139,12 @@ public final class BridgeProcess {
         catch { stopped = true; throw BridgeProcessError.outputUnavailable }
     }
 
-    public func shutdown() throws {
+    public func shutdown(allowUIActions: Bool = true) throws {
         guard !shutdownCompleted else { return }
         shutdownCompleted = true
         stopped = true
         var failure: Error?
-        if let owner, !departureConfirmed, joined || adapter.departureUnconfirmed {
+        if allowUIActions, let owner, !departureConfirmed, joined || adapter.departureUnconfirmed {
             let command = BridgeCommandMessage(sessionId: owner.session, commandId: "shutdown-" + UUID().uuidString, command: .leave(reason: .coordinatorStop))
             do {
                 guard recorder?.record(command: command) == true else { throw BridgeProcessError.evidenceUnavailable }

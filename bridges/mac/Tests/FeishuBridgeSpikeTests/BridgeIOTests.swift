@@ -3,6 +3,28 @@ import Darwin
 @testable import FeishuBridgeSpike
 
 final class BridgeIOTests: XCTestCase {
+    func testReapTimeoutClosesEvidenceReportsUnconfirmedAndNeverOverlapsUI() throws {
+        for malformedInput in [false, true] {
+            let cancellation = BridgeCancellation()
+            let driver = FakeAccessibilityDriver(snapshots: [FakeTree.idleWithJoinSurface(), FakeTree.inMeeting()])
+            let sink = MemoryEvidenceSink()
+            let process = BridgeProcess(driver: driver, labels: .bundled, clock: SystemBridgeClock(), sink: sink, output: { _ in })
+            let join = BridgeCommandMessage(sessionId: "s", commandId: "join", command: .join(meetingOccurrenceId: "900000001@2026-09-02T14:00:00Z", meetingNo: "900000001", leaseId: "l"))
+            try process.accept(join)
+            let input = UnreapedInput(cancellation: cancellation, malformedInput: malformedInput)
+            var cleanupReports = 0
+            XCTAssertThrowsError(try runBridgeControl(process: process, input: input, cancellation: cancellation,
+                clock: SystemBridgeClock(), observationInterval: 10, cleanupFailed: { cleanupReports += 1 })) {
+                XCTAssertEqual($0 as? BridgeProcessError, malformedInput ? .invalidInput : .closed)
+            }
+            XCTAssertTrue(sink.closed)
+            XCTAssertEqual(cleanupReports, 1)
+            XCTAssertTrue(cancellation.isCancelled)
+            XCTAssertEqual(driver.pressed.count, 1, "unreaped worker must not overlap a leave action")
+            XCTAssertThrowsError(try process.accept(join), "failed reaping must permanently close the owner")
+        }
+    }
+
     func testEOFStillCancelsWhenBoundedInputQueueIsFull() throws {
         var fds: [Int32] = [0, 0]; XCTAssertEqual(pipe(&fds), 0)
         defer { Darwin.close(fds[0]) }
@@ -87,4 +109,15 @@ final class BridgeIOTests: XCTestCase {
         cancellation.cancel()
         XCTAssertThrowsError(try writer.write(Data([10])))
     }
+}
+
+private final class UnreapedInput: BridgeInputSource {
+    let cancellation: BridgeCancellation
+    let malformedInput: Bool
+    init(cancellation: BridgeCancellation, malformedInput: Bool) { self.cancellation = cancellation; self.malformedInput = malformedInput }
+    var reachedEOF: Bool { false }
+    var failed: Bool { false }
+    func start() { if !malformedInput { cancellation.cancel() } }
+    func next(wait: TimeInterval) -> Data? { Data("{\n".utf8) }
+    func finish(timeout: TimeInterval) -> Bool { cancellation.cancel(); return false }
 }

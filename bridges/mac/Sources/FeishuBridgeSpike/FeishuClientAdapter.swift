@@ -124,6 +124,10 @@ public final class FeishuClientAdapter {
         guard !final.hasPossibleMatch(labels.identifiers.meetingWindow, labels) else {
             return .failed(reason: "still_in_meeting")
         }
+        guard final.hasCompleteDepartureLocators(labels.identifiers.meetingWindow, labels,
+                matchedRoles: tree.possibleMatches(labels.identifiers.meetingWindow, labels).map(\.role)) else {
+            return .failed(reason: "client_not_observable")
+        }
         departureUnconfirmed = false
         return .left
     }

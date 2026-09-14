@@ -8,18 +8,6 @@ func diagnostic(_ code: String) {
     _ = (code + "\n").utf8CString.withUnsafeBytes { Darwin.write(STDERR_FILENO, $0.baseAddress, $0.count - 1) }
 }
 
-func readConfiguration(_ path: String, inspection: Bool) throws -> BridgeProcessConfiguration {
-    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-    guard fd >= 0 else { throw BridgeProcessError.invalidInput }
-    defer { close(fd) }
-    var info = stat()
-    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= 65_536 else { throw BridgeProcessError.invalidInput }
-    var bytes = [UInt8](repeating: 0, count: 65_537)
-    let count = read(fd, &bytes, bytes.count)
-    guard count >= 0, count <= 65_536 else { throw BridgeProcessError.invalidInput }
-    return try BridgeProcessConfiguration.decode(Data(bytes.prefix(count)), inspection: inspection)
-}
-
 func inspect(_ node: AccessibilityNode) -> [String: Any] {
     var value: [String: Any] = ["role": node.role, "enabled": node.isEnabled, "children": node.children.map(inspect)]
     if let identifier = node.identifier { value["identifier"] = identifier }
@@ -68,7 +56,7 @@ do {
     case .help:
         print("FeishuBridgeSpike --config /absolute/private/config.json [--inspect-ax]\nControl-only bridge; measured build/locale selectors required. Media unavailable.\nInspection is explicit, read-only, and saved only in the private evidence root.")
     case .run(let path, let inspection):
-        try run(readConfiguration(path, inspection: inspection), inspection: inspection)
+        try run(BridgeProcessConfiguration.read(path: path, inspection: inspection), inspection: inspection)
     }
 } catch {
     diagnostic((error as? BridgeProcessError)?.rawValue ?? "bridge_failed")

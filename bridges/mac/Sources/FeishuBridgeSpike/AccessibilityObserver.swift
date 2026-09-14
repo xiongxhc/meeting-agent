@@ -1,5 +1,16 @@
 import Foundation
 
+/// A missing or malformed identifying attribute cannot exclude a locator match.
+public enum AXStringRead: Equatable, Sendable {
+    case value(String), absent, malformed
+    public init(rawValue: Any?) {
+        guard let rawValue else { self = .absent; return }
+        if let text = rawValue as? String { self = .value(text) } else { self = .malformed }
+    }
+    public var text: String? { if case .value(let text) = self { text } else { nil } }
+    var identifies: Bool { text?.isEmpty == false }
+}
+
 /// One accessibility element as read off the Feishu client, flattened to the few
 /// attributes the bridge actually needs. A real implementation fills this from
 /// `AXUIElement` copy-attribute calls; the tests fill it from synthetic trees.
@@ -11,9 +22,11 @@ public struct AccessibilityNode: Equatable, Sendable {
     /// `AXRole`, e.g. `AXWindow`, `AXButton`, `AXRow`.
     public let role: String
     /// `AXIdentifier` — the stable locator, unaffected by display language.
-    public let identifier: String?
+    public var identifier: String? { identifierRead.text }
+    public let identifierRead: AXStringRead
     /// `AXTitle` — display text, localized, used only as a fallback locator.
-    public let title: String?
+    public var title: String? { titleRead.text }
+    public let titleRead: AXStringRead
     public let value: String?
     public let isEnabled: Bool
     /// Whether the element carries the client's active-speaking highlight.
@@ -27,11 +40,12 @@ public struct AccessibilityNode: Equatable, Sendable {
         value: String? = nil,
         isEnabled: Bool = true,
         isHighlighted: Bool = false,
-        children: [AccessibilityNode] = [], nativeKey: String? = nil
+        children: [AccessibilityNode] = [], nativeKey: String? = nil,
+        identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil
     ) {
         self.role = role
-        self.identifier = identifier
-        self.title = title
+        self.identifierRead = identifierRead ?? AXStringRead(rawValue: identifier)
+        self.titleRead = titleRead ?? AXStringRead(rawValue: title)
         self.value = value
         self.isEnabled = isEnabled
         self.isHighlighted = isHighlighted
@@ -41,7 +55,7 @@ public struct AccessibilityNode: Equatable, Sendable {
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
         // Polling compares UI content, not freshly minted snapshot capabilities.
-        lhs.role == rhs.role && lhs.identifier == rhs.identifier && lhs.title == rhs.title
+        lhs.role == rhs.role && lhs.identifierRead == rhs.identifierRead && lhs.titleRead == rhs.titleRead
             && lhs.value == rhs.value && lhs.isEnabled == rhs.isEnabled
             && lhs.isHighlighted == rhs.isHighlighted && lhs.children == rhs.children
     }
@@ -187,10 +201,20 @@ public final class AccessibilityObserver {
 }
 
 extension AccessibilityNode {
+    func hasCompleteDepartureLocators(_ identifier: String, _ labels: FeishuUiLabels, matchedRoles: [String]) -> Bool {
+        let roles = Set(["AXWindow", "AXSheet", "AXDialog"] + matchedRoles)
+        let usesTitle = !labels.titles(for: identifier).isEmpty
+        return descendants { roles.contains($0.role) }.allSatisfy {
+            $0.identifierRead.identifies && (!usesTitle || $0.titleRead.identifies)
+        }
+    }
     func hasPossibleMatch(_ identifier: String, _ labels: FeishuUiLabels) -> Bool {
-        guard !identifier.isEmpty else { return false }
+        !possibleMatches(identifier, labels).isEmpty
+    }
+    func possibleMatches(_ identifier: String, _ labels: FeishuUiLabels) -> [AccessibilityNode] {
+        guard !identifier.isEmpty else { return [] }
         let titles = labels.titles(for: identifier)
-        return !descendants { $0.identifier == identifier || ($0.title.map { titles.contains($0) } ?? false) }.isEmpty
+        return descendants { $0.identifier == identifier || ($0.title.map { titles.contains($0) } ?? false) }
     }
     /// Locates a control by its stable accessibility identifier, falling back to
     /// the localized titles that identifier is known by. Every string used here
