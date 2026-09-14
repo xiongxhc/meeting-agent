@@ -1,7 +1,7 @@
 import Foundation
 
-/// The bridge's only source of "now". Nothing in this package calls `Date()`
-/// inline, so recorded evidence is reproducible byte for byte in tests.
+/// The bridge's source of observation/recording "now". Production injects the
+/// system wall clock; tests inject deterministic instants without reading it.
 public protocol BridgeClock {
     /// Current instant as a Z-suffixed UTC timestamp.
     func now() -> String
@@ -139,10 +139,15 @@ public final class BridgeRecorder {
     private let clock: any BridgeClock
     private var lastSequence = 0
     private var issuedCommandIds: Set<String> = []
+    private let sink: (any BridgeEvidenceSink)?
+    private let retainRecords: Bool
 
-    public init(sessionId: String, clock: any BridgeClock) {
+    public init(sessionId: String, clock: any BridgeClock,
+                sink: (any BridgeEvidenceSink)? = nil, retainRecords: Bool = true) {
         self.sessionId = sessionId
         self.clock = clock
+        self.sink = sink
+        self.retainRecords = retainRecords
     }
 
     /// - Returns: whether the message was recorded. A rejected message never
@@ -153,7 +158,7 @@ public final class BridgeRecorder {
             BridgeCommandMessage.contractViolation(
                 sessionId: command.sessionId, commandId: command.commandId, command: command.command) == nil
         else { return false }
-        records.append(.command(recordedAt: clock.now(), message: EvidenceCommandMessage(command)))
+        guard append(.command(recordedAt: clock.now(), message: EvidenceCommandMessage(command))) else { return false }
         issuedCommandIds.insert(command.commandId)
         return true
     }
@@ -170,9 +175,30 @@ public final class BridgeRecorder {
         {
             return false
         }
+        guard append(.event(recordedAt: clock.now(), message: event)) else { return false }
         lastSequence = event.sequence
-        records.append(.event(recordedAt: clock.now(), message: event))
         return true
+    }
+
+    private func append(_ record: BridgeRecord) -> Bool {
+        do {
+            if let sink { try sink.append(Self.line(record)) }
+            if retainRecords { records.append(record) }
+            return true
+        } catch { return false }
+    }
+
+    private static func line(_ record: BridgeRecord) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data: Data
+        switch record {
+        case .command(let at, let message):
+            data = try encoder.encode(RecordLine(recordedAt: at, direction: "command", message: message))
+        case .event(let at, let message):
+            data = try encoder.encode(RecordLine(recordedAt: at, direction: "event", message: message))
+        }
+        return data + Data([10])
     }
 
     /// One JSON object per line, trailing newline; "" when nothing was recorded.

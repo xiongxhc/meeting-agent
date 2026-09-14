@@ -23,7 +23,7 @@ import Foundation
 public struct FeishuUiLabels: Sendable, Equatable {
 
     /// Stable accessibility identifiers, preferred over any localized title.
-    public struct Identifiers: Sendable, Equatable {
+    public struct Identifiers: Sendable, Equatable, Codable {
         public let appWindow: String
         public let joinMeetingNumberField: String
         public let joinButton: String

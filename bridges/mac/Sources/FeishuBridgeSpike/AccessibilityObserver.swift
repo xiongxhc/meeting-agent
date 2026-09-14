@@ -6,6 +6,8 @@ import Foundation
 /// Keeping the tree a plain value is what lets every observation rule be tested
 /// without a running client, a tenant, or an Accessibility grant.
 public struct AccessibilityNode: Equatable, Sendable {
+    /// Internal native snapshot capability; never serialized onto control wire.
+    public let nativeKey: String?
     /// `AXRole`, e.g. `AXWindow`, `AXButton`, `AXRow`.
     public let role: String
     /// `AXIdentifier` — the stable locator, unaffected by display language.
@@ -25,7 +27,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         value: String? = nil,
         isEnabled: Bool = true,
         isHighlighted: Bool = false,
-        children: [AccessibilityNode] = []
+        children: [AccessibilityNode] = [], nativeKey: String? = nil
     ) {
         self.role = role
         self.identifier = identifier
@@ -34,6 +36,14 @@ public struct AccessibilityNode: Equatable, Sendable {
         self.isEnabled = isEnabled
         self.isHighlighted = isHighlighted
         self.children = children
+        self.nativeKey = nativeKey
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        // Polling compares UI content, not freshly minted snapshot capabilities.
+        lhs.role == rhs.role && lhs.identifier == rhs.identifier && lhs.title == rhs.title
+            && lhs.value == rhs.value && lhs.isEnabled == rhs.isEnabled
+            && lhs.isHighlighted == rhs.isHighlighted && lhs.children == rhs.children
     }
 
     /// Depth-first, tree order — the order the client lays the UI out in.
@@ -177,19 +187,25 @@ public final class AccessibilityObserver {
 }
 
 extension AccessibilityNode {
+    func hasPossibleMatch(_ identifier: String, _ labels: FeishuUiLabels) -> Bool {
+        guard !identifier.isEmpty else { return false }
+        let titles = labels.titles(for: identifier)
+        return !descendants { $0.identifier == identifier || ($0.title.map { titles.contains($0) } ?? false) }.isEmpty
+    }
     /// Locates a control by its stable accessibility identifier, falling back to
     /// the localized titles that identifier is known by. Every string used here
     /// comes from `LocalizedLabels.swift`; no other file compares UI text.
     func locate(_ identifier: String, _ labels: FeishuUiLabels) -> AccessibilityNode? {
-        if let byIdentifier = firstDescendant(where: { $0.identifier == identifier }) {
-            return byIdentifier
-        }
+        guard !identifier.isEmpty else { return nil }
+        let identified = descendants(where: { $0.identifier == identifier })
+        if !identified.isEmpty { return identified.count == 1 ? identified[0] : nil }
         let titles = labels.titles(for: identifier)
         guard !titles.isEmpty else { return nil }
-        return firstDescendant { node in
+        let matched = descendants { node in
             guard let title = node.title else { return false }
             return titles.contains(title)
         }
+        return matched.count == 1 ? matched[0] : nil
     }
 }
 

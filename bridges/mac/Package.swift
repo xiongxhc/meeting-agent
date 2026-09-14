@@ -9,10 +9,12 @@ let package = Package(
     name: "FeishuBridgeSpike",
     platforms: [.macOS(.v13)],
     products: [
-        .library(name: "FeishuBridgeSpike", targets: ["FeishuBridgeSpike"])
+        .library(name: "FeishuBridgeLibrary", targets: ["FeishuBridgeSpike"]),
+        .executable(name: "FeishuBridgeSpike", targets: ["FeishuBridgeExecutable"])
     ],
     targets: [
         .target(name: "FeishuBridgeSpike"),
+        .executableTarget(name: "FeishuBridgeExecutable", dependencies: ["FeishuBridgeSpike"]),
         .testTarget(
             name: "FeishuBridgeSpikeTests",
             dependencies: ["FeishuBridgeSpike"]

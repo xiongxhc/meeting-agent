@@ -51,6 +51,7 @@ public final class FeishuClientAdapter {
     private let joinDeadline: TimeInterval
     private let actionDeadline: TimeInterval
     private var disclosureAttempted = false
+    public private(set) var departureUnconfirmed = false
 
     /// - Parameters:
     ///   - joinDeadline: how long to let the client take to show the meeting
@@ -82,7 +83,9 @@ public final class FeishuClientAdapter {
         guard driver.setValue(meetingNo, on: field) else {
             return .failed(reason: "meeting_number_not_accepted")
         }
-        guard button.isEnabled, driver.press(button) else {
+        guard button.isEnabled else { return .failed(reason: "join_control_not_actionable") }
+        departureUnconfirmed = true // A native action timeout may still have joined.
+        guard driver.press(button) else {
             return .failed(reason: "join_control_not_actionable")
         }
 
@@ -109,16 +112,19 @@ public final class FeishuClientAdapter {
         }
         guard driver.press(leaveButton) else { return .failed(reason: "leave_control_not_actionable") }
 
-        let after = driver.snapshot(waitingUpTo: actionDeadline)
-        if let confirm = after?.locate(labels.identifiers.leaveConfirmButton, labels) {
+        guard let after = driver.snapshot(waitingUpTo: actionDeadline) else {
+            return .failed(reason: "client_not_observable")
+        }
+        if let confirm = after.locate(labels.identifiers.leaveConfirmButton, labels) {
             guard driver.press(confirm) else { return .failed(reason: "leave_control_not_actionable") }
         }
-        guard
-            driver.snapshot(waitingUpTo: actionDeadline)?
-                .locate(labels.identifiers.meetingWindow, labels) == nil
-        else {
+        guard let final = driver.snapshot(waitingUpTo: actionDeadline) else {
+            return .failed(reason: "client_not_observable")
+        }
+        guard !final.hasPossibleMatch(labels.identifiers.meetingWindow, labels) else {
             return .failed(reason: "still_in_meeting")
         }
+        departureUnconfirmed = false
         return .left
     }
 

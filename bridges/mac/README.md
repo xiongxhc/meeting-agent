@@ -22,6 +22,13 @@ Sources/FeishuBridgeSpike/
   LoopbackMediaClient.swift   in-process stand-in for the Rust media endpoint
   BridgeRecorder.swift        JSONL evidence, injected clock
   LocalizedLabels.swift       the ONLY file holding UI strings
+  BridgeProcess.swift         one control owner, replay, sequence, cleanup
+  BridgeProcessIO.swift       bounded stdio pump and serialized run loop
+  AXAccessibilityDriver.swift public AX backend and snapshot-scoped actions
+  BridgeProcessConfiguration.swift strict private operator configuration
+  FileEvidenceSink.swift      create-new incremental private persistence
+  SystemBridgeClock.swift     system observation clock and monotonic deadlines
+Sources/FeishuBridgeExecutable/main.swift   executable composition/CLI
 Tests/FeishuBridgeSpikeTests/
   BridgeContractTests.swift        round-trips the frozen fixture from disk
   AccessibilityObserverTests.swift observation + ambiguity rules
@@ -130,19 +137,127 @@ human-gated step in `docs/HUMAN-CHECKLIST.md`, section Plan 1 Task 3, and must
 happen before `docs/feasibility/feishu-client-matrix.md` can hold a single
 measurement.
 
-## What is missing before this can drive a real client
+## Runnable control bridge (Task 11a)
 
-The package declares a library and a test target, no executable, and ships
-`AccessibilityDriver`, `UiIdentityResolver`, `MediaEndpointClient`,
-`AudioDevicePort` and `MediaClock` as protocols with only fakes behind them. A
-real run needs an `AXUIElement`-backed driver honouring the timing contract
-above, a real identity resolver — *if* the client exposes anything resolvable to
-a Feishu user id, which is itself an open feasibility question — a media client
-that dials the Rust runtime endpoint, a device port over the real capture and
-render units, a monotonic clock that is not the wall clock, and an entry point
-wiring adapter, observer, reducer, audio bridge and recorder together. No task
-in the current plan owns any of them; see `docs/HUMAN-CHECKLIST.md` sections 3.0
-and 4.0.
+`FeishuBridgeSpike` is now an executable; the importable module keeps that name
+and its library product is `FeishuBridgeLibrary`. It composes the existing
+adapter/observer/reducer/recorder with a public AX backend and serialized JSONL
+stdio. `connect_media` deliberately returns `media_adapter_unavailable`; no
+loopback client, capture device, renderer or provider is wired into production.
+The real Feishu matrix and language decision remain **unconfirmed**.
+
+Safe local checks, requiring no app access:
+
+```sh
+swift test --package-path bridges/mac
+swift build --package-path bridges/mac --product FeishuBridgeSpike
+bridges/mac/.build/debug/FeishuBridgeSpike --help
+PATH="/opt/homebrew/opt/node@24/bin:$PATH" node --test spikes/feishu/test/protocol.test.ts
+```
+
+### Private operator configuration and inspection (human-gated)
+
+Do not run live modes until the operator grants Accessibility and selects a
+throwaway meeting. The bridge checks trust without prompting, never launches
+or activates an app, and binds an explicit PID plus bundle path/ID/build and
+process launch time. A PID/build/locale change requires a refreshed config.
+No app display name implies Feishu versus Lark API region.
+
+Create a private directory **outside every repository**, using its canonical
+absolute path (for example `/Users/OPERATOR/meeting-agent-evidence`), mode 0700.
+Save a mode 0600 JSON config there using a local editor. The evidence directory
+and every parent must be real directories, not symlinks; `/tmp` and `/var` are
+symlinks on macOS (use `/private/tmp` for disposable tests). The root can be
+created by the bridge only when its parent already exists.
+
+Inspection config shape (replace PID/path/metadata with the selected process):
+
+```json
+{
+  "schema": "feishu-bridge-config/v1",
+  "pid": 12345,
+  "bundlePath": "/Applications/Lark.app",
+  "bundleIdentifier": "com.electron.lark",
+  "bundleVersion": "7499.203",
+  "locale": "en-US",
+  "evidenceRoot": "/Users/OPERATOR/meeting-agent-evidence",
+  "observationIntervalMs": 200,
+  "joinDeadlineMs": 60000,
+  "actionDeadlineMs": 5000,
+  "axCallTimeoutMs": 50
+}
+```
+
+The path/ID/build above are literal controller bundle inventory, not measured
+selectors or a marketing-version claim; verify them for each run. Obtain the
+exact PID from Activity Monitor, not the first similarly named process.
+
+```sh
+bridges/mac/.build/debug/FeishuBridgeSpike --config /Users/OPERATOR/meeting-agent-evidence/config.json --inspect-ax
+```
+
+Inspection writes a create-new private `inspection-*.jsonl`, never stdout. It
+contains raw UI text and must not be committed/shared; this explicit mode alone
+allows that content. Capture bounded snapshots in idle/in-meeting/ended/chat
+states and each supported locale. It neither presses controls nor resolves
+people. A tree exceeding128nodes/depth16/1024bytes per string is unavailable;
+normal control allows512nodes/4096bytes. No selected/focused attribute becomes
+an active-speaker highlight. Production identity remains unknown.
+
+For control mode, add `selectors` with exactly `build`, `locale`, `measured:true`,
+`identifiers`, `titles`. Build/locale must equal the outer config. `identifiers`
+has exactly the fifteen field names in `LocalizedLabels.swift`; use measured
+AX identifiers (or unique logical keys for explicitly measured title fallbacks).
+`titles` maps those keys to at most four measured titles each. Unavailable optional
+controls use empty identifiers; join field/button, meeting window/number and
+leave button are mandatory. Nonempty identifiers are unique, at most512UTF8bytes;
+bundled placeholder values are refused. Unknown keys, credentials, mismatched
+metadata, malformed types and config over 64 KiB are refused before AX access.
+Do not replace the bundled fixture labels with private measurements.
+
+```sh
+bridges/mac/.build/debug/FeishuBridgeSpike --config /Users/OPERATOR/meeting-agent-evidence/config.json
+```
+
+Control stdin/stdout use only frozen `bridge-session/v1` JSONL. Keep stdin open
+until command results; EOF cancels waits and discards unissued commands (while
+validating buffered framing). There is no interactive prompt or speech fallback.
+Only static diagnostic codes use stderr. Input lines cap at 64 KiB; input queue
+caps at 16 × 4 KiB; replay state caps at 256 command IDs without eviction. Identical
+replay emits a new sequenced result without repeating a UI action. Conflicting
+IDs, foreign sessions and exhausted bounds fail the generation visibly.
+
+One process generation owns one session/occurrence/lease. A successful leave
+requires a readable tree positively lacking any matching meeting window;
+duplicates and unreadable trees never prove absence. Release is terminal for
+new commands; exact cached replays remain answerable until the controller closes
+stdin. No unrelated session can reuse that process. EOF/SIGTERM/SIGINT
+reap the input worker, stop polling and attempt one bounded **recorded** leave
+if joining may have occurred. Cleanup has two at-most 1-second transition waits,
+plus bounded native reads/call timeouts; stdout stalls fail after 1 second.
+Normal AX reads cap at 2 seconds plus the last bounded native attribute batch;
+each native call is capped by `axCallTimeoutMs` (10–250ms).
+
+Evidence uses create-new 0600 files under 0700 roots, fsyncs each token-free command
+and event before output, and retains no in-memory record list. A sink failure
+blocks a new unrecorded UI action. `operator_cleanup_required_departure_unconfirmed`
+means the operator must inspect/leave the client; process exit is not proof of
+departure. Abrupt kill/power loss cannot guarantee cleanup; a partial last JSONL
+record is not a completed record. Stdout failure also cannot establish delivery.
+Internal cleanup commands/results exist only in evidence: the peer must never
+receive a result for a command it did not issue. After an existing terminal
+`left(bridge_failure)`, later physical-departure evidence stays private too;
+the control stream never emits a second `left` or resumes observation activity.
+
+The application process factory must close/cancel and await this generation,
+then forbid reuse of the physical client until departure is confirmed or the
+operator resolves it. Current TypeScript `meeting-session.ts` releases its
+durable lease on `bridge_failure`; that is not physical-client cleanup. Its
+application-level shutdown/recovery integration is a subsequent scope. Never
+silently recycle a still-joined desktop client just because a new lease exists.
+
+Real capture/render, authenticated Runtime media and a measured identity/highlight
+mapping remain separate work; see `docs/HUMAN-CHECKLIST.md` sections 3.0 and 4.0.
 
 ## Permissions
 
@@ -154,10 +269,10 @@ testable core.
 
 Driving a real client will need the macOS **Accessibility** permission (to read
 element state and perform actions) and, once a real `AudioDevicePort` exists,
-the **Microphone** permission. Nothing in this package has ever requested
-Microphone. Screen Recording is only needed if an observation turns out to be
-OCR-based rather than accessibility-based; nothing in this package needs it
-today.
+the appropriate audio permissions. ScreenCaptureKit audio capture additionally
+requires **Screen Recording** permission; Accessibility alone does not grant
+audio capture. Nothing in this control-only executable requests those grants
+or changes audio routes. OCR is not implemented or authorized here.
 
 ## Dependencies
 

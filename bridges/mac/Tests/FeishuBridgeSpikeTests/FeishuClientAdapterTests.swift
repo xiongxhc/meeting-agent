@@ -18,6 +18,12 @@ final class FeishuClientAdapterTests: XCTestCase {
 
     // MARK: - join
 
+    func testAmbiguousMeetingWindowsAreNotPositiveAbsenceAfterLeave() {
+        let duplicate = AccessibilityNode(role: "AXApplication", children: [FakeTree.inMeeting(), FakeTree.inMeeting()])
+        let (adapter, _) = self.adapter([FakeTree.inMeeting(), duplicate, duplicate])
+        XCTAssertEqual(adapter.leave(), .failed(reason: "still_in_meeting"))
+    }
+
     func testJoinsByMeetingNumberAndConfirmsTheMeetingItLandedIn() {
         let (adapter, driver) = self.adapter([
             FakeTree.idleWithJoinSurface(),
@@ -80,6 +86,20 @@ final class FeishuClientAdapterTests: XCTestCase {
     }
 
     // MARK: - leave
+
+    func testUnreadablePostActionTreeIsNotProofOfLeaving() {
+        let (adapter, _) = self.adapter([FakeTree.inMeeting(), nil])
+        XCTAssertEqual(adapter.leave(), .failed(reason: "client_not_observable"))
+    }
+
+    func testDuplicateJoinControlsCannotChooseAnArbitraryFirstMatch() {
+        let idle = FakeTree.idleWithJoinSurface()
+        let duplicate = AccessibilityNode(role: "AXWindow", children: idle.children + idle.children)
+        let (adapter, driver) = self.adapter([duplicate, FakeTree.inMeeting()])
+        XCTAssertEqual(adapter.join(meetingOccurrenceId: occurrence, meetingNo: "900000001"),
+                       .failed(reason: "join_controls_not_reachable"))
+        XCTAssertTrue(driver.pressed.isEmpty)
+    }
 
     func testLeavesAndConfirmsTheMeetingWindowIsGone() {
         let (adapter, driver) = self.adapter([

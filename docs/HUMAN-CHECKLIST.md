@@ -98,39 +98,36 @@ measurement. They are below.
 > without a wrong meeting, wrong participant, duplicate disclosure, or guessed
 > speaker.
 
-### 3.0 Prerequisites — bullets 4-6 cannot start until all three are done
+### 3.0 Prerequisites — control implementation exists; measurements remain gated
 
-The Mac package as committed cannot drive a real client. Three things are
-missing, and **no task in this plan creates them**: Task 4 adds audio, Task 5
-scores the language choice, Task 6 is the Linux probe, Task 7 publishes the
-verdict. They are unowned work that has to be scheduled before 3.1 can be
-attempted.
+Task 11a adds the runnable control-only `FeishuBridgeSpike`, public AX driver,
+system clock and incremental private evidence sink. Synthetic tests/builds do
+not establish Feishu feasibility. Follow the exact private-config/inspection
+commands in `bridges/mac/README.md`; no real measurements have been performed.
 
 1. **Real labels.** Every identifier and localized title in
    `bridges/mac/Sources/FeishuBridgeSpike/LocalizedLabels.swift` is a
    placeholder; none was captured from a real client. See 3.0a below.
-2. **An `AXUIElement`-backed `AccessibilityDriver`.** The package ships the
-   protocol only, and it carries a timing contract that a real implementation
-   must honour: `snapshot(waitingUpTo:)` must keep re-reading until the tree
-   changes or the deadline elapses, and must not return a stale tree
-   immediately. `FeishuClientAdapter` waits 60s after pressing join (the
-   waiting-room path takes as long as the host takes to admit) and 5s after a
-   within-meeting press; both are constructor parameters. A driver that ignores
-   the deadline will report `meeting_window_not_observed` on nearly every real
-   join.
+2. **Validate the real AX driver against measured controls.** Its public native
+   implementation binds exact PID/bundle/build/launch identity, checks trust
+   without prompting, bounds reads/actions and rejects stale/ambiguous handles.
+   It honors `snapshot(waitingUpTo:)`; delayed joins and waiting-room paths
+   still require the human matrix. Permission, build and locale are operator
+   prerequisites, not guessed from an app label.
 3. **A real `UiIdentityResolver`, and the finding of whether one is even
-   possible.** The package ships the protocol only; the sole implementation is
-   a fake in the test target. See 3.0b — this is a feasibility question, not
-   just an implementation gap.
-4. **A runnable entry point.** `bridges/mac/Package.swift` declares a library
-   and a test target, no executable, so there is nothing to launch. Whoever
-   builds items 2 and 3 must also add the executable target that wires an
-   adapter, an observer, a reducer, and a `BridgeRecorder` together and writes
-   the JSONL evidence file that 3.1 and 3.2 ask for. **Name that executable
-   `FeishuBridgeSpike`.** Sections 5.1 criteria 3 and 6 match the running
-   process with `pkill -f FeishuBridgeSpike` and `pgrep -f FeishuBridgeSpike`;
-   under any other name those commands match nothing and the two criteria
-   cannot be measured as written.
+   possible.** Production deliberately returns unknown. See 3.0b; do not map
+   names/order to user IDs or generic focus/selection to speaker highlights.
+4. **Build and configure the executable.** `swift build --package-path
+   bridges/mac --product FeishuBridgeSpike` creates
+   `bridges/mac/.build/debug/FeishuBridgeSpike`; `--help` is safe without AX.
+   Production refuses bundled placeholders and requires private measured
+   selector configuration. Normal evidence contains no runtime session token
+   or raw AX dump; `--inspect-ax` writes sensitive UI evidence privately only.
+   `connect_media` is explicitly unavailable until the next media scope.
+   One process owns one generation: process exit, unreadability and
+   `left(reason: "bridge_failure")` are not confirmed physical departure.
+   The application factory must await cleanup and block physical-client reuse
+   on an unconfirmed departure, even if TypeScript released a durable lease.
 
 #### 3.0a Capture the real accessibility identifiers
 
@@ -148,8 +145,10 @@ Record, for each control the adapter looks for (`joinMeetingNumberField`,
 `leaveConfirmButton`, `chatToggle`, `chatInput`, `chatSendButton`,
 `participantsPanel`, `participantRowPrefix`, `speakerGrid`,
 `speakerTilePrefix`): its `AXIdentifier`, its `AXRole`, and its `AXTitle` in
-both display languages the tenant uses. Then replace the placeholders in
-`LocalizedLabels.swift` — that one file, no other — and re-run:
+both display languages the tenant uses. Put measurements in the private
+build/locale-bound config described in `bridges/mac/README.md`; leave bundled
+fixture placeholders unchanged. The executable also offers an explicit
+`--inspect-ax` path which never presses controls. Re-run:
 
 ```
 cd bridges/mac && swift test
@@ -300,10 +299,11 @@ anywhere in this repository**, and no row of
 
 ### 4.0 Prerequisites — bullets 4-5 cannot start until all four are done
 
-Everything in section 3.0 still applies (real labels, a real
-`AccessibilityDriver`, a real `UiIdentityResolver`, a runnable entry point):
-without a real join there is no meeting to carry audio. Media adds four more,
-and **no task in this plan creates them**:
+The human validation in section 3.0 still applies: measured labels and identity
+feasibility remain open despite the new real control driver/executable. Without
+a verified real join there is no meeting to carry audio. The control executable
+does not wire media; the separate media implementation must satisfy these four
+prerequisites before this matrix is attempted:
 
 1. **A real `MediaEndpointClient`.** The package ships the protocol and
    `LoopbackMediaClient`, an in-process stand-in that echoes frames back. A real
