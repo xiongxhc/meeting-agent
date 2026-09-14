@@ -3,7 +3,7 @@
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
-import { parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
+import { canonicalArtifactHash, canonicalArtifactJson, parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -41,9 +41,9 @@ export type DeliveryJournal = {
   savePending(row: DeliveryRow): void;
   pending(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
-  /** SQLite provides the atomic publication + notification transaction.
-   * Lightweight unit fakes may omit it and retain the pre-Task-10 path. */
-  acceptPublication?(input: AcceptPublicationInput): void;
+  /** Publication evidence, legal state transition and notification intent
+   * must commit as one operation before cleanup is allowed. */
+  acceptPublication(input: AcceptPublicationInput): void;
 };
 
 export type OutboxWorker = {
@@ -69,6 +69,7 @@ export function createOutboxWorker(options: {
   readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed") => void;
 }): OutboxWorker {
   if (options.reconciliationEvidence === undefined) throw new Error("reconciliation purge dependency is required");
+  if (typeof options.journal.acceptPublication !== "function") throw new Error("atomic publication and notification intent journal capability is required");
   const recordingOwners = new Map<string, string>();
   return {
     enqueue(input): string {
@@ -135,6 +136,13 @@ export function createOutboxWorker(options: {
           }
           const state = options.session.state(current.occurrenceId);
           if (current.publishedAtMs !== null) {
+            if ((state === "published" || state === "notified") && current.publicationUrl !== null && current.vaultCommit !== null) {
+              options.journal.acceptPublication({
+                occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
+                publishedAtMs: current.publishedAtMs, publicationUrl: current.publicationUrl, vaultCommit: current.vaultCommit,
+                notification: notificationFromRecovery(current),
+              });
+            }
             // Startup repair clears missing-source publication markers only
             // after a successful ownership claim. A remaining marker still
             // blocks cleanup of conflicting or malformed recording evidence.
@@ -173,24 +181,11 @@ export function createOutboxWorker(options: {
             vaultCommit: receipt.vault_commit,
             retryReason: null,
           };
-          if (options.journal.acceptPublication !== undefined) {
-            const notification = artifact.organizer === null
-              ? { terminalReason: "organizer_unresolved" as const }
-              : {
-                  recipientId: artifact.organizer.person_id,
-                  title: artifact.title,
-                  messageText: `Meeting notes: ${artifact.title}\n${receipt.markdown_url}`,
-                  requestUuid: notificationRequestUuid({ occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit }),
-                };
-            options.journal.acceptPublication({
-              occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
-              publishedAtMs: now, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit,
-              notification,
-            });
-          } else {
-            if (state === "awaiting_teammem") options.session.publish(current.occurrenceId);
-            options.journal.update(published);
-          }
+          options.journal.acceptPublication({
+            occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
+            publishedAtMs: now, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit,
+            notification: notificationForArtifact(artifact, current, receipt.markdown_url, receipt.vault_commit),
+          });
           if (current.transcriptComplete) {
             deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
           }
@@ -205,6 +200,40 @@ export function createOutboxWorker(options: {
       }
     },
   };
+}
+
+function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["notification"] {
+  if (row.recoveryArtifact === null || row.publicationUrl === null || row.vaultCommit === null) {
+    return { terminalReason: "notification_inputs_unavailable" };
+  }
+  try {
+    const artifact = parseTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
+    if (canonicalArtifactJson(artifact) !== row.recoveryArtifact
+      || canonicalArtifactHash(artifact) !== row.artifactHash
+      || artifact.occurrence_id !== row.occurrenceId
+      || artifact.revision !== row.revision) {
+      return { terminalReason: "notification_inputs_unavailable" };
+    }
+    return notificationForArtifact(artifact, row, row.publicationUrl, row.vaultCommit);
+  } catch {
+    return { terminalReason: "notification_inputs_unavailable" };
+  }
+}
+
+function notificationForArtifact(
+  artifact: TeamMemMeetingArtifact,
+  row: Pick<DeliveryRow, "occurrenceId" | "revision" | "artifactHash">,
+  publicationUrl: string,
+  vaultCommit: string,
+): AcceptPublicationInput["notification"] {
+  return artifact.organizer === null
+    ? { terminalReason: "organizer_unresolved" }
+    : {
+        recipientId: artifact.organizer.person_id,
+        title: artifact.title,
+        messageText: `Meeting notes: ${artifact.title}\n${publicationUrl}`,
+        requestUuid: notificationRequestUuid({ occurrenceId: row.occurrenceId, revision: row.revision, artifactHash: row.artifactHash, publicationUrl, vaultCommit }),
+      };
 }
 
 function deleteOccurrenceEvidence(

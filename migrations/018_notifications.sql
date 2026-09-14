@@ -29,6 +29,8 @@ CREATE TABLE notification_intents (
   CHECK (title IS NULL OR length(CAST(title AS BLOB)) BETWEEN 1 AND 800),
   CHECK (message_text IS NULL OR length(CAST(message_text AS BLOB)) BETWEEN 1 AND 16384),
   CHECK (request_uuid IS NULL OR (length(request_uuid) = 36 AND request_uuid NOT GLOB '*[^0-9a-f-]*' AND request_uuid GLOB '????????-????-????-????-????????????')),
+  CHECK (claim_token IS NULL OR (length(claim_token) = 32 AND claim_token NOT GLOB '*[^0-9a-f]*')),
+  CHECK (provider_message_id IS NULL OR length(CAST(provider_message_id AS BLOB)) BETWEEN 1 AND 1024),
   CHECK (state IN ('pending', 'claimed', 'sent', 'terminal')),
   CHECK (terminal_reason IS NULL OR terminal_reason IN ('organizer_unresolved', 'notification_inputs_unavailable', 'notification_delivery_uncertain', 'notification_retry_exhausted')),
   CHECK (attempt_count >= 0),
@@ -52,8 +54,9 @@ CREATE TABLE notification_intents (
 CREATE INDEX notification_intents_due_idx
   ON notification_intents(state, next_attempt_at_ms, occurrence_id, revision);
 
--- Publications accepted by pre-Task-10 code cannot safely reconstruct an
--- organizer/title after the fact. Preserve that limitation explicitly.
+-- Only publications whose canonical artifact bytes were already erased are
+-- irrecoverable. Retained bytes are validated and upgraded by the outbox
+-- before its cleanup path is allowed to run.
 INSERT INTO notification_intents
   (occurrence_id, revision, artifact_hash, publication_url, vault_commit,
    recipient_id, title, message_text, request_uuid, state, terminal_reason,
@@ -62,4 +65,4 @@ SELECT occurrence_id, revision, artifact_hash, publication_url, vault_commit,
        NULL, NULL, NULL, NULL, 'terminal', 'notification_inputs_unavailable',
        published_at_ms
   FROM delivery_journal
- WHERE published_at_ms IS NOT NULL;
+ WHERE published_at_ms IS NOT NULL AND recovery_artifact IS NULL;

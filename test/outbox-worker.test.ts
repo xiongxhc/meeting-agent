@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -12,11 +12,14 @@ import { deleteDeliveredEvidence, writeMeetingBundle } from "../src/adapters/fil
 import { readPublicationReceipt } from "../src/adapters/receipt-inbox.ts";
 import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurrence-id.ts";
 import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../src/delivery/outbox-worker.ts";
+import { createNotificationWorker } from "../src/delivery/notification-worker.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import type { AcceptPublicationInput } from "../src/ports/session-store.ts";
 
 const FIXTURES = new URL("../fixtures/contracts/", import.meta.url);
 const SHA = (bytes: Uint8Array) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const NOOP_PURGE = { purgeExpiredReconciliationEvidence: () => 0 };
+const MIGRATIONS = path.resolve(import.meta.dirname, "..", "migrations");
 
 function harness(): { root: string; recordings: string; outbox: string; receipts: string; cleanup(): void } {
   const root = mkdtempSync(path.join(tmpdir(), "meeting-outbox-test-"));
@@ -32,8 +35,8 @@ function runtimeRecordingPath(h: ReturnType<typeof harness>, digit = "a"): strin
   return path.join(h.recordings, `${digit.repeat(32)}.crsr`);
 }
 
-function artifactAndAudio(): { artifact: ReturnType<typeof parseTeamMemMeetingArtifact>; bytes: Buffer; serialized: string; hash: string } {
-  const artifact = structuredClone(JSON.parse(readFileSync(new URL("teammem-meeting-v1.complete.json", FIXTURES), "utf8"))) as Record<string, unknown>;
+function artifactAndAudio(fixture = "teammem-meeting-v1.complete.json"): { artifact: ReturnType<typeof parseTeamMemMeetingArtifact>; bytes: Buffer; serialized: string; hash: string } {
+  const artifact = structuredClone(JSON.parse(readFileSync(new URL(fixture, FIXTURES), "utf8"))) as Record<string, unknown>;
   const bytes = Buffer.from("synthetic encrypted audio bytes; never a container header", "utf8");
   const audio = artifact.audio as Record<string, unknown>;
   audio.bytes = bytes.length;
@@ -44,7 +47,13 @@ function artifactAndAudio(): { artifact: ReturnType<typeof parseTeamMemMeetingAr
 
 class FakeJournal implements DeliveryJournal {
   readonly rows = new Map<string, DeliveryRow>();
+  readonly notificationIntents = new Map<string, AcceptPublicationInput["notification"]>();
   failSave = false;
+  private readonly onFirstPublication: (occurrenceId: string) => void;
+
+  constructor(onFirstPublication: (occurrenceId: string) => void = () => undefined) {
+    this.onFirstPublication = onFirstPublication;
+  }
 
   savePending(row: DeliveryRow): void {
     if (this.failSave) throw new Error("synthetic journal failure");
@@ -52,6 +61,13 @@ class FakeJournal implements DeliveryJournal {
   }
   pending(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs === null); }
   update(row: DeliveryRow): void { this.savePending(row); }
+  acceptPublication(input: AcceptPublicationInput): void {
+    const row = this.rows.get(`${input.occurrenceId}:${input.revision}`);
+    if (row === undefined) throw new Error("unknown delivery");
+    this.update({ ...row, publishedAtMs: input.publishedAtMs, publicationUrl: input.publicationUrl, vaultCommit: input.vaultCommit, retryReason: null });
+    this.notificationIntents.set(`${input.occurrenceId}:${input.revision}`, input.notification);
+    if (row.publishedAtMs === null) this.onFirstPublication(input.occurrenceId);
+  }
 }
 
 function publishedReceipt(artifact: ReturnType<typeof parseTeamMemMeetingArtifact>, hash: string): Record<string, unknown> {
@@ -166,6 +182,120 @@ test("publication and session transition roll back when durable notification int
     assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "published");
     assert.equal(d.store().notifications().length, 1);
   } finally { raw.close(); d.close(); h.cleanup(); }
+});
+
+test("schema-17 publication with retained canonical metadata derives its intent before cleanup", () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const legacyMigrations = path.join(h.root, "migrations-17");
+  mkdirSync(legacyMigrations);
+  for (const name of readdirSync(MIGRATIONS).filter((candidate) => Number.parseInt(candidate, 10) <= 17)) {
+    copyFileSync(path.join(MIGRATIONS, name), path.join(legacyMigrations, name));
+  }
+  const filename = path.join(h.root, "legacy.db");
+  const source = runtimeRecordingPath(h);
+  writeFileSync(source, built.bytes);
+  let store = openSessionStore({ filename, migrationsDir: legacyMigrations, nowMs: 1 });
+  try {
+    store.createSession({ occurrenceId: built.artifact.occurrence_id, providerMeetingId: built.artifact.provider_meeting_id, occurrenceStartedAt: built.artifact.started_at, nowMs: 1 });
+    store.finalizeSession({
+      transition: { occurrenceId: built.artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: 2 },
+      recording: { handle: "a".repeat(32), encryptedPath: source, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake", gaps: [], runtimeGaps: [] },
+    });
+    const worker = () => createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store, clock: { now: () => 10 }, random: () => 0, session: { state: (id) => store.getSession(id)?.state ?? null, publish: () => assert.fail("atomic store owns publication") }, reconciliationEvidence: store });
+    const bundle = worker().enqueue({ artifact: built.artifact, serializedArtifact: built.serialized, artifactHash: built.hash, recordingPath: source });
+    store.transition({ occurrenceId: built.artifact.occurrence_id, fromState: "awaiting_teammem", toState: "published", reason: "legacy", terminalReason: null, nowMs: 3 });
+    store.update({ ...store.pending()[0]!, publishedAtMs: 3, publicationUrl: publishedReceipt(built.artifact, built.hash).markdown_url as string, vaultCommit: "a".repeat(40) });
+
+    const malformedArtifact = parseTeamMemMeetingArtifact({ ...built.artifact, occurrence_id: "vc:legacy-malformed@2026-09-02T14:00:00Z", provider_meeting_id: "vc:legacy-malformed" });
+    const malformedHash = canonicalArtifactHash(malformedArtifact);
+    const malformedSource = runtimeRecordingPath(h, "b");
+    writeFileSync(malformedSource, built.bytes);
+    store.createSession({ occurrenceId: malformedArtifact.occurrence_id, providerMeetingId: malformedArtifact.provider_meeting_id, occurrenceStartedAt: malformedArtifact.started_at, nowMs: 1 });
+    store.finalizeSession({
+      transition: { occurrenceId: malformedArtifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: 2 },
+      recording: { handle: "b".repeat(32), encryptedPath: malformedSource, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake", gaps: [], runtimeGaps: [] },
+    });
+    worker().enqueue({ artifact: malformedArtifact, serializedArtifact: canonicalArtifactJson(malformedArtifact), artifactHash: malformedHash, recordingPath: malformedSource });
+    store.transition({ occurrenceId: malformedArtifact.occurrence_id, fromState: "awaiting_teammem", toState: "published", reason: "legacy", terminalReason: null, nowMs: 3 });
+    const malformedRow = store.pending().find((row) => row.occurrenceId === malformedArtifact.occurrence_id)!;
+    store.update({ ...malformedRow, publishedAtMs: 3, publicationUrl: publishedReceipt(malformedArtifact, malformedHash).markdown_url as string, vaultCommit: "a".repeat(40), recoveryArtifact: "{malformed" });
+    store.close();
+
+    store = openSessionStore({ filename, nowMs: 4 });
+    assert.deepEqual(store.notifications(), [], "retained canonical metadata must not be blanket-classified unavailable");
+    const oldTask10 = new Database(filename);
+    try {
+      oldTask10.prepare(
+        `INSERT INTO notification_intents
+          (occurrence_id, revision, artifact_hash, publication_url, vault_commit, state, terminal_reason, next_attempt_at_ms)
+         SELECT occurrence_id, revision, artifact_hash, publication_url, vault_commit,
+                'terminal', 'notification_inputs_unavailable', published_at_ms
+           FROM delivery_journal WHERE occurrence_id = ?`,
+      ).run(built.artifact.occurrence_id);
+    } finally { oldTask10.close(); }
+    worker().reconcile();
+    assert.deepEqual(store.notifications().map((row) => [row.occurrenceId, row.state, row.recipientId, row.title, row.terminalReason]), [
+      [built.artifact.occurrence_id, "pending", built.artifact.organizer!.person_id, built.artifact.title, null],
+      [malformedArtifact.occurrence_id, "terminal", null, null, "notification_inputs_unavailable"],
+    ]);
+    assert.equal(existsSync(source), false);
+    assert.equal(existsSync(bundle), false);
+  } finally { store.close(); h.cleanup(); }
+});
+
+test("real SQLite rejects negative receipts and sends nothing before authoritative publication", async () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const d = durableWorker(h, built);
+  try {
+    let sends = 0;
+    const notificationWorker = createNotificationWorker({
+      store: d.store(),
+      sender: { sendText: async () => { sends += 1; return { messageId: "impossible" }; } },
+      clock: { now: d.now }, random: () => 0, requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000,
+    });
+    d.worker().reconcile();
+    assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
+    assert.deepEqual(d.store().notifications(), []);
+    await notificationWorker.poll();
+    assert.equal(sends, 0);
+
+    const receiptFile = path.join(h.receipts, `${occurrencePathSegment(built.artifact.occurrence_id as OccurrenceId)}.json`);
+    const invalidReceipts = [
+      { ...publishedReceipt(built.artifact, built.hash), revision: built.artifact.revision + 1 },
+      { ...publishedReceipt(built.artifact, built.hash), artifact_hash: `sha256:${"f".repeat(64)}` },
+      { ...publishedReceipt(built.artifact, built.hash), status: "failed" },
+    ];
+    for (const receipt of invalidReceipts) {
+      writeFileSync(receiptFile, `${JSON.stringify(receipt)}\n`);
+      d.worker().reconcile();
+      assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
+      assert.deepEqual(d.store().notifications(), []);
+      d.advance(d.store().pending()[0]!.nextRetryAtMs);
+    }
+    await notificationWorker.poll();
+    assert.equal(sends, 0);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("null-organizer artifact never derives its attendee as recipient and sends nothing", async () => {
+  const h = harness();
+  const built = artifactAndAudio("teammem-meeting-v1.minimal.json");
+  const d = durableWorker(h, built);
+  try {
+    assert.equal(built.artifact.organizer, null);
+    assert.equal(built.artifact.participants[0]!.person_id, "ou_ada", "legitimate attendee remains tempting but unrelated");
+    d.receipt();
+    d.worker().reconcile();
+    const intent = d.store().notifications()[0]!;
+    assert.equal(intent.terminalReason, "organizer_unresolved");
+    assert.equal(intent.recipientId, null);
+    assert.notEqual(intent.recipientId, built.artifact.participants[0]!.person_id);
+    let sends = 0;
+    await createNotificationWorker({ store: d.store(), sender: { sendText: async () => { sends += 1; return { messageId: "impossible" }; } }, clock: { now: d.now }, random: () => 0, requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000 }).poll();
+    assert.equal(sends, 0);
+  } finally { d.close(); h.cleanup(); }
 });
 
 test("a complete higher revision accepted after notified cleans retained evidence without replaying published", () => {
@@ -359,8 +489,8 @@ test("worker retries with injected bounded jitter and publishes only after a mat
     const { artifact, bytes, serialized, hash } = artifactAndAudio();
     const source = runtimeRecordingPath(h);
     writeFileSync(source, bytes);
-    const journal = new FakeJournal();
     let state = "awaiting_teammem";
+    const journal = new FakeJournal(() => { state = "published"; });
     let now = Date.parse("2026-09-02T14:00:00Z");
     const worker = createOutboxWorker({
       outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
@@ -745,8 +875,8 @@ test("a malformed receipt for one occurrence cannot block a valid second occurre
     const secondSource = runtimeRecordingPath(h, "c");
     writeFileSync(firstSource, first.bytes);
     writeFileSync(secondSource, first.bytes);
-    const journal = new FakeJournal();
     const published: string[] = [];
+    const journal = new FakeJournal((occurrenceId) => published.push(occurrenceId));
     const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal, clock: { now: () => 5 }, random: () => 0, session: { state: () => "awaiting_teammem", publish: (id) => published.push(id) }, reconciliationEvidence: NOOP_PURGE });
     worker.enqueue({ artifact: first.artifact, serializedArtifact: first.serialized, artifactHash: first.hash, recordingPath: firstSource });
     worker.enqueue({ artifact: second, serializedArtifact: canonicalArtifactJson(second), artifactHash: secondHash, recordingPath: secondSource });
@@ -892,6 +1022,19 @@ test("a worker without the mandatory reconciliation purge is rejected at constru
       session: { state: () => null, publish: () => undefined },
     } as unknown as Parameters<typeof createOutboxWorker>[0]), /reconciliation.*purge|required/i);
   } finally { h.cleanup(); }
+});
+
+test("a cleanup-capable outbox requires atomic publication plus notification intent", () => {
+  const h = harness();
+  const journal = new FakeJournal();
+  const nonAtomic = { ...journal };
+  assert.throws(() => createOutboxWorker({
+    outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings,
+    journal: nonAtomic as unknown as DeliveryJournal, clock: { now: () => 1 }, random: () => 0,
+    session: { state: () => "awaiting_teammem", publish: () => undefined },
+    reconciliationEvidence: NOOP_PURGE,
+  }), /atomic publication|acceptPublication/i);
+  h.cleanup();
 });
 
 test("a reopened worker recovers every durable-intent crash cut and later deletes its evidence", () => {
@@ -1241,8 +1384,6 @@ test("restart after a real process death immediately after occurrence detach lea
 });
 
 for (const interruption of [
-  "session_transition",
-  "publication_update",
   "filesystem_cleanup",
   "deletion_update_before_commit",
   "deletion_update_after_commit",
@@ -1253,21 +1394,16 @@ for (const interruption of [
       const { artifact, bytes, serialized, hash } = artifactAndAudio();
       const source = runtimeRecordingPath(h);
       writeFileSync(source, bytes);
-      const journal = new FakeJournal();
       const now = Date.parse("2026-09-02T14:00:00Z");
       let state = "awaiting_teammem";
       let publishCalls = 0;
+      const journal = new FakeJournal(() => { publishCalls += 1; state = "published"; });
       let interrupted = false;
       let movedOutbox: string | null = null;
       const originalUpdate = journal.update.bind(journal);
       journal.update = (row) => {
         const publicationWrite = row.publishedAtMs !== null && row.deletedAtMs === null;
         const deletionWrite = row.deletedAtMs !== null;
-        if (!interrupted && interruption === "publication_update" && publicationWrite) {
-          originalUpdate(row);
-          interrupted = true;
-          throw new Error("publication update interrupted after durable commit");
-        }
         if (!interrupted && interruption === "filesystem_cleanup" && publicationWrite) {
           originalUpdate(row);
           movedOutbox = `${h.outbox}.saved`;
@@ -1298,14 +1434,7 @@ for (const interruption of [
         random: () => 0,
         session: {
           state: () => state,
-          publish: () => {
-            publishCalls += 1;
-            state = "published";
-            if (!interrupted && interruption === "session_transition") {
-              interrupted = true;
-              throw new Error("session transition interrupted after durable commit");
-            }
-          },
+          publish: () => assert.fail("atomic journal owns the publication transition"),
         },
         reconciliationEvidence: NOOP_PURGE,
       });
@@ -1320,8 +1449,7 @@ for (const interruption of [
       const afterInterruption = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;
       assert.equal(interrupted, true);
       assert.notEqual(afterInterruption.retryReason, "recovery_unavailable");
-      if (interruption === "session_transition") assert.equal(afterInterruption.publishedAtMs, null);
-      else assert.equal(afterInterruption.publishedAtMs, now);
+      assert.equal(afterInterruption.publishedAtMs, now);
 
       worker.reconcile();
       const converged = journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)!;

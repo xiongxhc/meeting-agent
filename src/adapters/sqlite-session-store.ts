@@ -606,6 +606,7 @@ function notifications(db: Database.Database): NotificationRow[] {
 
 function acceptPublication(db: Database.Database, input: AcceptPublicationInput): void {
   const run = db.transaction(() => {
+    const deliverable = "recipientId" in input.notification;
     const delivery = db.prepare(
       "SELECT artifact_hash, published_at_ms, publication_url, vault_commit FROM delivery_journal WHERE occurrence_id = ? AND revision = ?",
     ).get(input.occurrenceId, input.revision) as { artifact_hash: string; published_at_ms: number | null; publication_url: string | null; vault_commit: string | null } | undefined;
@@ -620,8 +621,27 @@ function acceptPublication(db: Database.Database, input: AcceptPublicationInput)
       if (delivery.publication_url !== input.publicationUrl || delivery.vault_commit !== input.vaultCommit) {
         throw new OrchestrationError("constraint_violation", "publication evidence is immutable");
       }
-      const existing = db.prepare("SELECT 1 FROM notification_intents WHERE occurrence_id = ? AND revision = ?").get(input.occurrenceId, input.revision);
-      if (existing !== undefined) return;
+      const existing = db.prepare("SELECT state, terminal_reason, attempt_count FROM notification_intents WHERE occurrence_id = ? AND revision = ?")
+        .get(input.occurrenceId, input.revision) as { state: string; terminal_reason: string | null; attempt_count: number } | undefined;
+      if (existing !== undefined) {
+        // Repair databases opened by the pre-review Task-10 migration: an
+        // unavailable classification made before validating still-retained
+        // canonical bytes is replaceable only before any send attempt.
+        if (existing.state === "terminal" && existing.terminal_reason === "notification_inputs_unavailable" && existing.attempt_count === 0) {
+          if (deliverable) {
+            db.prepare(
+              `UPDATE notification_intents SET recipient_id = ?, title = ?, message_text = ?, request_uuid = ?,
+                 state = 'pending', terminal_reason = NULL, next_attempt_at_ms = ?
+               WHERE occurrence_id = ? AND revision = ?`,
+            ).run(input.notification.recipientId, input.notification.title, input.notification.messageText,
+              input.notification.requestUuid, input.publishedAtMs, input.occurrenceId, input.revision);
+          } else if (input.notification.terminalReason === "organizer_unresolved") {
+            db.prepare("UPDATE notification_intents SET terminal_reason = 'organizer_unresolved' WHERE occurrence_id = ? AND revision = ?")
+              .run(input.occurrenceId, input.revision);
+          }
+        }
+        return;
+      }
     } else {
       db.prepare(
         `UPDATE delivery_journal SET published_at_ms = ?, publication_url = ?, vault_commit = ?, retry_reason = NULL
@@ -631,7 +651,6 @@ function acceptPublication(db: Database.Database, input: AcceptPublicationInput)
     if (session.state === "awaiting_teammem") {
       transition(db, { occurrenceId: input.occurrenceId, fromState: "awaiting_teammem", toState: "published", reason: "receipt", terminalReason: null, nowMs: input.publishedAtMs });
     }
-    const deliverable = "recipientId" in input.notification;
     withConstraintTranslation(() => db.prepare(
       `INSERT INTO notification_intents
         (occurrence_id, revision, artifact_hash, publication_url, vault_commit, recipient_id, title,
@@ -667,14 +686,14 @@ function claimNotification(db: Database.Database, input: ClaimNotificationInput)
         ).run(row.occurrence_id, row.revision);
         continue;
       }
-      const changed = db.prepare(
-        `UPDATE notification_intents SET state = 'claimed', claim_token = ?, claim_expires_at_ms = ?,
-           first_attempt_at_ms = COALESCE(first_attempt_at_ms, ?), last_attempt_at_ms = ?, attempt_count = attempt_count + 1
-           , delivery_ambiguous = CASE WHEN state = 'claimed' THEN 1 ELSE delivery_ambiguous END
-         WHERE occurrence_id = ? AND revision = ?
-           AND ((state = 'pending' AND next_attempt_at_ms <= ?) OR (state = 'claimed' AND claim_expires_at_ms <= ?))`,
-      ).run(input.claimToken, input.nowMs + input.claimTtlMs, input.nowMs, input.nowMs,
-        row.occurrence_id, row.revision, input.nowMs, input.nowMs).changes;
+      const changed = withConstraintTranslation(() => db.prepare(
+          `UPDATE notification_intents SET state = 'claimed', claim_token = ?, claim_expires_at_ms = ?,
+             first_attempt_at_ms = COALESCE(first_attempt_at_ms, ?), last_attempt_at_ms = ?, attempt_count = attempt_count + 1,
+             delivery_ambiguous = CASE WHEN state = 'claimed' THEN 1 ELSE delivery_ambiguous END
+           WHERE occurrence_id = ? AND revision = ?
+             AND ((state = 'pending' AND next_attempt_at_ms <= ?) OR (state = 'claimed' AND claim_expires_at_ms <= ?))`,
+        ).run(input.claimToken, input.nowMs + input.claimTtlMs, input.nowMs, input.nowMs,
+          row.occurrence_id, row.revision, input.nowMs, input.nowMs).changes);
       if (changed === 1) {
         const claimed = db.prepare(`SELECT ${NOTIFICATION_COLUMNS} FROM notification_intents WHERE occurrence_id = ? AND revision = ?`)
           .get(row.occurrence_id, row.revision) as NotificationRaw;
@@ -711,11 +730,11 @@ function completeNotification(db: Database.Database, input: CompleteNotification
     } else if (session?.state !== "notified") {
       throw new OrchestrationError("state_conflict", "notification completion is not legal for the current session state");
     }
-    db.prepare(
-      `UPDATE notification_intents SET state = 'sent', provider_message_id = ?, sent_at_ms = ?,
-         claim_token = NULL, claim_expires_at_ms = NULL
-       WHERE occurrence_id = ? AND revision = ? AND state = 'claimed' AND claim_token = ?`,
-    ).run(input.providerMessageId, input.sentAtMs, input.occurrenceId, input.revision, input.claimToken);
+    withConstraintTranslation(() => db.prepare(
+        `UPDATE notification_intents SET state = 'sent', provider_message_id = ?, sent_at_ms = ?,
+           claim_token = NULL, claim_expires_at_ms = NULL
+         WHERE occurrence_id = ? AND revision = ? AND state = 'claimed' AND claim_token = ?`,
+      ).run(input.providerMessageId, input.sentAtMs, input.occurrenceId, input.revision, input.claimToken));
   });
   run();
 }

@@ -47,16 +47,38 @@ function harness(): { store: SessionStore; filename: string; close(): void } {
   };
 }
 
-function accept(store: SessionStore, revision = 1): void {
+function accept(store: SessionStore, input: { occurrenceId?: string; revision?: number; artifactHash?: string; recipientId?: string; publicationUrl?: string; vaultCommit?: string } = {}): void {
+  const occurrenceId = input.occurrenceId ?? OCCURRENCE;
+  const revision = input.revision ?? 1;
+  const artifactHash = input.artifactHash ?? HASH;
+  const publicationUrl = input.publicationUrl ?? URL;
+  const vaultCommit = input.vaultCommit ?? COMMIT;
   store.acceptPublication({
-    occurrenceId: OCCURRENCE, revision, artifactHash: HASH,
-    publishedAtMs: 10, publicationUrl: URL, vaultCommit: COMMIT,
+    occurrenceId, revision, artifactHash,
+    publishedAtMs: 10, publicationUrl, vaultCommit,
     notification: {
-      recipientId: "ou_organizer", title: "Weekly planning",
-      messageText: `Meeting notes: Weekly planning\n${URL}`,
-      requestUuid: notificationRequestUuid({ occurrenceId: OCCURRENCE, revision, artifactHash: HASH, publicationUrl: URL, vaultCommit: COMMIT }),
+      recipientId: input.recipientId ?? "ou_organizer", title: "Weekly planning",
+      messageText: `Meeting notes: Weekly planning\n${publicationUrl}`,
+      requestUuid: notificationRequestUuid({ occurrenceId, revision, artifactHash, publicationUrl, vaultCommit }),
     },
   });
+}
+
+function addPendingOccurrence(store: SessionStore, filename: string): { occurrenceId: string; artifactHash: string; publicationUrl: string; vaultCommit: string } {
+  const occurrenceId = "om_456@2026-09-02T15:00:00Z";
+  const artifactHash = `sha256:${"e".repeat(64)}`;
+  const vaultCommit = "f".repeat(40);
+  const publicationUrl = `https://example.test/group/vault/-/blob/${vaultCommit}/Meetings/second.md`;
+  const handle = "f".repeat(32);
+  const recordingPath = path.join(path.dirname(filename), `${handle}.crsr`);
+  writeFileSync(recordingPath, "second ciphertext");
+  store.createSession({ occurrenceId, providerMeetingId: "456", occurrenceStartedAt: "2026-09-02T15:00:00Z", nowMs: 1 });
+  store.finalizeSession({
+    transition: { occurrenceId, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: 2 },
+    recording: { handle, encryptedPath: recordingPath, sha256: "f".repeat(64), durationMs: 1, format: "opus", keyId: "fake", gaps: [], runtimeGaps: [] },
+  });
+  store.savePending({ occurrenceId, revision: 1, artifactHash, recordingPath, bundlePath: path.join(path.dirname(filename), "outbox", "2"), endedAtMs: 2, transcriptComplete: false, retryCount: 0, nextRetryAtMs: 2, retryReason: null, publishedAtMs: null, deletedAtMs: null, publicationUrl: null, vaultCommit: null, recoveryArtifact: "{}", stageToken: "f".repeat(32), recordingHandle: handle });
+  return { occurrenceId, artifactHash, publicationUrl, vaultCommit };
 }
 
 class ExpiringDedupSender implements NotificationSender {
@@ -155,18 +177,49 @@ test("expired ambiguity, clock regression, and stale claim completion never rese
   } finally { h.close(); }
 });
 
-test("a stale claim cannot overwrite a newer worker's successful completion", () => {
+test("two independently opened stores serialize claims and fence stale completion", () => {
   const h = harness();
+  const secondStore = openSessionStore({ filename: h.filename, nowMs: 20 });
   try {
     accept(h.store);
     const first = h.store.claimNotification({ nowMs: 20, claimToken: "1".repeat(32), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 })!;
-    const second = h.store.claimNotification({ nowMs: 31, claimToken: "2".repeat(32), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 })!;
+    assert.equal(secondStore.claimNotification({ nowMs: 20, claimToken: "2".repeat(32), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 }), null);
+    const second = secondStore.claimNotification({ nowMs: 31, claimToken: "2".repeat(32), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 })!;
     assert.equal(first.claimToken, "1".repeat(32));
     assert.equal(second.claimToken, "2".repeat(32));
-    h.store.completeNotification({ occurrenceId: OCCURRENCE, revision: 1, claimToken: second.claimToken!, providerMessageId: "om_new", sentAtMs: 32 });
+    secondStore.completeNotification({ occurrenceId: OCCURRENCE, revision: 1, claimToken: second.claimToken!, providerMessageId: "om_new", sentAtMs: 32 });
     assert.throws(() => h.store.completeNotification({ occurrenceId: OCCURRENCE, revision: 1, claimToken: first.claimToken!, providerMessageId: "om_old", sentAtMs: 33 }), /claim/i);
     assert.equal(h.store.notifications()[0]!.providerMessageId, "om_new");
-  } finally { h.close(); }
+  } finally { secondStore.close(); h.close(); }
+});
+
+test("two independent workers overlap on one due intent with one provider acceptance and reopen convergence", async () => {
+  const h = harness();
+  const secondStore = openSessionStore({ filename: h.filename, nowMs: 20 });
+  try {
+    accept(h.store);
+    let release!: () => void;
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    let accepts = 0;
+    const sender: NotificationSender = { sendText: async () => { accepts += 1; started(); await releasePromise; return { messageId: "om_only" }; } };
+    const options = { sender, clock: { now: () => 20 }, random: () => 0, requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000 };
+    const firstPoll = createNotificationWorker({ ...options, store: h.store }).poll();
+    await startedPromise;
+    await assert.doesNotReject(createNotificationWorker({ ...options, store: secondStore }).poll());
+    assert.equal(accepts, 1);
+    release();
+    await firstPoll;
+    assert.equal(h.store.notifications()[0]!.state, "sent");
+    secondStore.close();
+    h.store.close();
+    h.store = openSessionStore({ filename: h.filename, nowMs: 21 });
+    assert.equal(h.store.notifications()[0]!.providerMessageId, "om_only");
+  } finally {
+    try { secondStore.close(); } catch { /* already closed before reopen */ }
+    h.close();
+  }
 });
 
 test("crash after provider acceptance retries the same UUID inside the finite dedup window", async () => {
@@ -217,22 +270,33 @@ test("an expired stale claim is uncertain and never sent after the finite provid
   } finally { h.close(); }
 });
 
-test("bounded retry schedule isolates rows and terminates finite retry failures", async () => {
+test("bounded retry schedule isolates a failing row from a successful sibling across reopen", async () => {
   const h = harness();
   try {
-    accept(h.store);
+    const second = addPendingOccurrence(h.store, h.filename);
+    accept(h.store, { recipientId: "ou_fail" });
+    accept(h.store, { ...second, recipientId: "ou_ok" });
     let now = 20;
-    const sender = new ExpiringDedupSender();
-    sender.fail = "retryable";
+    let failFirst = true;
+    const calls: string[] = [];
+    const sender: NotificationSender = { sendText: async (input) => {
+      calls.push(input.receiveId);
+      if (input.receiveId === "ou_fail" && failFirst) throw Object.assign(new Error("redacted"), { deliveryKind: "retryable" as const });
+      return { messageId: `om_${input.receiveId}` };
+    } };
     const worker = createNotificationWorker({ store: h.store, sender, clock: { now: () => now }, random: () => 1, requestTimeoutMs: 5_000, claimTtlMs: 5_000, dedupSafetyMarginMs: 60_000, maxAttempts: 2 });
     await worker.poll();
-    const once = h.store.notifications()[0]!;
-    assert.equal(once.attemptCount, 1);
-    assert.ok(once.nextAttemptAtMs > now && once.nextAttemptAtMs <= now + 60_000);
-    now = once.nextAttemptAtMs;
-    await worker.poll();
-    assert.equal(sender.calls.length, 2);
-    assert.equal(h.store.notifications()[0]!.terminalReason, "notification_retry_exhausted");
+    const [failed, sent] = h.store.notifications();
+    assert.equal(failed!.state, "pending");
+    assert.equal(sent!.state, "sent");
+    assert.deepEqual(calls, ["ou_fail", "ou_ok"]);
+    now = failed!.nextAttemptAtMs;
+    h.store.close();
+    h.store = openSessionStore({ filename: h.filename, nowMs: now });
+    failFirst = false;
+    await createNotificationWorker({ store: h.store, sender, clock: { now: () => now }, random: () => 1, requestTimeoutMs: 5_000, claimTtlMs: 5_000, dedupSafetyMarginMs: 60_000, maxAttempts: 2 }).poll();
+    assert.deepEqual(h.store.notifications().map((row) => row.state), ["sent", "sent"]);
+    assert.deepEqual(calls, ["ou_fail", "ou_ok", "ou_fail"]);
   } finally { h.close(); }
 });
 
@@ -245,4 +309,17 @@ test("request UUID covers revision, artifact hash, URL and commit", () => {
     { ...base, publicationUrl: `${URL}?x=1` }, { ...base, vaultCommit: "c".repeat(40) },
   ]) assert.notEqual(notificationRequestUuid(changed), uuid);
   assert.equal(createHash("sha256").update(uuid).digest("hex").length, 64);
+});
+
+test("SQLite bounds opaque claim and provider message identifiers", () => {
+  const h = harness();
+  try {
+    accept(h.store);
+    assert.throws(() => h.store.claimNotification({ nowMs: 20, claimToken: "x".repeat(10_000), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 }), /constraint/i);
+    assert.equal(h.store.notifications()[0]!.state, "pending");
+    const claim = h.store.claimNotification({ nowMs: 20, claimToken: "4".repeat(32), claimTtlMs: 10, requestTimeoutMs: 5, dedupWindowMs: HOUR, dedupSafetyMarginMs: 60_000 })!;
+    assert.throws(() => h.store.completeNotification({ occurrenceId: OCCURRENCE, revision: 1, claimToken: claim.claimToken!, providerMessageId: "m".repeat(10_000), sentAtMs: 21 }), /constraint/i);
+    assert.equal(h.store.notifications()[0]!.state, "claimed");
+    assert.equal(h.store.getSession(OCCURRENCE)?.state, "published", "oversized provider evidence rolls back notified transition");
+  } finally { h.close(); }
 });
