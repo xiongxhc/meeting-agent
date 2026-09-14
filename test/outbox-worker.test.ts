@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
+import Database from "better-sqlite3";
 
 import { parseTeamMemMeetingArtifact, canonicalArtifactHash, canonicalArtifactJson } from "../src/contracts/teammem-meeting-v1.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../src/adapters/filesystem-outbox.ts";
@@ -66,6 +67,162 @@ function publishedReceipt(artifact: ReturnType<typeof parseTeamMemMeetingArtifac
     vault_commit: commit,
   };
 }
+
+function durableWorker(h: ReturnType<typeof harness>, built = artifactAndAudio()) {
+  const filename = path.join(h.root, "orchestration.db");
+  const source = runtimeRecordingPath(h);
+  writeFileSync(source, built.bytes);
+  let now = Date.parse(built.artifact.ended_at) + 1_000;
+  let store = openSessionStore({ filename, nowMs: now });
+  store.createSession({ occurrenceId: built.artifact.occurrence_id, providerMeetingId: built.artifact.provider_meeting_id, occurrenceStartedAt: built.artifact.started_at, nowMs: now });
+  store.finalizeSession({
+    transition: { occurrenceId: built.artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: now },
+    recording: { handle: "a".repeat(32), encryptedPath: source, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+  });
+  const worker = () => createOutboxWorker({
+    outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store,
+    clock: { now: () => now }, random: () => 0, reconciliationEvidence: store,
+    session: {
+      state: (id) => store.getSession(id)?.state ?? null,
+      publish: (id) => { store.transition({ occurrenceId: id, fromState: "awaiting_teammem", toState: "published", reason: "receipt", terminalReason: null, nowMs: now }); },
+    },
+  });
+  const bundle = worker().enqueue({ artifact: built.artifact, serializedArtifact: built.serialized, artifactHash: built.hash, recordingPath: source });
+  return {
+    filename, source, bundle, worker,
+    store: () => store,
+    now: () => now,
+    advance: (value: number) => { now = value; },
+    receipt: () => writeFileSync(path.join(h.receipts, `${occurrencePathSegment(built.artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(publishedReceipt(built.artifact, built.hash))}\n`),
+    reopen: () => { store.close(); store = openSessionStore({ filename, nowMs: now }); },
+    close: () => store.close(),
+  };
+}
+
+for (const legacyMarker of [false, true]) {
+  test(`SQLite reopen converges after deletion commit failure (legacy marker: ${legacyMarker})`, () => {
+    const h = harness();
+    const built = artifactAndAudio();
+    const d = durableWorker(h, built);
+    const raw = new Database(d.filename);
+    try {
+      d.receipt();
+      raw.exec("CREATE TRIGGER fail_deletion BEFORE UPDATE ON delivery_journal WHEN NEW.deleted_at_ms IS NOT NULL BEGIN SELECT RAISE(ABORT, 'deletion_update_before_commit'); END");
+      d.worker().reconcile();
+      const acceptedAt = d.now();
+      assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "published");
+      assert.equal(d.store().pending()[0]!.publishedAtMs, acceptedAt);
+      assert.equal(d.store().pending()[0]!.deletedAtMs, null);
+      assert.equal(d.store().pending()[0]!.recoveryArtifact, built.serialized);
+      assert.equal(existsSync(d.source), false);
+      assert.equal(existsSync(d.bundle), false);
+      raw.exec("DROP TRIGGER fail_deletion");
+      if (legacyMarker) raw.exec("UPDATE delivery_journal SET retry_reason = 'recovery_unavailable'");
+      d.advance(acceptedAt + 1_000);
+      d.reopen();
+      const reopened = d.store().pending()[0]!;
+      assert.equal(reopened.retryReason, null, "a missing published source is cleanup progress, not recovery failure");
+      d.worker().reconcile();
+      const deleted = raw.prepare("SELECT published_at_ms, publication_url, vault_commit, deleted_at_ms, retry_reason, recovery_artifact FROM delivery_journal").get();
+      assert.deepEqual(deleted, {
+        published_at_ms: acceptedAt, publication_url: publishedReceipt(built.artifact, built.hash).markdown_url,
+        vault_commit: "a".repeat(40), deleted_at_ms: acceptedAt + 1_000, retry_reason: null, recovery_artifact: null,
+      });
+      for (let replay = 0; replay < 2; replay += 1) {
+        d.advance(d.now() + 1_000);
+        d.reopen();
+        d.worker().reconcile();
+        assert.deepEqual(raw.prepare("SELECT published_at_ms, publication_url, vault_commit, deleted_at_ms, retry_reason, recovery_artifact FROM delivery_journal").get(), deleted);
+        assert.deepEqual(d.store().pending(), []);
+        assert.equal(existsSync(d.source), false);
+        assert.equal(existsSync(d.bundle), false);
+      }
+      assert.equal(d.store().listTransitions(built.artifact.occurrence_id).filter((row) => row.toState === "published").length, 1);
+    } finally { raw.close(); d.close(); h.cleanup(); }
+  });
+}
+
+test("SQLite reopen keeps an unpublished missing source fail-closed", () => {
+  const h = harness();
+  const d = durableWorker(h);
+  try {
+    d.receipt();
+    unlinkSync(d.source);
+    d.reopen();
+    const pending = d.store().pending()[0]!;
+    assert.equal(pending.retryReason, "recovery_unavailable");
+    d.worker().reconcile();
+    d.reopen();
+    d.worker().reconcile();
+    assert.deepEqual(d.store().pending(), [pending]);
+    assert.equal(d.store().getSession(pending.occurrenceId)?.state, "awaiting_teammem");
+    assert.equal(existsSync(d.bundle), true);
+    assert.equal(existsSync(d.source), false);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("SQLite reopened incomplete publication retains evidence until its original deadline", () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const artifact = { ...built.artifact, transcript_complete: false };
+  const serialized = canonicalArtifactJson(artifact);
+  const d = durableWorker(h, { ...built, artifact, serialized, hash: canonicalArtifactHash(artifact) });
+  try {
+    d.receipt();
+    d.worker().reconcile();
+    const accepted = d.store().pending()[0]!;
+    const deadline = Date.parse(artifact.ended_at) + 14 * 24 * 60 * 60 * 1_000;
+    for (const at of [d.now() + 1_000, deadline - 1]) {
+      d.advance(at);
+      d.reopen();
+      d.worker().reconcile();
+      assert.deepEqual(d.store().pending(), [accepted]);
+      assert.equal(readFileSync(d.source).equals(built.bytes), true);
+      assert.equal(readFileSync(path.join(d.bundle, "meeting.json"), "utf8"), serialized);
+    }
+    d.advance(deadline);
+    d.worker().reconcile();
+    d.reopen();
+    assert.deepEqual(d.store().pending(), []);
+    assert.equal(existsSync(d.source), false);
+    assert.equal(existsSync(d.bundle), false);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("SQLite published replay cannot delete a replacement inode owned by another occurrence", () => {
+  const h = harness();
+  const built = artifactAndAudio();
+  const d = durableWorker(h, built);
+  const raw = new Database(d.filename);
+  try {
+    d.receipt();
+    raw.exec("CREATE TRIGGER fail_deletion BEFORE UPDATE ON delivery_journal WHEN NEW.deleted_at_ms IS NOT NULL BEGIN SELECT RAISE(ABORT, 'deletion_update_before_commit'); END");
+    d.worker().reconcile();
+    raw.exec("DROP TRIGGER fail_deletion");
+    const other = { ...built.artifact, occurrence_id: "vc:other@2026-09-02T14:00:00Z", provider_meeting_id: "vc:other" };
+    const otherSource = runtimeRecordingPath(h, "b");
+    writeFileSync(otherSource, built.bytes);
+    d.store().createSession({ occurrenceId: other.occurrence_id, providerMeetingId: other.provider_meeting_id, occurrenceStartedAt: other.started_at, nowMs: d.now() });
+    d.store().finalizeSession({
+      transition: { occurrenceId: other.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: d.now() },
+      recording: { handle: "b".repeat(32), encryptedPath: otherSource, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+    });
+    const otherBundle = d.worker().enqueue({ artifact: other, serializedArtifact: canonicalArtifactJson(other), artifactHash: canonicalArtifactHash(other), recordingPath: otherSource });
+    linkSync(otherSource, d.source);
+    for (let replay = 0; replay < 2; replay += 1) {
+      d.reopen();
+      d.worker().reconcile();
+      const conflict = d.store().pending().find((row) => row.occurrenceId === built.artifact.occurrence_id)!;
+      assert.equal(conflict.retryReason, "recovery_unavailable");
+      assert.equal(conflict.deletedAtMs, null);
+      assert.equal(conflict.publishedAtMs, d.now());
+      assert.equal(conflict.recoveryArtifact, built.serialized);
+      assert.deepEqual(readFileSync(d.source), built.bytes);
+      assert.deepEqual(readFileSync(otherSource), built.bytes);
+      assert.equal(existsSync(otherBundle), true);
+    }
+  } finally { raw.close(); d.close(); h.cleanup(); }
+});
 
 test("writes the exact four-file TeamMem bundle atomically from a verified encrypted recording", () => {
   const h = harness();

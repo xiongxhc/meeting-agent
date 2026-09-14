@@ -707,10 +707,18 @@ function repairDeliveryRecordingOwners(db: Database.Database): void {
           db.prepare("UPDATE delivery_journal SET retry_reason = 'recovery_unavailable' WHERE rowid = ?").run(row.journal_rowid);
           continue;
         }
+        // Once publication is durable in both ledgers, an owned missing
+        // source can be a completed deletion awaiting its journal commit.
+        // Repair old missing-source markers only after ownership succeeds;
+        // conflicts and malformed bindings remain fail-closed above/below.
         db.prepare(
           `UPDATE delivery_journal
               SET recording_path = ?, recording_handle = ?,
-                  retry_reason = CASE WHEN ? IS NULL THEN 'recovery_unavailable' ELSE retry_reason END
+                  retry_reason = CASE WHEN ? IS NULL THEN
+                    CASE WHEN published_at_ms IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM sessions s WHERE s.occurrence_id = delivery_journal.occurrence_id AND s.state = 'published'
+                    ) THEN NULL ELSE 'recovery_unavailable' END
+                    ELSE retry_reason END
             WHERE rowid = ?`,
         ).run(binding.canonicalPath, binding.handle, binding.physicalIdentity, row.journal_rowid);
       } catch {

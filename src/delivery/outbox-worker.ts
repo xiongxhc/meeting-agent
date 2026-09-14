@@ -128,12 +128,15 @@ export function createOutboxWorker(options: {
             deleteOccurrenceEvidence(options, current, now, [current]);
             continue;
           }
-          if (current.retryReason === "recovery_unavailable") continue;
           const state = options.session.state(current.occurrenceId);
           if (current.publishedAtMs !== null) {
-            if (state === "published" && current.transcriptComplete) deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
+            // Startup repair clears missing-source publication markers only
+            // after a successful ownership claim. A remaining marker still
+            // blocks cleanup of conflicting or malformed recording evidence.
+            if (state === "published" && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
             continue;
           }
+          if (current.retryReason === "recovery_unavailable") continue;
           if (!recoverBundle(options, current)) continue;
           if (now < current.nextRetryAtMs) continue;
           const receipt = readPublicationReceipt({
