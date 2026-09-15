@@ -7,17 +7,33 @@ import path from "node:path";
 import process from "node:process";
 import { Readable } from "node:stream";
 import { RuntimeClient } from "@conversation/runtime";
-import { createConversationRuntimeClient, RecordingAlignmentOwner, openSessionStore } from "meeting-agent";
+import { createConversationRuntimeClient, RecordingAlignmentOwner, openSessionStore,
+  reconcilePersistedTimedSpeakers, buildTimedTeamMemMeetingArtifact, buildTimedTeamMemMeetingArtifactV2,
+  parseTeamMemMeetingArtifactV2, parseSupportedTeamMemMeetingArtifact } from "meeting-agent";
 
 const root = process.cwd(), meeting = path.join(root, "node_modules/meeting-agent");
 assert.equal(typeof openSessionStore, "function"); assert.equal(typeof RecordingAlignmentOwner, "function");
+assert.equal(typeof reconcilePersistedTimedSpeakers, "function"); assert.equal(typeof buildTimedTeamMemMeetingArtifact, "function");
+assert.equal(typeof buildTimedTeamMemMeetingArtifactV2, "function");
+assert.equal(typeof parseTeamMemMeetingArtifactV2, "function");
+assert.equal(typeof parseSupportedTeamMemMeetingArtifact, "function");
 const messages = new Readable({ objectMode: true, read() {} });
 messages.push({ type: "ready", protocol_version: 4, current_session_id: "42", status: { profile: "offline", transport: "stdio",
   privacy_mode: "local_only", language_location: "local", model_id: "synthetic", memory_enabled: false, memory_location: null,
   telemetry_enabled: false, capabilities: ["text"], components: [{ kind: "language_model", execution_location: "local", provider_label: "Synthetic" }], last_context_seed_operation_id: null } });
-const client = await RuntimeClient.connect({ messages, async send() {}, async close() { messages.push(null); } }, 4);
+const client = await RuntimeClient.connect({ messages, async send(command) {
+  if (command.type === "reconcile_finalized_recording") {
+    assert.equal(command.capability.sourceSessionId, 41n);
+    messages.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+    messages.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId,
+      reconciliation: { segments: [], warnings: [] } });
+  }
+}, async close() { messages.push(null); } }, 4);
 const runtime = createConversationRuntimeClient(client);
 assert.equal(typeof runtime.readRecordingAlignment, "function");
+const historical = await runtime.reconcileFinalizedRecording({ capability: { sourceSessionId: 41n, recordingHandle: "a".repeat(32),
+  sha256: "b".repeat(64), keyId: "c".repeat(16), authorization: "d".repeat(64) } });
+assert.equal(historical.source.sourceSessionId, 41n); assert.equal(runtime.currentSessionId, 42n);
 await assert.rejects(runtime.startVoiceSession({ profile: "online", responseMode: "external_gate" }), /Task 11/);
 await runtime.close();
 

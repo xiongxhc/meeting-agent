@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import { makeOccurrenceId } from "../domain/occurrence-id.ts";
+import type { SupportedTeamMemMeetingArtifact } from "./teammem-meeting-v2.ts";
 
 export const TEAMMEM_MEETING_V1_SCHEMA = "teammem-meeting/v1";
 
@@ -40,7 +41,7 @@ const speaker = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ambiguous") }).strict(),
 ]);
 
-const transcriptSegment = z.object({
+export const transcriptSegment = z.object({
   segment_id: boundedText(200),
   started_at: instant,
   ended_at: instant,
@@ -62,7 +63,7 @@ const personSummary = z.object({ person_id: boundedText(200), display_name: boun
 const recordingGap = z.object({ started_at: instant, ended_at: instant, reason: boundedText(500) }).strict();
 const processingWarning = z.object({ code: unicodeScalarString.regex(TOKEN), detail: unicodeScalarString.max(500) }).strict();
 
-const meetingArtifactBase = z.object({
+export const meetingArtifactBase = z.object({
   schema: z.literal(TEAMMEM_MEETING_V1_SCHEMA),
   occurrence_id: unicodeScalarString.max(400),
   revision: z.number().int().min(1).max(1_000_000),
@@ -118,12 +119,12 @@ export function parseTeamMemMeetingArtifact(value: unknown): TeamMemMeetingArtif
 
 /** TeamMem's canonical JSON hash: sorted object keys, compact separators,
  * UTF-8, and no formatting dependence. */
-export function canonicalArtifactHash(value: TeamMemMeetingArtifact): string {
+export function canonicalArtifactHash(value: SupportedTeamMemMeetingArtifact): string {
   const canonical = canonicalJson(value);
   return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
 }
 
-export function canonicalArtifactJson(value: TeamMemMeetingArtifact): string {
+export function canonicalArtifactJson(value: SupportedTeamMemMeetingArtifact): string {
   return canonicalJson(value);
 }
 
@@ -141,7 +142,7 @@ export function addMillisecondsToUtcInstant(origin: string, milliseconds: number
   return formatMicros(parseUtcInstant(origin) + BigInt(milliseconds) * 1_000n);
 }
 
-function validateRelationships(artifact: TeamMemMeetingArtifact): void {
+export function validateRelationships(artifact: SupportedTeamMemMeetingArtifact): void {
   const occurrence = parseOccurrence(artifact.occurrence_id);
   issue(occurrence.meetingId === artifact.provider_meeting_id, "provider_meeting_id must equal occurrence_id meeting id");
   issue(occurrence.startedAt === artifact.started_at, "started_at must equal occurrence_id start");
@@ -171,14 +172,22 @@ function validateRelationships(artifact: TeamMemMeetingArtifact): void {
 
   const segmentIds = new Set<string>();
   let previousTranscriptEnd: string | null = null;
+  let previousTranscript: TeamMemMeetingArtifact["transcript"][number] | null = null;
   const namedSpeakers = new Set<string>();
   for (const segment of artifact.transcript) {
     issue(!segmentIds.has(segment.segment_id), "transcript segment_id must be unique");
     segmentIds.add(segment.segment_id);
     issue(compareInstants(segment.ended_at, segment.started_at) >= 0, "transcript ended_at must not precede started_at");
     issue(compareInstants(segment.started_at, artifact.started_at) >= 0 && compareInstants(segment.ended_at, artifact.ended_at) <= 0, "transcript timing must be inside meeting window");
-    if (previousTranscriptEnd !== null) issue(compareInstants(segment.started_at, previousTranscriptEnd) >= 0, "transcript must be ordered and non-overlapping");
+    if (artifact.schema === TEAMMEM_MEETING_V1_SCHEMA) {
+      if (previousTranscriptEnd !== null) issue(compareInstants(segment.started_at, previousTranscriptEnd) >= 0, "transcript must be ordered and non-overlapping");
+    } else if (previousTranscript !== null) {
+      const startOrder = compareInstants(previousTranscript.started_at, segment.started_at);
+      const endOrder = compareInstants(previousTranscript.ended_at, segment.ended_at);
+      issue(startOrder < 0 || (startOrder === 0 && (endOrder < 0 || (endOrder === 0 && previousTranscript.segment_id < segment.segment_id))), "transcript must be ordered by start, end and segment_id");
+    }
     previousTranscriptEnd = segment.ended_at;
+    previousTranscript = segment;
     if (segment.speaker.kind === "person") {
       issue(participants.get(segment.speaker.person_id) === segment.speaker.display_name, "person speaker must be a reconciled actual participant with matching display_name");
       namedSpeakers.add(segment.speaker.person_id);

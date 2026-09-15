@@ -8,6 +8,8 @@ import { test } from "node:test";
 import Database from "better-sqlite3";
 
 import { parseTeamMemMeetingArtifact, canonicalArtifactHash, canonicalArtifactJson } from "../src/contracts/teammem-meeting-v1.ts";
+import { parseSupportedTeamMemMeetingArtifact } from "../src/contracts/teammem-meeting-v2.ts";
+import type { SupportedTeamMemMeetingArtifact } from "../src/contracts/teammem-meeting-v2.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../src/adapters/filesystem-outbox.ts";
 import { readPublicationReceipt } from "../src/adapters/receipt-inbox.ts";
 import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurrence-id.ts";
@@ -15,6 +17,10 @@ import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../s
 import { createNotificationWorker } from "../src/delivery/notification-worker.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import type { AcceptPublicationInput } from "../src/ports/session-store.ts";
+import { buildTimedTeamMemMeetingArtifactV2 } from "../src/delivery/artifact-builder.ts";
+import { createOwnedTimedSampleEvidence } from "../src/domain/attribution-evidence.ts";
+import { buildMeetingIdentity } from "../src/domain/meeting.ts";
+import type { TimedReconciledTranscript } from "../src/domain/transcript.ts";
 
 const FIXTURES = new URL("../fixtures/contracts/", import.meta.url);
 const SHA = (bytes: Uint8Array) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -45,6 +51,49 @@ function artifactAndAudio(fixture = "teammem-meeting-v1.complete.json"): { artif
   return { artifact: parsed, bytes, serialized: canonicalArtifactJson(parsed), hash: canonicalArtifactHash(parsed) };
 }
 
+function supportedArtifactAndAudio(fixture: "teammem-meeting-v2.minimal.json" | "teammem-meeting-v2.overlap.json") {
+  const artifact = structuredClone(JSON.parse(readFileSync(new URL(`fixtures/meetings/${fixture}`, import.meta.url), "utf8"))) as Record<string, unknown>;
+  const bytes = Buffer.from("synthetic encrypted audio bytes; never a container header", "utf8");
+  const audio = artifact.audio as Record<string, unknown>;
+  audio.bytes = bytes.length;
+  audio.sha256 = SHA(bytes);
+  const parsed = parseSupportedTeamMemMeetingArtifact(artifact);
+  return { artifact: parsed, bytes, serialized: canonicalArtifactJson(parsed), hash: canonicalArtifactHash(parsed) };
+}
+
+async function actualTimedV2Artifact() {
+  const bytes = Buffer.from("synthetic encrypted audio bytes; never a container header", "utf8");
+  const audioHash = SHA(bytes), source = { sourceSessionId: 41n, recordingHandle: "a".repeat(32), sha256: audioHash.slice(7) };
+  const identity = buildMeetingIdentity({ providerMeetingId: "synthetic-v2", meetingNo: "synthetic-v2", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "Synthetic overlap", organizer: null });
+  const wall = { startedAt: "2026-09-02T14:00:00.000000Z", endedAt: "2026-09-02T14:00:00.020000Z",
+    components: { maximumBracketNs: 1n, maximumResolutionNs: 1n, modelAllowanceNs: 1n, interpolationRoundingNs: 1n,
+      captureRoundingNs: 1n, captureUncertaintyNs: null, externalUtcAccuracyNs: null }, mappingRoundingNs: 1n, serializationRoundingNs: 1n };
+  const liveEvidence = createOwnedTimedSampleEvidence({ sampleRateHz: 24000, possibleSamples: 480n, candidateLower: [], observedUpper: [],
+    ambiguousUpper: 0n, unobservedUpper: 480n, freshCandidates: [] });
+  const finalEvidence = createOwnedTimedSampleEvidence({ sampleRateHz: 24000, possibleSamples: 432n, candidateLower: [], observedUpper: [],
+    ambiguousUpper: 0n, unobservedUpper: 432n, freshCandidates: [] });
+  const live = { segmentId: "obs-live", text: "Live wording retained.", range: { startSampleInclusive: 0n, endSampleExclusive: 480n, sampleRateHz: 24000, gapOffsetMs: 0n },
+    wording: "live" as const, liveSegmentIds: ["obs-live"], cluster: null, speaker: { kind: "anonymous" as const, label: "live-1" }, sampleEvidence: liveEvidence, wall };
+  const final = { ...live, segmentId: "obs-final", text: "Final wording retained.", wording: "reconciled" as const,
+    range: { ...live.range, startSampleInclusive: 24n, endSampleExclusive: 456n }, speaker: { kind: "anonymous" as const, label: "final-1" },
+    sampleEvidence: finalEvidence, wall: { ...wall, startedAt: "2026-09-02T14:00:00.001000Z", endedAt: "2026-09-02T14:00:00.019000Z" } };
+  const transcript: TimedReconciledTranscript = { kind: "timed_recording_transcript/v1", source, segments: [final, live], warnings: [
+    { code: "local_wall_timestamp_estimate", detail: "Synthetic local-wall estimate; physical accuracy unknown." }], transcriptComplete: true,
+    provenance: { occurrenceId: identity.occurrenceId, bridgeSessionId: "bridge", generationId: "generation", alignmentAttemptId: "attempt",
+      timingContract: "capture-clock/v1", policyId: "local-wall-estimate/v1" } };
+  const selected = { generationId: "generation", attemptId: "attempt", source, timingContract: "capture-clock/v1" as const,
+    policyId: "local-wall-estimate/v1" as const, coverageStatus: "available" as const, pageCount: 1, entryCount: 2, storedBytes: 100, warnings: [] };
+  const built = await buildTimedTeamMemMeetingArtifactV2({ identity, provider: "feishu", revision: 1, endedAt: "2026-09-02T14:10:00Z",
+    attendance: [{ feishuUserId: "person", displayName: "Person", joinedAt: "2026-09-02T14:00:00Z", leftAt: "2026-09-02T14:10:00Z" }],
+    transcript, selectedAlignment: selected, sessionId: 99n, meetingEnded: true, recordingGaps: [], processingWarnings: [],
+    runtime: { async processText() { return { output: { summary: "Both observations retained.", projects: [], decisions: [
+      { text: "Retain both.", evidence_segment_ids: ["obs-live", "obs-final"] }], action_items: [], discussion_points: [], person_summaries: [] }, warnings: [] }; } },
+    provenance: { runtimeProfile: "online", sttProvider: "synthetic", sttModel: "synthetic", textProvider: "synthetic", textModel: "synthetic",
+      agentVersion: "test", processedAt: "2026-09-02T14:11:00Z", finalBatchModel: "synthetic-final", liveStreamModel: "synthetic-live" },
+    audio: { format: "opus", encryption: "age-x25519", durationSeconds: 0.02, bytes: bytes.length, sha256: audioHash, expiresAt: "2026-09-16T14:10:00Z" } });
+  return { artifact: built.artifact, serialized: built.serialized, hash: built.artifact_hash, bytes };
+}
+
 class FakeJournal implements DeliveryJournal {
   readonly rows = new Map<string, DeliveryRow>();
   readonly notificationIntents = new Map<string, AcceptPublicationInput["notification"]>();
@@ -71,7 +120,45 @@ class FakeJournal implements DeliveryJournal {
   }
 }
 
-function publishedReceipt(artifact: ReturnType<typeof parseTeamMemMeetingArtifact>, hash: string): Record<string, unknown> {
+test("v2 filesystem write and SQLite reopen recovery preserve real builder bytes, hash and evidence IDs", async () => {
+  const h = harness(), built = await actualTimedV2Artifact();
+  const d = durableWorker(h, built);
+  try {
+    assert.equal(readFileSync(path.join(d.bundle, "meeting.json"), "utf8"), built.serialized);
+    rmSync(d.bundle, { recursive: true });
+    d.reopen();
+    const reopened = d.store().pending()[0]!;
+    assert.equal(reopened.recoveryArtifact, built.serialized);
+    assert.equal(reopened.artifactHash, built.hash);
+    d.worker().reconcile();
+    const recoveredBytes = readFileSync(path.join(d.bundle, "meeting.json"), "utf8");
+    const recovered = parseSupportedTeamMemMeetingArtifact(JSON.parse(recoveredBytes));
+    assert.equal(recovered.schema, "teammem-meeting/v2");
+    assert.equal(recoveredBytes, built.serialized);
+    assert.equal(canonicalArtifactHash(recovered), built.hash);
+    assert.deepEqual(recovered.decisions[0]?.evidence_segment_ids, ["obs-live", "obs-final"]);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("same-revision schema mutation conflicts while a higher versioned revision remains eligible", () => {
+  const h = harness(), v2 = supportedArtifactAndAudio("teammem-meeting-v2.minimal.json");
+  const source = runtimeRecordingPath(h); writeFileSync(source, v2.bytes);
+  const journal = new FakeJournal();
+  const worker = createOutboxWorker({ recordingsDir: h.recordings, outboxDir: h.outbox, receiptsDir: h.receipts, journal,
+    clock: { now: () => Date.parse(v2.artifact.ended_at) + 1 }, random: () => 0, reconciliationEvidence: NOOP_PURGE,
+    session: { state: () => "awaiting_teammem", publish: () => undefined } });
+  try {
+    worker.enqueue({ artifact: v2.artifact, serializedArtifact: v2.serialized, artifactHash: v2.hash, recordingPath: source });
+    const v1Raw = { ...v2.artifact, schema: "teammem-meeting/v1" };
+    const v1 = parseTeamMemMeetingArtifact(v1Raw);
+    assert.throws(() => worker.enqueue({ artifact: v1, serializedArtifact: canonicalArtifactJson(v1), artifactHash: canonicalArtifactHash(v1), recordingPath: source }), /immutable|conflicting/);
+    const higher = parseSupportedTeamMemMeetingArtifact({ ...v2.artifact, revision: v2.artifact.revision + 1 });
+    assert.doesNotThrow(() => worker.enqueue({ artifact: higher, serializedArtifact: canonicalArtifactJson(higher), artifactHash: canonicalArtifactHash(higher), recordingPath: source }));
+    assert.deepEqual(journal.pending().map(({ revision }) => revision), [1, 2]);
+  } finally { h.cleanup(); }
+});
+
+function publishedReceipt(artifact: SupportedTeamMemMeetingArtifact, hash: string): Record<string, unknown> {
   const commit = "a".repeat(40);
   return {
     artifact_hash: hash,
@@ -85,7 +172,7 @@ function publishedReceipt(artifact: ReturnType<typeof parseTeamMemMeetingArtifac
   };
 }
 
-function durableWorker(h: ReturnType<typeof harness>, built = artifactAndAudio()) {
+function durableWorker(h: ReturnType<typeof harness>, built: { artifact: SupportedTeamMemMeetingArtifact; bytes: Buffer; serialized: string; hash: string } = artifactAndAudio()) {
   const filename = path.join(h.root, "orchestration.db");
   const source = runtimeRecordingPath(h);
   writeFileSync(source, built.bytes);

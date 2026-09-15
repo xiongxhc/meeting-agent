@@ -4,6 +4,7 @@ import { RuntimeClient, type RuntimeTransport } from "@conversation/runtime";
 import type {
   ConversationContextExchange,
   ConversationRuntimePort,
+  FinalizedRecordingRuntime,
   RuntimeEvent,
 } from "../ports/conversation-runtime.ts";
 import type { InvocationDecisionReason, InvocationSink } from "../sessions/invocation-gate.ts";
@@ -11,11 +12,11 @@ import type { InvocationDecisionReason, InvocationSink } from "../sessions/invoc
 export type ConversationRuntimeSdk = RuntimeClient<4>;
 
 /** Explicit version negotiation; transport ownership stays with the caller. */
-export async function connectPostmeetingRuntime(transport: RuntimeTransport): Promise<ConversationRuntimePort> {
+export async function connectPostmeetingRuntime(transport: RuntimeTransport): Promise<ConversationRuntimePort & FinalizedRecordingRuntime> {
   return createConversationRuntimeClient(await RuntimeClient.connect(transport, 4));
 }
 
-export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): ConversationRuntimePort {
+export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): ConversationRuntimePort & FinalizedRecordingRuntime {
   if (!(sdk instanceof RuntimeClient) || typeof sdk.currentSessionId !== "bigint") {
     throw new Error("Postmeeting Runtime requires an open SDK protocol version 4 client");
   }
@@ -56,6 +57,7 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): Co
     finalizeRecording: (input) => sdk.finalizeRecording(input),
     readRecordingAlignment: (input) => sdk.readRecordingAlignment(input),
     reconcileRecording: (input) => sdk.reconcileRecording(input),
+    reconcileFinalizedRecording: (input) => sdk.reconcileFinalizedRecording(input),
     subscribe: (listener: (event: RuntimeEvent) => void) => {
       if (closing) throw new Error("Runtime live owner is closed");
       listeners.add(listener);

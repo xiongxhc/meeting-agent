@@ -13,11 +13,17 @@ import {
   TEAMMEM_MEETING_V1_SCHEMA,
   type TeamMemMeetingArtifact,
 } from "../contracts/teammem-meeting-v1.ts";
+import {
+  parseTeamMemMeetingArtifactV2,
+  type SupportedTeamMemMeetingArtifact,
+  type TeamMemMeetingArtifactV2,
+} from "../contracts/teammem-meeting-v2.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { AttendanceInterval } from "../domain/participants.ts";
-import { getOwnedUiExactMsSnapshot } from "../domain/attribution-evidence.ts";
-import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, TranscriptWarning } from "../domain/transcript.ts";
+import { getOwnedUiExactMsSnapshot, getOwnedTimedSampleSnapshot, namedTimedCandidate } from "../domain/attribution-evidence.ts";
+import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, TranscriptWarning, TimedReconciledTranscript } from "../domain/transcript.ts";
 import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
+import type { SelectedAlignment } from "../ports/session-store.ts";
 
 const text = z.string().min(1).max(20_000);
 const evidence = z.array(z.string().min(1).max(200)).min(1).max(100);
@@ -119,7 +125,18 @@ export type BuiltTeamMemMeetingArtifact = {
   readonly serialized: string;
 };
 
-export type ArtifactRevisionGuard = { check(artifact: TeamMemMeetingArtifact, hash: string): void };
+export type BuiltTeamMemMeetingArtifactV2 = {
+  readonly artifact: TeamMemMeetingArtifactV2;
+  readonly artifact_hash: string;
+  readonly serialized: string;
+};
+
+export type ArtifactRevisionGuard = { check(artifact: SupportedTeamMemMeetingArtifact, hash: string): void };
+export type TimedArtifactBuildInput = Omit<ArtifactBuildInput, "transcript"> & {
+  readonly transcript: TimedReconciledTranscript;
+  /** Exact selected reference revalidated by the final reader; never a capability. */
+  readonly selectedAlignment: SelectedAlignment;
+};
 
 /** Builds the only post-meeting contract payload. The Runtime produces a
  * bounded structured synthesis, but this process validates it locally and
@@ -129,20 +146,112 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
   const alignment = requireMatchingAlignment(input.transcript.alignment, input.sessionId);
   const participants = participantsFromAttendance(input.attendance);
   const transcript = transcriptFromReconciled(input.transcript.segments, alignment, participants, input.provenance);
+  return assembleArtifact(input, participants, transcript, input.transcript.warnings.map(transcriptWarning));
+}
+
+/** Historical capture identity is separate from the current processText control. */
+export async function buildTimedTeamMemMeetingArtifact(input: TimedArtifactBuildInput): Promise<BuiltTeamMemMeetingArtifact> {
+  return buildTimedArtifact(input, "v1");
+}
+
+export async function buildTimedTeamMemMeetingArtifactV2(input: TimedArtifactBuildInput): Promise<BuiltTeamMemMeetingArtifactV2> {
+  return buildTimedArtifact(input, "v2");
+}
+
+function buildTimedArtifact(input: TimedArtifactBuildInput, version: "v1"): Promise<BuiltTeamMemMeetingArtifact>;
+function buildTimedArtifact(input: TimedArtifactBuildInput, version: "v2"): Promise<BuiltTeamMemMeetingArtifactV2>;
+async function buildTimedArtifact(input: TimedArtifactBuildInput, version: "v1" | "v2"): Promise<BuiltTeamMemMeetingArtifact | BuiltTeamMemMeetingArtifactV2> {
+  if (!input.meetingEnded) throw new Error("meeting must have ended before processText (R54)");
+  const { transcript: value, selectedAlignment: selected } = input;
+  if (value.kind !== "timed_recording_transcript/v1" || value.provenance.occurrenceId !== input.identity.occurrenceId ||
+    value.provenance.generationId !== selected.generationId || value.provenance.alignmentAttemptId !== selected.attemptId ||
+    value.provenance.timingContract !== "capture-clock/v1" || selected.timingContract !== "capture-clock/v1" ||
+    value.provenance.policyId !== "local-wall-estimate/v1" || value.provenance.policyId !== selected.policyId ||
+    value.source.sourceSessionId !== selected.source.sourceSessionId || value.source.recordingHandle !== selected.source.recordingHandle ||
+    value.source.sha256 !== selected.source.sha256 || input.audio.sha256 !== `sha256:${value.source.sha256}`) throw new Error("timed recording provenance mismatch");
+  const participants = participantsFromAttendance(input.attendance);
+  const names = new Map(participants.map((entry) => [entry.person_id, entry.display_name]));
+  if (names.size > 500 || value.segments.length > 1280) throw new Error("timed artifact output bound exceeded");
+  const orderKey = (instant: string) => {
+    try {
+      const canonical = addMillisecondsToUtcInstant(instant, 0);
+      return `${canonical.slice(0, 19)}.${canonical.slice(19, -1).replace(".", "").padEnd(6, "0")}`;
+    } catch { throw new Error("timed artifact wall instant is invalid"); }
+  };
+  const meetingStart = orderKey(input.identity.occurrenceStartedAt), meetingEnd = orderKey(input.endedAt);
+  const ids = new Set<string>();
+  const segments = version === "v2" ? [...value.segments].sort((left, right) => {
+    const leftStart = orderKey(left.wall?.startedAt ?? ""), rightStart = orderKey(right.wall?.startedAt ?? "");
+    const leftEnd = orderKey(left.wall?.endedAt ?? ""), rightEnd = orderKey(right.wall?.endedAt ?? "");
+    return leftStart < rightStart ? -1 : leftStart > rightStart ? 1 : leftEnd < rightEnd ? -1 : leftEnd > rightEnd ? 1
+      : left.segmentId < right.segmentId ? -1 : left.segmentId > right.segmentId ? 1 : 0;
+  }) : value.segments;
+  let previousEnd: string | null = null;
+  const transcript: TeamMemMeetingArtifact["transcript"] = segments.map((segment) => {
+    const evidence = getOwnedTimedSampleSnapshot(segment.sampleEvidence), range = segment.range, wall = segment.wall;
+    if (!evidence || !range || !wall || evidence.sampleRateHz !== range.sampleRateHz ||
+      evidence.possibleSamples !== range.endSampleExclusive - range.startSampleInclusive || evidence.possibleSamples <= 0n) throw new Error("timed sample evidence or wall mapping unavailable");
+    const start = orderKey(wall.startedAt), end = orderKey(wall.endedAt);
+    if (start > end || start < meetingStart || end > meetingEnd || (version === "v1" && previousEnd !== null && start < previousEnd) || ids.has(segment.segmentId)) {
+      throw new Error("timed transcript is not representable as ordered nonoverlapping artifact intervals");
+    }
+    previousEnd = end; ids.add(segment.segmentId);
+    let confidence = 0;
+    if (segment.speaker.kind === "named") {
+      if (namedTimedCandidate(segment.sampleEvidence!) !== segment.speaker.feishuUserId) throw new Error("timed named evidence mismatch");
+      const lower = new Map(evidence.candidateLower).get(segment.speaker.feishuUserId)!;
+      confidence = Number(lower * 1000000n / evidence.possibleSamples) / 1000000;
+    }
+    return { segment_id: segment.segmentId, started_at: wall.startedAt, ended_at: wall.endedAt, text: segment.text,
+      speaker: toArtifactSpeaker(segment, names), attribution_confidence: confidence,
+      provenance: { stage: segment.wording === "reconciled" ? "final_batch" : "live_stream",
+        model: segment.wording === "reconciled" ? input.provenance.finalBatchModel : input.provenance.liveStreamModel } };
+  });
+  if (transcript.length && value.warnings.filter(({ code }) => code === "local_wall_timestamp_estimate").length !== 1) throw new Error("timed local-wall warning required");
+  return version === "v1"
+    ? assembleArtifact(input, participants, transcript, value.warnings)
+    : assembleArtifactV2(input, participants, transcript, value.warnings);
+}
+
+async function assembleArtifactV2(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
+  participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
+  transcriptWarnings: readonly { readonly code: string; readonly detail: string }[]): Promise<BuiltTeamMemMeetingArtifactV2> {
+  const built = await assembleSupportedArtifact(input, participants, transcript, transcriptWarnings, "v2");
+  return built;
+}
+
+async function assembleArtifact(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
+  participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
+  transcriptWarnings: readonly { readonly code: string; readonly detail: string }[]): Promise<BuiltTeamMemMeetingArtifact> {
+  const built = await assembleSupportedArtifact(input, participants, transcript, transcriptWarnings, "v1");
+  return built;
+}
+
+function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
+  participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
+  transcriptWarnings: readonly { readonly code: string; readonly detail: string }[], version: "v1"): Promise<BuiltTeamMemMeetingArtifact>;
+function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
+  participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
+  transcriptWarnings: readonly { readonly code: string; readonly detail: string }[], version: "v2"): Promise<BuiltTeamMemMeetingArtifactV2>;
+async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
+  participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
+  transcriptWarnings: readonly { readonly code: string; readonly detail: string }[], version: "v1" | "v2"): Promise<BuiltTeamMemMeetingArtifact | BuiltTeamMemMeetingArtifactV2> {
   const processed = await input.runtime.processText({
     sessionId: input.sessionId,
-    instructions: "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects.",
-    input: canonicalTranscriptInput(transcript),
+    instructions: version === "v1"
+      ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects."
+      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.",
+    input: canonicalTranscriptInput(transcript, version),
     outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
     maxOutputBytes: 1_000_000,
   });
   const synthesis = textSynthesis.parse(processed.output);
   const runtimeWarnings = processed.warnings.map(runtimeTextWarning);
-  if (input.processingWarnings.length + input.transcript.warnings.length + runtimeWarnings.length > 500) {
+  if (input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length > 500) {
     throw new Error("processing warning limit exceeded");
   }
-  const artifact = parseTeamMemMeetingArtifact({
-    schema: TEAMMEM_MEETING_V1_SCHEMA,
+  const artifactValue = {
+    schema: version === "v1" ? TEAMMEM_MEETING_V1_SCHEMA : "teammem-meeting/v2",
     occurrence_id: input.identity.occurrenceId,
     revision: input.revision,
     provider: input.provider,
@@ -163,7 +272,7 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
     discussion_points: synthesis.discussion_points,
     person_summaries: synthesis.person_summaries,
     recording_gaps: input.recordingGaps.map((gap) => ({ started_at: gap.startedAt, ended_at: gap.endedAt, reason: gap.reason })),
-    processing_warnings: [...input.processingWarnings, ...input.transcript.warnings.map(transcriptWarning), ...runtimeWarnings],
+    processing_warnings: [...input.processingWarnings, ...transcriptWarnings, ...runtimeWarnings],
     provenance: {
       runtime_profile: input.provenance.runtimeProfile,
       stt_provider: input.provenance.sttProvider,
@@ -182,7 +291,14 @@ export async function buildTeamMemMeetingArtifact(input: ArtifactBuildInput): Pr
       sha256: input.audio.sha256,
       expires_at: input.audio.expiresAt,
     },
-  });
+  };
+  if (version === "v1") {
+    const artifact = parseTeamMemMeetingArtifact(artifactValue);
+    const artifact_hash = canonicalArtifactHash(artifact);
+    input.revisionGuard?.check(artifact, artifact_hash);
+    return { artifact, artifact_hash, serialized: canonicalArtifactJson(artifact) };
+  }
+  const artifact = parseTeamMemMeetingArtifactV2(artifactValue);
   const artifact_hash = canonicalArtifactHash(artifact);
   input.revisionGuard?.check(artifact, artifact_hash);
   return { artifact, artifact_hash, serialized: canonicalArtifactJson(artifact) };
@@ -247,7 +363,7 @@ function transcriptFromReconciled(
   }));
 }
 
-function toArtifactSpeaker(segment: ReconciledSegment, names: ReadonlyMap<string, string>) {
+function toArtifactSpeaker(segment: Pick<ReconciledSegment, "speaker">, names: ReadonlyMap<string, string>) {
   switch (segment.speaker.kind) {
     case "named": {
       const display_name = names.get(segment.speaker.feishuUserId);
@@ -333,8 +449,11 @@ function runtimeTextWarning(warning: string): { readonly code: string; readonly 
   return { code: "runtime_text_warning", detail: `Runtime text processing warning (sha256:${digest})` };
 }
 
-function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript"]): string {
-  return JSON.stringify(transcript.map((segment) => ({ segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker })));
+function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript"], version: "v1" | "v2"): string {
+  return JSON.stringify(transcript.map((segment) => version === "v1"
+    ? { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker }
+    : { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker, started_at: segment.started_at,
+        ended_at: segment.ended_at, provenance: segment.provenance }));
 }
 
 function evidenceSchema(): Record<string, unknown> {

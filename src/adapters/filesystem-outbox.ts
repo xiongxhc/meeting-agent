@@ -19,7 +19,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-import { canonicalArtifactHash, canonicalArtifactJson, parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
+import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
+import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
 
 const NAMES = ["meeting.json", "audio.enc", "manifest.json", "READY"] as const;
@@ -29,7 +30,7 @@ const OWNER = "OWNER";
 export type WriteMeetingBundleInput = {
   readonly recordingsDir: string;
   readonly outboxDir: string;
-  readonly artifact: TeamMemMeetingArtifact;
+  readonly artifact: SupportedTeamMemMeetingArtifact;
   /** Task 8's already-canonical bytes: delivery must not reserialize them. */
   readonly serializedArtifact: string;
   readonly artifactHash: string;
@@ -58,7 +59,7 @@ export type DeleteFaultPoint = "after_recording_detach" | "after_bundle_detach" 
 
 /** Writes a complete ready bundle, or leaves no TeamMem-visible partial bundle. */
 export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
-  const artifact = parseTeamMemMeetingArtifact(input.artifact);
+  const artifact = parseSupportedTeamMemMeetingArtifact(input.artifact);
   const canonical = canonicalArtifactJson(artifact);
   const canonicalHash = canonicalArtifactHash(artifact);
   if (input.serializedArtifact !== canonical || input.artifactHash !== canonicalHash) {
@@ -206,7 +207,7 @@ function assertPathUnderRoot(root: string, target: string, requireTarget: boolea
   }
 }
 
-function readVerifiedRecording(recordings: string, recordingPath: string, artifact: TeamMemMeetingArtifact, persistedHandle?: string): Buffer {
+function readVerifiedRecording(recordings: string, recordingPath: string, artifact: SupportedTeamMemMeetingArtifact, persistedHandle?: string): Buffer {
   const target = path.resolve(recordingPath);
   assertPathUnderRoot(recordings, target, true);
   if (path.dirname(target) !== recordings) throw new Error("recording must be a direct child of the configured recordings root");
@@ -230,7 +231,7 @@ function looksLikePlaintextAudio(bytes: Buffer): boolean {
     || (bytes[0] === 0xff && bytes[1] !== undefined && bytes[1] >= 0xe0);
 }
 
-function canonicalManifest(artifact: TeamMemMeetingArtifact, artifactHash: string, audio: Buffer): string {
+function canonicalManifest(artifact: SupportedTeamMemMeetingArtifact, artifactHash: string, audio: Buffer): string {
   const audioSha = sha256(audio);
   if (!SHA256.test(artifactHash) || audioSha !== artifact.audio.sha256 || audio.length !== artifact.audio.bytes) {
     throw new Error("manifest integrity claims are invalid");

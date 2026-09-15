@@ -3,7 +3,8 @@
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
-import { canonicalArtifactHash, canonicalArtifactJson, parseTeamMemMeetingArtifact, type TeamMemMeetingArtifact } from "../contracts/teammem-meeting-v1.ts";
+import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
+import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -51,7 +52,7 @@ export type DeliveryJournal = {
 
 export type OutboxWorker = {
   enqueue(input: {
-    readonly artifact: TeamMemMeetingArtifact;
+    readonly artifact: SupportedTeamMemMeetingArtifact;
     readonly serializedArtifact: string;
     readonly artifactHash: string;
     readonly recordingPath: string;
@@ -230,7 +231,7 @@ function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["not
     return { terminalReason: "notification_inputs_unavailable" };
   }
   try {
-    const artifact = parseTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
+    const artifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
     if (canonicalArtifactJson(artifact) !== row.recoveryArtifact
       || canonicalArtifactHash(artifact) !== row.artifactHash
       || artifact.occurrence_id !== row.occurrenceId
@@ -244,7 +245,7 @@ function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["not
 }
 
 function notificationForArtifact(
-  artifact: TeamMemMeetingArtifact,
+  artifact: SupportedTeamMemMeetingArtifact,
   row: Pick<DeliveryRow, "occurrenceId" | "revision" | "artifactHash">,
   publicationUrl: string,
   vaultCommit: string,
@@ -284,7 +285,7 @@ function deleteOccurrenceEvidence(
 function recoverBundle(
   options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
   row: DeliveryRow,
-): TeamMemMeetingArtifact | null {
+): SupportedTeamMemMeetingArtifact | null {
   if (row.recoveryArtifact === null || row.stageToken === null) {
     options.journal.update({ ...row, retryReason: "recovery_unavailable" });
     return null;
@@ -292,7 +293,7 @@ function recoverBundle(
   try {
     const expected = path.join(path.resolve(options.outboxDir), occurrencePathSegment(row.occurrenceId as `${string}@${string}`), String(row.revision));
     if (row.bundlePath !== expected) throw new Error("recovery bundle path differs from durable journal");
-    const artifact = parseTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
+    const artifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
     const artifactHash = row.artifactHash;
     const written = writeMeetingBundle({
       recordingsDir: options.recordingsDir,

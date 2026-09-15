@@ -4,8 +4,52 @@ import { setImmediate } from "node:timers/promises";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { RuntimeEvent } from "../src/ports/conversation-runtime.ts";
-import { createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
-import { finalizedWire, runtimeTestClient } from "./lib/runtime-sdk.ts";
+import { connectPostmeetingRuntime, createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
+import { finalizedWire, RuntimeTestTransport, runtimeTestClient, testCapability } from "./lib/runtime-sdk.ts";
+
+test("public connected postmeeting runtime retains its actual finalized recovery surface", async () => {
+  const transport = new RuntimeTestTransport();
+  transport.push({ type: "ready", protocol_version: 4, current_session_id: "99", status: { profile: "offline", transport: "stdio",
+    privacy_mode: "local_only", language_location: "local", model_id: "synthetic", memory_enabled: false, memory_location: null,
+    telemetry_enabled: false, capabilities: ["text"], components: [{ kind: "language_model", execution_location: "local", provider_label: "Synthetic" }],
+    last_context_seed_operation_id: null } });
+  transport.onSend = (command) => {
+    transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+    transport.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId, reconciliation: { segments: [], warnings: [] } });
+  };
+  const connected = await connectPostmeetingRuntime(transport);
+  try {
+    // This call also guards the public inferred return declaration, not just runtime object shape.
+    const result = await connected.reconcileFinalizedRecording({ capability: testCapability });
+    assert.equal(connected.currentSessionId, 99n);
+    assert.equal(result.source.sourceSessionId, 41n);
+    assert.deepEqual(result.segments, []);
+  } finally { await connected.close(); }
+});
+
+test("finalized reconciliation preserves historical samples through actual SDK with a different current control identity", async () => {
+  const { client, transport } = await runtimeTestClient(4, 42n), runtime = createConversationRuntimeClient(client);
+  transport.onSend = (command) => {
+    transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+    transport.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId,
+      reconciliation: { segments: [{ segment_id: "final-1", started_at_ms: "0", ended_at_ms: "20", text: "preserve historical words",
+        speaker_cluster: "cluster-1", media_sample_range: { start_sample_inclusive: "0", end_sample_exclusive: "480", sample_rate_hz: 24000,
+          gap_offset_ms: "0", quantization_policy: "provider_seconds_outward_samples/v1" } }], warnings: [] } });
+  };
+  try {
+    assert.equal(typeof runtime.reconcileFinalizedRecording, "function", "the real adapter must expose historical recovery, not substitute current-session reconciliation");
+    const capability = { ...testCapability };
+    const pending = runtime.reconcileFinalizedRecording({ capability });
+    capability.sourceSessionId = 999n;
+    const result = await pending;
+    assert.deepEqual(result.source, { sourceSessionId: 41n, recordingHandle: "a".repeat(32), sha256: "b".repeat(64) });
+    assert.deepEqual(result.segments[0]?.mediaSampleRange, { startSampleInclusive: 0n, endSampleExclusive: 480n, sampleRateHz: 24000,
+      gapOffsetMs: 0n, quantizationPolicy: "provider_seconds_outward_samples/v1" });
+    assert.equal(result.segments[0]?.text, "preserve historical words");
+    assert.equal(transport.commands[0]?.type, "reconcile_finalized_recording");
+    assert.equal(JSON.stringify(result, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value).includes(testCapability.authorization), false);
+  } finally { await runtime.close(); }
+});
 
 test("actual SDK timed admission preserves source evidence and never invents UTC or automatic authorization", async () => {
   const { client, transport } = await runtimeTestClient(4);

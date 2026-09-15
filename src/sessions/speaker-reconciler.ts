@@ -72,7 +72,11 @@ import type {
   RecordingReconciliation,
   TranscriptSegment,
 } from "../ports/conversation-runtime.ts";
-import type { ReconciliationEvidenceRow, RecordingRow } from "../ports/session-store.ts";
+import type { ReconciliationEvidenceRow, RecordingRow, SessionStore } from "../ports/session-store.ts";
+import type { FinalizedRecordingRuntime, RecordingAlignmentEntry, VersionFourVoiceTranscriptFinalEvent } from "../ports/conversation-runtime.ts";
+import type { BridgeEventMessageV2 } from "../contracts/bridge-session-v2.ts";
+import type { TimedReconciledTranscript } from "../domain/transcript.ts";
+import { mergeTimedRecordingEvidence } from "./timed-evidence-merge.ts";
 
 export const MIN_ALIGNED_COVERAGE = 0.8;
 export const MAX_CONFLICTING_OVERLAP_MS = 500;
@@ -312,6 +316,91 @@ export async function reconcilePersistedSpeakers(input: {
     occurrenceId: input.occurrenceId, sessionId: evidence.runtimeSessionId, recordings: input.recordings, runtime: input.runtime,
     ...common,
   });
+}
+
+/** Read-only final consumer. The caller must already have closed/reaped live
+ * ownership; this function never recovers a writer or starts an alignment read. */
+export async function reconcilePersistedTimedSpeakers(input: {
+  readonly occurrenceId: string; readonly bridgeSessionId: string; readonly recordingHandle: string;
+  readonly store: Pick<SessionStore, "getRecordingRecovery" | "getTimedEvidenceBinding" | "getTimedEvidenceStatus" |
+    "getSelectedAlignment" | "readSelectedAlignmentPage" | "readTimedUi" | "readTimedFinal" | "getRecording" | "getBridgeFailureRecording">;
+  readonly runtime: FinalizedRecordingRuntime; readonly nowMs: () => number; readonly signal?: AbortSignal;
+}): Promise<TimedReconciledTranscript> {
+  const { store } = input;
+  const recovery = store.getRecordingRecovery(input.occurrenceId, input.bridgeSessionId, input.recordingHandle);
+  if (!recovery) throw new Error("final recording recovery unavailable");
+  const recording = recovery.recordingKind === "bridge_failure" && recovery.failureAttempt !== null
+    ? store.getBridgeFailureRecording(input.occurrenceId, recovery.failureAttempt) : store.getRecording(input.occurrenceId);
+  if (!recording || recording.handle !== input.recordingHandle || recording.sha256 !== recovery.capability.sha256) throw new Error("timed recording metadata mismatch");
+  const selected = store.getSelectedAlignment(recovery.generationId);
+  if (!selected || selected.source.sourceSessionId !== recovery.capability.sourceSessionId ||
+    selected.source.recordingHandle !== input.recordingHandle || selected.source.sha256 !== recovery.capability.sha256) throw new Error("selected final alignment unavailable or mismatched");
+  function check() {
+    if (input.signal?.aborted) throw new Error("timed evidence read cancelled");
+    const now = input.nowMs(), descriptor = store.getTimedEvidenceBinding(recovery!.generationId, now);
+    if (descriptor.kind !== "timed" || descriptor.state !== "closed" ||
+      descriptor.recordingHandle !== input.recordingHandle || descriptor.binding.occurrenceId !== input.occurrenceId ||
+      descriptor.binding.bridgeSessionId !== input.bridgeSessionId || descriptor.binding.runtimeSessionId !== selected!.source.sourceSessionId) {
+      throw new Error("timed evidence is unavailable, expired, or not quiescent");
+    }
+    const current = store.getSelectedAlignment(recovery!.generationId);
+    if (!current || current.attemptId !== selected!.attemptId || current.source.sourceSessionId !== selected!.source.sourceSessionId ||
+      current.source.recordingHandle !== selected!.source.recordingHandle || current.source.sha256 !== selected!.source.sha256) throw new Error("selected final alignment changed");
+    const status = store.getTimedEvidenceStatus(descriptor.binding, now);
+    if (!status || status.state !== "closed") throw new Error("timed evidence is unavailable, expired, or not quiescent");
+    return { binding: descriptor.binding, status, now };
+  }
+  check();
+  const live: VersionFourVoiceTranscriptFinalEvent[] = [];
+  let after = "";
+  for (;;) {
+    const { binding, now } = check(), row = store.readTimedFinal(binding, after, now);
+    if (!row) break;
+    if (live.length === 256 || row.event.segmentId <= after) throw new Error("invalid bounded final wording cursor");
+    live.push(row.event); after = row.event.segmentId;
+  }
+  function* ui(): Generator<BridgeEventMessageV2> {
+    let after = 0;
+    for (;;) {
+      const { binding, now } = check(), page = store.readTimedUi(binding, after, now);
+      if (page.length === 0) return;
+      if (page.length > 8) throw new Error("invalid bounded UI page");
+      for (const event of page) {
+        check();
+        if (event.sequence <= after) throw new Error("invalid UI keyset cursor");
+        after = event.sequence; yield event;
+      }
+    }
+  }
+  function* alignment(): Generator<RecordingAlignmentEntry> {
+    let pageIndex = -1, count = 0;
+    for (;;) {
+      check();
+      const page = store.readSelectedAlignmentPage(selected!, pageIndex);
+      if (!page) {
+        if (pageIndex + 1 !== selected!.pageCount || count !== selected!.entryCount) throw new Error("selected final alignment incomplete");
+        return;
+      }
+      if (page.entries.length > 64 || page.pageIndex !== BigInt(pageIndex + 1)) throw new Error("invalid bounded alignment page");
+      pageIndex++; count += page.entries.length;
+      for (const entry of page.entries) { check(); yield entry; }
+    }
+  }
+  let final: Awaited<ReturnType<FinalizedRecordingRuntime["reconcileFinalizedRecording"]>> | { unavailable: true };
+  try { final = await input.runtime.reconcileFinalizedRecording({ capability: recovery.capability }); }
+  catch { final = { unavailable: true }; } // Provider/transport details may contain private inputs.
+  const { status } = check();
+  const merged = await mergeTimedRecordingEvidence({ source: selected.source, bridgeSessionId: input.bridgeSessionId,
+    entries: alignment(), ui: ui(), live, final, uiLossReason: status.uiLossReason, wordingLossReason: status.wordingLossReason,
+    ...(input.signal ? { signal: input.signal } : {}) });
+  check();
+  const knownCaptureLoss = recovery.recordingKind === "bridge_failure" || recording.gaps.some((gap) => gap.direction === "capture");
+  return { kind: "timed_recording_transcript/v1", ...merged, transcriptComplete: merged.transcriptComplete && !knownCaptureLoss,
+    warnings: knownCaptureLoss && !merged.warnings.some(({ code }) => code === "timed_capture_loss")
+      ? [...merged.warnings, { code: "timed_capture_loss", detail: recovery.recordingKind === "bridge_failure" ? "failed_attempt_prefix" : "recorded_capture_gap" }] : merged.warnings,
+    provenance: { occurrenceId: input.occurrenceId,
+    bridgeSessionId: input.bridgeSessionId, generationId: recovery.generationId, alignmentAttemptId: selected.attemptId,
+    timingContract: selected.timingContract, policyId: selected.policyId } };
 }
 
 // ---------------------------------------------------------------------------

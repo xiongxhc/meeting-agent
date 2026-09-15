@@ -39,6 +39,32 @@ export function snapshot(sequence = 1): BridgeEventMessageV2 {
     state: "ui_exact", feishuUserId: "person", reason: null, barrierBefore: null };
 }
 
+test("final evidence lookup resolves exact generation without a first UI row or writer authority, and distinguishes expiry", () => {
+  const f = liveFixture();
+  try {
+    const owner = f.store.beginTimedEvidence(f.binding, 1000);
+    assert.equal(typeof f.store.getTimedEvidenceBinding, "function", "a final reader needs the exact persisted binding, not latest-generation inference");
+    const generationId = owner.generationId;
+    assert.deepEqual(f.store.getTimedEvidenceBinding(generationId, 1000), {
+      kind: "timed", generationId, binding: f.binding, recordingHandle: null, terminalAtMs: null, expiresAtMs: null, state: "active",
+    });
+    f.store.closeTimedEvidence(owner, 1001);
+    f.store.completeReconciliationGeneration(f.binding.occurrenceId, f.binding.bridgeSessionId, 2000, "local_clock");
+    const expiry = 2000 + 14 * 24 * 60 * 60 * 1000;
+    const other = openSessionStore({ filename: f.filename });
+    try {
+      assert.deepEqual(other.getTimedEvidenceBinding(generationId, expiry - 1), {
+        kind: "timed", generationId, binding: f.binding, recordingHandle: null, terminalAtMs: 2000, expiresAtMs: expiry, state: "closed",
+      });
+      assert.deepEqual(other.getTimedEvidenceBinding(generationId, expiry), { kind: "expired" });
+      assert.deepEqual(other.getTimedEvidenceBinding("not-a-generation", 1000), { kind: "absent" });
+      assert.throws(() => other.getTimedEvidenceBinding(generationId, NaN), /clock/);
+      const value = other.getTimedEvidenceBinding(generationId, expiry - 1);
+      assert.equal(JSON.stringify(value, (_key, v: unknown) => typeof v === "bigint" ? v.toString() : v).includes(owner.token), false);
+    } finally { other.close(); }
+  } finally { f.close(); }
+});
+
 test("SQLite retains parsed timed wording/source and exact v2 brackets before one-shot result, across reopen", () => {
   const f = liveFixture();
   try {

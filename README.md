@@ -45,7 +45,7 @@ export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if need
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive 6f8e88ff1376d0dd541a3616725280cde42dfde7 | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive dbcd440924bd0bf7ed7f6ffe8c3d3c6b2dbf80ac | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
@@ -111,8 +111,9 @@ operators need additional disk headroom. Representation overhead can reject an
 otherwise Runtime-valid maximum page; this fails visibly instead of truncating.
 Tentative pages never appear in selected evidence. Matching terminal selection
 is atomic, and bounded keyset reads retain the chosen attempt identity. Partial
-coverage stays partial; legacy unavailable has no timing policy/anchor. Existing
-speaker/artifact consumers still see their legacy null alignment in this scope.
+coverage stays partial; legacy unavailable has no timing policy/anchor. Legacy
+speaker/artifact consumers keep that null alignment; timed final consumers use
+the separate selected-evidence path below.
 
 Use one shared `RecordingAlignmentOwner`, and await `owner.close()` **before**
 closing its Runtime/SQLite dependencies. A failed cleanup retains ownership.
@@ -131,9 +132,71 @@ payload cleanup without asserting a nonexistent reader has died. A real staging
 or failed-cleanup reader still requires the trusted proof. Owner close waits for
 pending reclaim, and no new reader is admitted during it.
 
+### Timed final evidence library
+
+`reconcilePersistedTimedSpeakers` reads one exact occurrence/bridge/recording binding
+through the actual SDK's `reconcileFinalizedRecording({capability})`. It requires
+an already closed timed evidence owner and selected authenticated alignment; it
+does not recover a live owner, start alignment staging, or take ownership of the
+Runtime client/store. Historical source ID/handle/hash remain distinct from the
+current text-control ID. Callers must await the operation before closing SQLite;
+an abort signal fences result acceptance and iterator cleanup, but the actual SDK
+RPC has no per-call abort option, so its transport lifecycle remains caller-owned.
+
+Reads use one at-most64-entry/32KiB alignment page and at-most8 UI rows, with only
+the separately bounded256 live-wording rows reordered in memory. Expiry, closed
+ownership and the selected source/attempt are checked throughout and at return.
+No transaction spans the Runtime await. Null terminal time on an exact closed
+failed attempt does not prevent reading its prefix, but never establishes an
+occurrence end; the result stays incomplete. Nothing extends retention deadlines.
+
+Names are recomputed from fresh, attended, same-host UI-observed whole-frame
+coverage. Outward sample boundaries use conservative candidate-lower/conflict-upper
+counts, exact80%/500ms comparisons and the prior observation's earliest activation
+bound. Provider clusters can veto, never grant, identity. Timingless administrative
+rows do not erase coverage; explicit observation/disconnect barriers do. Unlocated
+UI-loss disables naming for that generation without erasing words or by itself
+making transcription incomplete. Fully processed final wording may recover live-
+cache loss; known capture gaps, failed prefixes, failed final processing or retained
+live buffers outside final coverage remain incomplete. These are processing-level
+claims, not acoustic accuracy or evidence that every utterance was recognized.
+
+Final wording supersedes a live unit only when its outward worded interval union
+covers the entire mapped submitted live buffer (including its padding). Equality
+and adjacency count; even a one-sample hole retains the entire live unit. Original
+durable live history is never removed. No semantic matching or word-time guessing
+is used. `buildTimedTeamMemMeetingArtifact` checks the exact selected provenance
+and audio hash separately from current `processText` identity. It requires an
+authoritative known meeting end and admitted local-wall endpoints, and emits one
+bounded component-maxima warning with overall physical/UTC accuracy still unknown.
+Signed local estimates are floored to the frozen artifact's microsecond precision;
+mapping and serialization rounding remain separately described, not invented UTC.
+
+**v1 compatibility:** ordinary padding/partially overlapping live and final
+observations, or overlapping final speech, can produce overlapping retained units.
+Frozen artifact v1 requires nonoverlapping intervals. The builder therefore refuses
+before text synthesis when all retained units cannot be represented, just as it
+refuses missing/step-crossing timestamps. All private words/history remain available;
+it does not drop, splice, retime, group mixed provenance, or weaken the contract.
+For these observations, explicitly opt into `buildTimedTeamMemMeetingArtifactV2`.
+It emits `teammem-meeting/v2`, preserving each whole observation's wording,
+interval, ID, speaker, confidence and stage/model provenance. Entries are ordered
+by exact start, end and ASCII ID, with overlap allowed. Synthesis receives those
+intervals/provenance and treats overlap as potentially the same speech, not proof
+of repeated events. This is not semantic deduplication or a model-accuracy claim.
+The existing v1 builder and reader retain their original refusal behavior.
+`parseTeamMemMeetingArtifactV2` and `parseSupportedTeamMemMeetingArtifact` expose
+explicit v2 and supported-version validation; the outbox preserves either version
+through restart. Manifest and receipt versions remain v1. Consuming v2 requires a
+matching v2-capable TeamMem package; it is never silently downgraded to v1.
+
+These library paths are not yet selected by a shipped application lifecycle.
+Application composition and human live checks remain separate gates; no live
+provider/device/TeamMem or whole-application E2E proof is implied here.
+
 ### Timed live evidence library
 
-The reviewed SDK6f8e88f adapter accepts the discriminated
+The reviewed SDK dbcd440 adapter accepts the discriminated
 `{ timingContract: "capture-clock/v1", bridgeSessionId, profile: "online",
 responseMode: "external_gate" }` start. Its typed lease proves command admission,
 not provider/native health. `createMeetingSession` accepts a bridge-v2 transport

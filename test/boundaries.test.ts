@@ -157,6 +157,40 @@ test("negative control: flags a TeamMem module path", () => {
   });
 });
 
+test("explicit local v1 and v2 meeting contract imports are allowed", () => {
+  withTempDir((dir) => {
+    const specifiers = [
+      "../contracts/teammem-meeting-v1.ts",
+      "./teammem-meeting-v1.ts",
+      "../contracts/teammem-meeting-v2.ts",
+      "./contracts/teammem-meeting-v2.ts",
+      "./teammem-meeting-v2.ts",
+    ];
+    writeFileSync(path.join(dir, "local-contracts.ts"), specifiers.map(
+      (specifier) => `export * from ${JSON.stringify(specifier)};`,
+    ).join("\n"));
+    assert.deepEqual(findViolations(collectImports(dir)), []);
+  });
+});
+
+test("local contract exceptions do not admit external or lookalike TeamMem paths", () => {
+  withTempDir((dir) => {
+    const specifiers = [
+      "../contracts/teammem-meeting-v2.py",
+      "../contracts/teammem-meeting-v3.ts",
+      "../contracts/teammem-meeting-v2.ts/helper",
+      "../../team-memory-agent/teammem-meeting-v2.ts",
+      "teammem-meeting-v2.ts",
+    ];
+    writeFileSync(path.join(dir, "lookalikes.ts"), specifiers.map(
+      (specifier) => `export * from ${JSON.stringify(specifier)};`,
+    ).join("\n"));
+    const violations = findViolations(collectImports(dir));
+    assert.deepEqual(violations.map((violation) => violation.specifier), specifiers);
+    assert.ok(violations.every((violation) => violation.rule === "TeamMem Python/module path"));
+  });
+});
+
 test("negative control: flags TeamMem's SQLite ledger file", () => {
   withTempDir((dir) => {
     writeFileSync(

@@ -191,6 +191,12 @@ export type ReconciliationLiveSegmentRow = {
   readonly endedAt: string;
 };
 export type TimedEvidenceBinding = { readonly occurrenceId: string; readonly bridgeSessionId: string; readonly runtimeSessionId: bigint };
+/** Read-only identity; never a live writer/recovery permit or recording capability. */
+export type TimedEvidenceBindingResult =
+  | { readonly kind: "absent" | "legacy" | "expired" }
+  | { readonly kind: "timed"; readonly generationId: string; readonly binding: TimedEvidenceBinding;
+      readonly recordingHandle: string | null; readonly terminalAtMs: number | null; readonly expiresAtMs: number | null;
+      readonly state: TimedEvidenceStatus["state"] };
 export type TimedEvidenceOwner = TimedEvidenceBinding & { readonly generationId: string; readonly token: string; readonly storeIdentity: string };
 export type ProvisionalResult =
   | { readonly kind: "provisional_ui_observed"; readonly feishuUserId: string }
@@ -498,6 +504,7 @@ export type SessionStore = {
   readTimedUi(binding: TimedEvidenceBinding, afterSequence: number, nowMs: number): readonly import("../contracts/bridge-session-v2.ts").BridgeEventMessageV2[];
   readTimedFinal(binding: TimedEvidenceBinding, afterSegmentId: string, nowMs: number): TimedLiveRow | null;
   getTimedEvidenceStatus(binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceStatus | null;
+  getTimedEvidenceBinding(generationId: string, nowMs: number): TimedEvidenceBindingResult;
   closeTimedEvidence(owner: TimedEvidenceOwner, nowMs: number): void;
   markTimedUiLoss(owner: TimedEvidenceOwner, reason: NonNullable<TimedEvidenceStatus["uiLossReason"]>, nowMs: number): void;
   markTimedWordingLoss(owner: TimedEvidenceOwner, reason: NonNullable<TimedEvidenceStatus["wordingLossReason"]>, nowMs: number): void;

@@ -26,6 +26,33 @@
 // must not be deleted yet.
 
 import type { OwnedUiExactMs } from "./attribution-evidence.ts";
+import type { OwnedTimedSampleEvidence } from "./attribution-evidence.ts";
+import type { DiarizedMediaSampleRange, LocalWallEstimate, RecordingIdentity } from "../ports/conversation-runtime.ts";
+
+export type TimedWallComponents = Pick<LocalWallEstimate, "maximumBracketNs" | "maximumResolutionNs" | "modelAllowanceNs" |
+  "interpolationRoundingNs" | "captureRoundingNs" | "captureUncertaintyNs" | "externalUtcAccuracyNs">;
+export type TimedReconciledSegment = {
+  readonly segmentId: string;
+  readonly text: string;
+  readonly range: Pick<DiarizedMediaSampleRange, "startSampleInclusive" | "endSampleExclusive" | "sampleRateHz" | "gapOffsetMs"> | null;
+  readonly wording: "live" | "reconciled";
+  readonly liveSegmentIds: readonly string[];
+  readonly cluster: string | null;
+  readonly speaker: SpeakerAttribution;
+  readonly sampleEvidence: OwnedTimedSampleEvidence | null;
+  readonly wall: { readonly startedAt: string; readonly endedAt: string; readonly components: TimedWallComponents;
+    readonly mappingRoundingNs: bigint; readonly serializationRoundingNs: bigint } | null;
+};
+export type TimedTranscriptWarning = { readonly code: "local_wall_timestamp_estimate" | "timed_ui_evidence_loss" | "timed_live_wording_loss" |
+  "timed_final_processing_incomplete" | "timed_capture_loss" | "timed_live_outside_final" | "timed_cluster_conflict"; readonly detail: string };
+/** Separate timed path: never reinterprets the legacy single media origin. */
+export type TimedEvidenceMergeResult = { readonly source: RecordingIdentity; readonly segments: readonly TimedReconciledSegment[];
+  readonly warnings: readonly TimedTranscriptWarning[]; readonly transcriptComplete: boolean };
+export type TimedReconciledTranscript = TimedEvidenceMergeResult & {
+  readonly kind: "timed_recording_transcript/v1";
+  readonly provenance: { readonly occurrenceId: string; readonly bridgeSessionId: string; readonly generationId: string;
+    readonly alignmentAttemptId: string; readonly timingContract: "capture-clock/v1"; readonly policyId: "local-wall-estimate/v1" | null };
+};
 
 /** One bridge observation of the Feishu active-speaker UI, on the wall
  * clock. Two shapes, never a third: the bridge validator rejects an

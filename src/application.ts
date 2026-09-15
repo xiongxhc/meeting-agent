@@ -27,6 +27,12 @@ export { createFeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
 export { createInviteDiscovery } from "./sessions/invite-discovery.ts";
 export { createConversationRuntimeClient, connectPostmeetingRuntime, type ConversationRuntimeSdk } from "./adapters/conversation-runtime-client.ts";
 export { RecordingAlignmentOwner } from "./sessions/recording-alignment.ts";
+export { reconcilePersistedTimedSpeakers } from "./sessions/speaker-reconciler.ts";
+export { buildTimedTeamMemMeetingArtifact, buildTimedTeamMemMeetingArtifactV2, type TimedArtifactBuildInput } from "./delivery/artifact-builder.ts";
+export { parseTeamMemMeetingArtifactV2, parseSupportedTeamMemMeetingArtifact,
+  type TeamMemMeetingArtifactV2, type SupportedTeamMemMeetingArtifact } from "./contracts/teammem-meeting-v2.ts";
+export type { TimedReconciledTranscript, TimedReconciledSegment, TimedTranscriptWarning } from "./domain/transcript.ts";
+export type { FinalizedRecordingRuntime, FinalizedRecordingReconciliation } from "./ports/conversation-runtime.ts";
 export { createMeetingSession, type CreateMeetingSessionOptions } from "./sessions/meeting-session.ts";
 export { createCoordinator } from "./sessions/coordinator.ts";
 export { LiveProvisionalCorrelator, recoverPendingLiveEvidence, drainExpiredTimedEvidence,

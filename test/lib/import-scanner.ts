@@ -471,6 +471,14 @@ export type ForbiddenRule = {
   readonly matches: (specifier: string) => boolean;
 };
 
+const LOCAL_MEETING_CONTRACT_IMPORTS = new Set([
+  "../contracts/teammem-meeting-v1.ts",
+  "./teammem-meeting-v1.ts",
+  "../contracts/teammem-meeting-v2.ts",
+  "./contracts/teammem-meeting-v2.ts",
+  "./teammem-meeting-v2.ts",
+]);
+
 /**
  * The import-specifier layer: cheap, but only sees a violation that takes the
  * shape of an actual import. See findForbiddenPathLiterals and
@@ -486,7 +494,7 @@ export const FORBIDDEN_IMPORT_RULES: readonly ForbiddenRule[] = [
   {
     name: "TeamMem Python/module path",
     matches: (specifier) =>
-      (specifier !== "../contracts/teammem-meeting-v1.ts" && specifier !== "./teammem-meeting-v1.ts" && /team-?mem/i.test(specifier)) ||
+      (!LOCAL_MEETING_CONTRACT_IMPORTS.has(specifier) && /team-?mem/i.test(specifier)) ||
       /team-memory-agent/i.test(specifier) ||
       /\.py$/i.test(specifier),
   },

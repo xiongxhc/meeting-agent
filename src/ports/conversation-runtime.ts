@@ -1,14 +1,17 @@
 // Actual SDK types own postmeeting and opt-in timed live boundaries. The
 // injected legacy UTC path remains distinct; no live timestamps are invented.
-import type { RecordingSummary as SdkRecordingSummary, ProcessedText as SdkProcessedText, FinalizedRecordingCapability,
+import type { RuntimeClient, RecordingSummary as SdkRecordingSummary, ProcessedText as SdkProcessedText, FinalizedRecordingCapability,
   RecordingAlignmentPage, RecordingAlignmentComplete, TimedMediaLease, VersionFourVoiceSessionEvent } from "@conversation/runtime";
 export type { ConversationContextExchange, RecordingGap, DiarizedSegment, RecordingReconciliation,
   FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete,
   AlignmentPolicy, RecordingAlignmentEntry, RuntimeProfile, VersionFourVoiceTranscriptFinalEvent,
   SourceSampleRange, WholeFrameNominalEnvelope, CaptureUnavailableReason } from "@conversation/runtime";
+export type { FinalizedRecordingReconciliation, DiarizedMediaSampleRange, RecordingIdentity, LocalWallEstimate } from "@conversation/runtime";
 import type { ConversationContextExchange, RecordingGap, RecordingReconciliation } from "@conversation/runtime";
 
 export type ProcessedText = Readonly<Omit<SdkProcessedText, "warnings">> & { readonly warnings: readonly string[] };
+/** Actual SDK recovery method, separate from the legacy injected session port. */
+export type FinalizedRecordingRuntime = Pick<RuntimeClient<4>, "reconcileFinalizedRecording">;
 
 /** Meeting Agent pins online explicitly; the SDK default remains offline. */
 import type { RuntimeProfile } from "@conversation/runtime";

@@ -30,7 +30,7 @@ import { consumeAlignmentRecoveryPermit, type AlignmentRecoveryPermit } from "..
 import type { RecordingAlignmentPage, RecordingAlignmentComplete } from "../ports/conversation-runtime.ts";
 import { ALIGNMENT_LIMITS, encodeAlignmentPage, decodeAlignmentPage, validateAlignmentComplete, pageWarnings } from "../sessions/recording-alignment.ts";
 import type { PhysicalCustodyRow, PhysicalClientClear } from "../ports/session-store.ts";
-import type { TimedEvidenceBinding, TimedEvidenceOwner, TimedEvidenceStatus, ProvisionalResult, TimedAppendResult, TimedLiveRow, TimedPurgeProgress } from "../ports/session-store.ts";
+import type { TimedEvidenceBinding, TimedEvidenceBindingResult, TimedEvidenceOwner, TimedEvidenceStatus, ProvisionalResult, TimedAppendResult, TimedLiveRow, TimedPurgeProgress } from "../ports/session-store.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import { parseEventV2, type BridgeEventMessageV2 } from "../contracts/bridge-session-v2.ts";
 import { encodeLiveEvidence, decodeLiveEvidence, encodeProvisionalResult, decodeProvisionalResult } from "../sessions/live-evidence-codec.ts";
@@ -191,6 +191,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     appendTimedFinal: (owner, event, nowMs) => appendTimedFinal(db, owner, event, nowMs),
     resolveTimedFinal: (owner, segmentId, result, nowMs) => resolveTimedFinal(db, owner, segmentId, result, nowMs),
     readTimedUi: (binding, after, nowMs) => readTimedUi(db, binding, after, nowMs),
+    getTimedEvidenceBinding: (generationId, nowMs) => getTimedEvidenceBinding(db, generationId, nowMs),
     readTimedFinal: (binding, after, nowMs) => readTimedFinal(db, binding, after, nowMs),
     getTimedEvidenceStatus: (binding, nowMs) => {
       const row = timedHeader(db, binding, nowMs);
@@ -1635,6 +1636,25 @@ type TimedHeader = TimedEvidenceStatus & { generationId: string; token: string; 
 // An inspected durable descriptor is not a current writer capability. The
 // object admission is private/process-local; exact-token SQL CAS is final.
 const timedWriterPermits = new WeakSet<object>();
+function getTimedEvidenceBinding(db: Database.Database, generationId: string, nowMs: number): TimedEvidenceBindingResult {
+  requirePrivateState(db);
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("invalid timed evidence clock");
+  const row = db.prepare(`SELECT g.occurrence_id, g.bridge_session_id, g.runtime_session_id, g.recording_handle,
+      g.terminal_at_ms, g.expires_at_ms, o.state
+    FROM reconciliation_generations g LEFT JOIN timed_evidence_owners o USING(generation_id)
+    WHERE g.generation_id = ?`).get(generationId) as { occurrence_id: string; bridge_session_id: string; runtime_session_id: string | null;
+      recording_handle: string | null; terminal_at_ms: number | null; expires_at_ms: number | null; state: string | null } | undefined;
+  if (!row) return { kind: "absent" };
+  if (generationId !== reconciliationGenerationId(row.occurrence_id, row.bridge_session_id) ||
+    [row.terminal_at_ms, row.expires_at_ms].some((value) => value !== null && (!Number.isSafeInteger(value) || value < 0))) throw new Error("invalid timed evidence identity");
+  if (row.expires_at_ms !== null && row.expires_at_ms <= nowMs) return { kind: "expired" };
+  if (row.state === null) return { kind: "legacy" };
+  if (row.runtime_session_id === null || !/^[1-9][0-9]{0,19}$/.test(row.runtime_session_id) || BigInt(row.runtime_session_id) > (1n << 64n) - 1n ||
+    (row.recording_handle !== null && !/^[0-9a-f]{32}$/.test(row.recording_handle)) ||
+    (row.state !== "active" && row.state !== "recovering" && row.state !== "closed")) throw new Error("invalid timed evidence identity");
+  return { kind: "timed", generationId, binding: { occurrenceId: row.occurrence_id, bridgeSessionId: row.bridge_session_id, runtimeSessionId: BigInt(row.runtime_session_id) },
+    recordingHandle: row.recording_handle, terminalAtMs: row.terminal_at_ms, expiresAtMs: row.expires_at_ms, state: row.state };
+}
 function timedHeader(db: Database.Database, binding: TimedEvidenceBinding, nowMs: number, includeExpired = false): TimedHeader | null {
   if (!Number.isSafeInteger(nowMs) || nowMs < 0 || binding.runtimeSessionId <= 0n) throw new Error("invalid timed evidence binding");
   const row = db.prepare(`SELECT o.generation_id AS generationId, o.owner_token AS token, o.state, o.ui_rows AS uiRows, o.ui_bytes AS uiBytes,
