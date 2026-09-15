@@ -2,6 +2,31 @@ import XCTest
 @testable import FeishuBridgeSpike
 
 final class AudioOutputRendererTests: XCTestCase, @unchecked Sendable {
+    func testExpectedGenerationCancelCannotUnscheduleNewAudioAndPlayedIsCallbackOnly() async throws {
+        let engine = SyntheticOutputEngine(), delivered = PlayedCallbacks()
+        let renderer = AudioOutputRenderer(backendFactory: {
+            SelectedAudioOutputBackend(devices: SyntheticOutputLookup(), engineFactory: { engine })
+        }, onPlayed: { generation, sequence in delivered.append(generation, sequence) })
+        _ = await renderer.start(try PlaybackRequest(outputDeviceUID: "synthetic-output", operationBudget: 0.2))
+        _ = renderer.enqueue(try playbackPacket(sequence: 1))
+        await waitForAudio { engine.scheduledCount == 1 }
+        XCTAssertEqual(delivered.count, 0)
+        let stale = await renderer.cancel(expectedGeneration: 99)
+        XCTAssertEqual(stale, .failedUnconfirmed)
+        XCTAssertEqual(engine.cancelCount, 0)
+        XCTAssertEqual(renderer.generation, 1)
+        engine.completeFirstTwice()
+        await waitForAudio { renderer.lastPlayedSequence == 1 && delivered.count == 1 }
+        XCTAssertEqual(delivered.values, [[1, 1]])
+        let flushed = await renderer.cancel(expectedGeneration: 1)
+        XCTAssertEqual(flushed, .stopped)
+        XCTAssertEqual(engine.cancelCount, 1)
+        XCTAssertTrue(renderer.resume(generation: 2))
+        _ = renderer.enqueue(try playbackPacket(generation: 2, sequence: 1))
+        engine.completeOld()
+        XCTAssertEqual(delivered.values, [[1, 1]])
+        _ = await renderer.stop()
+    }
     func testDuplicateCompletionReturnsCreditOnlyOnceAndScheduleFailureStops() async throws {
         let engine = SyntheticOutputEngine()
         let renderer = AudioOutputRenderer(backendFactory: {
@@ -152,6 +177,14 @@ final class AudioOutputRendererTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(engine.scheduledCount, 0)
         XCTAssertEqual(engine.stopCount, 1)
     }
+}
+
+private final class PlayedCallbacks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [[UInt64]] = []
+    var count: Int { lock.withLock { stored.count } }
+    var values: [[UInt64]] { lock.withLock { stored } }
+    func append(_ generation: UInt64, _ sequence: UInt64) { lock.withLock { stored.append([generation, sequence]) } }
 }
 
 func playbackPacket(generation: UInt64 = 1, sequence: UInt64) throws -> PlaybackPcmPacket {

@@ -93,14 +93,17 @@ public final class AudioOutputRenderer: @unchecked Sendable {
     private var startReply: (@Sendable (AudioStartOutcome) -> Void)?
     private var stopReply: (@Sendable (AudioStopOutcome) -> Void)?
     private var fault: AudioPrimitiveError?
+    private let onPlayed: @Sendable (UInt64, UInt64) -> Void
     public var generation: UInt64 { lock.withLock { currentGeneration } }
     public var lastPlayedSequence: UInt64 { lock.withLock { lastPlayed } }
     public var failure: AudioPrimitiveError? { lock.withLock { fault } }
-    public convenience init(backendFactory: @escaping @Sendable () -> any NativeAudioOutputBackend = { SelectedAudioOutputBackend() }) {
-        self.init(backendFactory: backendFactory, ownerQueue: DispatchQueue(label: "meeting.audio.render.owner"))
+    public convenience init(backendFactory: @escaping @Sendable () -> any NativeAudioOutputBackend = { SelectedAudioOutputBackend() },
+                            onPlayed: @escaping @Sendable (UInt64, UInt64) -> Void = { _, _ in }) {
+        self.init(backendFactory: backendFactory, ownerQueue: DispatchQueue(label: "meeting.audio.render.owner"), onPlayed: onPlayed)
     }
-    init(backendFactory: @escaping @Sendable () -> any NativeAudioOutputBackend, ownerQueue: DispatchQueue) {
-        self.backendFactory = backendFactory; self.ownerQueue = ownerQueue
+    init(backendFactory: @escaping @Sendable () -> any NativeAudioOutputBackend, ownerQueue: DispatchQueue,
+         onPlayed: @escaping @Sendable (UInt64, UInt64) -> Void = { _, _ in }) {
+        self.backendFactory = backendFactory; self.ownerQueue = ownerQueue; self.onPlayed = onPlayed
     }
     public func start(_ request: PlaybackRequest) async -> AudioStartOutcome {
         if Task.isCancelled { return .cancelled }
@@ -180,9 +183,15 @@ public final class AudioOutputRenderer: @unchecked Sendable {
         scheduled.removeFirst(); completionQueued.remove(packet.sequence); lastPlayed = packet.sequence
         let work = reserveLocked()
         schedule(work); lock.unlock()
+        onPlayed(packet.generation, packet.sequence)
     }
     public func cancel() async -> AudioStopOutcome {
         await withCheckedContinuation { continuation in beginEnd(flush: true) { continuation.resume(returning: $0) } }
+    }
+    public func cancel(expectedGeneration: UInt64) async -> AudioStopOutcome {
+        await withCheckedContinuation { continuation in
+            beginEnd(flush: true, expectedGeneration: expectedGeneration) { continuation.resume(returning: $0) }
+        }
     }
     public func stop() async -> AudioStopOutcome {
         await withCheckedContinuation { continuation in beginEnd(flush: false) { continuation.resume(returning: $0) } }
@@ -193,8 +202,9 @@ public final class AudioOutputRenderer: @unchecked Sendable {
             state = .running; return true
         }
     }
-    private func beginEnd(flush: Bool, reply: @escaping @Sendable (AudioStopOutcome) -> Void) {
+    private func beginEnd(flush: Bool, expectedGeneration: UInt64? = nil, reply: @escaping @Sendable (AudioStopOutcome) -> Void) {
         lock.lock()
+        guard expectedGeneration == nil || expectedGeneration == currentGeneration else { lock.unlock(); reply(.failedUnconfirmed); return }
         if state == .stopped || state == .idle { state = .stopped; lock.unlock(); reply(.stopped); return }
         guard stopReply == nil, state != .stopping, state != .flushing,
               !flush || state == .running || state == .paused,

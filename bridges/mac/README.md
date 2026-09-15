@@ -1,11 +1,12 @@
 # Feishu Mac bridge (spike)
 
 The macOS half of the Feishu bridge: it reads the Feishu client's accessibility
-tree, drives its controls, and emits the frozen `bridge-session/v1` event stream
-that `protocols/bridge-session-v1.schema.json` defines.
+tree, drives its controls, and emits frozen `bridge-session/v1` (config1/2) or
+opt-in `bridge-session/v2` timed media/UI evidence (config3).
 
 **This package has never been run against a real Feishu client.** Every test
-runs against synthetic accessibility trees or memory-only synthetic audio.
+runs against synthetic accessibility trees, memory-only synthetic audio, or
+owned loopback TCP peers.
 Native CPU conversion is tested, but no real captured audio has passed through
 the bridge and no real client has been measured. Bundled accessibility identifiers are placeholders —
 see "Placeholders" below. No latency, echo, or barge-in figure exists anywhere
@@ -42,7 +43,10 @@ Tests/FeishuBridgeSpikeTests/
   FakeAccessibilityTrees.swift     the synthetic trees and fake ports
 ```
 
-## The rules this package exists to hold
+## Original spike rules (legacy AudioBridge and bridge-session/v1)
+
+The receipt clock/jitter behavior below belongs to the original synthetic
+`AudioBridge`, not the config3 timed path. Task11d below specifies that path.
 
 - **Speaker identity is never guessed.** Two or more highlighted tiles, or a
   single tile whose identity cannot be resolved, yields `active_speaker` with
@@ -146,8 +150,8 @@ measurement.
 `FeishuBridgeSpike` is now an executable; the importable module keeps that name
 and its library product is `FeishuBridgeLibrary`. It composes the existing
 adapter/observer/reducer/recorder with a public AX backend and serialized JSONL
-stdio. `connect_media` deliberately returns `media_adapter_unavailable`; no
-loopback client, capture device, renderer or provider is wired into production.
+stdio. Config1/2 `connect_media` returns `media_adapter_unavailable`;
+config3 separately composes the timed path described below.
 The real Feishu matrix and language decision remain **unconfirmed**.
 
 Safe local checks, requiring no app access:
@@ -226,7 +230,7 @@ Do not replace the bundled fixture labels with private measurements.
 bridges/mac/.build/debug/FeishuBridgeSpike --config /Users/OPERATOR/meeting-agent-evidence/config.json
 ```
 
-Control stdin/stdout use only frozen `bridge-session/v1` JSONL. Keep stdin open
+Config1/2 stdin/stdout use frozen `bridge-session/v1` JSONL. Keep stdin open
 until command results; EOF cancels waits and discards unissued commands (while
 validating buffered framing). There is no interactive prompt or speech fallback.
 Only static diagnostic codes use stderr. Input lines cap at 64 KiB; input queue
@@ -315,12 +319,9 @@ Clear is an audited exact-generation CAS; no wildcard/TTL/startup clear exists.
 Stable slot labels identify provisioned clients/accounts, not PID or build.
 Renaming one is an audited provisioning action, never a recovery shortcut.
 Other configured slots continue independently. All automated proof uses temporary
-SQLite DBs and synthetic children/native backends, not the desktop. Media remains
-unavailable; this is not full-meeting acceptance.
-
-Capture/render primitives are compiled and hardware-free tested, but are not
-composed into this executable. Authenticated Runtime media and measured
-identity/highlight mapping remain separate work; see the human checklist.
+SQLite DBs and synthetic children/native backends, not the desktop. That
+application factory still selects config2: media remains unavailable through
+it. Config3 executable composition is separate; this is not full-meeting acceptance.
 
 ## Independent native audio primitives (Task 11b)
 
@@ -328,8 +329,7 @@ identity/highlight mapping remain separate work; see the human checklist.
 PID, bundle path/ID/build and launch date. Start checks existing Screen Recording
 access without prompting and uses the app-including ScreenCaptureKit filter,
 audio-only output and exclusion of this process. No default/all-system fallback.
-Do not invoke native start for a dry run. The executable still returns
-`media_adapter_unavailable`; no CLI or control/media wire has been extended here.
+Do not invoke native start for a dry run. Config1/2 remain control-only.
 
 Accepted source PCM is Float32 or signed16LE, mono/stereo, planar/interleaved,
 at 24/44.1/48 kHz. Stereo is averaged, nonfinite floats rejected, and persistent
@@ -375,24 +375,111 @@ cannot accept the terminal marker. No payload/evidence/audio file is written.
 
 The older `AudioBridge` still has receipt-clock timing and void device-cancel
 limitations. New isolated primitive proofs do not fix that old integration.
-Later media2/bridge2 composition must consume the accepted Runtime timing
-contract and await confirmed native flush before acknowledging cancellation.
+The separate config3 media2 path consumes the accepted Runtime timing
+contract and awaits confirmed native flush before acknowledging cancellation.
 No local playback result proves remote audibility, duplex/echo quality or the
 300 ms acoustic stop target. No output UID or BlackHole route was selected here.
+
+## Timed media and periodic UI evidence (Task 11d)
+
+Config3 uses [bridge-session/v2](../../protocols/bridge-session-v2.schema.json),
+not a reinterpretation of frozen v1. Keep every config2 field (including exact
+custody binding/descriptor3) and change/add only:
+
+```json
+{
+  "schema": "feishu-bridge-config/v3",
+  "audio": { "captureDisplayId": 42, "outputDeviceUid": "OPERATOR_SELECTED_UID" }
+}
+```
+
+This fragment is not a complete config. Display ID must be1..UInt32max; UID is
+1..512UTF8 bytes without NUL. Both must name deliberately provisioned resources;
+there is no automatic route/BlackHole choice, device enumeration command, prompt
+or fallback. Config3 rejects inspection mode. Use explicit config1 inspection
+only after human permission. Config3 polls actual AX snapshots every250ms;
+legacy observationIntervalMs remains required but does not change that cadence.
+
+The byte-identical [Runtime fixture mirror](../../fixtures/runtime-4c97c47/SOURCE.md)
+pins accepted `4c97c47c9cb044728413516c48aa86534e58523b`. `connect_media` carries
+the exact timed lease with separate Runtime source session and bridge session.
+Decimal u64 strings never pass through JavaScript Number. Every initial/retry
+socket must consume matching MED2 kind9 confirmation within the shared2s
+open/auth-write/ACK deadline BEFORE renderer, clock pairs or capture starts.
+Local write success is not authentication. TLS uses normal system trust;
+plaintext is limited to literal127.0.0.1/::1 endpoints with explicit ports.
+Credentials are structurally removed before command evidence; no PCM goes to
+JSONL/stdout/stderr. The media socket goes directly to Runtime, never through Node.
+
+Capture retains native source PTS→stream synchronization clock→CMhost mapping,
+480-sample packets and real short tails. Authenticated epoch precedes frames;
+one process-random clock domain is shared with AX brackets. Clock pairs bracket
+actual CLOCK_REALTIME reads with CMhost, include clock_getres resolution, and
+retain unknown external UTC accuracy. Steps, missing mapping, drops and epochs
+close coverage; no receipt origin, global interpolation or invented zero error.
+Every retained nominal source piece is checked before endpoint-only wire
+evidence; support envelopes are never serialized as packet timing.
+
+One capture write is outstanding. One writer serializes it with bounded control
+work (at most16 queued writes/69,632 queued bytes, plus active write). Read chunks
+cap4096; one playback frame may contain65,536 PCM bytes and is sliced into<=960
+byte native packets. Native bounds remain2 scheduled+10 pending; at most12 live
+network receipts. Accepted means the LAST slice was admitted; Rendered follows
+all ordered actual dataPlayedBack callbacks. Flush fences the expected native
+generation, really unschedules, and ACKs only confirmed stop. Old callbacks cannot
+acknowledge new work. A directly following flush interrupts partial admission;
+another playback header ahead of flush can create TCP/FIFO head-of-line delay.
+No acoustic/interrupt-latency bound is claimed. No-played-progress2s checked1s
+means up to3s detection PLUS owned cleanup, not instant EOF detection.
+
+Automatic media recovery allows at most3 attempts over the lease,100ms apart,
+only after positively confirmed native AND socket cleanup. Each outage has one
+deadline from its first disconnect, capped by reconnectWindowMs and credential
+expiry; failed startup/cleanup consume it. Only complete new media readiness
+ends that outage. Reconnect authenticates again, emits reason3 barrier/new capture
+epoch, and preserves process clock/pair sequence and128metadata-records/s budget.
+Unconfirmed cleanup is terminal. Static media_disconnected reasons preserve
+`capture_delivery_interrupted`/`final_clock_pair_undelivered`; positively confirmed
+resource cleanup is not a delivery claim or meeting departure.
+
+EOF/stop owns one TOTAL20s media-close budget: maintenance write2s + capture
+stop/tail5s + remaining delivery2s + final pair2s + renderer stop5s + socket
+close1s =17s, with3s owner margin. Native phase budgets>5s are refused before
+start. Socket/task reap is awaited; expired/unconfirmed cleanup cannot succeed.
+Later application config3 composition must explicitly select/test cooperative
+grace within the existing30s maximum that ALSO covers bounded UI/evidence/private
+outcome cleanup. Current config2 default10s is not sufficient for this worst case
+and is unchanged; the config3 application factory is not implemented here.
+
+Every actual UI snapshot, including unchanged state, emits ordered ui_snapshot
+with one same-domain host bracket (or explicit timing_unavailable), identity
+state, and barriers for missing/overlong/regressed/>2s-gap observations. Consumers
+may claim UI-OBSERVED coverage only through the latest valid watermark, never
+physical continuity or indefinite held identity. Startup/repeated highlight is
+not a new activation. Native identity/highlight capabilities remain unknown until
+measured; AX selected/focused is not substituted. Future evidence composition
+must require stable unique UI coverage over the WHOLE touched audio frame if no
+exact interior source map exists. No live attribution/store ingestion is added here.
+
+Human acceptance still requires measured build/locale/identity/highlight selectors,
+explicit client account and permissions, selected output route and actual duplex,
+echo/leakage/latency testing. Synthetic CPU/socket proof does not establish any
+of those or a runnable end-to-end Meeting application.
 
 ## Permissions
 
 Running `swift test` needs nothing: no Feishu app, no Accessibility, Screen
-Recording or Microphone grant, no audio hardware, no network, no API keys. That
+Recording or Microphone grant, no audio hardware, no external network, no API keys.
+Tests create bounded owned localhost TCP peers. That
 is the point of keeping the driver, the device and the media endpoint behind
 protocols. Native framework implementations are compiled but never started by
 tests; AVAudioConverter alone executes CPU-only synthetic conversion.
 
 Driving a real client will need the macOS **Accessibility** permission (to read
-element state and perform actions) and, once a real `AudioDevicePort` exists,
-the appropriate audio permissions. ScreenCaptureKit audio capture additionally
+element state and perform actions) and appropriate audio permissions.
+ScreenCaptureKit audio capture additionally
 requires **Screen Recording** permission; Accessibility alone does not grant
-audio capture. Nothing in this control-only executable requests those grants
+audio capture. Nothing in this executable requests those grants
 or changes audio routes. OCR is not implemented or authorized here.
 
 ## Dependencies

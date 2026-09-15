@@ -90,14 +90,22 @@ public func runBridgeControl(process: BridgeProcess, input: any BridgeInputSourc
                              cleanupFailed: () -> Void = {}) throws {
     input.start()
     var decoder = BoundedCommandLines()
+    var decoderV2 = BoundedCommandLinesV2()
     var failure: Error?
     var nextObservation = clock.monotonicSeconds() + observationInterval
     do {
         while !cancellation.isCancelled {
             if let data = input.next(wait: 0.05) {
-                for command in try decoder.append(data) {
-                    guard !cancellation.isCancelled else { break }
-                    try process.accept(command)
+                if process.usesTimedProtocol {
+                    for command in try decoderV2.append(data) {
+                        guard !cancellation.isCancelled else { break }
+                        try process.accept(command)
+                    }
+                } else {
+                    for command in try decoder.append(data) {
+                        guard !cancellation.isCancelled else { break }
+                        try process.accept(command)
+                    }
                 }
             }
             guard !cancellation.isCancelled else { break }
@@ -107,8 +115,12 @@ public func runBridgeControl(process: BridgeProcess, input: any BridgeInputSourc
             }
         }
         if input.reachedEOF {
-            while let data = input.next(wait: 0) { _ = try decoder.append(data) }
-            try decoder.finish()
+            while let data = input.next(wait: 0) {
+                if process.usesTimedProtocol { _ = try decoderV2.append(data) }
+                else { _ = try decoder.append(data) }
+            }
+            if process.usesTimedProtocol { try decoderV2.finish() }
+            else { try decoder.finish() }
         }
         if input.failed { throw BridgeProcessError.invalidInput }
     } catch { failure = error }

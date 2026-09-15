@@ -3,6 +3,10 @@ import CoreFoundation
 import Darwin
 
 public struct BridgeProcessConfiguration {
+    public struct Audio: Sendable {
+        public let captureDisplayId: UInt32
+        public let outputDeviceUid: String
+    }
     public static func read(path: String, inspection: Bool) throws -> Self {
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else { throw BridgeProcessError.invalidInput }
@@ -42,6 +46,7 @@ public struct BridgeProcessConfiguration {
     public let axCallTimeout: Float
     public let labels: FeishuUiLabels
     public let custody: BridgeCustodyBinding?
+    public let audio: Audio?
 
     public static func arguments(_ args: [String]) throws -> Arguments {
         if args == ["--help"] { return .help }
@@ -63,9 +68,11 @@ public struct BridgeProcessConfiguration {
 
     public static func decode(_ data: Data, inspection: Bool) throws -> Self {
         guard data.count <= 65_536, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeProcessError.invalidInput }
-        let v2 = object["schema"] as? String == "feishu-bridge-config/v2"
+        let v3 = object["schema"] as? String == "feishu-bridge-config/v3"
+        let v2 = object["schema"] as? String == "feishu-bridge-config/v2" || v3
         var required: Set<String> = ["schema", "pid", "bundlePath", "bundleIdentifier", "bundleVersion", "locale", "evidenceRoot", "observationIntervalMs", "joinDeadlineMs", "actionDeadlineMs", "axCallTimeoutMs"]
         if v2 { required.insert("custody") }
+        if v3 { required.insert("audio") }
         guard required.isSubset(of: Set(object.keys)), Set(object.keys).isSubset(of: required.union(["selectors"])) else { throw BridgeProcessError.invalidInput }
         func string(_ key: String) throws -> String {
             guard let value = object[key] as? String, !value.isEmpty, value.utf8.count <= 1024, !value.contains("\0") else { throw BridgeProcessError.invalidInput }; return value
@@ -81,6 +88,14 @@ public struct BridgeProcessConfiguration {
             guard let raw = object["custody"] as? [String: Any] else { throw BridgeProcessError.invalidInput }
             custody = try BridgeCustodyBinding(object: raw)
         } else { custody = nil }
+        let audio: Audio?
+        if v3 {
+            guard let raw = object["audio"] as? [String: Any], Set(raw.keys) == ["captureDisplayId", "outputDeviceUid"],
+                  let display = raw["captureDisplayId"] as? NSNumber, CFGetTypeID(display) != CFBooleanGetTypeID(),
+                  display.doubleValue >= 1, display.doubleValue <= Double(UInt32.max), display.doubleValue == Double(display.uint32Value),
+                  let uid = raw["outputDeviceUid"] as? String, !uid.isEmpty, uid.utf8.count <= 512, !uid.contains("\0") else { throw BridgeProcessError.invalidInput }
+            audio = Audio(captureDisplayId: display.uint32Value, outputDeviceUid: uid)
+        } else { audio = nil }
         let path = try string("bundlePath"), root = try string("evidenceRoot"), build = try string("bundleVersion"), locale = try string("locale")
         guard path.hasPrefix("/"), path.hasSuffix(".app"), root.hasPrefix("/"), root != "/" else { throw BridgeProcessError.invalidInput }
         var labels = FeishuUiLabels.bundled
@@ -104,6 +119,6 @@ public struct BridgeProcessConfiguration {
                     observationInterval: Double(try integer("observationIntervalMs", 50...5000)) / 1000,
                     joinDeadline: Double(try integer("joinDeadlineMs", 100...120_000)) / 1000,
                     actionDeadline: Double(try integer("actionDeadlineMs", 100...10_000)) / 1000,
-                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels, custody: custody)
+                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels, custody: custody, audio: audio)
     }
 }

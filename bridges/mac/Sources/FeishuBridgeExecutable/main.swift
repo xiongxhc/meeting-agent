@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AppKit
 import FeishuBridgeSpike
 
 func diagnostic(_ code: String) {
@@ -28,6 +29,10 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     }
     defer { signals.forEach { $0.cancel() } }
     let clock = SystemBridgeClock()
+    // Bind capture before constructing the AX owner. PID recycling between
+    // these reads can only make capture fail its launch-date check, never make
+    // it follow a later process by PID alone.
+    let captureLaunchDate = configuration.audio == nil ? nil : NSRunningApplication(processIdentifier: configuration.pid)?.launchDate
     let backend = SystemAXBackend(pid: configuration.pid, bundlePath: configuration.bundlePath,
                                   bundleId: configuration.bundleIdentifier, build: configuration.bundleVersion,
                                   callTimeout: configuration.axCallTimeout)
@@ -44,13 +49,30 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     let sink = try FileEvidenceSink(root: configuration.evidenceRoot)
     defer { try? sink.close() }
     let writer = try BridgeOutputWriter(fd: STDOUT_FILENO, cancellation: cancellation)
+    let timingClock = try configuration.audio == nil ? nil : CaptureClockPairSampler()
+    let timedMedia: TimedMediaControlOwner?
+    if let audio = configuration.audio, let timingClock {
+        guard let captureLaunchDate else { throw BridgeProcessError.invalidInput }
+        let request = try CaptureRequest(pid: configuration.pid, bundlePath: configuration.bundlePath,
+            bundleIdentifier: configuration.bundleIdentifier, build: configuration.bundleVersion,
+            launchDate: captureLaunchDate, displayID: audio.captureDisplayId)
+        let session = TimedMediaSession(clock: timingClock,
+            playbackRequest: try PlaybackRequest(outputDeviceUID: audio.outputDeviceUid),
+            captureRequest: { request }, nowUnixMs: {
+                let milliseconds = Date().timeIntervalSince1970 * 1000
+                guard milliseconds.isFinite, milliseconds >= 0, milliseconds < Double(UInt64.max) else { return UInt64.max }
+                return UInt64(milliseconds)
+            })
+        timedMedia = TimedMediaControlOwner(session: session, cancellation: cancellation)
+    } else { timedMedia = nil }
     let process = BridgeProcess(driver: driver, labels: configuration.labels, clock: clock, sink: sink,
                                 joinDeadline: configuration.joinDeadline, actionDeadline: configuration.actionDeadline, custody: configuration.custody,
+                                v2Clock: timingClock, timedMedia: timedMedia,
                                 output: writer.write)
     let input = BridgeInputPump(fd: STDIN_FILENO, cancellation: cancellation)
     var failure: Error?
     do { try runBridgeControl(process: process, input: input, cancellation: cancellation, clock: clock,
-                         observationInterval: configuration.observationInterval,
+                         observationInterval: configuration.audio == nil ? configuration.observationInterval : 0.25,
                          cleanupFailed: { diagnostic("operator_cleanup_required_departure_unconfirmed") }) }
     catch { failure = error }
     if let binding = configuration.custody, let writer = outcomeWriter, let status = process.shutdownResult {
@@ -63,7 +85,7 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
 do {
     switch try BridgeProcessConfiguration.arguments(Array(CommandLine.arguments.dropFirst())) {
     case .help:
-        print("FeishuBridgeSpike --config /absolute/private/config.json [--inspect-ax]\nControl-only bridge; measured build/locale selectors required. Media unavailable.\nInspection is explicit, read-only, and saved only in the private evidence root.")
+        print("FeishuBridgeSpike --config /absolute/private/config.json [--inspect-ax]\nConfig1/2: control only. Config3: timed media with explicit display/output UID and authenticated Runtime2 endpoint.\nMeasured build/locale selectors and existing permissions required; no automatic routes or prompts.\nInspection is explicit, read-only, and saved only in the private evidence root.")
     case .run(let path, let inspection):
         try run(BridgeProcessConfiguration.read(path: path, inspection: inspection), inspection: inspection)
     }

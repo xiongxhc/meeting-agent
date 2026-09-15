@@ -4,6 +4,30 @@ import XCTest
 @testable import FeishuBridgeSpike
 
 final class BridgeConfigurationTests: XCTestCase {
+    func testTimedAudioFieldsAreExactBoundedAndNeverAcceptedByLegacyConfig() throws {
+        var config = try JSONSerialization.jsonObject(with: meetingFixture("spikes/feishu/fixtures/process/config-v2.json")) as! [String: Any]
+        config["schema"] = "feishu-bridge-config/v3"
+        for invalid: [String: Any] in [[:], ["captureDisplayId": true, "outputDeviceUid": "x"],
+            ["captureDisplayId": 0, "outputDeviceUid": "x"], ["captureDisplayId": UInt64(UInt32.max) + 1, "outputDeviceUid": "x"],
+            ["captureDisplayId": 1, "outputDeviceUid": ""], ["captureDisplayId": 1, "outputDeviceUid": String(repeating: "x", count: 513)],
+            ["captureDisplayId": 1, "outputDeviceUid": "x\0y"], ["captureDisplayId": 1, "outputDeviceUid": "x", "route": "default"]] {
+            config["audio"] = invalid
+            XCTAssertThrowsError(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: config), inspection: false))
+        }
+        config["audio"] = ["captureDisplayId": UInt32.max, "outputDeviceUid": String(repeating: "x", count: 512)]
+        XCTAssertNoThrow(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: config), inspection: false))
+        config["schema"] = "feishu-bridge-config/v2"
+        XCTAssertThrowsError(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: config), inspection: false))
+    }
+    func testExplicitTimedConfigIsAcceptedWithoutChangingLegacyConfig() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        var object = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("spikes/feishu/fixtures/process/config-v2.json"))) as! [String: Any]
+        _ = try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false)
+        object["schema"] = "feishu-bridge-config/v3"
+        object["audio"] = ["captureDisplayId": 42, "outputDeviceUid": "synthetic-explicit-output"]
+        XCTAssertNoThrow(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false))
+        XCTAssertThrowsError(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: true))
+    }
     func testConfigurationReadsShortChunksAndRetriesInterruptedReadToEOF() throws {
         var calls = 0
         let data = try BridgeProcessConfiguration.readData(fd: -1) { _, buffer, count in

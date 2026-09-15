@@ -180,6 +180,38 @@ public final class BridgeRecorder {
         return true
     }
 
+    /// V2 is incrementally persisted only. The projection removes the credential
+    /// structurally before serialization; neither retained records nor evidence
+    /// can contain a live timed lease token.
+    @discardableResult
+    public func record(command: BridgeCommandMessageV2) -> Bool {
+        guard command.sessionId == sessionId else { return false }
+        do {
+            var object = try JSONSerialization.jsonObject(with: command.bytes) as! [String: Any]
+            if var lease = object["mediaLease"] as? [String: Any] {
+                lease.removeValue(forKey: "credential"); object["mediaLease"] = lease
+            }
+            try appendV2(object, direction: "command")
+            issuedCommandIds.insert(command.commandId)
+            return true
+        } catch { return false }
+    }
+    @discardableResult
+    public func record(event: BridgeEventMessageV2) -> Bool {
+        guard event.sessionId == sessionId, event.sequence > lastSequence else { return false }
+        do {
+            let object = try JSONSerialization.jsonObject(with: event.bytes) as! [String: Any]
+            if object["type"] as? String == "command_result", !issuedCommandIds.contains(object["commandId"] as? String ?? "") { return false }
+            try appendV2(object, direction: "event")
+            lastSequence = event.sequence
+            return true
+        } catch { return false }
+    }
+    private func appendV2(_ object: [String: Any], direction: String) throws {
+        let line = try JSONSerialization.data(withJSONObject: ["direction": direction, "message": object, "recordedAt": clock.now()], options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
+        try sink?.append(line)
+    }
+
     private func append(_ record: BridgeRecord) -> Bool {
         do {
             if let sink { try sink.append(Self.line(record)) }

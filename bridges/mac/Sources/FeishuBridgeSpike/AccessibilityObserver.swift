@@ -31,6 +31,9 @@ public struct AccessibilityNode: Equatable, Sendable {
     public let isEnabled: Bool
     /// Whether the element carries the client's active-speaking highlight.
     public let isHighlighted: Bool
+    /// V2 evidence requires a measured readable highlight channel. Native AX
+    /// projection currently has none: nil is unsupported/unknown, never false.
+    public let highlightRead: Bool?
     public let children: [AccessibilityNode]
 
     public init(
@@ -41,7 +44,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         isEnabled: Bool = true,
         isHighlighted: Bool = false,
         children: [AccessibilityNode] = [], nativeKey: String? = nil,
-        identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil
+        identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil, highlightRead: Bool? = nil
     ) {
         self.role = role
         self.identifierRead = identifierRead ?? AXStringRead(rawValue: identifier)
@@ -49,6 +52,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         self.value = value
         self.isEnabled = isEnabled
         self.isHighlighted = isHighlighted
+        self.highlightRead = highlightRead
         self.children = children
         self.nativeKey = nativeKey
     }
@@ -58,6 +62,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         lhs.role == rhs.role && lhs.identifierRead == rhs.identifierRead && lhs.titleRead == rhs.titleRead
             && lhs.value == rhs.value && lhs.isEnabled == rhs.isEnabled
             && lhs.isHighlighted == rhs.isHighlighted && lhs.children == rhs.children
+            && lhs.highlightRead == rhs.highlightRead
     }
 
     /// Depth-first, tree order — the order the client lays the UI out in.
@@ -197,6 +202,86 @@ public final class AccessibilityObserver {
         }
 
         return observations
+    }
+
+    public func snapshotState(from tree: AccessibilityNode?) -> UiSnapshotState {
+        guard let tree, let window = tree.locate(labels.identifiers.meetingWindow, labels) else {
+            return UiSnapshotState(state: "unreadable", feishuUserId: nil, reason: "snapshot_unreadable")
+        }
+        guard let grid = window.locate(labels.identifiers.speakerGrid, labels), !labels.identifiers.speakerTilePrefix.isEmpty else {
+            return UiSnapshotState(state: "unreadable", feishuUserId: nil, reason: "grid_unavailable")
+        }
+        let prefix = labels.identifiers.speakerTilePrefix
+        let possible = grid.children.flatMap { $0.descendants { node in
+            node.identifier?.hasPrefix(prefix) == true || ["AXGroup", "AXCell", "AXImage", "AXUnknown"].contains(node.role)
+        } }
+        guard !possible.isEmpty, possible.allSatisfy({ $0.identifier?.hasPrefix(prefix) == true && $0.identifier != prefix }) else {
+            return UiSnapshotState(state: "unreadable", feishuUserId: nil, reason: "snapshot_unreadable")
+        }
+        guard possible.allSatisfy({ $0.highlightRead != nil }) else {
+            return UiSnapshotState(state: "unknown", feishuUserId: nil, reason: "identity_unavailable")
+        }
+        let highlighted = possible.filter { $0.highlightRead == true }
+        if highlighted.isEmpty { return UiSnapshotState(state: "unknown", feishuUserId: nil, reason: "no_highlight") }
+        guard highlighted.count == 1 else { return UiSnapshotState(state: "ambiguous", feishuUserId: nil, reason: nil) }
+        let element = String(highlighted[0].identifier!.dropFirst(prefix.count))
+        guard let id = identity.identify(uiElementId: element), !id.isEmpty else {
+            return UiSnapshotState(state: "ambiguous", feishuUserId: nil, reason: "identity_unavailable")
+        }
+        guard id.utf8.count <= 1024 else { return UiSnapshotState(state: "unknown", feishuUserId: nil, reason: "identity_unavailable") }
+        return UiSnapshotState(state: "ui_exact", feishuUserId: id, reason: nil)
+    }
+}
+
+public struct UiSnapshotState: Sendable {
+    public let state: String, feishuUserId: String?, reason: String?
+}
+public struct UiSnapshotEvidence: Sendable {
+    public let sequence: Int
+    public let timing: ObservationTiming?
+    public let state: String, feishuUserId: String?, reason: String?, barrierBefore: String?
+    public let observedSpeakerChange: ActiveSpeaker?
+    var object: [String: Any] {
+        ["type": "ui_snapshot", "snapshotSequence": sequence, "observationTiming": timing?.object ?? NSNull(),
+         "state": state, "feishuUserId": feishuUserId ?? NSNull(), "reason": reason ?? NSNull(), "barrierBefore": barrierBefore ?? NSNull()]
+    }
+}
+public final class UiSnapshotProducer {
+    private let clock: CaptureClockPairSampler
+    private let observer: AccessibilityObserver
+    private var sequence = 0
+    private var previous: ObservationTiming?
+    private var missing = false
+    private var previousState: UiSnapshotState?
+    public init(clock: CaptureClockPairSampler, labels: FeishuUiLabels, identity: any UiIdentityResolver) {
+        self.clock = clock; observer = AccessibilityObserver(labels: labels, identity: identity)
+    }
+    public func observe(_ snapshot: () -> AccessibilityNode?) throws -> (tree: AccessibilityNode?, snapshot: UiSnapshotEvidence) {
+        guard sequence < 9_007_199_254_740_991 else { throw BridgeProcessError.stateLimit }
+        sequence += 1
+        let before = try? clock.hostNanoseconds()
+        let tree = snapshot() // Exactly one actual read, even when host timing failed.
+        let after = try? clock.hostNanoseconds()
+        var timing: ObservationTiming?
+        if let before, let after { timing = try? ObservationTiming(clockDomainId: clock.clockDomainId, hostBeforeNs: before, hostAfterNs: after) }
+        var barrier: String? = sequence == 1 ? "stream_start" : (missing ? "observation_drop" : nil)
+        if let prior = previous, let current = timing {
+            if current.hostBeforeNs < prior.hostAfterNs { barrier = "clock_reset"; timing = nil }
+            else if current.hostBeforeNs - prior.hostBeforeNs > 2_000_000_000 { barrier = "poll_gap" }
+        }
+        let state = timing == nil ? UiSnapshotState(state: "unreadable", feishuUserId: nil, reason: "timing_unavailable") : observer.snapshotState(from: tree)
+        var change: ActiveSpeaker?
+        if barrier == nil, let prior = previousState,
+           ["ui_exact", "ambiguous"].contains(prior.state) || prior.reason == "no_highlight",
+           state.state != prior.state || state.feishuUserId != prior.feishuUserId {
+            if state.state == "ui_exact", let id = state.feishuUserId { change = .uiExact(feishuUserId: id) }
+            else if state.state == "ambiguous" { change = .ambiguous }
+        }
+        missing = timing == nil
+        if let timing { previous = timing }
+        previousState = timing == nil ? nil : state
+        return (tree, UiSnapshotEvidence(sequence: sequence, timing: timing, state: state.state,
+            feishuUserId: state.feishuUserId, reason: state.reason, barrierBefore: barrier, observedSpeakerChange: change))
     }
 }
 
