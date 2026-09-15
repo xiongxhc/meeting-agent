@@ -1,10 +1,11 @@
-// Actual SDK types own the postmeeting boundary. Live construction/events are
-// still a separate, explicitly fail-closed composition prerequisite.
+// Actual SDK types own postmeeting and opt-in timed live boundaries. The
+// injected legacy UTC path remains distinct; no live timestamps are invented.
 import type { RecordingSummary as SdkRecordingSummary, ProcessedText as SdkProcessedText, FinalizedRecordingCapability,
-  RecordingAlignmentPage, RecordingAlignmentComplete } from "@conversation/runtime";
+  RecordingAlignmentPage, RecordingAlignmentComplete, TimedMediaLease, VersionFourVoiceSessionEvent } from "@conversation/runtime";
 export type { ConversationContextExchange, RecordingGap, DiarizedSegment, RecordingReconciliation,
   FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete,
-  AlignmentPolicy, RecordingAlignmentEntry, RuntimeProfile } from "@conversation/runtime";
+  AlignmentPolicy, RecordingAlignmentEntry, RuntimeProfile, VersionFourVoiceTranscriptFinalEvent,
+  SourceSampleRange, WholeFrameNominalEnvelope, CaptureUnavailableReason } from "@conversation/runtime";
 import type { ConversationContextExchange, RecordingGap, RecordingReconciliation } from "@conversation/runtime";
 
 export type ProcessedText = Readonly<Omit<SdkProcessedText, "warnings">> & { readonly warnings: readonly string[] };
@@ -29,16 +30,22 @@ export type MediaDescriptor = {
 export type StartVoiceSessionInput = {
   readonly profile: RuntimeProfile;
   readonly responseMode: RuntimeResponseMode;
-};
+} & ({ readonly timingContract?: undefined } | { readonly timingContract: "capture-clock/v1"; readonly bridgeSessionId: string });
 
 /** Test/local injection boundary only. Task 11 replaces this with the SDK's
  * eventual session/media construction; production code must not synthesize it. */
 export type VoiceSessionHandle = {
+  readonly timingContract?: undefined;
   readonly sessionId: bigint;
   readonly profile: RuntimeProfile;
   readonly responseMode: RuntimeResponseMode;
   readonly status: RuntimeSessionStatus;
   readonly media: MediaDescriptor;
+} | {
+  readonly timingContract: "capture-clock/v1";
+  readonly bridgeSessionId: string;
+  readonly sessionId: bigint;
+  readonly mediaLease: TimedMediaLease;
 };
 
 /** Exact SDK context shape. It is a conversation exchange, not an ad-hoc
@@ -62,9 +69,7 @@ export type ProcessTextRequest = {
 };
 
 
-/** Meeting Agent's internal routed event union. Task 11 owns converting the
- * SDK VoiceSession event stream once startVoiceSession has the missing join
- * material; this port never invents an event wire codec. */
+/** Legacy injected UTC segment. Timed SDK events never fabricate these fields. */
 export type TranscriptSegment = {
   readonly segmentId: string;
   readonly text: string;
@@ -74,6 +79,7 @@ export type TranscriptSegment = {
 };
 
 export type RuntimeEvent =
+  | { readonly type: "timed_voice_event"; readonly bridgeSessionId: string; readonly event: VersionFourVoiceSessionEvent }
   | { readonly type: "transcript_final"; readonly segment: TranscriptSegment }
   | { readonly type: "response_authorized"; readonly segmentId: string }
   | { readonly type: "response_skipped"; readonly segmentId: string; readonly reason: string }
@@ -81,7 +87,9 @@ export type RuntimeEvent =
   | { readonly type: "provider_unavailable"; readonly detail: string };
 
 export type ConversationRuntimePort = {
-  /** Explicitly unresolved in the concrete SDK adapter until Task 11. */
+  /** Connected control identity, not proof that voice admission has occurred. */
+  readonly currentSessionId?: bigint;
+  /** Actual adapter requires the explicit timed discriminant and external gate. */
   startVoiceSession(input: StartVoiceSessionInput): Promise<VoiceSessionHandle>;
   seedConversationContext(exchanges: ConversationContextExchange[], operationId: string): Promise<void>;
   authorizeVoiceResponse(input: {

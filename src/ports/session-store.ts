@@ -190,6 +190,18 @@ export type ReconciliationLiveSegmentRow = {
   readonly startedAt: string;
   readonly endedAt: string;
 };
+export type TimedEvidenceBinding = { readonly occurrenceId: string; readonly bridgeSessionId: string; readonly runtimeSessionId: bigint };
+export type TimedEvidenceOwner = TimedEvidenceBinding & { readonly generationId: string; readonly token: string; readonly storeIdentity: string };
+export type ProvisionalResult =
+  | { readonly kind: "provisional_ui_observed"; readonly feishuUserId: string }
+  | { readonly kind: "anonymous"; readonly reason: "coverage_missing" | "timing_unavailable" | "coverage_barrier" | "identity_ambiguous" | "activation_not_fresh" | "attendance_missing" | "catchup_timeout" | "pending_limit" | "observation_limit" | "generation_changed" | "owner_closed" | "owner_restarted" | "evidence_expired" | "ui_storage_loss" };
+export type TimedEvidenceStatus = { readonly state: "active" | "recovering" | "closed"; readonly uiRows: number; readonly uiBytes: number; readonly liveRows: number;
+  readonly uiLossReason: "ui_limit_exceeded" | "ui_invalid" | "ui_sequence_gap" | null;
+  readonly wordingLossReason: "text_limit_exceeded" | "live_limit_exceeded" | "runtime_queue_overflow" | null };
+export type TimedLiveRow = { readonly event: import("@conversation/runtime").VersionFourVoiceTranscriptFinalEvent; readonly result: ProvisionalResult | null };
+export type TimedAppendResult = "inserted" | "duplicate" | "overflow" | "expired";
+export type TimedPurgeProgress = { readonly removedRows: number; readonly removedGenerations: number; readonly pending: boolean };
+
 export type ReconciliationEvidenceRow = {
   readonly occurrenceId: string;
   readonly generationId: string;
@@ -479,6 +491,20 @@ export type SessionStore = {
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   getReconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;
   purgeExpiredReconciliationEvidence(nowMs: number): number;
+  beginTimedEvidence(binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceOwner;
+  appendTimedUi(owner: TimedEvidenceOwner, event: import("../contracts/bridge-session-v2.ts").BridgeEventMessageV2, nowMs: number): TimedAppendResult;
+  appendTimedFinal(owner: TimedEvidenceOwner, event: import("@conversation/runtime").VersionFourVoiceTranscriptFinalEvent, nowMs: number): TimedAppendResult;
+  resolveTimedFinal(owner: TimedEvidenceOwner, segmentId: string, result: ProvisionalResult, nowMs: number): boolean;
+  readTimedUi(binding: TimedEvidenceBinding, afterSequence: number, nowMs: number): readonly import("../contracts/bridge-session-v2.ts").BridgeEventMessageV2[];
+  readTimedFinal(binding: TimedEvidenceBinding, afterSegmentId: string, nowMs: number): TimedLiveRow | null;
+  getTimedEvidenceStatus(binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceStatus | null;
+  closeTimedEvidence(owner: TimedEvidenceOwner, nowMs: number): void;
+  markTimedUiLoss(owner: TimedEvidenceOwner, reason: NonNullable<TimedEvidenceStatus["uiLossReason"]>, nowMs: number): void;
+  markTimedWordingLoss(owner: TimedEvidenceOwner, reason: NonNullable<TimedEvidenceStatus["wordingLossReason"]>, nowMs: number): void;
+  getTimedRecoveryOwner(binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceOwner | null;
+  beginTimedRecovery(owner: TimedEvidenceOwner, permit: import("./live-evidence-authority.ts").LiveRecoveryPermit, nowMs: number): TimedEvidenceOwner;
+  settleTimedRecoveryBatch(owner: TimedEvidenceOwner, nowMs: number): boolean;
+  purgeExpiredTimedEvidenceBatch(nowMs: number): TimedPurgeProgress;
   recordBridgeFailure(input: {
     readonly occurrenceId: string;
     readonly nowMs: number;

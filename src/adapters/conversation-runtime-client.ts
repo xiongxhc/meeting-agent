@@ -1,5 +1,4 @@
 // The installed reviewed SDK owns framing, validation and credit/cancellation.
-// This slice composes postmeeting methods only, not live voice/UI events.
 import { RuntimeClient, type RuntimeTransport } from "@conversation/runtime";
 
 import type {
@@ -20,9 +19,34 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): Co
   if (!(sdk instanceof RuntimeClient) || typeof sdk.currentSessionId !== "bigint") {
     throw new Error("Postmeeting Runtime requires an open SDK protocol version 4 client");
   }
+  const listeners = new Set<(event: RuntimeEvent) => void>();
+  let admitted = false;
+  let closing = false;
+  let pump: Promise<void> | undefined;
+  let closePromise: Promise<void> | undefined;
+  const emit = (event: RuntimeEvent) => {
+    if (!closing) for (const listener of listeners) listener(event);
+  };
   return {
-    async startVoiceSession() {
-      throw new Error("Conversation Runtime live start/events require the later Task 11 application composition");
+    get currentSessionId() { return sdk.currentSessionId!; },
+    async startVoiceSession(input) {
+      if (input.timingContract !== "capture-clock/v1") throw new Error("Task 11 timed bridge input is required for actual Runtime live admission");
+      if (closing || admitted) throw new Error("Runtime live owner is closed or already admitted");
+      if (input.profile !== "online" || input.responseMode !== "external_gate") throw new Error("Meeting timed admission requires online/external_gate");
+      admitted = true; // One generation per adapter, including failed starts.
+      const session = await sdk.startTimedVoiceSession({ bridgeSessionId: input.bridgeSessionId, profile: "online", responseMode: "external_gate" });
+      if (closing) throw new Error("Runtime live owner closed during admission");
+      pump = (async () => {
+        try {
+          for await (const event of session.events()) {
+            emit({ type: "timed_voice_event", bridgeSessionId: input.bridgeSessionId, event });
+          }
+        } catch {
+          emit({ type: "provider_unavailable", detail: "runtime_live_transport_failed" });
+        }
+      })();
+      return { timingContract: "capture-clock/v1", bridgeSessionId: input.bridgeSessionId,
+        sessionId: session.mediaLease.sessionId, mediaLease: session.mediaLease };
     },
     seedConversationContext: (exchanges, operationId) =>
       sdk.seedConversationContext(exchanges, operationId),
@@ -32,15 +56,20 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): Co
     finalizeRecording: (input) => sdk.finalizeRecording(input),
     readRecordingAlignment: (input) => sdk.readRecordingAlignment(input),
     reconcileRecording: (input) => sdk.reconcileRecording(input),
-    // No SDK VoiceSession event stream is available because start is
-    // fail-closed above. This inert subscription is safe only in that state;
-    // Task 11 replaces it with a real event bridge once it has actual session
-    // construction material.
     subscribe: (listener: (event: RuntimeEvent) => void) => {
-      void listener;
-      return () => {};
+      if (closing) throw new Error("Runtime live owner is closed");
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
     },
-    close: () => sdk.close(),
+    close: () => {
+      if (closePromise) return closePromise;
+      closing = true;
+      listeners.clear();
+      closePromise = (async () => {
+        try { await sdk.close(); } finally { await pump; }
+      })();
+      return closePromise;
+    },
   };
 }
 

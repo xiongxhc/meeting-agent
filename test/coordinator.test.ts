@@ -231,7 +231,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 21);
+      assert.equal(store.schemaVersion, 22);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -254,6 +254,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 19, name: "019_physical_client_custody.sql", appliedAtMs: BASE_MS },
         { version: 20, name: "020_feishu_invite_discovery.sql", appliedAtMs: BASE_MS },
         { version: 21, name: "021_recording_recovery_alignment.sql", appliedAtMs: BASE_MS },
+        { version: 22, name: "022_live_timed_evidence.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -298,7 +299,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 21);
+      assert.equal(second.schemaVersion, 22);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -323,6 +324,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 19, name: "019_physical_client_custody.sql", appliedAtMs: BASE_MS },
         { version: 20, name: "020_feishu_invite_discovery.sql", appliedAtMs: BASE_MS },
         { version: 21, name: "021_recording_recovery_alignment.sql", appliedAtMs: BASE_MS },
+        { version: 22, name: "022_live_timed_evidence.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -386,7 +388,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const store = h.open(BASE_MS + 2);
         try {
-          assert.equal(store.schemaVersion, 21);
+          assert.equal(store.schemaVersion, 22);
           assert.deepEqual(store.foreignKeyCheck(), []);
           const migrated = store.pending().find((row) => row.occurrenceId === reserved.occurrenceId)!;
           assert.equal(migrated.retryReason, "recovery_unavailable");
@@ -497,7 +499,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const reopened = h.open(BASE_MS + 3);
         try {
-          assert.equal(reopened.schemaVersion, 21);
+          assert.equal(reopened.schemaVersion, 22);
           assert.deepEqual(reopened.foreignKeyCheck(), []);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === reserved.occurrenceId).length, 2);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === unrelated.occurrenceId).length, 1);
@@ -824,7 +826,7 @@ test("a schema-10 terminal recording generation upgrades with honest legacy prov
     }
 
     const upgraded = h.open(BASE_MS + 1);
-    assert.equal(upgraded.schemaVersion, 21);
+    assert.equal(upgraded.schemaVersion, 22);
     upgraded.close();
 
     const reopened = h.open(BASE_MS + 2);
@@ -925,7 +927,7 @@ test("a schema-11 database upgrades to the current constraints without losing re
 
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 21);
+      assert.equal(store.schemaVersion, 22);
       const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
       assert.equal(evidence?.runtimeSessionId, 45n);
       assert.equal(evidence?.terminalSource, "bridge_observed");
@@ -1071,7 +1073,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 21);
+      assert.equal(store.schemaVersion, 22);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);
@@ -1102,12 +1104,15 @@ test("the control tables exclude transcript/audio; local-only reconciliation wor
       }
 
       // Every control-table free-text column is bounded and token-formatted.
-      // Task 7's one exception is the explicit local reconciliation ledger;
-      // it is never a Team Vault/output table and holds no audio bytes.
+      // Explicit local legacy/timed wording ledgers are not control tables;
+      // neither is a Team Vault/output table or an audio-byte store.
       const liveLedger = schema.find((table) => table.name === "reconciliation_live_segments");
       assert.ok(liveLedger !== undefined);
       assert.deepEqual(liveLedger.columns.map((column) => column.name), ["generation_id", "segment_id", "text", "started_at", "started_at_ms", "ended_at", "ended_at_ms"]);
-      for (const table of schema.filter((candidate) => !candidate.name.startsWith("reconciliation_") && candidate.name !== "delivery_journal" && candidate.name !== "notification_intents")) {
+      const timedLedger = schema.find((table) => table.name === "timed_live_evidence");
+      assert.ok(timedLedger !== undefined);
+      assert.deepEqual(timedLedger.columns.map((column) => column.name), ["generation_id", "segment_id", "text", "evidence", "result"]);
+      for (const table of schema.filter((candidate) => !candidate.name.startsWith("reconciliation_") && candidate.name !== "timed_live_evidence" && candidate.name !== "delivery_journal" && candidate.name !== "notification_intents")) {
         assert.ok(!table.columns.some((column) => /transcript|text|audio/i.test(column.name)), `control table ${table.name} must not carry prose`);
       }
       const id = identity(1);

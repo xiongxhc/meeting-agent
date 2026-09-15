@@ -30,6 +30,11 @@ import { consumeAlignmentRecoveryPermit, type AlignmentRecoveryPermit } from "..
 import type { RecordingAlignmentPage, RecordingAlignmentComplete } from "../ports/conversation-runtime.ts";
 import { ALIGNMENT_LIMITS, encodeAlignmentPage, decodeAlignmentPage, validateAlignmentComplete, pageWarnings } from "../sessions/recording-alignment.ts";
 import type { PhysicalCustodyRow, PhysicalClientClear } from "../ports/session-store.ts";
+import type { TimedEvidenceBinding, TimedEvidenceOwner, TimedEvidenceStatus, ProvisionalResult, TimedAppendResult, TimedLiveRow, TimedPurgeProgress } from "../ports/session-store.ts";
+import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
+import { parseEventV2, type BridgeEventMessageV2 } from "../contracts/bridge-session-v2.ts";
+import { encodeLiveEvidence, decodeLiveEvidence, encodeProvisionalResult, decodeProvisionalResult } from "../sessions/live-evidence-codec.ts";
+import { consumeLiveRecoveryPermit, type LiveRecoveryPermit } from "../ports/live-evidence-authority.ts";
 
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
 import {
@@ -181,6 +186,42 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     appendReconciliationLiveSegment: (occurrenceId, segment) => appendReconciliationLiveSegment(db, occurrenceId, segment),
     getReconciliationEvidence: (occurrenceId, recordingHandle) => getReconciliationEvidence(db, occurrenceId, recordingHandle),
     purgeExpiredReconciliationEvidence: (nowMs) => purgeExpiredReconciliationEvidence(db, nowMs),
+    beginTimedEvidence: (binding, nowMs) => beginTimedEvidence(db, binding, nowMs),
+    appendTimedUi: (owner, event, nowMs) => appendTimedUi(db, owner, event, nowMs),
+    appendTimedFinal: (owner, event, nowMs) => appendTimedFinal(db, owner, event, nowMs),
+    resolveTimedFinal: (owner, segmentId, result, nowMs) => resolveTimedFinal(db, owner, segmentId, result, nowMs),
+    readTimedUi: (binding, after, nowMs) => readTimedUi(db, binding, after, nowMs),
+    readTimedFinal: (binding, after, nowMs) => readTimedFinal(db, binding, after, nowMs),
+    getTimedEvidenceStatus: (binding, nowMs) => {
+      const row = timedHeader(db, binding, nowMs);
+      return row === null ? null : { state: row.state, uiRows: row.uiRows, uiBytes: row.uiBytes, liveRows: row.liveRows,
+        uiLossReason: row.uiLossReason, wordingLossReason: row.wordingLossReason };
+    },
+    markTimedUiLoss: (owner, reason, nowMs) => {
+      db.transaction(() => {
+        if (ownedTimedHeader(db, owner, nowMs)) db.prepare("UPDATE timed_evidence_owners SET ui_loss_reason = COALESCE(ui_loss_reason, ?) WHERE generation_id = ?").run(reason, owner.generationId);
+      })();
+    },
+    markTimedWordingLoss: (owner, reason, nowMs) => {
+      db.transaction(() => {
+        if (ownedTimedHeader(db, owner, nowMs)) db.prepare("UPDATE timed_evidence_owners SET wording_loss_reason = COALESCE(wording_loss_reason, ?) WHERE generation_id = ?").run(reason, owner.generationId);
+      })();
+    },
+    closeTimedEvidence: (owner, nowMs) => closeTimedEvidence(db, owner, nowMs),
+    getTimedRecoveryOwner: (binding, nowMs) => getTimedRecoveryOwner(db, binding, nowMs),
+    beginTimedRecovery: (owner, permit, nowMs) => beginTimedRecovery(db, owner, permit, nowMs),
+    settleTimedRecoveryBatch: (owner, nowMs) => db.transaction(() => {
+      const row = ownedTimedHeader(db, owner, nowMs, true);
+      if (row !== null && row.state !== "recovering") throw new Error("live recovery has not been admitted");
+      // No expired evidence is exposed to the caller. One exact-owner pending
+      // row receives only a fixed anonymous result per transaction.
+      const result: ProvisionalResult = { kind: "anonymous", reason: row === null ? "evidence_expired" : "owner_restarted" };
+      const changed = db.prepare(`UPDATE timed_live_evidence SET result = ? WHERE generation_id = ? AND segment_id =
+        (SELECT segment_id FROM timed_live_evidence WHERE generation_id = ? AND result IS NULL ORDER BY segment_id LIMIT 1) AND result IS NULL`)
+        .run(encodeProvisionalResult(result), owner.generationId, owner.generationId).changes;
+      return changed !== 0;
+    })(),
+    purgeExpiredTimedEvidenceBatch: (nowMs) => purgeExpiredTimedEvidenceBatch(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
     savePending: (row) => savePendingDelivery(db, row, options.deliveryIdentityCheckpoint),
@@ -1585,7 +1626,143 @@ function getReconciliationEvidence(db: Database.Database, occurrenceId: string, 
 }
 
 function purgeExpiredReconciliationEvidence(db: Database.Database, nowMs: number): number {
-  return db.prepare("DELETE FROM reconciliation_generations WHERE terminal_at_ms IS NOT NULL AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?").run(nowMs).changes;
+  const legacy = db.prepare(`DELETE FROM reconciliation_generations WHERE terminal_at_ms IS NOT NULL AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?
+    AND NOT EXISTS (SELECT 1 FROM timed_evidence_owners WHERE timed_evidence_owners.generation_id = reconciliation_generations.generation_id)`).run(nowMs).changes;
+  return legacy + purgeExpiredTimedEvidenceBatch(db, nowMs).removedGenerations;
+}
+
+type TimedHeader = TimedEvidenceStatus & { generationId: string; token: string; expiresAtMs: number | null };
+// An inspected durable descriptor is not a current writer capability. The
+// object admission is private/process-local; exact-token SQL CAS is final.
+const timedWriterPermits = new WeakSet<object>();
+function timedHeader(db: Database.Database, binding: TimedEvidenceBinding, nowMs: number, includeExpired = false): TimedHeader | null {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0 || binding.runtimeSessionId <= 0n) throw new Error("invalid timed evidence binding");
+  const row = db.prepare(`SELECT o.generation_id AS generationId, o.owner_token AS token, o.state, o.ui_rows AS uiRows, o.ui_bytes AS uiBytes,
+      o.live_rows AS liveRows, o.ui_loss_reason AS uiLossReason, o.wording_loss_reason AS wordingLossReason, g.expires_at_ms AS expiresAtMs
+    FROM timed_evidence_owners o JOIN reconciliation_generations g USING(generation_id)
+    WHERE g.occurrence_id = ? AND g.bridge_session_id = ? AND g.runtime_session_id = ?`).get(binding.occurrenceId, binding.bridgeSessionId, binding.runtimeSessionId.toString()) as TimedHeader | undefined;
+  return !row || (!includeExpired && row.expiresAtMs !== null && row.expiresAtMs <= nowMs) ? null : row;
+}
+function ownedTimedHeader(db: Database.Database, owner: TimedEvidenceOwner, nowMs: number, recovering = false, recoveryProbe = false): TimedHeader | null {
+  if (!recoveryProbe && !timedWriterPermits.has(owner)) throw new Error("missing live writer authority");
+  if (requirePrivateState(db) !== owner.storeIdentity) throw new Error("timed evidence owner changed store");
+  const row = timedHeader(db, owner, nowMs, true);
+  if (!row || row.generationId !== owner.generationId || row.token !== owner.token || (row.state !== "active" && !(recovering && row.state === "recovering"))) throw new Error("timed evidence owner is stale or closed");
+  return row.expiresAtMs !== null && row.expiresAtMs <= nowMs ? null : row;
+}
+function beginTimedEvidence(db: Database.Database, binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceOwner {
+  const storeIdentity = requirePrivateState(db), generationId = reconciliationGenerationId(binding.occurrenceId, binding.bridgeSessionId);
+  return db.transaction(() => {
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("invalid timed evidence clock");
+    const generation = db.prepare(`SELECT 1 FROM reconciliation_generations WHERE generation_id = ? AND runtime_session_id = ? AND terminal_at_ms IS NULL`).get(generationId, binding.runtimeSessionId.toString());
+    if (!generation || binding.runtimeSessionId <= 0n) throw new Error("timed evidence generation is not current");
+    if (db.prepare("SELECT 1 FROM timed_evidence_owners WHERE generation_id = ?").get(generationId)) throw new Error("timed evidence owner already exists");
+    const token = randomUUID();
+    db.prepare("INSERT INTO timed_evidence_owners(generation_id, owner_token, state) VALUES (?, ?, 'active')").run(generationId, token);
+    const owner = Object.freeze({ ...binding, generationId, token, storeIdentity });
+    timedWriterPermits.add(owner); return owner;
+  })();
+}
+function appendTimedUi(db: Database.Database, owner: TimedEvidenceOwner, event: BridgeEventMessageV2, nowMs: number): TimedAppendResult {
+  return db.transaction((): TimedAppendResult => {
+    const row = ownedTimedHeader(db, owner, nowMs); if (!row) return "expired";
+    const parsed = parseEventV2(event);
+    if (parsed.sessionId !== owner.bridgeSessionId) throw new Error("invalid timed UI evidence");
+    const payload = JSON.stringify(parsed), bytes = Buffer.byteLength(payload);
+    const previous = db.prepare("SELECT payload FROM timed_ui_evidence WHERE generation_id = ? AND sequence = ?").get(owner.generationId, event.sequence) as { payload: string } | undefined;
+    if (previous) { if (previous.payload !== payload) throw new Error("timed UI duplicate changed evidence"); return "duplicate"; }
+    if (row.uiRows >= 65536 || row.uiBytes + bytes > 268435456) {
+      db.prepare("UPDATE timed_evidence_owners SET ui_loss_reason = COALESCE(ui_loss_reason, 'ui_limit_exceeded') WHERE generation_id = ?").run(owner.generationId);
+      return "overflow";
+    }
+    db.prepare("INSERT INTO timed_ui_evidence(generation_id, sequence, payload) VALUES (?, ?, ?)").run(owner.generationId, event.sequence, payload);
+    return "inserted";
+  })();
+}
+function appendTimedFinal(db: Database.Database, owner: TimedEvidenceOwner, event: VersionFourVoiceTranscriptFinalEvent, nowMs: number): TimedAppendResult {
+  return db.transaction((): TimedAppendResult => {
+    const row = ownedTimedHeader(db, owner, nowMs); if (!row) return "expired";
+    if (event.sessionId !== owner.runtimeSessionId || event.type !== "voice_transcript_final") throw new Error("timed final changed live source");
+    const previous = db.prepare("SELECT text, evidence FROM timed_live_evidence WHERE generation_id = ? AND segment_id = ?").get(owner.generationId, event.segmentId) as { text: string; evidence: string } | undefined;
+    const evidence = encodeLiveEvidence(event);
+    if (previous) { if (previous.text !== event.text || previous.evidence !== evidence) throw new Error("timed final duplicate changed evidence"); return "duplicate"; }
+    if (Buffer.byteLength(event.text) > 16384 || row.liveRows >= 256) {
+      db.prepare("UPDATE timed_evidence_owners SET wording_loss_reason = COALESCE(wording_loss_reason, ?) WHERE generation_id = ?")
+        .run(Buffer.byteLength(event.text) > 16384 ? "text_limit_exceeded" : "live_limit_exceeded", owner.generationId);
+      return "overflow";
+    }
+    db.prepare("INSERT INTO timed_live_evidence(generation_id, segment_id, text, evidence) VALUES (?, ?, ?, ?)").run(owner.generationId, event.segmentId, event.text, evidence);
+    return "inserted";
+  })();
+}
+function resolveTimedFinal(db: Database.Database, owner: TimedEvidenceOwner, segmentId: string, result: ProvisionalResult, nowMs: number): boolean {
+  return db.transaction(() => {
+    const row = ownedTimedHeader(db, owner, nowMs, result.kind === "anonymous" && (result.reason === "owner_restarted" || result.reason === "evidence_expired"));
+    const actual: ProvisionalResult = row === null ? { kind: "anonymous", reason: "evidence_expired" } : result;
+    return db.prepare("UPDATE timed_live_evidence SET result = ? WHERE generation_id = ? AND segment_id = ? AND result IS NULL")
+      .run(encodeProvisionalResult(actual), owner.generationId, segmentId).changes === 1;
+  })();
+}
+function readTimedUi(db: Database.Database, binding: TimedEvidenceBinding, afterSequence: number, nowMs: number): readonly BridgeEventMessageV2[] {
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("invalid timed UI cursor");
+  const row = timedHeader(db, binding, nowMs); if (!row) return [];
+  return (db.prepare("SELECT payload FROM timed_ui_evidence WHERE generation_id = ? AND sequence > ? ORDER BY sequence LIMIT 8").all(row.generationId, afterSequence) as { payload: string }[]).map(({ payload }) => {
+    const parsed = parseEventV2(JSON.parse(payload) as unknown);
+    if (parsed.sessionId !== binding.bridgeSessionId) throw new Error("corrupt timed UI evidence");
+    return parsed;
+  });
+}
+function closeTimedEvidence(db: Database.Database, owner: TimedEvidenceOwner, nowMs: number): void {
+  db.transaction(() => {
+    ownedTimedHeader(db, owner, nowMs, true);
+    if (db.prepare("SELECT 1 FROM timed_live_evidence WHERE generation_id = ? AND result IS NULL LIMIT 1").get(owner.generationId)) throw new Error("timed owner still has unresolved evidence");
+    db.prepare("UPDATE timed_evidence_owners SET state = 'closed' WHERE generation_id = ? AND owner_token = ?").run(owner.generationId, owner.token);
+  })();
+  timedWriterPermits.delete(owner);
+}
+function getTimedRecoveryOwner(db: Database.Database, binding: TimedEvidenceBinding, nowMs: number): TimedEvidenceOwner | null {
+  const storeIdentity = requirePrivateState(db), row = timedHeader(db, binding, nowMs);
+  if (!row || row.state === "closed") return null;
+  return { ...binding, generationId: row.generationId, token: row.token, storeIdentity };
+}
+function beginTimedRecovery(db: Database.Database, owner: TimedEvidenceOwner, permit: LiveRecoveryPermit, nowMs: number): TimedEvidenceOwner {
+  return db.transaction(() => {
+    ownedTimedHeader(db, owner, nowMs, true, true);
+    consumeLiveRecoveryPermit(permit, owner);
+    const token = randomUUID();
+    const changed = db.prepare("UPDATE timed_evidence_owners SET state = 'recovering', owner_token = ? WHERE generation_id = ? AND owner_token = ? AND state != 'closed'")
+      .run(token, owner.generationId, owner.token).changes;
+    if (changed !== 1) throw new Error("live recovery owner changed");
+    const admitted = Object.freeze({ ...owner, token });
+    timedWriterPermits.add(admitted); return admitted;
+  })();
+}
+function readTimedFinal(db: Database.Database, binding: TimedEvidenceBinding, afterSegmentId: string, nowMs: number): TimedLiveRow | null {
+  const row = timedHeader(db, binding, nowMs); if (!row) return null;
+  const stored = db.prepare("SELECT segment_id, text, evidence, result FROM timed_live_evidence WHERE generation_id = ? AND segment_id > ? ORDER BY segment_id LIMIT 1")
+    .get(row.generationId, afterSegmentId) as { segment_id: string; text: string; evidence: string; result: string | null } | undefined;
+  if (!stored) return null;
+  const event = decodeLiveEvidence(stored.evidence, stored.text);
+  if (event.sessionId !== binding.runtimeSessionId || event.segmentId !== stored.segment_id) throw new Error("corrupt timed live binding");
+  return { event, result: stored.result === null ? null : decodeProvisionalResult(stored.result) };
+}
+function purgeExpiredTimedEvidenceBatch(db: Database.Database, nowMs: number): TimedPurgeProgress {
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT g.generation_id FROM reconciliation_generations g JOIN timed_evidence_owners o USING(generation_id)
+      WHERE g.terminal_at_ms IS NOT NULL AND g.expires_at_ms <= ? ORDER BY g.expires_at_ms, g.generation_id LIMIT 1`).get(nowMs) as { generation_id: string } | undefined;
+    if (!row) return { removedRows: 0, removedGenerations: 0, pending: false };
+    const removedUi = db.prepare(`DELETE FROM timed_ui_evidence WHERE generation_id = ? AND sequence IN
+      (SELECT sequence FROM timed_ui_evidence WHERE generation_id = ? ORDER BY sequence LIMIT 8)`).run(row.generation_id, row.generation_id).changes;
+    const removedLive = db.prepare(`DELETE FROM timed_live_evidence WHERE generation_id = ? AND segment_id IN
+      (SELECT segment_id FROM timed_live_evidence WHERE generation_id = ? ORDER BY segment_id LIMIT 1)`).run(row.generation_id, row.generation_id).changes;
+    let removedGenerations = 0;
+    if (!db.prepare("SELECT 1 FROM timed_ui_evidence WHERE generation_id = ? LIMIT 1").get(row.generation_id) && !db.prepare("SELECT 1 FROM timed_live_evidence WHERE generation_id = ? LIMIT 1").get(row.generation_id)) {
+      db.prepare("DELETE FROM timed_evidence_owners WHERE generation_id = ?").run(row.generation_id);
+      removedGenerations = db.prepare("DELETE FROM reconciliation_generations WHERE generation_id = ?").run(row.generation_id).changes;
+    }
+    const pending = !!db.prepare(`SELECT 1 FROM reconciliation_generations g JOIN timed_evidence_owners o USING(generation_id) WHERE g.terminal_at_ms IS NOT NULL AND g.expires_at_ms <= ? LIMIT 1`).get(nowMs);
+    return { removedRows: removedUi + removedLive, removedGenerations, pending };
+  })();
 }
 
 function parseCanonicalUtc(value: string, field: string): number {

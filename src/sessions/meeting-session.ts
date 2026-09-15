@@ -57,6 +57,11 @@ import {
   type BridgeEventMessage,
 } from "../contracts/bridge-session-v1.ts";
 import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
+import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2 } from "../contracts/bridge-session-v2.ts";
+import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
+import type { SessionStore } from "../ports/session-store.ts";
+import { LiveProvisionalCorrelator, type LiveCatchupClock, type ProvisionalResolution } from "./live-provisional.ts";
+import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { ActiveSpeakerObservation } from "../domain/transcript.ts";
 import {
@@ -254,7 +259,6 @@ export type MeetingSession = {
 
 export type CreateMeetingSessionOptions = {
   readonly identity: MeetingIdentity;
-  readonly bridge: BridgeTransport;
   readonly runtime: ConversationRuntimePort;
   readonly coordinator: SessionCoordinator;
   readonly clock: Clock;
@@ -285,7 +289,12 @@ export type CreateMeetingSessionOptions = {
    * cleanup has finished, so applications can stop retaining sensitive
    * session state without reopening shutdown races. */
   readonly onInactive?: () => void;
-};
+} & ({ readonly bridge: BridgeTransport; readonly timedEvidence?: undefined } | {
+  readonly bridge: BridgeTransportV2;
+  readonly timedEvidence: { readonly store: SessionStore; readonly catchupClock?: LiveCatchupClock;
+    readonly onResult?: (resolution: ProvisionalResolution) => void;
+    readonly onTranscript?: (event: VersionFourVoiceTranscriptFinalEvent) => void };
+});
 
 type QueueItem =
   | { readonly source: "bridge"; readonly raw: unknown }
@@ -328,6 +337,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let speaking: SpeakingState = "enabled";
   let speakingAbortReason: string | null = null;
   let runtimeSessionId: bigint | null = null;
+  let evidenceControlId: bigint | null = null;
+  let provisional: LiveProvisionalCorrelator | null = null;
+  let timedVoiceAdmitted = false;
+  let lastBridgeV2Sequence = 0;
+  let lastAuthorizedTurn: { turnId: bigint; segmentId: string } | null = null;
   let reconciliationGenerationStarted = false;
   let bridgeConnected = true;
   let mediaConnected = false;
@@ -461,8 +475,16 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   // ---- outbound ---------------------------------------------------------
 
-  async function issue(command: BridgeCommand): Promise<void> {
+  async function issue(command: BridgeCommand | BridgeCommandV2): Promise<void> {
     const commandId = nextCommandId();
+    if (options.timedEvidence) {
+      if (issuedCommandTypes.has(commandId)) throw new Error("duplicate bridge command identifier");
+      const message = parseCommandV2({ schema: "bridge-session/v2", sessionId: bridgeSessionId, commandId, ...command });
+      issuedCommandTypes.set(commandId, command.type);
+      await options.bridge.send(message);
+      if (command.type === "join") joinCommandSent = true;
+      return;
+    }
     const accepted = validator.acceptCommand({
       schema: BRIDGE_SESSION_SCHEMA,
       sessionId: bridgeSessionId,
@@ -478,7 +500,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       );
     }
     issuedCommandTypes.set(commandId, command.type);
-    await bridge.send(accepted.value);
+    await options.bridge.send(accepted.value);
     if (command.type === "join") joinCommandSent = true;
   }
 
@@ -529,6 +551,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   function enqueue(item: QueueItem): void {
     if (disposed) return;
+    // Admission is checked at arrival, not after a queued event waits for a
+    // future lease. Control-ID prebinding permits UI only. Never hold this
+    // reader on start completion (terminal events must remain serviceable).
+    if (options.timedEvidence && !timedVoiceAdmitted && item.source === "runtime" && item.event.type === "timed_voice_event" &&
+      ["voice_transcript_final", "response_authorized", "response_skipped", "voice_barge_in"].includes(item.event.event.type)) return;
 
     if (queue.length >= maxQueuedEvents) {
       // Dropping the newest arrival costs one event for every ordinary type.
@@ -566,6 +593,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         atMs: clock.now(),
         disposition: "dropped",
       });
+      if (options.timedEvidence) {
+        try {
+          if (item.source === "bridge") provisional?.invalidateCoverage("ui_sequence_gap");
+          else if (item.event.type === "timed_voice_event" && item.event.bridgeSessionId === bridgeSessionId &&
+            item.event.event.sessionId === evidenceControlId && item.event.event.type === "voice_transcript_final") provisional?.noteWordingDrop();
+        } catch (error) { routingErrors.push({ source: item.source, error }); }
+      }
       abortSpeaking("queue_overflow");
       return;
     }
@@ -585,7 +619,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
     const record = raw as Record<string, unknown>;
     return (
-      record["schema"] === BRIDGE_SESSION_SCHEMA &&
+      record["schema"] === (options.timedEvidence ? "bridge-session/v2" : BRIDGE_SESSION_SCHEMA) &&
       record["type"] === "left" &&
       record["sessionId"] === bridgeSessionId
     );
@@ -664,13 +698,34 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       return;
     }
     // The ONLY door in. A frame-shaped message dies here as `unknown_type`.
-    const parsed = validator.acceptEvent(raw);
-    if (!parsed.ok) {
-      rejectedInbound.push({ code: parsed.rejection.code, path: parsed.rejection.path });
-      return;
+    let event: BridgeEventMessage | BridgeEventMessageV2;
+    if (options.timedEvidence) {
+      try { event = parseEventV2(raw); }
+      catch { provisional?.invalidateCoverage(); rejectedInbound.push({ code: "invalid_bridge_v2", path: "$" }); return; }
+      if (event.sessionId !== bridgeSessionId) {
+        rejectedInbound.push({ code: "stale_bridge_v2", path: "$.sequence" }); return;
+      }
+      if (event.sequence <= lastBridgeV2Sequence) {
+        // Only observational replays reach the durable duplicate/conflict fence.
+        // Identical payloads are idempotent; changed/backward evidence closes
+        // coverage. Stale administrative/terminal messages are never rerouted.
+        if (["ui_snapshot", "active_speaker", "participant_joined", "participant_left"].includes(event.type)) {
+          try { provisional?.observe(event); } catch (error) { routingErrors.push({ source: "bridge", error }); }
+        }
+        rejectedInbound.push({ code: "stale_bridge_v2", path: "$.sequence" }); return;
+      }
+      if (event.type === "command_result" && !issuedCommandTypes.has(event.commandId)) {
+        rejectedInbound.push({ code: "unknown_command_id", path: "$.commandId" }); return;
+      }
+      lastBridgeV2Sequence = event.sequence;
+      try { provisional?.observe(event); } catch (error) { routingErrors.push({ source: "bridge", error }); }
+    } else {
+      const parsed = validator.acceptEvent(raw);
+      if (!parsed.ok) { rejectedInbound.push({ code: parsed.rejection.code, path: parsed.rejection.path }); return; }
+      event = parsed.value;
     }
-    const event: BridgeEventMessage = parsed.value;
     routedEventTypes.push(event.type);
+    if (event.schema === "bridge-session/v2" && ["ui_snapshot", "active_speaker", "participant_joined", "participant_left"].includes(event.type)) return;
 
     switch (event.type) {
       case "joined":
@@ -736,6 +791,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         return;
 
       case "active_speaker":
+        if (event.schema !== "bridge-session/v1") return;
         // Retained as provisional evidence -- the observation, its two legal
         // shapes intact, and the bridge's own timestamp. Not correlated with
         // any segment here: attribution is src/sessions/speaker-reconciler.ts's
@@ -755,12 +811,14 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // counted here so the "every routed type is a declared contract type"
       // evidence is complete.
       case "participant_joined":
+        if (event.schema !== "bridge-session/v1") return;
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
           bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_joined", feishuUserId: event.feishuUserId, displayName: event.displayName, confidence: null,
         });
         return;
       case "participant_left":
+        if (event.schema !== "bridge-session/v1") return;
         coordinator.appendReconciliationBridgeEvent(identity.occurrenceId, {
           bridgeSessionId: event.sessionId, sequence: event.sequence, schema: event.schema, observedAt: event.observedAt,
           type: "participant_left", feishuUserId: event.feishuUserId, displayName: null, confidence: null,
@@ -771,19 +829,46 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   // ---- inbound: runtime -------------------------------------------------
 
-  async function handleRuntimeEvent(event: RuntimeEvent): Promise<void> {
+  async function handleRuntimeEvent(incoming: RuntimeEvent): Promise<void> {
     if (terminalReason !== null) {
       ignoredAfterTerminal += 1;
       return;
     }
 
+    let event: Exclude<RuntimeEvent, { type: "timed_voice_event" }> | { type: "timed_transcript_final"; segment: Pick<TranscriptSegment, "segmentId" | "text" | "final"> };
+    if (incoming.type === "timed_voice_event") {
+      if (!options.timedEvidence || incoming.bridgeSessionId !== bridgeSessionId || incoming.event.sessionId !== evidenceControlId) throw new Error("timed Runtime event changed live binding");
+      if (terminalReason !== null || disposed) return;
+      const value = incoming.event;
+      switch (value.type) {
+        case "voice_transcript_final":
+          if (settledTurns.has(value.segmentId) || openTurns.has(value.segmentId)) return;
+          try { provisional?.finalize(value); } catch (error) { routingErrors.push({ source: "runtime", error }); }
+          try { options.timedEvidence.onTranscript?.(value); } catch (error) { routingErrors.push({ source: "runtime", error }); }
+          event = { type: "timed_transcript_final", segment: { segmentId: value.segmentId, text: value.text, final: true } }; break;
+        case "response_authorized":
+          lastAuthorizedTurn = { turnId: value.turnId, segmentId: value.segmentId };
+          event = { type: "response_authorized", segmentId: value.segmentId }; break;
+        case "response_skipped": event = { type: "response_skipped", segmentId: value.segmentId, reason: value.reason }; break;
+        case "voice_barge_in":
+          if (lastAuthorizedTurn?.turnId !== value.turnId) return;
+          event = { type: "barge_in", segmentId: lastAuthorizedTurn.segmentId }; break;
+        case "voice_session_failed": event = { type: "provider_unavailable", detail: "runtime_voice_failed" }; break;
+        default: return;
+      }
+    } else {
+      if (options.timedEvidence && incoming.type === "transcript_final") throw new Error("legacy transcript cannot enter timed live evidence");
+      event = incoming;
+    }
+
     switch (event.type) {
+      case "timed_transcript_final":
       case "transcript_final": {
         const segmentId = event.segment.segmentId;
         if (settledTurns.has(segmentId) || openTurns.has(segmentId)) return; // redelivery
 
         // Final segments only: a partial is neither transcript nor evidence.
-        if (event.segment.final) {
+        if (event.type === "transcript_final" && event.segment.final) {
           liveTranscript.push(event.segment);
           coordinator.appendReconciliationLiveSegment(identity.occurrenceId, {
             bridgeSessionId, segmentId: event.segment.segmentId, text: event.segment.text,
@@ -1008,7 +1093,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
    * terminal for `reason`. Terminal, not merely "already joined": a retry
    * means a NEW session against a NEW lease, exactly as after a `left`. */
   async function closeRuntime(): Promise<void> {
-    if (!runtimeStartAttempted || runtimeClosed) return;
+    if (provisional !== null) {
+      const owner = provisional; provisional = null;
+      try { await owner.close(); } catch (error) { routingErrors.push({ source: "join_cleanup", error }); }
+    }
+    if ((!runtimeStartAttempted && evidenceControlId === null) || runtimeClosed) return;
     runtimeClosed = true;
     try {
       await runtime.close();
@@ -1127,6 +1216,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       coordinator.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
       reconciliationGenerationStarted = true;
 
+      if (options.timedEvidence) {
+        const controlId = runtime.currentSessionId;
+        if (typeof controlId !== "bigint" || controlId <= 0n) throw new Error("timed session requires actual connected v4 control identity");
+        evidenceControlId = controlId;
+        coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, controlId);
+        provisional = new LiveProvisionalCorrelator({ store: options.timedEvidence.store,
+          binding: { occurrenceId: identity.occurrenceId, bridgeSessionId, runtimeSessionId: controlId }, nowMs: () => clock.now(),
+          ...(options.timedEvidence.catchupClock ? { catchupClock: options.timedEvidence.catchupClock } : {}),
+          ...(options.timedEvidence.onResult ? { onResult: options.timedEvidence.onResult } : {}) });
+      }
+
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });
       });
@@ -1143,14 +1243,28 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       assertJoinCanContinue();
 
       runtimeStartAttempted = true;
-      const handle = await runtime.startVoiceSession({
-        profile: PINNED_PROFILE,
-        responseMode: PINNED_RESPONSE_MODE,
-      });
+      const runtimeAdmission = runtime.startVoiceSession(options.timedEvidence
+        ? { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE, timingContract: "capture-clock/v1", bridgeSessionId }
+        : { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE });
+      const handle = await runtimeAdmission;
+      if (options.timedEvidence && (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId ||
+        handle.bridgeSessionId !== bridgeSessionId || handle.mediaLease.sessionId !== evidenceControlId ||
+        handle.mediaLease.mediaProtocolVersion !== 2 || handle.mediaLease.timingContract !== "capture-clock/v1" ||
+        handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms")) throw new Error("timed media lease changed admitted binding or format");
       runtimeSessionId = handle.sessionId;
-      coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, handle.sessionId);
+      if (!options.timedEvidence) coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, handle.sessionId);
       assertJoinCanContinue();
-      if (handle.profile !== PINNED_PROFILE) {
+      if (options.timedEvidence) {
+        if (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId || handle.bridgeSessionId !== bridgeSessionId ||
+          handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms") throw new Error("timed media lease changed admitted binding or format");
+        timedVoiceAdmitted = true;
+        await issue({ type: "connect_media", mediaLease: { sessionId: handle.sessionId.toString(), bridgeSessionId,
+          connectEndpoint: handle.mediaLease.connectEndpoint, credential: handle.mediaLease.credential,
+          expiresAtMs: handle.mediaLease.expiresAtMs.toString(), reconnectWindowMs: handle.mediaLease.reconnectWindowMs.toString(),
+          mediaProtocolVersion: 2, captureFormat: "pcm_s16le/24000/1/20ms", timingContract: "capture-clock/v1" } });
+      } else {
+        if (handle.timingContract !== undefined) throw new Error("timed Runtime lease requires explicit bridge v2 composition");
+        if (handle.profile !== PINNED_PROFILE) {
         abortSpeaking("profile_mismatch");
       } else if (handle.responseMode !== PINNED_RESPONSE_MODE) {
         abortSpeaking("response_mode_mismatch");
@@ -1159,6 +1273,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       }
 
       await issue({ type: "connect_media", ...handle.media });
+      }
       assertJoinCanContinue();
 
       try {

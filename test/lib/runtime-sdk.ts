@@ -11,9 +11,9 @@ export class RuntimeTestTransport implements RuntimeTransport {
   async close(): Promise<void> { this.messages.push(null); }
 }
 
-export async function runtimeTestClient<V extends ClientProtocolVersion>(version: V) {
+export async function runtimeTestClient<V extends ClientProtocolVersion>(version: V, currentSessionId = 42n) {
   const transport = new RuntimeTestTransport();
-  transport.push({ type: "ready", protocol_version: version, ...(version === 4 ? { current_session_id: "42" } : {}),
+  transport.push({ type: "ready", protocol_version: version, ...(version === 4 ? { current_session_id: currentSessionId.toString() } : {}),
     status: { profile: "offline", transport: "stdio", privacy_mode: "local_only", language_location: "local",
       model_id: "synthetic", memory_enabled: false, memory_location: null, telemetry_enabled: false,
       capabilities: ["text", "conversation_context_seed"], components: [{ kind: "language_model", execution_location: "local", provider_label: "Synthetic" }],

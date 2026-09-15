@@ -27,6 +27,12 @@ export { createFeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
 export { createInviteDiscovery } from "./sessions/invite-discovery.ts";
 export { createConversationRuntimeClient, connectPostmeetingRuntime, type ConversationRuntimeSdk } from "./adapters/conversation-runtime-client.ts";
 export { RecordingAlignmentOwner } from "./sessions/recording-alignment.ts";
+export { createMeetingSession, type CreateMeetingSessionOptions } from "./sessions/meeting-session.ts";
+export { createCoordinator } from "./sessions/coordinator.ts";
+export { LiveProvisionalCorrelator, recoverPendingLiveEvidence, drainExpiredTimedEvidence,
+  type LiveCatchupClock, type ProvisionalResolution } from "./sessions/live-provisional.ts";
+export type { BridgeTransportV2, BridgeCommandMessageV2, BridgeEventMessageV2 } from "./ports/bridge-v2.ts";
+export type { TimedEvidenceBinding, TimedLiveRow, TimedEvidenceStatus, ProvisionalResult } from "./ports/session-store.ts";
 export { openSessionStore, type OpenSessionStoreOptions } from "./adapters/sqlite-session-store.ts";
 export type { RecordingRecovery, SelectedAlignment, AlignmentAttempt } from "./ports/session-store.ts";
 export type { FeishuScope, NormalizedInvite, InviteOccurrence } from "./ports/feishu-ingress.ts";

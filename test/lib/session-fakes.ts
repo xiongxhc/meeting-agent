@@ -71,7 +71,7 @@ export type RuntimeCall =
   | { readonly method: "close" };
 
 export type FakeRuntimeOptions = {
-  readonly handle?: Partial<VoiceSessionHandle>;
+  readonly handle?: Partial<Extract<VoiceSessionHandle, { timingContract?: undefined }>>;
   readonly recording?: Partial<RecordingSummary>;
   readonly finalizedGaps?: readonly RecordingGap[];
   readonly startVoiceSessionError?: Error;
@@ -88,7 +88,7 @@ export type FakeRuntime = ConversationRuntimePort & {
   callsOf(method: RuntimeCall["method"]): RuntimeCall[];
 };
 
-const DEFAULT_HANDLE: VoiceSessionHandle = {
+const DEFAULT_HANDLE: Extract<VoiceSessionHandle, { timingContract?: undefined }> = {
   sessionId: 17n,
   profile: "online",
   responseMode: "external_gate",

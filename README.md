@@ -45,7 +45,7 @@ export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if need
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive 4c97c47c9cb044728413516c48aa86534e58523b | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive 6f8e88ff1376d0dd541a3616725280cde42dfde7 | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
@@ -91,7 +91,9 @@ and execs the gateway. Meeting receives only the finalized opaque capability.
 
 `createConversationRuntimeClient` accepts an actual open SDK v4 client;
 `connectPostmeetingRuntime` explicitly negotiates v4 over a caller-owned transport.
-Both leave live start/events unavailable. `RecordingAlignmentOwner` stages one
+Live admission is available only through explicit timed/v2 library composition
+described below; legacy injected starts remain unavailable in the actual adapter.
+`RecordingAlignmentOwner` stages one
 reader at a time using a separately stored `RecordingRecovery`. Historical
 `sourceSessionId` is never replaced by the new gateway's `currentSessionId`.
 Normal and failed-generation recording transactions bind restart authority
@@ -128,6 +130,52 @@ that cleanup in bounded yielding batches; `recover` can also finish released
 payload cleanup without asserting a nonexistent reader has died. A real staging
 or failed-cleanup reader still requires the trusted proof. Owner close waits for
 pending reclaim, and no new reader is admitted during it.
+
+### Timed live evidence library
+
+The reviewed SDK6f8e88f adapter accepts the discriminated
+`{ timingContract: "capture-clock/v1", bridgeSessionId, profile: "online",
+responseMode: "external_gate" }` start. Its typed lease proves command admission,
+not provider/native health. `createMeetingSession` accepts a bridge-v2 transport
+and explicit `timedEvidence: { store, onTranscript?, onResult? }`. The connected
+control ID binds evidence before synchronous join observations arrive; it is not
+voice-start or recording-finalization authority. Legacy v1 callers/guards remain
+unchanged. This does not select config3 or change the application/main factory.
+
+Wording, source sample locator and separately labelled whole-touched-frame nominal
+envelope are retained atomically, without invented UTC, receipt-time origins or
+physical accuracy. Missing timing never discards admissible wording. Text/name
+gate/retrieval/authorization proceeds without waiting for UI. A separate one-shot
+provisional result may arrive up to2s later, and never rewrites a response or final
+speaker identity. Positive names require fresh observed activation, attendance,
+same-host ordered readable snapshots over the **whole** envelope and no gap over2s.
+Unchanged polls do not refresh activation; first-frame **end** governs freshness.
+This is UI-observed coverage, not physical continuity between polls or final80%
+reconciliation. Unknown physical uncertainty remains null.
+
+One correlator admits32 pending segments and4096 observation/domain-history slots.
+Durable generation bounds are256 live rows, each16KiB text +4KiB evidence +4KiB
+result, and65536 UI rows/256MiB payload at4096bytes/event. Reads take at most8 UI
+rows or1 live row. Payload caps exclude SQLite/WAL/index overhead; provision disk
+headroom. Pure250ms polls fit roughly4.55h, less with other events. Overflow latches
+separate UI/wording loss facts; wording delivery/name gating continues, but no
+unpersisted row/result is represented as durable. B2 interprets these facts later.
+The existing bounded event queue/drop policy is unchanged: a dropped v2 event
+immediately closes provisional coverage, and a dropped timed final latches the
+separate `runtime_queue_overflow` wording-loss fact. Failed loss writes remain
+visible cleanup/routing failures, never falsely reported as persisted evidence.
+
+Await session/correlator close before store close. `recoverPendingLiveEvidence`
+requires an awaited, trusted exclusive prior-owner cleanup proof, then fences the
+old token and terminalizes unresolved rows anonymously in yielding one-row batches.
+Reopen/TTL alone never authorizes recovery. No pre-crash UI coverage is reconstructed.
+The callback must own/bound its cleanup; controlled tests actually reap a child.
+Existing terminal+14d expiry remains authoritative. Expired data is unreadable
+even while physical reclamation is pending. Synchronous legacy purge performs at
+most one timed batch (8 UI +1 live row); for a complete timed drain, own and await
+`drainExpiredTimedEvidence(store, nowMs, signal?)`, which yields between transactions.
+Cancellation leaves unreadable expired rows for an explicit later drain. No audio
+retention, final completeness, artifact builder or TeamMem policy changes here.
 
 ### External package check
 
