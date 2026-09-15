@@ -112,7 +112,7 @@ public enum RuntimeMediaCodecV2 {
                 guard previous.bufferInputRange.upperBound == piece.bufferInputRange.lowerBound,
                       CMTimeCompare(CMTimeAdd(previous.sourcePTS, previous.sourceDuration), piece.sourcePTS) == 0,
                       let priorHost = previous.convertedBufferHostSpan,
-                      abs(host.startNs - priorHost.endNs) <= 2 else { return false }
+                      abs(host.startNs - priorHost.endNs) <= 1 else { return false }
             }
             next = piece.nominalRange.upperNumerator; previous = piece
         }

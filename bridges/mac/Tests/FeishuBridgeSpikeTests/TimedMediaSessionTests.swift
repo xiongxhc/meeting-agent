@@ -4,6 +4,141 @@ import Darwin
 @testable import FeishuBridgeSpike
 
 final class TimedMediaSessionTests: XCTestCase, @unchecked Sendable {
+    func testHealthyAuthenticatedTrafficSurvivesCredentialExpiryAndForwardWallStep() async throws {
+        let socket = ScriptedTimedConnection(), capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+        let wall = TimedMutableWall(1_059_800)
+        let session = try makeTimedSession(socket, capture, engine, clock, nowUnixMs: { wall.value })
+        socket.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+        wall.value = 9_000_000
+        try await Task.sleep(for: .milliseconds(1100))
+        socket.feed(playbackBytes(network: 1, generation: 1))
+        await waitForAudio { engine.scheduledCount == 1 }
+        engine.completeFirst()
+        await waitForAudio { socket.writes.contains { $0[5] == 3 && $0[22] == 2 } }
+        XCTAssertFalse(socket.closed)
+        XCTAssertTrue(socket.writes.contains { $0[5] == 3 && $0[22] == 2 })
+        let stopped = await session.stop(); XCTAssertTrue(stopped)
+        XCTAssertEqual(capture.stopCount, 1); XCTAssertEqual(engine.stopCount, 1)
+    }
+    func testWallRollbackCannotExtendOriginalReconnectAdmissionCutoff() async throws {
+        let first = ScriptedTimedConnection(), second = ScriptedTimedConnection(), sockets = TimedSocketSequence()
+        sockets.values = [first, second]
+        let capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock(), wall = TimedMutableWall(1_059_800)
+        let monotonic = TimedAdmissionClock()
+        let session = try makeTimedSession(first, capture, engine, clock, connections: { _ in try sockets.next() }, nowUnixMs: { wall.value }, nowMonotonic: { monotonic.now })
+        first.feed(try authAcceptedFixture()); second.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+        wall.value = 1
+        monotonic.advance(0.3)
+        first.cancel()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(sockets.count, 1, "fresh authentication cannot outlive the initial monotonic cutoff")
+        XCTAssertEqual(capture.startCount, 1)
+        _ = await session.stop()
+    }
+    func testLateInitialACKAfterFrozenCutoffCannotStartNativeDespiteWallRollback() async throws {
+        let socket = ScriptedTimedConnection(), capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock(), wall = TimedMutableWall(1_059_800)
+        let monotonic = TimedAdmissionClock()
+        let session = try makeTimedSession(socket, capture, engine, clock, nowUnixMs: { wall.value }, nowMonotonic: { monotonic.now })
+        let start = Task { await session.start(try timedFixtureLease()) }
+        await waitForAudio { socket.writes.count == 1 }
+        wall.value = 1
+        monotonic.advance(0.3)
+        socket.feed(try authAcceptedFixture())
+        let started = try await start.value; XCTAssertFalse(started)
+        XCTAssertEqual(capture.startCount, 0); XCTAssertEqual(engine.startCount, 0)
+        _ = await session.stop()
+    }
+    func testWallSamplingTimeConsumesAdmissionBeforeAnyNetworkStep() async throws {
+        let socket = ScriptedTimedConnection(), capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+        let monotonic = TimedAdmissionClock()
+        let session = try makeTimedSession(socket, capture, engine, clock,
+            nowUnixMs: { monotonic.advance(0.3); return 1_059_800 }, nowMonotonic: { monotonic.now })
+        socket.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertFalse(started)
+        XCTAssertTrue(socket.writes.isEmpty); XCTAssertEqual(engine.startCount, 0); XCTAssertEqual(capture.startCount, 0)
+        _ = await session.stop()
+    }
+    func testNativeCaptureFaultAndConsequentReadCloseNeverReconnect() async throws {
+        let first = ScriptedTimedConnection(), second = ScriptedTimedConnection(), sockets = TimedSocketSequence()
+        sockets.values = [first, second]
+        let capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+        let session = try makeTimedSession(first, capture, engine, clock, connections: { _ in try sockets.next() })
+        first.feed(try authAcceptedFixture()); second.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+        capture.failNative()
+        await waitForAudio { first.closed }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(first.closed); XCTAssertEqual(sockets.count, 1)
+        let events = await session.takeEvents(); XCTAssertFalse(events.contains { $0.typeName == "reconnecting" })
+        let stopped = await session.stop(); XCTAssertFalse(stopped)
+        // The primitive may own its fault-triggered stop before the cycle asks
+        // for cleanup; both remain bounded and neither confirms the faulted source.
+        XCTAssertTrue((1...2).contains(capture.stopCount)); XCTAssertEqual(engine.stopCount, 1)
+    }
+    func testInvalidClockOrProtocolDoesNotReconnectAfterConfirmedCleanup() async throws {
+        for invalidClock in [true, false] {
+            let first = ScriptedTimedConnection(), second = ScriptedTimedConnection(), sockets = TimedSocketSequence()
+            sockets.values = [first, second]
+            let capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+            let session = try makeTimedSession(first, capture, engine, clock, connections: { _ in try sockets.next() })
+            first.feed(try authAcceptedFixture()); second.feed(try authAcceptedFixture())
+            let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+            if invalidClock { clock.invalidate() } else { first.feed(try authAcceptedFixture()) }
+            let deadline = ProcessInfo.processInfo.systemUptime + 1.5
+            while !first.closed && ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertTrue(first.closed); XCTAssertEqual(sockets.count, 1)
+            let stopped = await session.stop(); XCTAssertTrue(stopped)
+            XCTAssertEqual(capture.stopCount, 1); XCTAssertEqual(engine.stopCount, 1)
+        }
+    }
+    func testTransportWriteFailureCannotReconnectAfterUnconfirmedNativeStop() async throws {
+        let first = ScriptedTimedConnection(), second = ScriptedTimedConnection(), sockets = TimedSocketSequence()
+        sockets.values = [first, second]; first.holdReaderUntilClose = true
+        let capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+        let session = try makeTimedSession(first, capture, engine, clock, connections: { _ in try sockets.next() })
+        first.feed(try authAcceptedFixture()); second.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+        first.feed(playbackBytes(network: 1, generation: 1))
+        await waitForAudio { first.writes.contains { $0[5] == 3 && $0[22] == 1 } }
+        capture.delayStop = true; first.failNextWrite(); engine.completeFirst()
+        await waitForAudio { first.closed }
+        try await Task.sleep(for: .milliseconds(150))
+        let stopped = await session.stop(); XCTAssertFalse(stopped)
+        XCTAssertEqual(sockets.count, 1)
+        capture.completeStop() // Late positive callback cannot resurrect this cycle.
+        XCTAssertFalse(first.writes.contains { $0[5] == 3 && $0[22] == 2 })
+    }
+    func testOneSidedPeriodicPairWriteFailureReconnectsAfterConfirmedCleanup() async throws {
+        try await assertOneSidedWriteFailureRecovers(rendered: false)
+    }
+    func testOneSidedRenderedACKWriteFailureReconnectsAfterConfirmedCleanup() async throws {
+        try await assertOneSidedWriteFailureRecovers(rendered: true)
+    }
+    private func assertOneSidedWriteFailureRecovers(rendered: Bool) async throws {
+        let first = ScriptedTimedConnection(), second = ScriptedTimedConnection(), sockets = TimedSocketSequence()
+        sockets.values = [first, second]; first.holdReaderUntilClose = true
+        let capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
+        let session = try makeTimedSession(first, capture, engine, clock, connections: { _ in try sockets.next() })
+        first.feed(try authAcceptedFixture()); second.feed(try authAcceptedFixture())
+        let started = await session.start(try timedFixtureLease()); XCTAssertTrue(started)
+        if rendered {
+            first.feed(playbackBytes(network: 1, generation: 1))
+            await waitForAudio { first.writes.contains { $0[5] == 3 && $0[22] == 1 } }
+            first.failNextWrite(); engine.completeFirst()
+        } else { first.failNextWrite() }
+        let deadline = ProcessInfo.processInfo.systemUptime + 1.7
+        while capture.startCount < 2 && ProcessInfo.processInfo.systemUptime < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(capture.startCount, 2)
+        XCTAssertEqual(sockets.count, 2)
+        XCTAssertEqual(capture.stopCount, 1); XCTAssertEqual(engine.stopCount, 1)
+        XCTAssertTrue(first.closed)
+        if rendered { XCTAssertFalse(first.writes.contains { $0[5] == 3 && $0[22] == 2 }) }
+        let events = await session.takeEvents(); XCTAssertTrue(events.contains(.reconnected(attempt: 1)))
+        _ = await session.stop()
+    }
     func testWholeMaximumPlaybackIsAcceptedAfterLastAdmissionAndRenderedAfterAll69Callbacks() async throws {
         let socket = ScriptedTimedConnection(), capture = SyntheticCaptureBackend(), engine = SyntheticOutputEngine(), clock = TimedFixtureClock()
         let session = try makeTimedSession(socket, capture, engine, clock)
@@ -421,20 +556,41 @@ func authAcceptedFixture() throws -> Data {
     return fixtureHex(object["authenticationAcceptedHex"] as! String)
 }
 func makeTimedSession(_ socket: ScriptedTimedConnection, _ capture: SyntheticCaptureBackend, _ engine: SyntheticOutputEngine, _ clock: TimedFixtureClock, nativeBudget: TimeInterval = 0.2,
-                      connections: (@Sendable (String) throws -> any RuntimeMediaConnection)? = nil) throws -> TimedMediaSession {
+                      connections: (@Sendable (String) throws -> any RuntimeMediaConnection)? = nil,
+                      nowUnixMs: @escaping @Sendable () -> UInt64 = { 1_000_000 },
+                      nowMonotonic: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> TimedMediaSession {
     try TimedMediaSession(clock: CaptureClockPairSampler(clockDomainId: "source-process", source: clock),
         playbackRequest: PlaybackRequest(outputDeviceUID: "synthetic-output", operationBudget: 0.2),
         captureRequest: { try captureRequest(budget: nativeBudget) }, connectionFactory: connections ?? { _ in socket },
         captureFactory: { SystemAudioCapture(backendFactory: { capture }, clock: IdentityCaptureClock()) },
         rendererFactory: { played in AudioOutputRenderer(backendFactory: { SelectedAudioOutputBackend(devices: SyntheticOutputLookup(), engineFactory: { engine }) }, onPlayed: played) },
-        nowUnixMs: { 1_000_000 })
+        nowUnixMs: nowUnixMs, nowMonotonic: nowMonotonic)
+}
+final class TimedMutableWall: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: UInt64
+    init(_ value: UInt64) { current = value }
+    var value: UInt64 { get { lock.withLock { current } } set { lock.withLock { current = newValue } } }
+}
+final class TimedAdmissionClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var offset: TimeInterval = 0
+    var now: TimeInterval { lock.withLock { ProcessInfo.processInfo.systemUptime + offset } }
+    func advance(_ seconds: TimeInterval) { lock.withLock { offset += seconds } }
 }
 final class TimedFixtureClock: CapturePairClockSource, @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
+    private var invalid = false
+    func invalidate() { lock.withLock { invalid = true } }
     var calls: Int { lock.withLock { count } }
     func hostNanoseconds() throws -> UInt64 { lock.withLock { count += 1; return UInt64(count) * 1_000_000_000 } }
-    func wallSample() throws -> (unixNs: Int64, resolutionNs: UInt64) { lock.withLock { (Int64(count) * 1_000_000_000 + 1_000_000_000_000, 1) } }
+    func wallSample() throws -> (unixNs: Int64, resolutionNs: UInt64) {
+        try lock.withLock {
+            guard !invalid else { throw BridgeProcessError.invalidInput }
+            return (Int64(count) * 1_000_000_000 + 1_000_000_000_000, 1)
+        }
+    }
 }
 final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable {
     private let lock = NSLock()
@@ -443,6 +599,9 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
     private var readMaximum = 4096
     private var terminal = false
     var openFailureDelay: TimeInterval?
+    var holdReaderUntilClose = false
+    private var failWrite = false
+    func failNextWrite() { lock.withLock { failWrite = true } }
     private var holdWrite = false, writeOverlap = false
     private var heldWrite: CheckedContinuation<Void, Error>?
     var hasHeldWrite: Bool { lock.withLock { heldWrite != nil } }
@@ -458,6 +617,7 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
         try await withCheckedThrowingContinuation { (reply: CheckedContinuation<Void, Error>) in
             lock.lock()
             guard !terminal else { lock.unlock(); reply.resume(throwing: RuntimeMediaConnectionError.closed); return }
+            if failWrite { failWrite = false; lock.unlock(); reply.resume(throwing: RuntimeMediaConnectionError.unavailable); return }
             if heldWrite != nil { writeOverlap = true; lock.unlock(); reply.resume(throwing: RuntimeMediaConnectionError.busy); return }
             outbound.append(data)
             if holdWrite { holdWrite = false; heldWrite = reply; lock.unlock() }
@@ -485,9 +645,11 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
             lock.unlock(); callback.resume(returning: part)
         } else { inbound.append(bytes); lock.unlock() }
     }
-    func close() async -> Bool { cancel(); return true }
+    func close() async -> Bool { lock.withLock { holdReaderUntilClose = false }; cancel(); return true }
     func cancel() {
-        lock.lock(); terminal = true; let callback = reader, write = heldWrite; reader = nil; heldWrite = nil; inbound.removeAll(); lock.unlock()
+        lock.lock(); terminal = true; let callback = holdReaderUntilClose ? nil : reader, write = heldWrite
+        if !holdReaderUntilClose { reader = nil }
+        heldWrite = nil; inbound.removeAll(); lock.unlock()
         callback?.resume(throwing: RuntimeMediaConnectionError.closed)
         write?.resume(throwing: RuntimeMediaConnectionError.closed)
     }

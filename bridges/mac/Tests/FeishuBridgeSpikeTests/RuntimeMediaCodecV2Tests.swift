@@ -8,6 +8,31 @@ func fixtureHex(_ text: String) -> Data {
 }
 
 final class RuntimeMediaCodecV2Tests: XCTestCase {
+    func testInteriorOverlapCannotBeHiddenByCompactEndpointsOrLosePCM() throws {
+        for (delta, present): (Int64, UInt8) in [(0, 1), (-1, 1), (-2, 0), (3, 0)] {
+            let pieces = [
+                SourceSampleSpan(bufferInputRange: 0..<480, nominalRange: RationalSampleRange(lowerNumerator: 0, upperNumerator: 11_520_000),
+                    sourcePTS: CMTime(value: 0, timescale: 48_000), sourceDuration: CMTime(value: 480, timescale: 48_000),
+                    convertedBufferHostSpan: HostAudioSpan(startNs: 1_000_000, endNs: 11_000_000, roundingEnvelopeNs: 1)),
+                SourceSampleSpan(bufferInputRange: 480..<960, nominalRange: RationalSampleRange(lowerNumerator: 11_520_000, upperNumerator: 23_040_000),
+                    sourcePTS: CMTime(value: 480, timescale: 48_000), sourceDuration: CMTime(value: 480, timescale: 48_000),
+                    convertedBufferHostSpan: HostAudioSpan(startNs: 11_000_000 + delta, endNs: 21_000_000, roundingEnvelopeNs: 1))
+            ]
+            let pcm = Data(repeating: 42, count: 960)
+            let packet = CapturedPcmPacket(pcm: pcm, epoch: 1, sequence: 1, outputRange: 0..<480,
+                sourceRange: RationalSampleRange(lowerNumerator: 0, upperNumerator: 23_040_000), sourceSpans: pieces,
+                primeLeadingInputFrames: 0, primeTrailingInputFrames: 0,
+                nominalHostSpan: HostAudioSpan(startNs: 1_000_000, endNs: 21_000_000, roundingEnvelopeNs: 1),
+                sourceSupportEnvelope: nil, mappingQuality: .piecewiseNominalSourceInterpolation)
+            let timing = try RuntimeMediaCodecV2.timing(packet)
+            XCTAssertEqual(timing[1], present, "interior delta \(delta)")
+            XCTAssertEqual(timing[2], present == 1 ? 1 : 5)
+            XCTAssertEqual(RuntimeMediaCodecV2.uint(timing, 28, UInt32.self), 480)
+            XCTAssertEqual(RuntimeMediaCodecV2.uint(timing, 40, UInt64.self), 23_040_000)
+            XCTAssertEqual(try RuntimeMediaCodecV2.capture(session: 41, timing: timing, pcm: pcm).suffix(960), pcm)
+            if present == 0 { XCTAssertTrue(timing[56..<88].allSatisfy { $0 == 0 }) }
+        }
+    }
     func testClockPairSignedWallExtremesAndAbsentPhysicalAccuracyNeverAdmitZeroHost() throws {
         for wall in [Int64.min, Int64.max] {
             let pair = CaptureClockPair(clockDomainId: "d", epoch: UInt64.max, sequence: UInt64.max,

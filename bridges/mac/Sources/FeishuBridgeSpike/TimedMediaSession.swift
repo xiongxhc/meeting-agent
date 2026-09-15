@@ -65,6 +65,8 @@ public actor TimedMediaSession {
     public static let maximumCloseSeconds = TimedMediaCycle.maximumCloseSeconds
     private let factory: @Sendable (UInt64, TimeInterval?) -> TimedMediaCycle
     private let nowUnixMs: @Sendable () -> UInt64
+    private let nowMonotonic: @Sendable () -> TimeInterval
+    private var credentialDeadline: TimeInterval?
     private var cycle: TimedMediaCycle?
     private var supervisor: Task<Void, Never>?
     private var stopRequested = false
@@ -87,18 +89,27 @@ public actor TimedMediaSession {
                 connectionFactory: @escaping @Sendable (String) throws -> any RuntimeMediaConnection = { try RuntimeMediaEndpointClient(endpoint: $0) },
                 captureFactory: @escaping @Sendable () -> SystemAudioCapture = { SystemAudioCapture() },
                 rendererFactory: @escaping RendererFactory = { AudioOutputRenderer(onPlayed: $0) },
-                nowUnixMs: @escaping @Sendable () -> UInt64) {
+                nowUnixMs: @escaping @Sendable () -> UInt64,
+                nowMonotonic: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         let metadataBudget = TimedMetadataBudget()
         self.nowUnixMs = nowUnixMs
+        self.nowMonotonic = nowMonotonic
         factory = { epoch, deadline in
             TimedMediaCycle(clock: clock, playbackRequest: playbackRequest, captureRequest: captureRequest,
                 connectionFactory: connectionFactory, captureFactory: captureFactory, rendererFactory: rendererFactory,
-                nowUnixMs: nowUnixMs, firstEpoch: epoch, admissionDeadline: deadline, metadataBudget: metadataBudget)
+                nowMonotonic: nowMonotonic, firstEpoch: epoch, admissionDeadline: deadline, metadataBudget: metadataBudget)
         }
     }
     public func start(_ lease: TimedMediaLease) async -> Bool {
         guard cycle == nil, !stopRequested else { return false }
-        let first = factory(1, nil); cycle = first
+        // Anchor before the wall read: time spent sampling cannot extend admission.
+        // This is a one-time authentication cutoff, never a healthy-stream TTL.
+        let before = nowMonotonic(), wall = nowUnixMs()
+        guard before.isFinite, before >= 0, lease.expiresAtMs > wall else { return false }
+        let cutoff = before + Double(lease.expiresAtMs - wall) / 1000
+        guard cutoff.isFinite, nowMonotonic() < cutoff else { return false }
+        credentialDeadline = cutoff
+        let first = factory(1, cutoff); cycle = first
         guard await first.start(lease), !stopRequested else { return false }
         event(.mediaConnected(endpoint: lease.connectEndpoint))
         supervisor = Task { await self.supervise(lease, first: first) }
@@ -117,19 +128,18 @@ public actor TimedMediaSession {
                 diagnostic("media_failed"); return
             }
             if reconnectDeadline == nil {
-                let now = nowUnixMs()
-                let expiryRemaining = lease.expiresAtMs > now ? Double(lease.expiresAtMs - now) / 1000 : 0
+                guard let credentialDeadline else { return }
                 reconnectDeadline = min(ended.disconnectedAt + Double(lease.reconnectWindowMs) / 1000,
-                    ProcessInfo.processInfo.systemUptime + expiryRemaining)
+                    credentialDeadline)
             }
             guard let deadline = reconnectDeadline, attempts < 3, ended.captureEpoch < UInt64.max,
-                  ProcessInfo.processInfo.systemUptime + 0.1 < deadline, nowUnixMs() < lease.expiresAtMs else {
+                  nowMonotonic() + 0.1 < deadline else {
                 diagnostic("reconnect_exhausted"); return
             }
             attempts += 1
             event(.reconnecting(attempt: attempts))
             do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
-            guard !stopRequested, !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline else { return }
+            guard !stopRequested, !Task.isCancelled, nowMonotonic() < deadline else { return }
             let next = factory(ended.captureEpoch + 1, deadline); current = next; cycle = next
             // Only complete ACK/native/capture readiness ends this outage.
             // Failed attempts and their cleanup retain the original deadline.
@@ -193,7 +203,7 @@ private actor TimedMediaCycle {
     private let connectionFactory: @Sendable (String) throws -> any RuntimeMediaConnection
     private let captureFactory: @Sendable () -> SystemAudioCapture
     private let rendererFactory: RendererFactory
-    private let nowUnixMs: @Sendable () -> UInt64
+    private let nowMonotonic: @Sendable () -> TimeInterval
     private var connection: (any RuntimeMediaConnection)?
     private var writer: TimedMediaWriter?
     private var capture: SystemAudioCapture?
@@ -231,11 +241,11 @@ private actor TimedMediaCycle {
                 connectionFactory: @escaping @Sendable (String) throws -> any RuntimeMediaConnection = { try RuntimeMediaEndpointClient(endpoint: $0) },
                 captureFactory: @escaping @Sendable () -> SystemAudioCapture = { SystemAudioCapture() },
                 rendererFactory: @escaping RendererFactory = { AudioOutputRenderer(onPlayed: $0) },
-                nowUnixMs: @escaping @Sendable () -> UInt64, firstEpoch: UInt64,
+                nowMonotonic: @escaping @Sendable () -> TimeInterval, firstEpoch: UInt64,
                 admissionDeadline: TimeInterval?, metadataBudget: TimedMetadataBudget) {
         self.clock = clock; self.playbackRequest = playbackRequest; self.captureRequest = captureRequest
         self.connectionFactory = connectionFactory; self.captureFactory = captureFactory
-        self.rendererFactory = rendererFactory; self.nowUnixMs = nowUnixMs
+        self.rendererFactory = rendererFactory; self.nowMonotonic = nowMonotonic
         captureEpoch = firstEpoch; epochOffset = firstEpoch - 1
         self.admissionDeadline = admissionDeadline; self.metadataBudget = metadataBudget
     }
@@ -256,10 +266,11 @@ private actor TimedMediaCycle {
     private func cancelStart() { _ = beginCleanup() }
     private func begin(_ lease: TimedMediaLease) async -> Bool {
         do {
-            guard !terminal, lease.expiresAtMs > nowUnixMs() else { throw RuntimeMediaConnectionError.closed }
+            guard !terminal else { throw RuntimeMediaConnectionError.closed }
+            try checkAdmissionDeadline()
             self.lease = lease
             let connection = try connectionFactory(lease.connectEndpoint); self.connection = connection
-            let writer = TimedMediaWriter(connection); self.writer = writer
+            let writer = TimedMediaWriter(connection) { [weak self] error in await self?.noteFailure(error) }; self.writer = writer
             let deadline = min(ProcessInfo.processInfo.systemUptime + 2, admissionDeadline ?? .infinity)
             try await connection.open(deadline: deadline)
             try checkActive()
@@ -282,7 +293,7 @@ private actor TimedMediaCycle {
             let renderer = rendererFactory { [weak self] generation, sequence in
                 Task { await self?.played(generation: generation, sequence: sequence) }
             }; self.renderer = renderer
-            guard await renderer.start(playbackRequest) == .started else { throw RuntimeMediaConnectionError.closed }
+            guard await renderer.start(playbackRequest) == .started else { throw AudioPrimitiveError.nativeFailure }
             try checkActive()
             try checkAdmissionDeadline()
             try await metadata(RuntimeMediaCodecV2.epoch(session: lease.sessionId, bridge: lease.bridgeSessionId, domain: clock.clockDomainId, epoch: captureEpoch))
@@ -298,7 +309,7 @@ private actor TimedMediaCycle {
                 return await self.writeCapture(value)
             }, ready: { capture.resumeDelivery() })
             self.delivery = delivery
-            guard await capture.start(request, sink: { delivery.offer($0) }) == .started else { throw RuntimeMediaConnectionError.closed }
+            guard await capture.start(request, sink: { delivery.offer($0) }) == .started else { throw AudioPrimitiveError.nativeFailure }
             try checkActive()
             try checkAdmissionDeadline()
             reading = Task { await self.readLoop() }
@@ -311,15 +322,15 @@ private actor TimedMediaCycle {
         }
     }
     private func checkAdmissionDeadline() throws {
-        if let admissionDeadline, ProcessInfo.processInfo.systemUptime >= admissionDeadline { throw RuntimeMediaConnectionError.timedOut }
+        if let admissionDeadline, nowMonotonic() >= admissionDeadline { throw RuntimeMediaConnectionError.timedOut }
     }
     private func noteFailure(_ error: Error) {
-        guard !terminal else { return }
-        disconnectedAt = disconnectedAt ?? ProcessInfo.processInfo.systemUptime
+        guard !terminal, disconnectedAt == nil else { return }
+        disconnectedAt = nowMonotonic()
         transportFailure = error is RuntimeMediaConnectionError
     }
     private func checkActive() throws {
-        guard !Task.isCancelled, !terminal, let lease, lease.expiresAtMs > nowUnixMs() else { throw RuntimeMediaConnectionError.closed }
+        guard !Task.isCancelled, !terminal, lease != nil else { throw RuntimeMediaConnectionError.closed }
     }
     private func writeCapture(_ value: CaptureDelivery) async -> Bool {
         guard let connection, let writer, let lease else { return false }
@@ -346,10 +357,15 @@ private actor TimedMediaCycle {
                 case .invalidSample: reason = 7
                 }
                 try await metadata(RuntimeMediaCodecV2.discontinuity(session: lease.sessionId, epoch: captureEpoch, reason: reason))
-            case .failed: throw RuntimeMediaConnectionError.unavailable
+            case .failed: throw AudioPrimitiveError.nativeFailure
             }
             return true
-        } catch { connection.cancel(); return false }
+        } catch {
+            noteFailure(error)
+            _ = beginCleanup()
+            connection.cancel()
+            return false
+        }
     }
     private func metadata(_ bytes: Data, deadline: TimeInterval? = nil) async throws {
         guard let writer else { throw RuntimeMediaConnectionError.closed }
@@ -362,11 +378,11 @@ private actor TimedMediaCycle {
             while !terminal {
                 try await Task.sleep(for: .seconds(1))
                 try Task.checkCancellation(); try checkActive()
-                guard renderer?.failure == nil, capture?.state == .running, let lease else { throw RuntimeMediaConnectionError.unavailable }
-                if let playbackProgressDeadline, ProcessInfo.processInfo.systemUptime >= playbackProgressDeadline { throw RuntimeMediaConnectionError.timedOut }
+                guard renderer?.failure == nil, capture?.state == .running, let lease else { throw AudioPrimitiveError.nativeFailure }
+                if let playbackProgressDeadline, ProcessInfo.processInfo.systemUptime >= playbackProgressDeadline { throw AudioPrimitiveError.nativeFailure }
                 try await metadata(RuntimeMediaCodecV2.clockPair(session: lease.sessionId, pair: clock.sample()))
             }
-        } catch { if !terminal { _ = beginCleanup() } }
+        } catch { if !terminal { noteFailure(error); _ = beginCleanup() } }
     }
     private func readLoop() async {
         guard let connection else { return }
@@ -407,7 +423,7 @@ private actor TimedMediaCycle {
             guard generation > lastFlushedGeneration else { return }
             guard runtimeGeneration == nil || runtimeGeneration == generation else { return }
             receipts.removeAll(); pendingPlayback = nil; playbackProgressDeadline = nil
-            guard await renderer.cancel(expectedGeneration: renderer.generation) == .stopped else { throw RuntimeMediaConnectionError.closed }
+            guard await renderer.cancel(expectedGeneration: renderer.generation) == .stopped else { throw AudioPrimitiveError.ownershipUnconfirmed }
             try checkActive()
             lastFlushedGeneration = generation; runtimeGeneration = nil; playbackSequence = 0
             signalPlaybackCredit()
@@ -418,7 +434,7 @@ private actor TimedMediaCycle {
                   pendingPlayback == nil, receipts.count < 12 else { throw BridgeProcessError.invalidInput }
             if runtimeGeneration == nil {
                 runtimeGeneration = frame.generation
-                if lastFlushedGeneration > 0, !renderer.resume(generation: renderer.generation) { throw RuntimeMediaConnectionError.closed }
+                if lastFlushedGeneration > 0, !renderer.resume(generation: renderer.generation) { throw AudioPrimitiveError.nativeFailure }
             }
             let end = playbackSequence.addingReportingOverflow(UInt64((frame.pcm.count + 959) / 960))
             guard !end.overflow else { throw BridgeProcessError.invalidInput }
@@ -433,7 +449,7 @@ private actor TimedMediaCycle {
         playbackProgressDeadline = ProcessInfo.processInfo.systemUptime + 2
         if receipts[sequence]?.generation == generation { receipts[sequence]?.played = true }
         do { try await acknowledgePlayed(sequence); try await pumpPlayback(); signalPlaybackCredit() }
-        catch { _ = await beginCleanup().value }
+        catch { noteFailure(error); _ = await beginCleanup().value }
     }
     private func signalPlaybackCredit() { let reply = playbackCredit; playbackCredit = nil; reply?.resume() }
     private func pumpPlayback() async throws {
@@ -446,7 +462,7 @@ private actor TimedMediaCycle {
             let part = Data(current.frame.pcm[current.offset..<current.offset + count])
             switch renderer.enqueue(try PlaybackPcmPacket(generation: renderer.generation, sequence: sequence, pcm: part)) {
             case .backpressured: return
-            case .closed: throw RuntimeMediaConnectionError.closed
+            case .closed: throw AudioPrimitiveError.nativeFailure
             case .accepted: break
             }
             playbackSequence = sequence
@@ -515,7 +531,7 @@ private actor TimedMediaCycle {
     private func complete(nativeConfirmed: Bool, delivered: Bool, finalPairUndelivered: Bool) {
         let value = TimedCycleEnd(nativeCleanupConfirmed: nativeConfirmed, deliveryComplete: delivered,
             transportFailure: transportFailure, finalPairUndelivered: finalPairUndelivered,
-            disconnectedAt: disconnectedAt ?? ProcessInfo.processInfo.systemUptime, captureEpoch: captureEpoch)
+            disconnectedAt: disconnectedAt ?? nowMonotonic(), captureEpoch: captureEpoch)
         ended = value; let reply = endWaiter; endWaiter = nil; reply?.resume(returning: value)
     }
 }
@@ -527,11 +543,14 @@ private actor TimedMediaWriter {
         let bytes: Data, deadline: TimeInterval, reply: CheckedContinuation<Void, Error>
     }
     private let connection: any RuntimeMediaConnection
+    private let failed: @Sendable (Error) async -> Void
     private var queue: [Pending] = []
     private var queuedBytes = 0
     private var worker: Task<Void, Never>?
     private var closed = false
-    init(_ connection: any RuntimeMediaConnection) { self.connection = connection }
+    init(_ connection: any RuntimeMediaConnection, failed: @escaping @Sendable (Error) async -> Void) {
+        self.connection = connection; self.failed = failed
+    }
     func send(_ data: Data, deadline: TimeInterval) async throws {
         guard !closed, queue.count < 16, queuedBytes + data.count <= 69_632 else { throw RuntimeMediaConnectionError.busy }
         try await withCheckedThrowingContinuation { reply in
@@ -547,7 +566,11 @@ private actor TimedMediaWriter {
                 try await connection.write(value.bytes, deadline: value.deadline)
                 value.reply.resume()
             } catch {
-                closed = true; value.reply.resume(throwing: error); connection.cancel()
+                closed = true
+                // Record the primary write error before induced read-close or
+                // rejected queued writes can be mistaken for its cause.
+                await failed(error)
+                value.reply.resume(throwing: error); connection.cancel()
             }
         }
         if closed { rejectPending() }
