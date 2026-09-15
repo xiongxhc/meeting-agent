@@ -467,6 +467,7 @@ export type SessionStore = {
   getSelectedAlignment(generationId: string): SelectedAlignment | null;
   readSelectedAlignmentPage(selected: SelectedAlignment, afterPageIndex: number): RecordingAlignmentPage | null;
   getPendingAlignment(generationId: string): AlignmentAttempt | null;
+  getReclaimableAlignment(generationId: string): AlignmentAttempt | null;
   markAlignmentCleanupFailed(attempt: AlignmentAttempt): void;
   abandonRecordingAlignment(attempt: AlignmentAttempt, permit: AlignmentRecoveryPermit, reason?: AlignmentFailure): void;
   reclaimRecordingAlignment(attempt: AlignmentAttempt, limit?: number): boolean;

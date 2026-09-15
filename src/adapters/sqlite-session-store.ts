@@ -169,6 +169,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     getSelectedAlignment: (generationId) => getSelectedAlignment(db, generationId),
     readSelectedAlignmentPage: (selected, after) => readSelectedAlignmentPage(db, selected, after),
     getPendingAlignment: (generationId) => getPendingAlignment(db, generationId),
+    getReclaimableAlignment: (generationId) => getReclaimableAlignment(db, generationId),
     markAlignmentCleanupFailed: (attempt) => markAlignmentCleanupFailed(db, attempt),
     abandonRecordingAlignment: (attempt, permit, reason) => abandonRecordingAlignment(db, attempt, permit, reason),
     reclaimRecordingAlignment: (attempt, limit) => reclaimRecordingAlignment(db, attempt, limit),
@@ -935,10 +936,18 @@ function completeRecordingAlignment(db: Database.Database, attempt: AlignmentAtt
       (completion.coverageStatus === "unavailable_legacy" && (row.page_count !== 0 || !completion.warnings.includes("unavailable_legacy")))) {
       throw new Error("invalid alignment completion binding, count or warnings");
     }
+    const previous = getSelectedAlignment(db, attempt.generationId);
     db.prepare("UPDATE recording_alignment_attempts SET state='complete',coverage_status=?,warnings_json=? WHERE attempt_id=?")
       .run(completion.coverageStatus, JSON.stringify([...completion.warnings].sort()), attempt.attemptId);
     db.prepare(`INSERT INTO recording_alignment_selected(generation_id,attempt_id) VALUES(?,?)
       ON CONFLICT(generation_id) DO UPDATE SET attempt_id=excluded.attempt_id`).run(attempt.generationId, attempt.attemptId);
+    if (previous) {
+      // The prior reader already completed cleanup before selection. Retire its
+      // payload in the same transaction, not as a failed or unresolved owner.
+      const retired = db.prepare(`UPDATE recording_alignment_attempts SET state='abandoned',coverage_status=NULL,failure_reason=NULL
+        WHERE attempt_id=? AND generation_id=? AND state='complete'`).run(previous.attemptId, attempt.generationId);
+      if (retired.changes !== 1) throw new Error("invalid retired alignment binding");
+    }
     db.prepare("UPDATE recording_recovery_bindings SET last_alignment_failure=NULL WHERE generation_id=?").run(attempt.generationId);
     return selectedReference(alignmentHeader(db, attempt.attemptId));
   }).immediate();
@@ -970,9 +979,21 @@ function getPendingAlignment(db: Database.Database, generationId: string): Align
   const storeIdentity = requirePrivateState(db);
   const pending = db.prepare(`SELECT a.attempt_id FROM recording_alignment_attempts a
     LEFT JOIN recording_alignment_selected s ON s.attempt_id=a.attempt_id
-    WHERE a.generation_id=? AND s.attempt_id IS NULL ORDER BY a.attempt_id LIMIT 1`).get(generationId) as { attempt_id: string } | undefined;
+    WHERE a.generation_id=? AND a.state IN ('staging','cleanup_failed') AND s.attempt_id IS NULL
+    ORDER BY a.attempt_id LIMIT 1`).get(generationId) as { attempt_id: string } | undefined;
   if (!pending) return null;
   const row = alignmentHeader(db, pending.attempt_id);
+  return { storeIdentity, generationId, attemptId: row.attempt_id, ownerId: row.owner_id, token: row.token };
+}
+
+function getReclaimableAlignment(db: Database.Database, generationId: string): AlignmentAttempt | null {
+  const storeIdentity = requirePrivateState(db);
+  const released = db.prepare(`SELECT a.attempt_id FROM recording_alignment_attempts a
+    LEFT JOIN recording_alignment_selected s ON s.attempt_id=a.attempt_id
+    WHERE a.generation_id=? AND a.state='abandoned' AND s.attempt_id IS NULL
+    ORDER BY a.attempt_id LIMIT 1`).get(generationId) as { attempt_id: string } | undefined;
+  if (!released) return null;
+  const row = alignmentHeader(db, released.attempt_id);
   return { storeIdentity, generationId, attemptId: row.attempt_id, ownerId: row.owner_id, token: row.token };
 }
 

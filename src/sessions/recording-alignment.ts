@@ -139,15 +139,26 @@ export class RecordingAlignmentOwner {
     if (!stored || stored.generationId !== recovery.generationId || stored.capability.sourceSessionId !== recovery.capability.sourceSessionId ||
       stored.capability.sha256 !== recovery.capability.sha256 || stored.capability.keyId !== recovery.capability.keyId ||
       stored.capability.authorization !== recovery.capability.authorization) return Promise.reject(new Error("recording recovery binding changed"));
-    const result = this.store.beginRecordingAlignment(stored.generationId, this.ownerId, replace);
-    if (result.kind === "selected") return Promise.resolve(result.selected);
-    const active: ActiveAlignment = { attempt: result.attempt, iterator: null, cancelled: false,
-      work: Promise.resolve(undefined as never) };
-    this.active = active;
-    // Begin is durable before the first SDK read; the microtask also publishes
-    // ownership before any synchronous transport callback can run.
-    active.work = Promise.resolve().then(() => this.read(active, stored));
-    return active.work;
+    // Hold the one-reader admission across bounded, yielding payload cleanup.
+    // This is not an assertion that any unresolved reader has stopped.
+    this.recovering = true;
+    this.recoveryWork = this.reclaimReleased(stored.generationId);
+    return this.recoveryWork.then(() => {
+      this.recovering = false; this.recoveryWork = undefined;
+      if (this.closed) throw new Error("alignment owner is closed");
+      const result = this.store.beginRecordingAlignment(stored.generationId, this.ownerId, replace);
+      if (result.kind === "selected") return result.selected;
+      const active: ActiveAlignment = { attempt: result.attempt, iterator: null, cancelled: false,
+        work: Promise.resolve(undefined as never) };
+      this.active = active;
+      // Begin is durable before the first SDK read; publish ownership before a
+      // synchronous transport callback can run.
+      active.work = Promise.resolve().then(() => this.read(active, stored));
+      return active.work;
+    }, () => {
+      this.recovering = false; this.recoveryWork = undefined;
+      throw new Error("alignment released payload cleanup incomplete");
+    });
   }
 
   private async cleanup(active: ActiveAlignment): Promise<void> {
@@ -161,6 +172,14 @@ export class RecordingAlignmentOwner {
   private async reclaim(attempt: AlignmentAttempt): Promise<void> {
     // Each transaction deletes <=64 rows; no transaction crosses this yield.
     while (!this.store.reclaimRecordingAlignment(attempt, 64)) await yieldImmediate();
+  }
+
+  private async reclaimReleased(generationId: string): Promise<void> {
+    for (;;) {
+      const released = this.store.getReclaimableAlignment(generationId);
+      if (!released) return;
+      await this.reclaim(released);
+    }
   }
 
   private async read(active: ActiveAlignment, recovery: RecordingRecovery): Promise<SelectedAlignment> {
@@ -212,16 +231,18 @@ export class RecordingAlignmentOwner {
   }
 
   async recover(generationId: string): Promise<void> {
-    if (this.closed || this.active || this.recovering || !this.proveExclusiveOwnership) throw new Error("exclusive alignment owner proof required");
+    if (this.closed || this.active || this.recovering) throw new Error("exclusive alignment owner proof required");
     const attempt = this.store.getPendingAlignment(generationId);
-    if (!attempt) return;
+    if (attempt && !this.proveExclusiveOwnership) throw new Error("exclusive alignment owner proof required");
     this.recovering = true;
     const proof = this.proveExclusiveOwnership;
     this.recoveryWork = (async () => {
-      await proof(attempt);
-      if (this.closed) throw new Error("alignment owner is closed");
-      this.store.abandonRecordingAlignment(attempt, mintAlignmentRecoveryPermit(attempt));
-      await this.reclaim(attempt);
+      if (attempt && proof) {
+        await proof(attempt);
+        if (this.closed) throw new Error("alignment owner is closed");
+        this.store.abandonRecordingAlignment(attempt, mintAlignmentRecoveryPermit(attempt));
+      }
+      await this.reclaimReleased(generationId);
     })();
     try {
       await this.recoveryWork;

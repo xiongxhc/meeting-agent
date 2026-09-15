@@ -122,6 +122,12 @@ The proof callback must own and bound its cleanup; it is not a cryptographic
 guarantee. Runtime-validated one-use permits and exact-token CAS enforce binding.
 Reclaim deletes at most64 pages per transaction; selected evidence survives failed
 replacement and a bounded static last-failure reason remains durable.
+Successful replacement atomically retires the previous selection as non-owner
+payload, without a failure warning. Before another stage, the shared owner resumes
+that cleanup in bounded yielding batches; `recover` can also finish released
+payload cleanup without asserting a nonexistent reader has died. A real staging
+or failed-cleanup reader still requires the trusted proof. Owner close waits for
+pending reclaim, and no new reader is admitted during it.
 
 ### External package check
 

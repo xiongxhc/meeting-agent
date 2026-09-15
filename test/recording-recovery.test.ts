@@ -188,12 +188,136 @@ test("terminal header and selected pointer commit atomically; old selected reade
     raw.exec("CREATE TRIGGER fail_selection BEFORE UPDATE ON recording_alignment_selected BEGIN SELECT RAISE(ABORT,'synthetic terminal failure'); END");
     assert.throws(() => f.store.completeRecordingAlignment(second.attempt, f.complete), /synthetic terminal failure/);
     assert.deepEqual(f.store.getSelectedAlignment(f.recovery.generationId), oldSelected);
+    assert.equal(f.store.getReclaimableAlignment(f.recovery.generationId), null);
+    assert.deepEqual(raw.prepare("SELECT state FROM recording_alignment_attempts WHERE attempt_id=?").get(first.attempt.attemptId), { state: "complete" });
     assert.deepEqual(raw.prepare("SELECT state FROM recording_alignment_attempts WHERE attempt_id=?").get(second.attempt.attemptId), { state: "staging" });
     raw.exec("DROP TRIGGER fail_selection");
+    raw.exec("CREATE TRIGGER fail_retirement BEFORE UPDATE ON recording_alignment_attempts WHEN NEW.state='abandoned' BEGIN SELECT RAISE(ABORT,'synthetic retirement failure'); END");
+    assert.throws(() => f.store.completeRecordingAlignment(second.attempt, f.complete), /synthetic retirement failure/);
+    assert.deepEqual(f.store.getSelectedAlignment(f.recovery.generationId), oldSelected);
+    assert.equal(f.store.getReclaimableAlignment(f.recovery.generationId), null);
+    raw.exec("DROP TRIGGER fail_retirement");
     const current = f.store.completeRecordingAlignment(second.attempt, f.complete);
     assert.notEqual(current.attemptId, oldSelected.attemptId);
     assert.throws(() => f.store.readSelectedAlignmentPage(oldSelected, -1), /generation changed/);
   } finally { raw.close(); f.close(); }
+});
+
+test("successful A to B to C refreshes do not require recovery of a nonexistent reader", async () => {
+  const f = alignmentFixture(), { client, transport } = await runtimeTestClient(4);
+  const owner = new RecordingAlignmentOwner({ store: f.store, runtime: client });
+  transport.onSend = (command) => {
+    if (command.type === "read_recording_alignment") {
+      transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+      transport.push(wirePage(command.requestId));
+    }
+    if (command.type === "recording_alignment_credit") transport.push(wireComplete(command.requestId));
+  };
+  try {
+    const a = await owner.stage(f.recovery), b = await owner.stage(f.recovery, true);
+    assert.notEqual(a.attemptId, b.attemptId);
+    const c = await owner.stage(f.recovery, true);
+    assert.notEqual(b.attemptId, c.attemptId);
+    assert.deepEqual(f.store.readSelectedAlignmentPage(c, -1), f.page);
+    assert.equal(f.store.getPendingAlignment(f.recovery.generationId), null);
+    assert.equal(f.store.getRecordingAlignmentFailure(f.recovery.generationId), null);
+  } finally { await owner.close(); await client.close(); f.close(); }
+});
+
+test("superseded successful selection is not a pending owner after reopen", () => {
+  const f = alignmentFixture(), other = openSessionStore({ filename: f.filename });
+  try {
+    for (const ownerId of ["a", "b"]) {
+      const result = f.store.beginRecordingAlignment(f.recovery.generationId, ownerId, true);
+      assert.equal(result.kind, "claimed"); if (result.kind !== "claimed") return;
+      f.store.appendRecordingAlignment(result.attempt, f.page);
+      f.store.completeRecordingAlignment(result.attempt, f.complete);
+    }
+    assert.equal(other.getPendingAlignment(f.recovery.generationId), null);
+    assert.equal(other.getRecordingAlignmentFailure(f.recovery.generationId), null);
+  } finally { other.close(); f.close(); }
+});
+
+test("retired payload reclaim is bounded and resumes after reopen without an exclusive-owner assertion", async () => {
+  const f = alignmentFixture(), raw = new Database(f.filename);
+  let reopened: ReturnType<typeof openSessionStore> | undefined;
+  let owner: RecordingAlignmentOwner | undefined;
+  try {
+    const a = f.store.beginRecordingAlignment(f.recovery.generationId, "a");
+    assert.equal(a.kind, "claimed"); if (a.kind !== "claimed") return;
+    for (let i = 0; i < 68; i++) f.store.appendRecordingAlignment(a.attempt, { ...f.page, pageIndex: BigInt(i) });
+    f.store.completeRecordingAlignment(a.attempt, { ...f.complete, pageCount: 68n });
+    const b = f.store.beginRecordingAlignment(f.recovery.generationId, "b", true);
+    assert.equal(b.kind, "claimed"); if (b.kind !== "claimed") return;
+    f.store.appendRecordingAlignment(b.attempt, f.page);
+    const selected = f.store.completeRecordingAlignment(b.attempt, f.complete);
+    assert.deepEqual(f.store.getReclaimableAlignment(f.recovery.generationId), a.attempt);
+    assert.throws(() => f.store.reclaimRecordingAlignment(b.attempt), /cleanup/);
+    assert.throws(() => f.store.reclaimRecordingAlignment({ ...a.attempt, token: "0".repeat(36) }), /fence/);
+    assert.equal(f.store.reclaimRecordingAlignment(a.attempt, 64), false);
+    assert.deepEqual(raw.prepare("SELECT count(*) AS n FROM recording_alignment_pages WHERE attempt_id=?").get(a.attempt.attemptId), { n: 4 });
+    assert.throws(() => f.store.beginRecordingAlignment(f.recovery.generationId, "c", true), /unreclaimed/);
+    f.store.close(); // Actual handle close/reopen in the middle of reclaim.
+    reopened = openSessionStore({ filename: f.filename });
+    owner = new RecordingAlignmentOwner({ store: reopened, runtime: { readRecordingAlignment() { throw new Error("unused"); } } });
+    assert.equal(reopened.getPendingAlignment(f.recovery.generationId), null);
+    await owner.recover(f.recovery.generationId); // No proof callback is supplied or needed.
+    assert.equal(reopened.getReclaimableAlignment(f.recovery.generationId), null);
+    assert.equal(reopened.getRecordingAlignmentFailure(f.recovery.generationId), null);
+    assert.deepEqual(reopened.readSelectedAlignmentPage(selected, -1), f.page);
+    assert.deepEqual(raw.prepare("SELECT count(*) AS n FROM recording_alignment_pages").get(), { n: 1 });
+  } finally { await owner?.close(); reopened?.close(); if (raw.open) raw.close(); f.close(); }
+});
+
+test("retired reclaim retains single-reader admission and close awaits every batch before refusing a new read", async () => {
+  const f = alignmentFixture(), raw = new Database(f.filename), { client, transport } = await runtimeTestClient(4);
+  const owner = new RecordingAlignmentOwner({ store: f.store, runtime: client });
+  try {
+    const a = f.store.beginRecordingAlignment(f.recovery.generationId, "a");
+    assert.equal(a.kind, "claimed"); if (a.kind !== "claimed") return;
+    for (let i = 0; i < 130; i++) f.store.appendRecordingAlignment(a.attempt, { ...f.page, pageIndex: BigInt(i) });
+    f.store.completeRecordingAlignment(a.attempt, { ...f.complete, pageCount: 130n });
+    const b = f.store.beginRecordingAlignment(f.recovery.generationId, "b", true);
+    assert.equal(b.kind, "claimed"); if (b.kind !== "claimed") return;
+    f.store.appendRecordingAlignment(b.attempt, f.page);
+    const selected = f.store.completeRecordingAlignment(b.attempt, f.complete);
+    const pending = owner.stage(f.recovery, true), rejected = assert.rejects(pending, /closed/);
+    assert.deepEqual(raw.prepare("SELECT count(*) AS n FROM recording_alignment_pages WHERE attempt_id=?").get(a.attempt.attemptId), { n: 66 });
+    const overlapping = assert.rejects(owner.stage(f.recovery, true), /busy/);
+    let closed = false;
+    const closing = owner.close().then(() => { closed = true; });
+    assert.equal(closed, false);
+    await nextTurn(); assert.equal(closed, false); // Third <=64-page batch still pending.
+    await closing; await rejected; await overlapping;
+    assert.equal(f.store.getReclaimableAlignment(f.recovery.generationId), null);
+    assert.equal(f.store.getRecordingAlignmentFailure(f.recovery.generationId), null);
+    assert.deepEqual(f.store.readSelectedAlignmentPage(selected, -1), f.page);
+    assert.equal(transport.commands.some((command) => command.type === "read_recording_alignment"), false);
+  } finally { await owner.close(); await client.close(); raw.close(); f.close(); }
+});
+
+test("failed retired-payload deletion preserves selection and permits a later cleanup retry without a fake owner failure", async () => {
+  const f = alignmentFixture(), raw = new Database(f.filename), { client, transport } = await runtimeTestClient(4);
+  const owner = new RecordingAlignmentOwner({ store: f.store, runtime: client });
+  try {
+    for (const ownerId of ["a", "b"]) {
+      const attempt = f.store.beginRecordingAlignment(f.recovery.generationId, ownerId, true);
+      assert.equal(attempt.kind, "claimed"); if (attempt.kind !== "claimed") return;
+      f.store.appendRecordingAlignment(attempt.attempt, f.page);
+      f.store.completeRecordingAlignment(attempt.attempt, f.complete);
+    }
+    const selected = f.store.getSelectedAlignment(f.recovery.generationId); assert.ok(selected);
+    raw.exec("CREATE TRIGGER fail_reclaim BEFORE DELETE ON recording_alignment_pages BEGIN SELECT RAISE(ABORT,'synthetic reclaim failure'); END");
+    await assert.rejects(owner.stage(f.recovery, true), /released payload cleanup incomplete/);
+    assert.equal(f.store.getPendingAlignment(f.recovery.generationId), null);
+    assert.ok(f.store.getReclaimableAlignment(f.recovery.generationId));
+    assert.equal(f.store.getRecordingAlignmentFailure(f.recovery.generationId), null);
+    assert.deepEqual(f.store.readSelectedAlignmentPage(selected, -1), f.page);
+    assert.equal(transport.commands.some((command) => command.type === "read_recording_alignment"), false);
+    raw.exec("DROP TRIGGER fail_reclaim");
+    assert.deepEqual(await owner.stage(f.recovery), selected); // Resumes payload-only cleanup, then safely reuses B.
+    assert.equal(f.store.getReclaimableAlignment(f.recovery.generationId), null);
+  } finally { await owner.close(); await client.close(); raw.close(); f.close(); }
 });
 
 test("legacy terminal is unavailable without a policy anchor and partial warnings cannot become available", () => {
@@ -251,7 +375,7 @@ test("actual SDK EOF leaves cleanup failure fenced rather than blessing reopen t
   } finally { await client.close(); f.close(); }
 });
 
-test("actual child crash before page, after append and after terminal requires reap before exact-token recovery", { timeout: 15000 }, async () => {
+test("actual child crash requires reap for pending readers but a completed selection only leaves retired payload", { timeout: 15000 }, async () => {
   for (const phase of ["before-page", "after-page", "after-terminal"] as const) {
     const f = alignmentFixture();
     const first = f.store.beginRecordingAlignment(f.recovery.generationId, "first-owner");
@@ -265,15 +389,20 @@ test("actual child crash before page, after append and after terminal requires r
       proveExclusiveOwnership: async () => { if (!reaped || (child.exitCode === null && child.signalCode === null)) throw new Error("owned child is still active"); } });
     try {
       await within(Promise.race([once(child, "message"), exited.then(() => { throw new Error("owned child exited before checkpoint"); })]));
-      await assert.rejects(owner.recover(f.recovery.generationId), /still active/);
       if (phase !== "after-terminal") {
+        await assert.rejects(owner.recover(f.recovery.generationId), /still active/);
         assert.deepEqual(f.store.getSelectedAlignment(f.recovery.generationId), oldSelected);
         assert.throws(() => f.store.beginRecordingAlignment(f.recovery.generationId, "overlapping-owner", true), /owned|unreclaimed/);
+      } else {
+        assert.equal(f.store.getPendingAlignment(f.recovery.generationId), null);
+        await owner.recover(f.recovery.generationId); // Does not assert the still-alive process has died.
+        assert.equal(f.store.getRecordingAlignmentFailure(f.recovery.generationId), null);
       }
       child.kill("SIGTERM"); await within(exited); reaped = true;
       const reopened = openSessionStore({ filename: f.filename });
       try {
-        assert.ok(reopened.getPendingAlignment(f.recovery.generationId));
+        if (phase !== "after-terminal") assert.ok(reopened.getPendingAlignment(f.recovery.generationId));
+        else assert.equal(reopened.getPendingAlignment(f.recovery.generationId), null);
         await owner.recover(f.recovery.generationId);
         assert.equal(reopened.getPendingAlignment(f.recovery.generationId), null);
         const selected = reopened.getSelectedAlignment(f.recovery.generationId); assert.ok(selected);
