@@ -71,6 +71,7 @@ import {
 import type {
   ConversationRuntimePort,
   RecordingSummary,
+  FinalizedRecordingCapability,
   RuntimeEvent,
   TranscriptSegment,
 } from "../ports/conversation-runtime.ts";
@@ -333,6 +334,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let reconnectAttempts = 0;
   let disclosure: "pending" | DisclosureOutcome = "pending";
   let recording: RecordingSummary | null = null;
+  let recoveryCapability: FinalizedRecordingCapability | null = null;
   let finalizationError: unknown = null;
   const gapReconciliation: GapReconciliation = "not_needed";
   let terminalReason: string | null = null;
@@ -886,7 +888,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // two have to be written together. See applyTerminalTransition.
       await finalizeRecording();
       if (reason === "bridge_failure") {
-        const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps);
+        const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId);
         coordinator.recordBridgeFailure(
           identity.occurrenceId,
           bridgeFailureRetryLimit,
@@ -949,7 +951,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             : { kind: "fail", terminalReason: reason };
 
       if (recording !== null) {
-        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps), bridgeSessionId, terminalAtMs, terminalSource);
+        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId), bridgeSessionId, terminalAtMs, terminalSource);
         return;
       }
       if (outcome.kind === "fail") {
@@ -977,7 +979,16 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
     if (runtimeSessionId === null) return;
     try {
-      recording = await runtime.finalizeRecording({ sessionId: runtimeSessionId });
+      const finalizedRecording = await runtime.finalizeRecording({ sessionId: runtimeSessionId });
+      recoveryCapability = finalizedRecording.recoveryCapability ?? null;
+      // Explicit allowlist: the SDK result also carries private authorization.
+      recording = {
+        recordingHandle: finalizedRecording.recordingHandle, encryptedPath: finalizedRecording.encryptedPath,
+        sha256: finalizedRecording.sha256, durationMs: finalizedRecording.durationMs, format: finalizedRecording.format,
+        keyId: finalizedRecording.keyId, gaps: finalizedRecording.gaps.map((gap) => ({
+          startedAtMs: gap.startedAtMs, endedAtMs: gap.endedAtMs, reason: gap.reason,
+        })),
+      };
     } catch (error) {
       // Recorded as its own typed fact rather than a generic routing error:
       // "there is no recording" and "finalization was attempted and failed"
@@ -1257,11 +1268,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 /** The orchestration schema currently stores a SQLite number. Refuse a value
  * outside JavaScript's exact integer range rather than silently truncating an
  * SDK bigint; the complete bigint remains in MeetingSessionState regardless. */
-function recordingInput(summary: RecordingSummary, bridgeGaps: readonly ObservedAudioGap[]): RecordingInput {
+function recordingInput(summary: RecordingSummary, bridgeGaps: readonly ObservedAudioGap[], capability: FinalizedRecordingCapability | null, bridgeSessionId: string): RecordingInput {
   if (summary.durationMs > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new RangeError("runtime recording duration exceeds SQLite's exact numeric representation");
   }
   return {
+    ...(capability === null ? {} : { recovery: { bridgeSessionId, capability } }),
     handle: summary.recordingHandle,
     encryptedPath: summary.encryptedPath,
     sha256: summary.sha256,

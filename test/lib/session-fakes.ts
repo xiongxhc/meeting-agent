@@ -129,6 +129,7 @@ export function fakeRuntime(options: FakeRuntimeOptions = {}): FakeRuntime {
 
   return {
     calls,
+    readRecordingAlignment() { throw new Error("legacy fake has no authenticated recording alignment"); },
     sessionId: handle.sessionId,
     callsOf: (method) => calls.filter((call) => call.method === method),
     async startVoiceSession(input) {

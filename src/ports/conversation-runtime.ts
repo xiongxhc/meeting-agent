@@ -1,16 +1,16 @@
-// Conversation Runtime SDK boundary.
-//
-// The declarations in runtime-sdk-ready.md are authoritative for every SDK
-// method below. This package deliberately does not import the SDK yet: Task
-// 11 is the one construction boundary where the SDK's current
-// startVoiceSession result is insufficient for Meeting Agent. The SDK does
-// not yet issue the session ID or authenticated media descriptor that the
-// bridge join sequence needs, so the concrete adapter fails closed there.
-// Test fakes inject the explicitly-local MeetingVoiceSession only to exercise
-// Tasks 1-6 without fabricating a production SDK contract.
+// Actual SDK types own the postmeeting boundary. Live construction/events are
+// still a separate, explicitly fail-closed composition prerequisite.
+import type { RecordingSummary as SdkRecordingSummary, ProcessedText as SdkProcessedText, FinalizedRecordingCapability,
+  RecordingAlignmentPage, RecordingAlignmentComplete } from "@conversation/runtime";
+export type { ConversationContextExchange, RecordingGap, DiarizedSegment, RecordingReconciliation,
+  FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete,
+  AlignmentPolicy, RecordingAlignmentEntry, RuntimeProfile } from "@conversation/runtime";
+import type { ConversationContextExchange, RecordingGap, RecordingReconciliation } from "@conversation/runtime";
+
+export type ProcessedText = Readonly<Omit<SdkProcessedText, "warnings">> & { readonly warnings: readonly string[] };
 
 /** Meeting Agent pins online explicitly; the SDK default remains offline. */
-export type RuntimeProfile = "online" | "offline";
+import type { RuntimeProfile } from "@conversation/runtime";
 
 /** SDK spelling: automatic, never the old invented "autonomous" value. */
 export type RuntimeResponseMode = "automatic" | "external_gate";
@@ -43,40 +43,15 @@ export type VoiceSessionHandle = {
 
 /** Exact SDK context shape. It is a conversation exchange, not an ad-hoc
  * metadata blob or serialized wire payload. */
-export type ConversationContextExchange = { readonly user: string; readonly assistant: string };
 
 /** Exact SDK recording timeline. Bigints remain bigints at the port boundary;
  * callers may convert only after proving a value is safely representable. */
-export type RecordingGap = {
-  readonly startedAtMs: bigint;
-  readonly endedAtMs: bigint | null;
-  readonly reason: string;
-};
 
 /** Exact SDK RecordingSummary. `recordingHandle` is opaque and the recording
  * key never leaves the runtime host. */
-export type RecordingSummary = {
-  readonly recordingHandle: string;
-  readonly encryptedPath: string;
-  readonly sha256: string;
-  readonly durationMs: bigint;
-  readonly format: string;
-  readonly keyId: string;
-  readonly gaps: readonly RecordingGap[];
-};
-
-export type DiarizedSegment = {
-  readonly segmentId: string;
-  readonly startedAtMs: bigint;
-  readonly endedAtMs: bigint;
-  readonly text: string;
-  readonly speakerCluster: string | null;
-};
-
-export type RecordingReconciliation = {
-  readonly segments: readonly DiarizedSegment[];
-  readonly warnings: readonly string[];
-};
+export type RecordingSummary = Readonly<Omit<SdkRecordingSummary, "gaps">> & { readonly gaps: readonly RecordingGap[] };
+/** Legacy injected recordings remain explicitly without restart authority. */
+export type FinalizedRecording = RecordingSummary & { readonly recoveryCapability?: FinalizedRecordingCapability };
 
 export type ProcessTextRequest = {
   readonly sessionId: bigint;
@@ -86,7 +61,6 @@ export type ProcessTextRequest = {
   readonly maxOutputBytes: number;
 };
 
-export type ProcessedText = { readonly output: unknown; readonly warnings: readonly string[] };
 
 /** Meeting Agent's internal routed event union. Task 11 owns converting the
  * SDK VoiceSession event stream once startVoiceSession has the missing join
@@ -119,7 +93,8 @@ export type ConversationRuntimePort = {
   /** Post-meeting only; the SDK refuses this while its voice session is live. */
   processText(input: ProcessTextRequest): Promise<ProcessedText>;
   /** Post-meeting finalization. Bridge-observed gaps remain separate evidence. */
-  finalizeRecording(input: { readonly sessionId: bigint }): Promise<RecordingSummary>;
+  finalizeRecording(input: { readonly sessionId: bigint }): Promise<FinalizedRecording>;
+  readRecordingAlignment(input: { readonly capability: FinalizedRecordingCapability }): AsyncIterable<RecordingAlignmentPage | RecordingAlignmentComplete>;
   /** Post-meeting only; the SDK refuses this while its voice session is live. */
   reconcileRecording(input: {
     readonly sessionId: bigint;

@@ -15,7 +15,41 @@
 // SQLite driver, and no other database concern, lives here.
 
 import type { CustodyBinding, BridgeProcessOutcome } from "../contracts/bridge-process-outcome-v1.ts";
+import type { AlignmentRecoveryPermit } from "./recording-alignment-authority.ts";
 import type { BridgeShutdownResult, BridgeProcessFailure } from "./bridge-process.ts";
+import type { FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete } from "./conversation-runtime.ts";
+
+/** Private application authority. Never returned by ordinary recording/evidence getters. */
+export type RecordingRecovery = {
+  readonly generationId: string;
+  readonly occurrenceId: string;
+  readonly bridgeSessionId: string;
+  readonly capability: FinalizedRecordingCapability;
+  readonly recordingKind: "final" | "bridge_failure";
+  readonly failureAttempt: number | null;
+};
+
+export type AlignmentAttempt = {
+  readonly storeIdentity: string;
+  readonly generationId: string;
+  readonly attemptId: string;
+  readonly ownerId: string;
+  readonly token: string;
+};
+export type AlignmentFailure = "read_failed" | "cancelled" | "cleanup_failed" | "recovered_owner";
+/** Safe identity/reference only; never includes restart authorization or pages. */
+export type SelectedAlignment = {
+  readonly generationId: string;
+  readonly attemptId: string;
+  readonly source: RecordingAlignmentPage["source"];
+  readonly timingContract: "capture-clock/v1";
+  readonly policyId: "local-wall-estimate/v1" | null;
+  readonly coverageStatus: RecordingAlignmentComplete["coverageStatus"];
+  readonly pageCount: number;
+  readonly entryCount: number;
+  readonly storedBytes: number;
+  readonly warnings: readonly string[];
+};
 
 export type PhysicalCustodyRow = CustodyBinding & {
   readonly state: "quarantined" | "cleared";
@@ -180,6 +214,7 @@ export type ReconciliationEvidenceRow = {
  * recording is written with, so the two halves cannot disagree about which
  * occurrence finalized, or when. */
 export type RecordingInput = {
+  readonly recovery?: { readonly bridgeSessionId: string; readonly capability: FinalizedRecordingCapability };
   readonly handle: string;
   readonly encryptedPath: string;
   readonly sha256: string;
@@ -424,6 +459,18 @@ export type SessionStore = {
    * may land alone. */
   finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
   getRecording(occurrenceId: string): RecordingRow | null;
+  getRecordingRecovery(occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null;
+  beginRecordingAlignment(generationId: string, ownerId: string, replace?: boolean):
+    { readonly kind: "selected"; readonly selected: SelectedAlignment } | { readonly kind: "claimed"; readonly attempt: AlignmentAttempt };
+  appendRecordingAlignment(attempt: AlignmentAttempt, page: RecordingAlignmentPage): void;
+  completeRecordingAlignment(attempt: AlignmentAttempt, completion: RecordingAlignmentComplete): SelectedAlignment;
+  getSelectedAlignment(generationId: string): SelectedAlignment | null;
+  readSelectedAlignmentPage(selected: SelectedAlignment, afterPageIndex: number): RecordingAlignmentPage | null;
+  getPendingAlignment(generationId: string): AlignmentAttempt | null;
+  markAlignmentCleanupFailed(attempt: AlignmentAttempt): void;
+  abandonRecordingAlignment(attempt: AlignmentAttempt, permit: AlignmentRecoveryPermit, reason?: AlignmentFailure): void;
+  reclaimRecordingAlignment(attempt: AlignmentAttempt, limit?: number): boolean;
+  getRecordingAlignmentFailure(generationId: string): AlignmentFailure | null;
   beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, createdAtMs: number): void;
   setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
   completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number, terminalSource: "bridge_observed" | "local_clock"): void;

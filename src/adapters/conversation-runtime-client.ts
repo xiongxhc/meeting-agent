@@ -1,55 +1,28 @@
-// Structural adapter for the current Conversation Runtime SDK.
-//
-// There is deliberately no SDK import and no wire codec here. The SDK owns
-// transport framing. Task 11 alone owns the still-missing startVoiceSession
-// construction: the current SDK VoiceSession has neither the bigint session
-// ID nor authenticated media descriptor Meeting Agent needs to join its
-// bridge, so this adapter fails closed instead of inventing either value.
+// The installed reviewed SDK owns framing, validation and credit/cancellation.
+// This slice composes postmeeting methods only, not live voice/UI events.
+import { RuntimeClient, type RuntimeTransport } from "@conversation/runtime";
 
 import type {
   ConversationContextExchange,
   ConversationRuntimePort,
-  ProcessTextRequest,
-  ProcessedText,
-  RecordingReconciliation,
-  RecordingSummary,
   RuntimeEvent,
-  RuntimeProfile,
-  RuntimeResponseMode,
 } from "../ports/conversation-runtime.ts";
 import type { InvocationDecisionReason, InvocationSink } from "../sessions/invocation-gate.ts";
 
-/** The currently-built SDK's public client surface, structurally described so
- * a real `RuntimeClient<3>` satisfies it without a dependency or adapter-side
- * protocol types. `startVoiceSession` remains `unknown` because its present
- * VoiceSession result is intentionally opaque until Task 11 can construct a
- * Meeting Agent bridge session from real SDK material. */
-export type ConversationRuntimeSdk = {
-  startVoiceSession(options?: {
-    profile?: RuntimeProfile;
-    responseMode?: RuntimeResponseMode;
-  }): Promise<unknown>;
-  seedConversationContext(exchanges: readonly ConversationContextExchange[], operationId: string): Promise<void>;
-  authorizeVoiceResponse(input: {
-    sessionId: bigint;
-    segmentId: string;
-    contextExchanges: ConversationContextExchange[];
-  }): Promise<bigint>;
-  skipVoiceResponse(input: { sessionId: bigint; segmentId: string; reason: string }): Promise<void>;
-  finalizeRecording(input: { sessionId: bigint }): Promise<RecordingSummary>;
-  reconcileRecording(input: { sessionId: bigint; recordingHandle: string }): Promise<RecordingReconciliation>;
-  processText(input: ProcessTextRequest): Promise<ProcessedText>;
-  close(): Promise<void>;
-};
+export type ConversationRuntimeSdk = RuntimeClient<4>;
+
+/** Explicit version negotiation; transport ownership stays with the caller. */
+export async function connectPostmeetingRuntime(transport: RuntimeTransport): Promise<ConversationRuntimePort> {
+  return createConversationRuntimeClient(await RuntimeClient.connect(transport, 4));
+}
 
 export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): ConversationRuntimePort {
+  if (!(sdk instanceof RuntimeClient) || typeof sdk.currentSessionId !== "bigint") {
+    throw new Error("Postmeeting Runtime requires an open SDK protocol version 4 client");
+  }
   return {
     async startVoiceSession() {
-      // Do not even call the SDK: accepting a VoiceSession that lacks both
-      // required fields would force this package to fabricate a session ID or
-      // media descriptor. Runtime Tasks 6-8 and Meeting Agent Task 11 close
-      // this one explicit construction gap.
-      throw new Error("Conversation Runtime startVoiceSession cannot construct a Meeting Agent session before Task 11");
+      throw new Error("Conversation Runtime live start/events require the later Task 11 application composition");
     },
     seedConversationContext: (exchanges, operationId) =>
       sdk.seedConversationContext(exchanges, operationId),
@@ -57,6 +30,7 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): Co
     skipVoiceResponse: (input) => sdk.skipVoiceResponse(input),
     processText: (input) => sdk.processText(input),
     finalizeRecording: (input) => sdk.finalizeRecording(input),
+    readRecordingAlignment: (input) => sdk.readRecordingAlignment(input),
     reconcileRecording: (input) => sdk.reconcileRecording(input),
     // No SDK VoiceSession event stream is available because start is
     // fail-closed above. This inert subscription is safe only in that state;

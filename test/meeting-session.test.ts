@@ -1236,6 +1236,29 @@ test("session end stores the finalized handle, hash, duration and gaps", async (
   }
 });
 
+test("normal and failed-generation session state never exposes private Runtime recovery authorization", async () => {
+  for (const reason of ["ended", "bridge_failure"] as const) {
+    const runtime = fakeRuntime({ recording: { keyId: "c".repeat(16) } });
+    const finalize = runtime.finalizeRecording;
+    runtime.finalizeRecording = async (input) => {
+      const summary = await finalize(input);
+      return { ...summary, recoveryCapability: { sourceSessionId: input.sessionId,
+        recordingHandle: summary.recordingHandle, sha256: summary.sha256, keyId: summary.keyId,
+        authorization: "d".repeat(64) } };
+    };
+    const h = harness({ runtime });
+    try {
+      await joined(h);
+      h.bridge.emit(h.bridge.event({ type: "left", reason }));
+      await h.session.settled();
+      const recording = h.session.state().recording;
+      assert.ok(recording);
+      assert.equal(Object.hasOwn(recording, "recoveryCapability"), false);
+      assert.equal(JSON.stringify(recording, (_key, value: unknown) => typeof value === "bigint" ? String(value) : value).includes("d".repeat(64)), false);
+    } finally { await h.cleanup(); }
+  }
+});
+
 test("runtime summary gaps and bridge gaps remain independently exact", async () => {
   const h = harness({ runtime: fakeRuntime({ finalizedGaps: [] }) });
   try {

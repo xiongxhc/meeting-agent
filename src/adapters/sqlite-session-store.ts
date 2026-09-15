@@ -23,8 +23,12 @@ import { validateOrganizerReferenceKeys } from "../ports/feishu.ts";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import process from "node:process";
 import { validateCustodyBinding, parseBridgeProcessOutcome, sameCustodyBinding, type CustodyBinding } from "../contracts/bridge-process-outcome-v1.ts";
 import type { BridgeShutdownResult } from "../ports/bridge-process.ts";
+import { consumeAlignmentRecoveryPermit, type AlignmentRecoveryPermit } from "../ports/recording-alignment-authority.ts";
+import type { RecordingAlignmentPage, RecordingAlignmentComplete } from "../ports/conversation-runtime.ts";
+import { ALIGNMENT_LIMITS, encodeAlignmentPage, decodeAlignmentPage, validateAlignmentComplete, pageWarnings } from "../sessions/recording-alignment.ts";
 import type { PhysicalCustodyRow, PhysicalClientClear } from "../ports/session-store.ts";
 
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
@@ -39,6 +43,11 @@ import {
   type RecordingGapRow,
   type RuntimeRecordingGapRow,
   type RecordingRow,
+  type RecordingRecovery,
+  type RecordingInput,
+  type AlignmentAttempt,
+  type AlignmentFailure,
+  type SelectedAlignment,
   type ReconciliationBridgeEventRow,
   type ReconciliationEvidenceRow,
   type ReconciliationLiveSegmentRow,
@@ -85,10 +94,42 @@ export type OpenSessionStoreOptions = {
 };
 
 const DEFAULT_MIGRATIONS_DIR = path.resolve(import.meta.dirname, "..", "..", "migrations");
+const privateStateGuards = new WeakMap<Database.Database, () => string>();
+
+/** Private recovery is opt-in by use, not a change to legacy SQLite opening.
+ * No permission repair and no Windows/ACL confidentiality claim. */
+function privateStateGuard(filename: string): () => string {
+  const resolved = path.resolve(filename);
+  const inspect = () => {
+    if (filename === ":memory:" || typeof process.getuid !== "function") throw new Error("unsupported private state");
+    const uid = BigInt(process.getuid());
+    const file = lstatSync(resolved, { bigint: true });
+    const parent = lstatSync(path.dirname(resolved), { bigint: true });
+    if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1n || file.uid !== uid ||
+      !parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== uid || (parent.mode & 0o077n) !== 0n) {
+      throw new Error("unsupported private state");
+    }
+    return `${parent.dev}:${parent.ino}:${parent.birthtimeNs}:${file.dev}:${file.ino}:${file.birthtimeNs}`;
+  };
+  let original: string | null = null;
+  try { original = inspect(); } catch { /* Legacy open remains available. */ }
+  return () => {
+    try { if (original === null || inspect() !== original) throw new Error("identity changed"); }
+    catch { throw new Error("Recovery requires private persistent recording state with stable owned file identity"); }
+    return original;
+  };
+}
+
+function requirePrivateState(db: Database.Database): string {
+  const guard = privateStateGuards.get(db);
+  if (!guard) throw new Error("Recovery requires private persistent recording state");
+  return guard();
+}
 
 export function openSessionStore(options: OpenSessionStoreOptions): SessionStore {
   const migrationsDir = options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR;
   const db = new Database(options.filename);
+  privateStateGuards.set(db, privateStateGuard(options.filename));
   db.pragma("foreign_keys = ON"); // better-sqlite3 does NOT enable this by default; must be set per connection.
 
   applyMigrations(db, migrationsDir, options.nowMs ?? Date.now());
@@ -121,6 +162,17 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
 
     finalizeSession: (input) => finalizeSession(db, input),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
+    getRecordingRecovery: (occurrenceId, bridgeSessionId, recordingHandle) => getRecordingRecovery(db, occurrenceId, bridgeSessionId, recordingHandle),
+    beginRecordingAlignment: (generationId, ownerId, replace) => beginRecordingAlignment(db, generationId, ownerId, replace),
+    appendRecordingAlignment: (attempt, page) => appendRecordingAlignment(db, attempt, page),
+    completeRecordingAlignment: (attempt, complete) => completeRecordingAlignment(db, attempt, complete),
+    getSelectedAlignment: (generationId) => getSelectedAlignment(db, generationId),
+    readSelectedAlignmentPage: (selected, after) => readSelectedAlignmentPage(db, selected, after),
+    getPendingAlignment: (generationId) => getPendingAlignment(db, generationId),
+    markAlignmentCleanupFailed: (attempt) => markAlignmentCleanupFailed(db, attempt),
+    abandonRecordingAlignment: (attempt, permit, reason) => abandonRecordingAlignment(db, attempt, permit, reason),
+    reclaimRecordingAlignment: (attempt, limit) => reclaimRecordingAlignment(db, attempt, limit),
+    getRecordingAlignmentFailure: (generationId) => getRecordingAlignmentFailure(db, generationId),
     beginReconciliationGeneration: (occurrenceId, bridgeSessionId, createdAtMs) => beginReconciliationGeneration(db, occurrenceId, bridgeSessionId, createdAtMs),
     setReconciliationRuntimeSession: (occurrenceId, bridgeSessionId, runtimeSessionId) => setReconciliationRuntimeSession(db, occurrenceId, bridgeSessionId, runtimeSessionId),
     completeReconciliationGeneration: (occurrenceId, bridgeSessionId, terminalAtMs, terminalSource) => completeReconciliationGeneration(db, occurrenceId, bridgeSessionId, terminalAtMs, terminalSource),
@@ -148,6 +200,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
 
     close: () => {
       db.close();
+      privateStateGuards.delete(db);
     },
   };
 }
@@ -653,6 +706,10 @@ function finalizeSession(
         insertGap.run(occurrenceId, ordinal, gap.direction, gap.startedAt, gap.endedAt);
       });
       insertRuntimeGaps(db, "recording_runtime_gaps", [occurrenceId], input.recording.runtimeGaps);
+      if (input.recording.recovery !== undefined && input.recording.recovery.bridgeSessionId !== input.reconciliationBridgeSessionId) {
+        throw new OrchestrationError("constraint_violation", "recording recovery generation mismatch");
+      }
+      bindRecordingRecovery(db, occurrenceId, input.recording, null);
       if (input.reconciliationBridgeSessionId !== undefined) {
         const associated = db.prepare(
           `UPDATE reconciliation_generations
@@ -722,6 +779,254 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
     ),
     runtimeGaps,
   };
+}
+
+function bindRecordingRecovery(db: Database.Database, occurrenceId: string, recording: RecordingInput, failureAttempt: number | null): void {
+  const recovery = recording.recovery;
+  if (recovery === undefined) return; // Legacy is explicitly unavailable, never reconstructed.
+  requirePrivateState(db);
+  const { capability: cap, bridgeSessionId } = recovery;
+  const invalid = () => new OrchestrationError("constraint_violation", "invalid private recording recovery binding");
+  if (typeof cap !== "object" || cap === null || Object.keys(cap).sort().join(",") !== "authorization,keyId,recordingHandle,sha256,sourceSessionId" ||
+      typeof cap.sourceSessionId !== "bigint" || cap.sourceSessionId <= 0n || cap.sourceSessionId > 18_446_744_073_709_551_615n ||
+      typeof cap.recordingHandle !== "string" || !/^[0-9a-f]{32}$/.test(cap.recordingHandle) ||
+      typeof cap.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(cap.sha256) ||
+      typeof cap.keyId !== "string" || !/^[0-9a-f]{16}$/.test(cap.keyId) ||
+      typeof cap.authorization !== "string" || !/^[0-9a-f]{64}$/.test(cap.authorization) ||
+      cap.recordingHandle !== recording.handle || cap.sha256 !== recording.sha256 || cap.keyId !== recording.keyId) throw invalid();
+  const id = reconciliationGenerationId(occurrenceId, bridgeSessionId);
+  const generation = db.prepare("SELECT runtime_session_id, recording_handle FROM reconciliation_generations WHERE generation_id=? AND occurrence_id=? AND bridge_session_id=?")
+    .get(id, occurrenceId, bridgeSessionId) as { runtime_session_id: string | null; recording_handle: string | null } | undefined;
+  if (!generation || generation.runtime_session_id !== cap.sourceSessionId.toString() || generation.recording_handle !== null) throw invalid();
+  db.prepare(`INSERT INTO recording_recovery_bindings (generation_id,occurrence_id,bridge_session_id,source_session_id,recording_handle,sha256,key_id,authorization,recording_kind,failure_attempt)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, occurrenceId, bridgeSessionId, cap.sourceSessionId.toString(), cap.recordingHandle, cap.sha256, cap.keyId, cap.authorization,
+      failureAttempt === null ? "final" : "bridge_failure", failureAttempt);
+  if (failureAttempt !== null) {
+    // No terminal instant is inferred here. Existing observed/local terminal
+    // completion remains separate; only exact failed recording identity is bound.
+    db.prepare("UPDATE reconciliation_generations SET recording_handle=? WHERE generation_id=? AND recording_handle IS NULL").run(cap.recordingHandle, id);
+  }
+}
+
+function getRecordingRecovery(db: Database.Database, occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null {
+  requirePrivateState(db);
+  const row = db.prepare(`SELECT generation_id,source_session_id,recording_handle,sha256,key_id,authorization,recording_kind,failure_attempt
+    FROM recording_recovery_bindings WHERE occurrence_id=? AND bridge_session_id=? AND recording_handle=?`)
+    .get(occurrenceId, bridgeSessionId, recordingHandle) as { generation_id: string; source_session_id: string; recording_handle: string; sha256: string; key_id: string; authorization: string;
+      recording_kind: RecordingRecovery["recordingKind"]; failure_attempt: number | null } | undefined;
+  if (!row) return null;
+  if (row.generation_id !== reconciliationGenerationId(occurrenceId, bridgeSessionId) ||
+    !/^[1-9][0-9]{0,19}$/.test(row.source_session_id) || BigInt(row.source_session_id) > (1n << 64n) - 1n ||
+    !/^[0-9a-f]{32}$/.test(row.recording_handle) || !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    !/^[0-9a-f]{16}$/.test(row.key_id) || !/^[0-9a-f]{64}$/.test(row.authorization) ||
+    (row.recording_kind !== "final" && row.recording_kind !== "bridge_failure") ||
+    (row.recording_kind === "final" ? row.failure_attempt !== null : !Number.isSafeInteger(row.failure_attempt) || (row.failure_attempt ?? 0) < 1)) {
+    throw new Error("invalid private recording recovery binding");
+  }
+  return { generationId: row.generation_id, occurrenceId, bridgeSessionId, recordingKind: row.recording_kind, failureAttempt: row.failure_attempt,
+    capability: { sourceSessionId: BigInt(row.source_session_id), recordingHandle: row.recording_handle, sha256: row.sha256, keyId: row.key_id, authorization: row.authorization } };
+}
+
+type AlignmentHeader = {
+  attempt_id: string; generation_id: string; owner_id: string; token: string;
+  source_session_id: string; recording_handle: string; sha256: string; key_id: string;
+  state: "staging" | "complete" | "cleanup_failed" | "abandoned";
+  page_count: number; entry_count: number; stored_bytes: number; warnings_json: string;
+  coverage_status: RecordingAlignmentComplete["coverageStatus"] | null;
+};
+
+function alignmentHeader(db: Database.Database, attemptId: string): AlignmentHeader {
+  const row = db.prepare(`SELECT a.* FROM recording_alignment_attempts a JOIN recording_recovery_bindings b
+    ON a.generation_id=b.generation_id AND a.source_session_id=b.source_session_id AND a.recording_handle=b.recording_handle
+    AND a.sha256=b.sha256 AND a.key_id=b.key_id WHERE a.attempt_id=? AND a.timing_contract='capture-clock/v1'
+    AND length(CAST(a.warnings_json AS BLOB))<=4096`).get(attemptId) as AlignmentHeader | undefined;
+  if (!row || !Number.isSafeInteger(row.page_count) || row.page_count < 0 || row.page_count > ALIGNMENT_LIMITS.attemptPages ||
+      !Number.isSafeInteger(row.entry_count) || row.entry_count < 0 || row.entry_count > ALIGNMENT_LIMITS.attemptEntries ||
+      !Number.isSafeInteger(row.stored_bytes) || row.stored_bytes < 0 || row.stored_bytes > ALIGNMENT_LIMITS.attemptBytes ||
+      typeof row.warnings_json !== "string" || Buffer.byteLength(row.warnings_json) > 4096 ||
+      !/^[1-9][0-9]{0,19}$/.test(row.source_session_id)) throw new Error("invalid private alignment header");
+  // Reuse the bounded parsed-value validator, not a second wire decoder.
+  headerCompletion(row);
+  return row;
+}
+
+function headerCompletion(row: AlignmentHeader): RecordingAlignmentComplete {
+  try { return validateAlignmentComplete({ type: "recording_alignment_complete",
+    source: { sourceSessionId: BigInt(row.source_session_id), recordingHandle: row.recording_handle, sha256: row.sha256 },
+    pageCount: BigInt(row.page_count), coverageStatus: row.coverage_status ?? "partial",
+    warnings: JSON.parse(row.warnings_json) as string[], traversalSucceeded: true }); }
+  catch { throw new Error("invalid private alignment header"); }
+}
+
+function alignmentFence(db: Database.Database, attempt: AlignmentAttempt): AlignmentHeader {
+  if (requirePrivateState(db) !== attempt.storeIdentity) throw new Error("alignment owner fence mismatch");
+  const row = alignmentHeader(db, attempt.attemptId);
+  if (row.generation_id !== attempt.generationId || row.owner_id !== attempt.ownerId || row.token !== attempt.token || row.state !== "staging") {
+    throw new Error("alignment owner fence mismatch");
+  }
+  return row;
+}
+
+function selectedReference(row: AlignmentHeader): SelectedAlignment {
+  const terminal = headerCompletion(row);
+  if (row.state !== "complete" || row.coverage_status === null) throw new Error("invalid selected alignment");
+  return { generationId: row.generation_id, attemptId: row.attempt_id, source: terminal.source,
+    timingContract: "capture-clock/v1", policyId: row.page_count === 0 ? null : "local-wall-estimate/v1",
+    pageCount: row.page_count, entryCount: row.entry_count, storedBytes: row.stored_bytes,
+    coverageStatus: terminal.coverageStatus, warnings: terminal.warnings };
+}
+
+function getSelectedAlignment(db: Database.Database, generationId: string): SelectedAlignment | null {
+  requirePrivateState(db);
+  const row = db.prepare("SELECT attempt_id FROM recording_alignment_selected WHERE generation_id=?").get(generationId) as { attempt_id: string } | undefined;
+  if (!row) return null;
+  const header = alignmentHeader(db, row.attempt_id);
+  if (header.generation_id !== generationId) throw new Error("invalid selected alignment binding");
+  return selectedReference(header);
+}
+
+function beginRecordingAlignment(db: Database.Database, generationId: string, ownerId: string, replace = false):
+  { kind: "selected"; selected: SelectedAlignment } | { kind: "claimed"; attempt: AlignmentAttempt } {
+  const storeIdentity = requirePrivateState(db);
+  if (typeof ownerId !== "string" || ownerId.length === 0 || Buffer.byteLength(ownerId) > 128) throw new Error("invalid alignment owner");
+  return db.transaction(() => {
+    const selected = getSelectedAlignment(db, generationId);
+    if (selected && !replace) return { kind: "selected" as const, selected };
+    if (db.prepare(`SELECT 1 FROM recording_alignment_attempts WHERE generation_id=? AND attempt_id!=? LIMIT 1`)
+      .get(generationId, selected?.attemptId ?? "")) throw new Error("alignment is owned or has unreclaimed pages");
+    const binding = db.prepare("SELECT * FROM recording_recovery_bindings WHERE generation_id=?").get(generationId) as
+      { source_session_id: string; recording_handle: string; sha256: string; key_id: string } | undefined;
+    if (!binding) throw new Error("missing private recording recovery binding");
+    const attempt = { storeIdentity, generationId, attemptId: randomUUID(), ownerId, token: randomUUID() };
+    db.prepare(`INSERT INTO recording_alignment_attempts(attempt_id,generation_id,owner_id,token,source_session_id,recording_handle,sha256,key_id,timing_contract,state)
+      VALUES(?,?,?,?,?,?,?,?,'capture-clock/v1','staging')`).run(attempt.attemptId, generationId, ownerId, attempt.token,
+        binding.source_session_id, binding.recording_handle, binding.sha256, binding.key_id);
+    alignmentHeader(db, attempt.attemptId);
+    return { kind: "claimed" as const, attempt };
+  }).immediate();
+}
+
+function sameAlignmentSource(row: AlignmentHeader, source: RecordingAlignmentPage["source"]): boolean {
+  return source.sourceSessionId.toString() === row.source_session_id && source.recordingHandle === row.recording_handle && source.sha256 === row.sha256;
+}
+
+function appendRecordingAlignment(db: Database.Database, attempt: AlignmentAttempt, page: RecordingAlignmentPage): void {
+  const payload = encodeAlignmentPage(page), bytes = Buffer.byteLength(payload);
+  db.transaction(() => {
+    const row = alignmentFence(db, attempt);
+    if (!sameAlignmentSource(row, page.source) || page.pageIndex !== BigInt(row.page_count)) throw new Error("invalid alignment page binding or index");
+    if (row.page_count + 1 > ALIGNMENT_LIMITS.attemptPages || row.entry_count + page.entries.length > ALIGNMENT_LIMITS.attemptEntries ||
+      row.stored_bytes + bytes > ALIGNMENT_LIMITS.attemptBytes) throw new Error("alignment staging limit exceeded");
+    const warnings = [...new Set([...headerCompletion(row).warnings, ...pageWarnings(page)])].sort();
+    db.prepare("INSERT INTO recording_alignment_pages(attempt_id,page_index,entry_count,payload) VALUES(?,?,?,?)")
+      .run(attempt.attemptId, row.page_count, page.entries.length, payload);
+    db.prepare("UPDATE recording_alignment_attempts SET page_count=page_count+1,entry_count=entry_count+?,stored_bytes=stored_bytes+?,warnings_json=? WHERE attempt_id=?")
+      .run(page.entries.length, bytes, JSON.stringify(warnings), attempt.attemptId);
+  }).immediate();
+}
+
+function completeRecordingAlignment(db: Database.Database, attempt: AlignmentAttempt, value: RecordingAlignmentComplete): SelectedAlignment {
+  const completion = validateAlignmentComplete(value);
+  return db.transaction(() => {
+    const row = alignmentFence(db, attempt), observed = headerCompletion(row).warnings;
+    if (!sameAlignmentSource(row, completion.source) || completion.pageCount !== BigInt(row.page_count) ||
+      observed.some((warning) => !completion.warnings.includes(warning)) ||
+      (completion.coverageStatus === "available" && observed.some((warning) => warning !== "local_wall_timestamp_estimate")) ||
+      (completion.coverageStatus === "unavailable_legacy" && (row.page_count !== 0 || !completion.warnings.includes("unavailable_legacy")))) {
+      throw new Error("invalid alignment completion binding, count or warnings");
+    }
+    db.prepare("UPDATE recording_alignment_attempts SET state='complete',coverage_status=?,warnings_json=? WHERE attempt_id=?")
+      .run(completion.coverageStatus, JSON.stringify([...completion.warnings].sort()), attempt.attemptId);
+    db.prepare(`INSERT INTO recording_alignment_selected(generation_id,attempt_id) VALUES(?,?)
+      ON CONFLICT(generation_id) DO UPDATE SET attempt_id=excluded.attempt_id`).run(attempt.generationId, attempt.attemptId);
+    db.prepare("UPDATE recording_recovery_bindings SET last_alignment_failure=NULL WHERE generation_id=?").run(attempt.generationId);
+    return selectedReference(alignmentHeader(db, attempt.attemptId));
+  }).immediate();
+}
+
+function readSelectedAlignmentPage(db: Database.Database, selected: SelectedAlignment, after: number): RecordingAlignmentPage | null {
+  if (!Number.isSafeInteger(after) || after < -1 || after >= ALIGNMENT_LIMITS.attemptPages) throw new Error("invalid alignment page cursor");
+  const current = getSelectedAlignment(db, selected.generationId);
+  if (!current || current.attemptId !== selected.attemptId || current.source.sourceSessionId !== selected.source.sourceSessionId ||
+    current.source.recordingHandle !== selected.source.recordingHandle || current.source.sha256 !== selected.source.sha256) throw new Error("selected alignment generation changed");
+  const row = db.prepare(`SELECT page_index,entry_count,
+    CASE WHEN length(CAST(payload AS BLOB)) BETWEEN 1 AND 32768 THEN payload ELSE NULL END AS payload
+    FROM recording_alignment_pages WHERE attempt_id=? AND page_index>? ORDER BY page_index LIMIT 1`)
+    .get(selected.attemptId, after) as { page_index: number; entry_count: number; payload: string | null } | undefined;
+  if (!row) {
+    if (after + 1 < current.pageCount) throw new Error("missing selected alignment page");
+    return null;
+  }
+  if (row.payload === null) throw new Error("invalid private alignment page size");
+  const page = decodeAlignmentPage(row.payload);
+  if (row.page_index !== after + 1 || row.page_index >= current.pageCount || page.pageIndex !== BigInt(row.page_index) || page.entries.length !== row.entry_count ||
+    page.source.sourceSessionId !== current.source.sourceSessionId || page.source.recordingHandle !== current.source.recordingHandle || page.source.sha256 !== current.source.sha256) {
+    throw new Error("invalid selected alignment page binding");
+  }
+  return page;
+}
+
+function getPendingAlignment(db: Database.Database, generationId: string): AlignmentAttempt | null {
+  const storeIdentity = requirePrivateState(db);
+  const pending = db.prepare(`SELECT a.attempt_id FROM recording_alignment_attempts a
+    LEFT JOIN recording_alignment_selected s ON s.attempt_id=a.attempt_id
+    WHERE a.generation_id=? AND s.attempt_id IS NULL ORDER BY a.attempt_id LIMIT 1`).get(generationId) as { attempt_id: string } | undefined;
+  if (!pending) return null;
+  const row = alignmentHeader(db, pending.attempt_id);
+  return { storeIdentity, generationId, attemptId: row.attempt_id, ownerId: row.owner_id, token: row.token };
+}
+
+function matchAlignmentOwner(db: Database.Database, attempt: AlignmentAttempt): AlignmentHeader {
+  if (requirePrivateState(db) !== attempt.storeIdentity) throw new Error("alignment owner fence mismatch");
+  const row = alignmentHeader(db, attempt.attemptId);
+  if (row.generation_id !== attempt.generationId || row.owner_id !== attempt.ownerId || row.token !== attempt.token) throw new Error("alignment owner fence mismatch");
+  return row;
+}
+
+function markAlignmentCleanupFailed(db: Database.Database, attempt: AlignmentAttempt): void {
+  db.transaction(() => {
+    const row = matchAlignmentOwner(db, attempt);
+    if (row.state !== "staging" && row.state !== "cleanup_failed") throw new Error("alignment owner fence mismatch");
+    db.prepare("UPDATE recording_alignment_attempts SET state='cleanup_failed',failure_reason='cleanup_failed' WHERE attempt_id=?").run(attempt.attemptId);
+    db.prepare("UPDATE recording_recovery_bindings SET last_alignment_failure='cleanup_failed' WHERE generation_id=?").run(attempt.generationId);
+  }).immediate();
+}
+
+function abandonRecordingAlignment(db: Database.Database, attempt: AlignmentAttempt, permit: AlignmentRecoveryPermit, reason: AlignmentFailure = "recovered_owner"): void {
+  if (!["read_failed", "cancelled", "cleanup_failed", "recovered_owner"].includes(reason)) throw new Error("invalid alignment failure reason");
+  db.transaction(() => {
+    const row = matchAlignmentOwner(db, attempt);
+    if (db.prepare("SELECT 1 FROM recording_alignment_selected WHERE attempt_id=?").get(attempt.attemptId)) throw new Error("selected alignment cannot be abandoned");
+    consumeAlignmentRecoveryPermit(permit, attempt);
+    if (row.state === "complete") {
+      // Formerly selected immutable evidence is no longer a reader owner.
+      db.prepare("UPDATE recording_alignment_attempts SET state='abandoned',coverage_status=NULL,failure_reason=? WHERE attempt_id=?").run(reason, attempt.attemptId);
+    } else db.prepare("UPDATE recording_alignment_attempts SET state='abandoned',failure_reason=? WHERE attempt_id=?").run(reason, attempt.attemptId);
+    db.prepare("UPDATE recording_recovery_bindings SET last_alignment_failure=? WHERE generation_id=?").run(reason, attempt.generationId);
+  }).immediate();
+}
+
+function getRecordingAlignmentFailure(db: Database.Database, generationId: string): AlignmentFailure | null {
+  requirePrivateState(db);
+  const row = db.prepare("SELECT last_alignment_failure FROM recording_recovery_bindings WHERE generation_id=?").get(generationId) as { last_alignment_failure: AlignmentFailure | null } | undefined;
+  const value = row?.last_alignment_failure ?? null;
+  if (value !== null && !["read_failed", "cancelled", "cleanup_failed", "recovered_owner"].includes(value)) throw new Error("invalid private alignment failure");
+  return value;
+}
+
+function reclaimRecordingAlignment(db: Database.Database, attempt: AlignmentAttempt, limit = 64): boolean {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error("invalid alignment reclaim limit");
+  return db.transaction(() => {
+    const row = matchAlignmentOwner(db, attempt);
+    if (row.state !== "abandoned" || db.prepare("SELECT 1 FROM recording_alignment_selected WHERE attempt_id=?").get(attempt.attemptId)) {
+      throw new Error("alignment reclaim requires confirmed owner cleanup");
+    }
+    db.prepare(`DELETE FROM recording_alignment_pages WHERE attempt_id=? AND page_index IN
+      (SELECT page_index FROM recording_alignment_pages WHERE attempt_id=? ORDER BY page_index LIMIT ?)`).run(attempt.attemptId, attempt.attemptId, limit);
+    if (db.prepare("SELECT 1 FROM recording_alignment_pages WHERE attempt_id=? LIMIT 1").get(attempt.attemptId)) return false;
+    db.prepare("DELETE FROM recording_alignment_attempts WHERE attempt_id=?").run(attempt.attemptId);
+    return true;
+  }).immediate();
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1619,7 @@ function recordBridgeFailure(
         [input.occurrenceId, attempt],
         input.recording.runtimeGaps,
       );
+      bindRecordingRecovery(db, input.occurrenceId, input.recording, attempt);
     }
     const retryAllowed = attempt <= input.maxRetries;
     if (!retryAllowed) {

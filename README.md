@@ -30,6 +30,122 @@ docs/HUMAN-CHECKLIST.md  steps deliberately not attempted by an agent
 
 ## Running the tests
 
+Node24 is the verified local environment. SDK-dependent test/typecheck/build/start
+require the actual reviewed `@conversation/runtime` package. The optional peer
+prevents an unpublished package registry fetch; it does **not** make that
+prerequisite optional. `npm ci` removes a prior local bootstrap.
+
+### Local SDK bootstrap
+
+Use an existing Runtime checkout path, but package only the immutable reviewed
+commit; never copy a concurrent worktree's `dist` or install a source alias.
+
+```sh
+export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if needed
+: "${RUNTIME_REPO:?Set the local Runtime checkout path}"
+SDK_STAGE=$(mktemp -d)
+mkdir "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive 4c97c47c9cb044728413516c48aa86534e58523b | tar -x -C "$SDK_STAGE/runtime"
+npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
+npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
+npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
+npm ci --no-audit --no-fund
+npm install --save-dev --no-save --no-audit --no-fund "$SDK_STAGE/conversation-runtime-0.1.0.tgz"
+node scripts/check-runtime-sdk.mjs
+```
+
+Do not commit the tarball or a machine-specific dependency path; the tracked lock
+contains only optional peer metadata. The check pins reviewed built file digests,
+not just version0.1.0. Registry publication and future Runtime process ownership
+are separate gates. The package's `start` still intentionally refuses to compose
+unconfigured live adapters; a successful prerequisite check does not start a meeting.
+Both install flags are intentional: `--save-dev` selects a local dependency rather
+than re-inferring the existing optional peer, while `--no-save` preserves the
+manifest and lock. Plain `--no-save` may leave that optional peer uninstalled.
+
+Recovery capabilities and alignment staging belong in an owned private0700 state
+directory outside shared/Git/TeamMem roots. SQL projections alone do not encrypt
+or protect SQLite/WAL files. Deployment must establish and verify private roots
+before opening the store; no helper changes permissions on existing user paths.
+Recording/provider keys and plaintext audio remain exclusively outside Meeting.
+
+The hardware-free encrypted restart test also needs a prebuilt gateway from that
+same immutable source. Build it before starting the unchanged test deadlines:
+
+```sh
+RUNTIME_TARGET=$(mktemp -d)
+RUNTIME_BUILD_TMP=$(mktemp -d)
+(cd "$SDK_STAGE/runtime" && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 \
+  CARGO_TARGET_DIR="$RUNTIME_TARGET" TMPDIR="$RUNTIME_BUILD_TMP" \
+  cargo build --locked -p conversation-runtime-gateway --bin conversation-runtime-gateway)
+export MEETING_TEST_RUNTIME_GATEWAY="$RUNTIME_TARGET/debug/conversation-runtime-gateway"
+npm run build
+```
+
+Missing gateway/bootstrap prerequisites fail explicitly; tests do not skip this
+proof or start a real device/provider. Its private Runtime-owned shell generates
+a synthetic key, imports it with shell builtins after environment sanitization,
+and execs the gateway. Meeting receives only the finalized opaque capability.
+
+### Postmeeting alignment component
+
+`createConversationRuntimeClient` accepts an actual open SDK v4 client;
+`connectPostmeetingRuntime` explicitly negotiates v4 over a caller-owned transport.
+Both leave live start/events unavailable. `RecordingAlignmentOwner` stages one
+reader at a time using a separately stored `RecordingRecovery`. Historical
+`sourceSessionId` is never replaced by the new gateway's `currentSessionId`.
+Normal and failed-generation recording transactions bind restart authority
+atomically; ordinary session/recording/evidence projections omit it.
+
+`openSessionStore` leaves legacy behavior intact, but recovery/staging APIs reject
+memory-only stores, non-owned/symlink/hardlinked/replaced files, or immediate
+parents with group/other permissions. POSIX ownership is required; no Windows ACL
+claim is made. Private0700 parents protect DB and sidecars; SQL is not encryption.
+
+Each private page is at most64 entries and32KiB **stored UTF-8**, using a versioned
+canonical bigint-tag representation of SDK-parsed values. Attempts cap at2million
+entries,250000pages and256MiB payload. These are not SQLite/WAL/index disk bounds;
+operators need additional disk headroom. Representation overhead can reject an
+otherwise Runtime-valid maximum page; this fails visibly instead of truncating.
+Tentative pages never appear in selected evidence. Matching terminal selection
+is atomic, and bounded keyset reads retain the chosen attempt identity. Partial
+coverage stays partial; legacy unavailable has no timing policy/anchor. Existing
+speaker/artifact consumers still see their legacy null alignment in this scope.
+
+Use one shared `RecordingAlignmentOwner`, and await `owner.close()` **before**
+closing its Runtime/SQLite dependencies. A failed cleanup retains ownership.
+Reopen, age and absent in-memory state do not authorize takeover. Recovery needs
+an awaited trusted application/supervisor exclusive-owner proof; the controlled
+test actually terminates/reaps its owned child. A future host-restart app must
+establish exclusive ownership, not attempt to reap an unrelated historical PID.
+The proof callback must own and bound its cleanup; it is not a cryptographic
+guarantee. Runtime-validated one-use permits and exact-token CAS enforce binding.
+Reclaim deletes at most64 pages per transaction; selected evidence survives failed
+replacement and a bounded static last-failure reason remains durable.
+
+### External package check
+
+After building, install both tarballs into a fresh temporary consumer (no publish,
+source alias or global link). `--ignore-scripts` is intentional here: this check
+imports package roots/types and exercises safe startup, not SQLite native loading;
+the main suite separately uses real migrated SQLite with its installed binding.
+
+```sh
+CONSUMER_STAGE=$(mktemp -d)
+npm pack --ignore-scripts --pack-destination "$CONSUMER_STAGE"
+npm --prefix "$CONSUMER_STAGE" install --ignore-scripts --no-save --no-audit --no-fund \
+  "$CONSUMER_STAGE/meeting-agent-0.1.0.tgz" "$SDK_STAGE/conversation-runtime-0.1.0.tgz"
+cp test/fixtures/runtime-package-consumer.mjs test/fixtures/runtime-package-consumer.mts "$CONSUMER_STAGE/"
+(cd "$CONSUMER_STAGE" && node runtime-package-consumer.mjs)
+node node_modules/typescript/bin/tsc --noEmit --target ES2023 --module NodeNext \
+  --moduleResolution NodeNext --skipLibCheck "$CONSUMER_STAGE/runtime-package-consumer.mts"
+```
+
+The installed package includes its exact prerequisite helper. Missing or changed
+SDK builds give a bootstrap diagnostic; a valid installed SDK reaches the existing
+intentional adapter-composition refusal, never false service readiness. This is
+postmeeting component proof, not shipped application/live meeting acceptance.
+
 ```
 npm test                        # TypeScript: node --test over the source trees
 cd bridges/mac && swift test    # Swift: no external dependencies, no network
