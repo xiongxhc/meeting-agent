@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { createChildBridgeSlot } from "../src/adapters/child-bridge-process.ts";
 import { validateCustodyBinding } from "../src/contracts/bridge-process-outcome-v1.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { parseEventV2 } from "../src/contracts/bridge-session-v2.ts";
+import type { BridgeCommandMessage } from "../src/contracts/bridge-session-v1.ts";
 
 const fixture = JSON.parse(readFileSync(new URL("../spikes/feishu/fixtures/process/config-v2.json", import.meta.url), "utf8"));
 const binding = validateCustodyBinding(fixture.custody);
@@ -106,4 +108,156 @@ test("private launch rejects unsafe static input and malformed binding without c
     assert.throws(() => createChildBridgeSlot({ ...options, executable: "relative" }));
     assert.throws(() => createChildBridgeSlot({ ...options, cooperativeGraceMs: 0 }));
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- bridge-session/v2 transport (D026) --------------------------------------
+
+const audio = { captureDisplayId: 1, outputDeviceUid: "synthetic-output-device" };
+const v2Child = path.resolve("test/fixtures/bridge-v2-child.mjs");
+const v2Join = (commandId: string, meetingOccurrenceId = binding.occurrenceId) => ({ schema: "bridge-session/v2", sessionId: binding.bridgeSessionId, commandId,
+  type: "join", meetingOccurrenceId, meetingNo: "000000001", leaseId: "lease-1" }) as unknown as BridgeCommandMessage;
+const v2Lease = { sessionId: "7", bridgeSessionId: binding.bridgeSessionId, connectEndpoint: "wss://synthetic.invalid/media", credential: "synthetic-credential",
+  expiresAtMs: "1000", reconnectWindowMs: "5000", mediaProtocolVersion: 2, captureFormat: "pcm_s16le/24000/1/20ms", timingContract: "capture-clock/v1" };
+function staticFields(extra: Record<string, unknown>): Record<string, unknown> {
+  const fields: Record<string, unknown> = { ...fixture, schema: "feishu-bridge-config/v1", ...extra }; delete fields.custody; return fields;
+}
+function collect(bridge: { subscribe(listener: (raw: unknown) => void): () => void }, count: number, events: unknown[]): Promise<void> {
+  const promise = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`only ${events.length} of ${count} events arrived`)), 5000);
+    const check = () => { if (events.length >= count) { clearTimeout(timer); unsubscribe(); resolve(); } };
+    const unsubscribe = bridge.subscribe((raw) => { events.push(raw); check(); });
+    check();
+  });
+  promise.catch(() => {}); // awaited by the test; never an unhandled rejection after a failed send
+  return promise;
+}
+
+test("v1 default still rejects a v2 command and launches the child on feishu-bridge-config/v2", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "bridge-v2-default-"));
+  const configPath = path.join(dir, "static.json");
+  writeFileSync(configPath, JSON.stringify(staticFields({ evidenceRoot: dir })), { mode: 0o600 });
+  try {
+    const child = await createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+      argv: [v2Child], staticConfigPath: configPath, cooperativeGraceMs: 1000 }).launch(binding);
+    await assert.rejects(child.bridge.send(v2Join("c1")), /bridge_control_rejected/);
+    const result = await child.shutdown();
+    assert.equal(result.reaped, true); assert.equal(result.failure, null); assert.equal(result.outcome?.outcome, "no_join_action");
+    const launched = JSON.parse(readFileSync(path.join(dir, "child.config.json"), "utf8"));
+    assert.equal(launched.schema, "feishu-bridge-config/v2"); assert.equal(Object.hasOwn(launched, "audio"), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("protocol v2 accepts the session's v2 join, yields v2 events through subscribe and launches on feishu-bridge-config/v3 with audio", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "bridge-v2-accept-"));
+  const configPath = path.join(dir, "static.json");
+  const fields = staticFields({ evidenceRoot: dir, audio });
+  writeFileSync(configPath, JSON.stringify(fields), { mode: 0o600 });
+  try {
+    const child = await createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+      argv: [v2Child], staticConfigPath: configPath, cooperativeGraceMs: 1000, protocol: "bridge-session/v2" }).launch(binding);
+    const events: unknown[] = [];
+    const first = collect(child.bridge, 3, events);
+    await child.bridge.send(v2Join("c1"));
+    await first;
+    const typed = events.map((raw) => parseEventV2(raw));
+    assert.deepEqual(typed.map((event) => event.type), ["joined", "ui_snapshot", "command_result"]);
+    assert.deepEqual(typed.map((event) => event.sequence), [1, 2, 3]);
+    assert.ok(typed.every((event) => event.schema === "bridge-session/v2" && event.sessionId === binding.bridgeSessionId));
+    assert.deepEqual(events[2], { schema: "bridge-session/v2", sessionId: binding.bridgeSessionId, sequence: 3, observedAt: "2026-09-02T14:01:00.000Z", type: "command_result", commandId: "c1", outcome: "ok", detail: null });
+    const second = collect(child.bridge, 4, events);
+    await child.bridge.send({ schema: "bridge-session/v2", sessionId: binding.bridgeSessionId, commandId: "c2", type: "connect_media", mediaLease: v2Lease } as unknown as BridgeCommandMessage);
+    await second;
+    const media = parseEventV2(events[3]);
+    assert.equal(media.type, "command_result");
+    if (media.type === "command_result") { assert.equal(media.commandId, "c2"); assert.equal(media.outcome, "failed"); }
+    await assert.rejects(child.bridge.send({ ...v2Join("c3"), schema: "bridge-session/v1" }), /bridge_control_rejected/);
+    await assert.rejects(child.bridge.send(v2Join("c4", "other-meeting@2026-09-02T14:00:00Z")), /bridge_control_rejected/);
+    await assert.rejects(child.bridge.send(v2Join("c1")), /bridge_control_rejected/);
+    await assert.rejects(child.bridge.send({ schema: "bridge-session/v2", sessionId: binding.bridgeSessionId, commandId: "c5", type: "connect_media",
+      endpoint: "wss://x", sessionToken: "t", format: "pcm_s16le/24000/1/20ms", expiresAt: "2026-09-02T14:01:00.000Z" } as unknown as BridgeCommandMessage), /bridge_control_rejected/);
+    const result = await child.shutdown();
+    assert.equal(result.reaped, true); assert.equal(result.failure, null); assert.equal(result.exitDiagnostic, null);
+    assert.equal(result.outcome?.outcome, "departure_unconfirmed"); assert.equal(result.outcome?.bridgeSessionId, binding.bridgeSessionId);
+    assert.equal(events.length, 4);
+    const launched = JSON.parse(readFileSync(path.join(dir, "child.config.json"), "utf8"));
+    assert.equal(launched.schema, "feishu-bridge-config/v3");
+    assert.deepEqual(launched.custody, binding);
+    assert.deepEqual(launched.audio, audio);
+    assert.deepEqual(Object.keys(launched).sort(), [...Object.keys(fields), "custody"].sort());
+    for (const key of Object.keys(fields)) if (key !== "schema") assert.deepEqual(launched[key], fields[key]);
+    const generated = readFileSync(path.join(dir, "child.config-path"), "utf8");
+    assert.equal(existsSync(generated), false); assert.equal(existsSync(path.dirname(generated)), false);
+    assert.throws(() => process.kill(Number(readFileSync(path.join(dir, "child.pid"), "utf8")), 0), { code: "ESRCH" });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("v2 slot refuses a static file without the exact audio object before any spawn, and v1 refuses audio", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "bridge-v2-refuse-"));
+  const configPath = path.join(dir, "static.json");
+  const oldTmp = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    const cases: [string, Record<string, unknown>, "bridge-session/v1" | "bridge-session/v2"][] = [
+      ["missing", staticFields({ evidenceRoot: dir }), "bridge-session/v2"],
+      ["not-object", staticFields({ evidenceRoot: dir, audio: "1/uid" }), "bridge-session/v2"],
+      ["array", staticFields({ evidenceRoot: dir, audio: [1, "uid"] }), "bridge-session/v2"],
+      ["extra-key", staticFields({ evidenceRoot: dir, audio: { ...audio, extra: 1 } }), "bridge-session/v2"],
+      ["missing-uid", staticFields({ evidenceRoot: dir, audio: { captureDisplayId: 1 } }), "bridge-session/v2"],
+      ["display-zero", staticFields({ evidenceRoot: dir, audio: { ...audio, captureDisplayId: 0 } }), "bridge-session/v2"],
+      ["display-bool", staticFields({ evidenceRoot: dir, audio: { ...audio, captureDisplayId: true } }), "bridge-session/v2"],
+      ["display-fraction", staticFields({ evidenceRoot: dir, audio: { ...audio, captureDisplayId: 1.5 } }), "bridge-session/v2"],
+      ["display-string", staticFields({ evidenceRoot: dir, audio: { ...audio, captureDisplayId: "1" } }), "bridge-session/v2"],
+      ["display-overflow", staticFields({ evidenceRoot: dir, audio: { ...audio, captureDisplayId: 4_294_967_296 } }), "bridge-session/v2"],
+      ["uid-empty", staticFields({ evidenceRoot: dir, audio: { ...audio, outputDeviceUid: "" } }), "bridge-session/v2"],
+      ["uid-long", staticFields({ evidenceRoot: dir, audio: { ...audio, outputDeviceUid: "x".repeat(513) } }), "bridge-session/v2"],
+      ["uid-nul", staticFields({ evidenceRoot: dir, audio: { ...audio, outputDeviceUid: "a b" } }), "bridge-session/v2"],
+      ["uid-number", staticFields({ evidenceRoot: dir, audio: { ...audio, outputDeviceUid: 7 } }), "bridge-session/v2"],
+      ["v1-with-audio", staticFields({ evidenceRoot: dir, audio }), "bridge-session/v1"],
+    ];
+    for (const [label, fields, protocol] of cases) {
+      const bytes = JSON.stringify(fields);
+      writeFileSync(configPath, bytes, { mode: 0o600 });
+      await assert.rejects(createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+        argv: [v2Child], staticConfigPath: configPath, cooperativeGraceMs: 1000, protocol }).launch(binding), /invalid_bridge_static_config/, label);
+      assert.deepEqual(readdirSync(dir), ["static.json"], label);
+      assert.equal(readFileSync(configPath, "utf8"), bytes, label);
+    }
+    assert.throws(() => createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+      argv: [v2Child], staticConfigPath: configPath, protocol: "bridge-session/v3" as "bridge-session/v2" }), /invalid_bridge_launch_config/);
+  } finally {
+    if (oldTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmp;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("v2 slot keeps the fd 3 outcome, environment allowlist and reap behaviour", async () => {
+  for (const mode of ["allowlist", "hung"]) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "bridge-v2-owned-"));
+    const configPath = path.join(dir, "static.json");
+    writeFileSync(configPath, JSON.stringify(staticFields({ evidenceRoot: dir, audio, bundleVersion: mode })), { mode: 0o600 });
+    process.env.RUNTIME_SECRET = "synthetic-canary"; process.env.FEISHU_APP_SECRET = "synthetic-canary"; process.env.DYLD_TEST_CANARY = "synthetic-canary";
+    const oldNodeOptions = process.env.NODE_OPTIONS;
+    process.env.NODE_OPTIONS = "--no-warnings";
+    try {
+      const child = await createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+        argv: [v2Child], staticConfigPath: configPath, cooperativeGraceMs: 1000, protocol: "bridge-session/v2" }).launch(binding);
+      const start = performance.now();
+      const result = await child.shutdown();
+      assert.equal(result.reaped, true);
+      if (mode === "allowlist") {
+        // The child exits 7 without an outcome when any canary reaches its environment.
+        assert.equal(result.failure, null); assert.equal(result.exitDiagnostic, null); assert.equal(result.outcome?.outcome, "no_join_action");
+      } else {
+        assert.notEqual(result.failure, null); assert.equal(result.outcome, null);
+        assert.ok(performance.now() - start < 4500);
+      }
+      assert.throws(() => process.kill(Number(readFileSync(path.join(dir, "child.pid"), "utf8")), 0), { code: "ESRCH" });
+      const generated = readFileSync(path.join(dir, "child.config-path"), "utf8");
+      assert.equal(existsSync(generated), false); assert.equal(existsSync(path.dirname(generated)), false);
+    } finally {
+      delete process.env.RUNTIME_SECRET; delete process.env.FEISHU_APP_SECRET; delete process.env.DYLD_TEST_CANARY;
+      if (oldNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = oldNodeOptions;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { createBridgeSessionValidator } from "../contracts/bridge-session-v1.ts";
+import { createBridgeSessionValidatorV2 } from "../contracts/bridge-session-v2.ts";
 import { OUTCOME_MAX_BYTES, decodeBridgeProcessOutcome, sameCustodyBinding, validateCustodyBinding } from "../contracts/bridge-process-outcome-v1.ts";
 import { validateBridgeSlots } from "../config.ts";
 import type { BridgeProcessSlot, BridgeShutdownResult, BridgeProcessFailure } from "../ports/bridge-process.ts";
@@ -15,9 +16,23 @@ export type ChildBridgeOptions = {
   readonly staticConfigPath: string;
   readonly argv?: readonly string[];
   readonly cooperativeGraceMs?: number;
+  /** Wire contract for this slot; default v1 keeps the legacy behaviour byte for byte (D026). */
+  readonly protocol?: "bridge-session/v1" | "bridge-session/v2";
 };
 
-function readStaticConfig(filename: string): Record<string, unknown> {
+const PROTOCOLS = ["bridge-session/v1", "bridge-session/v2"] as const;
+
+/** Exactly the `audio` object the accepted Mac executable decodes for feishu-bridge-config/v3. */
+function validAudio(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const audio = value as Record<string, unknown>;
+  const display = audio.captureDisplayId, uid = audio.outputDeviceUid;
+  return Object.keys(audio).length === 2 && Object.hasOwn(audio, "captureDisplayId") && Object.hasOwn(audio, "outputDeviceUid") &&
+    Number.isInteger(display) && (display as number) >= 1 && (display as number) <= 4_294_967_295 &&
+    typeof uid === "string" && uid.length > 0 && Buffer.byteLength(uid) <= 512 && !uid.includes("\0");
+}
+
+function readStaticConfig(filename: string, v2: boolean): Record<string, unknown> {
   let fd: number;
   try { fd = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch { throw new Error("invalid_bridge_static_config"); }
@@ -36,7 +51,9 @@ function readStaticConfig(filename: string): Record<string, unknown> {
         const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset)));
         if (typeof value !== "object" || value === null || Array.isArray(value) ||
             (value as Record<string, unknown>).schema !== "feishu-bridge-config/v1" || Object.hasOwn(value, "custody")) throw new Error("invalid_bridge_static_config");
-        return value as Record<string, unknown>;
+        const record = value as Record<string, unknown>;
+        if (Object.hasOwn(record, "audio") !== v2 || v2 && !validAudio(record.audio)) throw new Error("invalid_bridge_static_config");
+        return record;
       }
     }
     throw new Error("invalid_bridge_static_config");
@@ -48,13 +65,15 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
   validateBridgeSlots([options]);
   const grace = options.cooperativeGraceMs ?? 10_000;
   const argv = [...(options.argv ?? [])];
+  const v2 = options.protocol === "bridge-session/v2";
+  if (options.protocol !== undefined && !PROTOCOLS.includes(options.protocol)) throw new Error("invalid_bridge_launch_config");
   if (!path.isAbsolute(options.executable) || !path.isAbsolute(options.staticConfigPath) ||
       !Number.isInteger(grace) || grace < 1000 || grace > 30_000 || argv.length > 16 ||
       argv.some((value) => typeof value !== "string" || value.includes("\0")) || Buffer.byteLength(JSON.stringify(argv)) > 4096) throw new Error("invalid_bridge_launch_config");
   return { physicalClientId: options.physicalClientId, bridgeId: options.bridgeId, async launch(value) {
     const binding = validateCustodyBinding(value);
     if (binding.physicalClientId !== options.physicalClientId) throw new Error("physical_client_binding_conflict");
-    const config = { ...readStaticConfig(options.staticConfigPath), schema: "feishu-bridge-config/v2", custody: binding };
+    const config = { ...readStaticConfig(options.staticConfigPath, v2), schema: v2 ? "feishu-bridge-config/v3" : "feishu-bridge-config/v2", custody: binding };
     const bytes = JSON.stringify(config);
     if (Buffer.byteLength(bytes) > 65_536) throw new Error("invalid_bridge_static_config");
     const directory = mkdtempSync(path.join(os.tmpdir(), "meeting-bridge-"));
@@ -79,7 +98,7 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
       try { unlinkSync(filename); rmdirSync(directory); } catch { /* private residue only */ }
       throw new Error("bridge_launch_failed");
     }
-    const validator = createBridgeSessionValidator(binding.bridgeSessionId);
+    const validator = v2 ? createBridgeSessionValidatorV2(binding.bridgeSessionId) : createBridgeSessionValidator(binding.bridgeSessionId);
     const listeners = new Set<(raw: unknown) => void>();
     const pending = new Map<() => void, number>();
     let pendingBytes = 0, sentCount = 0, stopping = false, reaped = false, exited = false;

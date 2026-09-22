@@ -9,10 +9,12 @@
 //   - `--standalone-config ABSOLUTE_PATH`: the macOS standalone admission
 //     boundary (Cut A). It parses the versioned config, checks the state root
 //     reference, takes the exclusive owner lock, and then hands off to the
-//     private composeAfterAdmission seam -- which in Cut A still reports
-//     composition_unavailable. The owner is closed last, exactly once, on
-//     every path after acquisition. No SQLite, Feishu, Runtime, bridge or
-//     child is touched here.
+//     private composeAfterAdmission seam. Cut B routes that seam to the live
+//     graph in ./application-composition.ts (compose, start, one durable
+//     discovery tick, wait for a shutdown signal, close); a graph that cannot
+//     be built still reports composition_unavailable. The owner is closed
+//     last, exactly once, on every path after acquisition. No SQLite, Feishu,
+//     Runtime, bridge or child is touched before the composition seam.
 //
 // runStandalone(argv, dependencies) is a test seam, not package API: main
 // passes the real dependencies; tests inject counting ones.
@@ -20,6 +22,7 @@
 import { pathToFileURL } from "node:url";
 
 import { acquireApplicationOwnerLock, type ApplicationOwnerLock } from "./adapters/application-owner-lock.ts";
+import { runStandaloneComposition, type StandaloneCompositionResult } from "./application-composition.ts";
 import { ConfigError, describeConfig, loadConfig } from "./config.ts";
 import {
   StandaloneConfigError,
@@ -30,6 +33,7 @@ import {
 } from "./standalone-config.ts";
 
 const EXIT_HELP = 0;
+const EXIT_OK = 0;
 const EXIT_USAGE = 64;
 const EXIT_REFERENCE = 65;
 const EXIT_FAILURE = 70;
@@ -46,8 +50,9 @@ const HELP = [
   "            70 helper or composition failure; 75 state root owned elsewhere",
 ].join("\n");
 
-/** Cut A composes nothing after admission; later cuts widen this union. */
-export type CompositionResult = { readonly status: "composition_unavailable" };
+/** Cut A reported only composition_unavailable; Cut B adds the closed graph.
+ * `reason` is a static refusal code from the composition, never a path. */
+export type CompositionResult = { readonly status: "composition_unavailable"; readonly reason?: string } | StandaloneCompositionResult;
 
 export type StandaloneDependencies = {
   readonly readConfig: (filename: string) => StandaloneConfigV1;
@@ -82,8 +87,8 @@ function lockMessage(error: unknown): string {
   return `meeting-agent: ${code}`;
 }
 
-async function composeAfterAdmission(): Promise<CompositionResult> {
-  return { status: "composition_unavailable" };
+function composeAfterAdmission(config: StandaloneConfigV1, owner: ApplicationOwnerLock): Promise<CompositionResult> {
+  return runStandaloneComposition(config, owner);
 }
 
 const realDependencies: StandaloneDependencies = {
@@ -132,16 +137,19 @@ export async function runStandalone(argv: readonly string[], dependencies: Stand
     return lockExitCode(error);
   }
 
+  let exit = EXIT_FAILURE;
   try {
     const composition = await dependencies.composeAfterAdmission(config, owner);
-    dependencies.report("stderr", `meeting-agent: ${composition.status}`);
+    const detail = composition.status === "composition_unavailable" && composition.reason !== undefined ? ` ${composition.reason}` : "";
+    dependencies.report("stderr", `meeting-agent: ${composition.status}${detail}`);
+    if (composition.status === "composition_closed" && composition.clean) exit = EXIT_OK;
   } catch {
     dependencies.report("stderr", "meeting-agent: composition failed");
   } finally {
     try { owner.close(); }
-    catch (error) { dependencies.report("stderr", lockMessage(error)); }
+    catch (error) { dependencies.report("stderr", lockMessage(error)); exit = EXIT_FAILURE; }
   }
-  return EXIT_FAILURE;
+  return exit;
 }
 
 function legacyMain(): void {

@@ -12,7 +12,8 @@ import type { MeetingIdentity } from "./domain/meeting.ts";
 import type { BridgeProcessSlot, OwnedBridgeProcess, BridgeShutdownResult } from "./ports/bridge-process.ts";
 import { validateCustodyBinding, type CustodyBinding } from "./contracts/bridge-process-outcome-v1.ts";
 import type { ConversationRuntimePort } from "./ports/conversation-runtime.ts";
-import type { SessionStore } from "./ports/session-store.ts";
+import type { BridgeTransportV2 } from "./ports/bridge-v2.ts";
+import type { BackfillSeedConfig, SessionStore } from "./ports/session-store.ts";
 import { createCoordinator, type Clock, type SessionCoordinator } from "./sessions/coordinator.ts";
 import { createMeetingSession, type MeetingSession } from "./sessions/meeting-session.ts";
 
@@ -60,6 +61,14 @@ export type CreateMeetingAgentApplicationOptions = {
   readonly maxConcurrentSessions?: number;
   readonly bridgeFailureRetryLimit?: number;
   readonly store?: SessionStore;
+  /** Opt-in timed (bridge-session/v2) live evidence. The accepted Runtime SDK
+   * adapter admits only the timed contract, so a composition that connects
+   * the actual SDK must select this; slots then carry the v2 producer and the
+   * session validates every message at runtime. Absent, sessions stay v1. */
+  readonly liveEvidence?: "timed";
+  /** Exact immutable seed inputs for one session, resolved at creation time
+   * from that occurrence's connected Runtime; undefined means no seed. */
+  readonly backfillSeedConfigFor?: (identity: MeetingIdentity) => BackfillSeedConfig | undefined;
 };
 
 export type MeetingAgentApplication = {
@@ -127,9 +136,8 @@ export function createMeetingAgentApplication(
           if (coordinator.get(identity.occurrenceId) === null) coordinator.discover(identity);
           owner.child = await slot.launch(binding);
           if (closed) throw new Error("meeting-agent application is closed");
-          const sessionOptions = {
+          const common = {
             identity,
-            bridge: owner.child.bridge,
             runtime: options.adapters.runtimeFor(identity),
             coordinator,
             clock,
@@ -139,6 +147,14 @@ export function createMeetingAgentApplication(
             disclosureText: "A meeting agent is listening and will create meeting notes.",
             teamVaultDir: options.config.dataPaths.teamVaultDir,
           };
+          const backfillSeedConfig = options.backfillSeedConfigFor?.(identity);
+          // The process port is typed for the v1 control plane; a timed slot
+          // carries the opt-in v2 producer on the same send/subscribe shape and
+          // the session re-validates every message against bridge-session/v2.
+          const seeded = backfillSeedConfig === undefined ? common : { ...common, backfillSeedConfig };
+          const sessionOptions = options.liveEvidence === "timed"
+            ? { ...seeded, bridge: owner.child.bridge as unknown as BridgeTransportV2, timedEvidence: { store } }
+            : { ...seeded, bridge: owner.child.bridge };
           const tracked: { session?: MeetingSession } = {};
           const lifecycleOptions = {
             ...sessionOptions,

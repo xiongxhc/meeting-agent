@@ -86,11 +86,17 @@ function fixture() {
     /** Canonical finalization. `source` is the reconciliation terminal
      * provenance; only "bridge_observed" is an authoritative known end. */
     finalize(source: "bridge_observed" | "local_clock" = "local_clock", outcome: TerminalOutcome = { kind: "advance", toState: "finalizing" },
-      seed?: BackfillSeedFinalizationInput) {
+      seed?: BackfillSeedFinalizationInput, reason?: "ended" | "removed" | "bridge_failure") {
       const recordingPath = writeSource(FINAL);
       openGeneration("bridge-final", FINAL);
       coordinator.finalizeWithRecording(occurrenceId, outcome, recordingInput(FINAL, recordingPath, "bridge-final"),
         "bridge-final", STOPPED_AT_MS, source, seed);
+      // Mirror the session's `finally`: every bridge left completes the
+      // generation as bridge_observed with the bridge's reason (D027).
+      if (source === "bridge_observed") {
+        coordinator.completeReconciliationGeneration(occurrenceId, "bridge-final", STOPPED_AT_MS, source,
+          reason ?? (outcome.kind === "fail" ? outcome.terminalReason as "removed" | "bridge_failure" | "ended" : "ended"));
+      }
       const source_: UnknownEndCustodySource = { kind: "final", occurrenceId };
       return { source: source_, cap: FINAL, recordingPath, exact: identityOf(FINAL, recordingPath), bridgeSessionId: "bridge-final" };
     },
@@ -148,21 +154,50 @@ function deleteWithClaim(recordingsDir: string, claim: UnknownEndCustodyCleanupC
 
 function token(letter: string): string { return letter.repeat(32); }
 
-test("migration 026 adds per-source custody at head with real FK/uniqueness and never assigns implicitly", () => {
+test("migrations 026 and 027 add per-source custody and the generation terminal reason at head and never assign implicitly", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-unknown-end-migrate-"));
   const filename = path.join(dir, "state.db");
   const oldMigrations = path.join(dir, "migrations-025");
   mkdirSync(oldMigrations);
-  cpSync(path.resolve("migrations"), oldMigrations, { recursive: true, filter: (source) => !/^026_/.test(path.basename(source)) });
+  cpSync(path.resolve("migrations"), oldMigrations, { recursive: true, filter: (source) => !/^02[67]_/.test(path.basename(source)) });
   try {
     const old = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
     const identity = buildMeetingIdentity({ providerMeetingId: "legacy", meetingNo: "1", occurrenceStartedAt: STARTED_AT, title: "Legacy", organizer: null });
     old.createSession({ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId, occurrenceStartedAt: identity.occurrenceStartedAt, nowMs: 1 });
+    // A pre-027 bridge_observed terminal (written by the old schema, which had
+    // no reason column) keeps a NULL reason after upgrade.
+    old.beginReconciliationGeneration(identity.occurrenceId, "bridge-legacy", 1);
     assert.equal(old.schemaVersion, 25);
     old.close();
+    const raw025 = new Database(filename);
+    try {
+      raw025.prepare("UPDATE reconciliation_generations SET terminal_at_ms=2, terminal_source='bridge_observed', expires_at_ms=2+1209600000 WHERE occurrence_id=?")
+        .run(identity.occurrenceId);
+    } finally { raw025.close(); }
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 26);
+      assert.equal(upgraded.schemaVersion, 27);
+      const raw027 = new Database(filename, { readonly: true });
+      try {
+        const columns = (raw027.pragma("table_info(reconciliation_generations)") as Array<{ name: string }>).map((column) => column.name);
+        assert.ok(columns.includes("terminal_reason"));
+        assert.deepEqual(raw027.prepare("SELECT terminal_source AS source, terminal_reason AS reason FROM reconciliation_generations").all(),
+          [{ source: "bridge_observed", reason: null }]);
+      } finally { raw027.close(); }
+      // New completions carry the bridge reason exactly: required for bridge_observed, forbidden for local_clock.
+      upgraded.beginReconciliationGeneration(identity.occurrenceId, "bridge-a", 3);
+      upgraded.beginReconciliationGeneration(identity.occurrenceId, "bridge-b", 3);
+      assert.throws(() => upgraded.completeReconciliationGeneration(identity.occurrenceId, "bridge-a", 4, "bridge_observed"), /terminal reason/i);
+      assert.throws(() => upgraded.completeReconciliationGeneration(identity.occurrenceId, "bridge-a", 4, "bridge_observed", "left" as never), /terminal reason/i);
+      assert.throws(() => upgraded.completeReconciliationGeneration(identity.occurrenceId, "bridge-b", 4, "local_clock", "ended"), /terminal reason/i);
+      upgraded.completeReconciliationGeneration(identity.occurrenceId, "bridge-a", 4, "bridge_observed", "removed");
+      upgraded.completeReconciliationGeneration(identity.occurrenceId, "bridge-b", 4, "local_clock");
+      const rawReasons = new Database(filename, { readonly: true });
+      try {
+        assert.deepEqual(rawReasons.prepare("SELECT bridge_session_id AS bridge, terminal_source AS source, terminal_reason AS reason FROM reconciliation_generations ORDER BY bridge").all(),
+          [{ bridge: "bridge-a", source: "bridge_observed", reason: "removed" }, { bridge: "bridge-b", source: "local_clock", reason: null },
+            { bridge: "bridge-legacy", source: "bridge_observed", reason: null }]);
+      } finally { rawReasons.close(); }
       const sql = new Map(upgraded.describeSchema().map((table) => [table.name, table.sql])).get("unknown_end_custody") ?? "";
       assert.match(sql, /STRICT/);
       assert.match(sql, /final_occurrence_id TEXT REFERENCES recordings\(occurrence_id\) ON DELETE RESTRICT/);
@@ -217,7 +252,7 @@ test("first canonical detection T is stable through retry, two handles, reopen, 
       assert.deepEqual(reopened.getUnknownEndCustody(final.source), first.custody);
       // A later trustworthy end on a reopened generation neither extends nor clears the assignment.
       reopened.beginReconciliationGeneration(f.occurrenceId, "bridge-reopen", DETECTED_AT_MS + DAY_MS);
-      reopened.completeReconciliationGeneration(f.occurrenceId, "bridge-reopen", DETECTED_AT_MS + 2 * DAY_MS, "bridge_observed");
+      reopened.completeReconciliationGeneration(f.occurrenceId, "bridge-reopen", DETECTED_AT_MS + 2 * DAY_MS, "bridge_observed", "ended");
       assert.deepEqual(reopened.assignUnknownEndCustody(final.source, DETECTED_AT_MS + 3 * DAY_MS, final.exact), { outcome: "existing", custody: first.custody });
       assert.equal(reopened.claimDueUnknownEndCustodyCleanup(DEADLINE_MS - 1, token("a")), null);
       const due = reopened.claimDueUnknownEndCustodyCleanup(DEADLINE_MS, token("a"));
@@ -311,12 +346,15 @@ test("a known bridge-observed end refuses assignment while removed, failure, loc
     } finally { f.close(); }
   }
   {
+    // The session terminates every bridge `left` as bridge_observed; a failed
+    // attempt's own recording row proves its generation ended in failure.
     const f = fixture();
     try {
       const attempt = f.failAttempt(1);
-      f.store.completeReconciliationGeneration(f.occurrenceId, attempt.bridgeSessionId, STOPPED_AT_MS, "bridge_observed");
-      assert.throws(() => f.store.assignUnknownEndCustody(attempt.source, DETECTED_AT_MS, attempt.exact), /known end/i);
-      assert.equal(f.custodyRows().length, 0);
+      f.store.completeReconciliationGeneration(f.occurrenceId, attempt.bridgeSessionId, STOPPED_AT_MS, "bridge_observed", "bridge_failure");
+      const assigned = f.store.assignUnknownEndCustody(attempt.source, DETECTED_AT_MS, attempt.exact);
+      assert.deepEqual([assigned.outcome, assigned.custody.detectedAtMs], ["assigned", DETECTED_AT_MS]);
+      assert.equal(f.custodyRows().length, 1);
     } finally { f.close(); }
   }
   {
@@ -350,6 +388,44 @@ test("a known bridge-observed end refuses assignment while removed, failure, loc
       assert.equal(assigned.custody.detectedAtMs, DETECTED_AT_MS);
       assert.equal(assigned.custody.deadlineMs, DEADLINE_MS);
       assert.throws(() => f.store.assignUnknownEndCustody(attempt.source, -1, attempt.exact), /clock/i);
+    } finally { f.close(); }
+  }
+});
+
+test("only a positively observed meeting end is a known end: the persisted generation reason, not the session's advance/fail split, decides", () => {
+  const cases: Array<{ name: string; outcome: TerminalOutcome; reason?: "ended" | "removed" | "bridge_failure"; seeded?: true; legacy?: true;
+    refused: boolean; session: { state: string; terminalReason: string | null } }> = [
+    { name: "removed while listening", outcome: { kind: "advance", toState: "finalizing" }, reason: "removed", refused: false,
+      session: { state: "finalizing", terminalReason: null } },
+    { name: "removed before listening", outcome: { kind: "fail", terminalReason: "removed" }, refused: false,
+      session: { state: "failed", terminalReason: "removed" } },
+    { name: "bridge_failure", outcome: { kind: "fail", terminalReason: "bridge_failure" }, refused: false,
+      session: { state: "failed", terminalReason: "bridge_failure" } },
+    { name: "ended while listening (seeded)", outcome: { kind: "advance", toState: "finalizing" }, seeded: true, refused: true,
+      session: { state: "finalizing", terminalReason: null } },
+    { name: "ended before listening", outcome: { kind: "fail", terminalReason: "ended" }, refused: true,
+      session: { state: "failed", terminalReason: "ended" } },
+    { name: "pre-027 bridge_observed row with NULL reason", outcome: { kind: "advance", toState: "finalizing" }, reason: "removed", legacy: true,
+      refused: true, session: { state: "finalizing", terminalReason: null } },
+  ];
+  for (const scenario of cases) {
+    const f = fixture();
+    try {
+      // Every bridge `left` is terminated as bridge_observed, whatever its reason.
+      const final = f.finalize("bridge_observed", scenario.outcome, scenario.seeded ? f.seedInput(new Date(STOPPED_AT_MS).toISOString()) : undefined, scenario.reason);
+      if (scenario.legacy) f.raw((db) => db.prepare("UPDATE reconciliation_generations SET terminal_reason=NULL WHERE occurrence_id=?").run(f.occurrenceId));
+      assert.equal(f.sideEffects().knownEnds, 1, scenario.name);
+      assert.equal(f.sideEffects().seeds, scenario.seeded ? 1 : 0, scenario.name);
+      assert.deepEqual(f.sideEffects().session, scenario.session, scenario.name);
+      if (scenario.refused) {
+        assert.throws(() => f.store.assignUnknownEndCustody(final.source, DETECTED_AT_MS, final.exact), /known end/i, scenario.name);
+        assert.equal(f.custodyRows().length, 0, scenario.name);
+        continue;
+      }
+      const assigned = f.store.assignUnknownEndCustody(final.source, DETECTED_AT_MS, final.exact);
+      assert.deepEqual([assigned.outcome, assigned.custody.detectedAtMs, assigned.custody.deadlineMs], ["assigned", DETECTED_AT_MS, DEADLINE_MS], scenario.name);
+      assert.deepEqual(f.store.assignUnknownEndCustody(final.source, DETECTED_AT_MS + 5_000, final.exact), { outcome: "existing", custody: assigned.custody }, scenario.name);
+      assert.equal(f.sideEffects().seeds, 0, scenario.name);
     } finally { f.close(); }
   }
 });

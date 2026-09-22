@@ -742,7 +742,11 @@ export type SessionStore = {
   getRecordingAlignmentFailure(generationId: string): AlignmentFailure | null;
   beginReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, createdAtMs: number): void;
   setReconciliationRuntimeSession(occurrenceId: string, bridgeSessionId: string, runtimeSessionId: bigint): void;
-  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number, terminalSource: "bridge_observed" | "local_clock"): void;
+  /** `terminalReason` is the bridge's own reason (D027): required and
+   * validated for `bridge_observed`, forbidden for `local_clock`. Only
+   * `ended` is ever an authoritative known end. */
+  completeReconciliationGeneration(occurrenceId: string, bridgeSessionId: string, terminalAtMs: number, terminalSource: "bridge_observed" | "local_clock",
+    terminalReason?: "ended" | "removed" | "bridge_failure"): void;
   appendReconciliationBridgeEvent(occurrenceId: string, event: ReconciliationBridgeEventRow): void;
   appendReconciliationLiveSegment(occurrenceId: string, segment: ReconciliationLiveSegmentRow): void;
   getReconciliationEvidence(occurrenceId: string, recordingHandle: string | null): ReconciliationEvidenceRow | null;

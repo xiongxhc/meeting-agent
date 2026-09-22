@@ -986,7 +986,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         );
         // This bridge generation is over even when recovery will create a
         // fresh one; its local wording must not remain a live generation.
-        coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
+        coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalSource === "bridge_observed" ? reason : undefined);
       } else {
         applyTerminalTransition(reason, terminalAtMs, terminalSource, terminalObservedAt);
       }
@@ -999,7 +999,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // matters most.
       if (reconciliationGenerationStarted) {
         try {
-          coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
+          coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalSource === "bridge_observed" ? reason : undefined);
         } catch (error) {
           routingErrors.push({ source: "join_cleanup", error });
         }
@@ -1056,7 +1056,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         coordinator.advance(identity.occurrenceId, outcome.toState);
       }
     } finally {
-      coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
+      coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalSource === "bridge_observed" ? reason : undefined);
     }
   }
 

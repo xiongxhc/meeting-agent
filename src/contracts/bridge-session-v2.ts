@@ -1,4 +1,4 @@
-import type { BridgeCommand, BridgeEvent } from "./bridge-session-v1.ts";
+import type { BridgeCommand, BridgeEvent, BridgeRejectionCode } from "./bridge-session-v1.ts";
 import { parseCommandShape, parseEventShape } from "./bridge-session-v1.ts";
 
 export const BRIDGE_SESSION_SCHEMA_V2 = "bridge-session/v2";
@@ -94,4 +94,92 @@ export function parseEventV2(input: unknown): BridgeEventMessageV2 {
     if (!parseEventShape({ ...legacy, schema: "bridge-session/v1" }).ok) fail();
   } else if (!parseEventShape({ ...value, schema: "bridge-session/v1" }).ok) fail();
   return input as BridgeEventMessageV2;
+}
+
+/**
+ * Session-scoped bridge-session/v2 stream validator: the v1 fences (exact
+ * schema literal, session id, issued command ids, strictly increasing event
+ * sequence, closed shapes) over the v2 grammar, returning the v1-style result
+ * so a transport can classify on `code` rather than on a thrown string.
+ * Beyond v1 it also rejects a command id issued twice and the v2 line bounds
+ * (65536-byte commands, 4096-byte events), which parseCommandV2/parseEventV2
+ * already enforce.
+ */
+export type BridgeRejectionCodeV2 = BridgeRejectionCode | "message_too_large" | "media_lease" | "v2_payload" | "command_id_duplicate";
+export type BridgeRejectionV2 = { code: BridgeRejectionCodeV2; path: string; detail: string };
+export type BridgeResultV2<T> = { ok: true; value: T } | { ok: false; rejection: BridgeRejectionV2 };
+export interface BridgeSessionValidatorV2 {
+  readonly sessionId: string;
+  acceptCommand(input: unknown): BridgeResultV2<BridgeCommandMessageV2>;
+  acceptEvent(input: unknown): BridgeResultV2<BridgeEventMessageV2>;
+}
+
+function rejectV2(code: BridgeRejectionCodeV2, path: string, detail: string): { ok: false; rejection: BridgeRejectionV2 } {
+  return { ok: false, rejection: { code, path, detail } };
+}
+function envelopeRejection(input: unknown, cap: number): BridgeRejectionV2 | null {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return { code: "not_an_object", path: "", detail: "expected a JSON object" };
+  const value = input as Record<string, unknown>;
+  if (!Object.hasOwn(value, "schema")) return { code: "missing_field", path: "/schema", detail: "schema is required" };
+  if (value.schema !== BRIDGE_SESSION_SCHEMA_V2) return { code: "schema_unknown", path: "/schema", detail: `expected ${BRIDGE_SESSION_SCHEMA_V2}` };
+  let bytes: number;
+  try { bytes = Buffer.byteLength(JSON.stringify(value)); } catch { return { code: "not_an_object", path: "", detail: "expected a JSON-serialisable object" }; }
+  if (bytes > cap) return { code: "message_too_large", path: "", detail: `expected at most ${cap} bytes` };
+  return null;
+}
+/** Explains a parseCommandV2 failure with the v1 rejection where the v1 grammar applies. */
+function commandRejection(value: Record<string, unknown>): BridgeRejectionV2 {
+  if (value.type === "connect_media") {
+    if (!Object.hasOwn(value, "mediaLease")) return { code: "missing_field", path: "/mediaLease", detail: "mediaLease is required" };
+    return { code: "media_lease", path: "/mediaLease", detail: "connect_media carries exactly schema, sessionId, commandId, type and a timed media lease" };
+  }
+  const legacy = parseCommandShape({ ...value, schema: "bridge-session/v1" });
+  return legacy.ok ? { code: "v2_payload", path: "", detail: "command violates bridge-session/v2" } : legacy.rejection;
+}
+/** Explains a parseEventV2 failure with the v1 rejection where the v1 grammar applies. */
+function eventRejection(value: Record<string, unknown>): BridgeRejectionV2 {
+  if (value.type === "ui_snapshot") {
+    const legacy = parseEventShape({ schema: "bridge-session/v1", sessionId: value.sessionId, sequence: value.sequence, observedAt: value.observedAt, type: "media_disconnected", reason: "validation" });
+    return legacy.ok ? { code: "v2_payload", path: "", detail: "ui_snapshot violates bridge-session/v2" } : legacy.rejection;
+  }
+  const legacyFields: Record<string, unknown> = { ...value, schema: "bridge-session/v1" };
+  if (uiTypes.has(value.type as string)) {
+    delete legacyFields.observationTiming; delete legacyFields.observationTimingReason;
+    const legacy = parseEventShape(legacyFields);
+    return legacy.ok
+      ? { code: "v2_payload", path: "/observationTiming", detail: "ui-derived events carry observationTiming or an explicit timing_unavailable reason" }
+      : legacy.rejection;
+  }
+  const legacy = parseEventShape(legacyFields);
+  return legacy.ok ? { code: "v2_payload", path: "", detail: "event violates bridge-session/v2" } : legacy.rejection;
+}
+
+export function createBridgeSessionValidatorV2(sessionId: string): BridgeSessionValidatorV2 {
+  const issued = new Set<string>();
+  let lastSequence = 0;
+  return {
+    sessionId,
+    acceptCommand(input) {
+      const envelopeFailure = envelopeRejection(input, 65536);
+      if (envelopeFailure !== null) return { ok: false, rejection: envelopeFailure };
+      let message: BridgeCommandMessageV2;
+      try { message = parseCommandV2(input); } catch { return { ok: false, rejection: commandRejection(input as Record<string, unknown>) }; }
+      if (message.sessionId !== sessionId) return rejectV2("session_mismatch", "/sessionId", `expected session ${sessionId}`);
+      if (issued.has(message.commandId)) return rejectV2("command_id_duplicate", "/commandId", `command ${message.commandId} was already issued in this session`);
+      issued.add(message.commandId);
+      return { ok: true, value: message };
+    },
+    acceptEvent(input) {
+      const envelopeFailure = envelopeRejection(input, 4096);
+      if (envelopeFailure !== null) return { ok: false, rejection: envelopeFailure };
+      let event: BridgeEventMessageV2;
+      try { event = parseEventV2(input); } catch { return { ok: false, rejection: eventRejection(input as Record<string, unknown>) }; }
+      if (event.sessionId !== sessionId) return rejectV2("session_mismatch", "/sessionId", `expected session ${sessionId}`);
+      if (event.sequence === lastSequence) return rejectV2("sequence_duplicate", "/sequence", `sequence ${event.sequence} was already observed`);
+      if (event.sequence < lastSequence) return rejectV2("sequence_out_of_order", "/sequence", `sequence ${event.sequence} is behind ${lastSequence}`);
+      if (event.type === "command_result" && !issued.has(event.commandId)) return rejectV2("unknown_command_id", "/commandId", `no command ${event.commandId} was issued in this session`);
+      lastSequence = event.sequence;
+      return { ok: true, value: event };
+    },
+  };
 }

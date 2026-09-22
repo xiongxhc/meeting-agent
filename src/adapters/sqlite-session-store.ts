@@ -225,7 +225,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     getRecordingAlignmentFailure: (generationId) => getRecordingAlignmentFailure(db, generationId),
     beginReconciliationGeneration: (occurrenceId, bridgeSessionId, createdAtMs) => beginReconciliationGeneration(db, occurrenceId, bridgeSessionId, createdAtMs),
     setReconciliationRuntimeSession: (occurrenceId, bridgeSessionId, runtimeSessionId) => setReconciliationRuntimeSession(db, occurrenceId, bridgeSessionId, runtimeSessionId),
-    completeReconciliationGeneration: (occurrenceId, bridgeSessionId, terminalAtMs, terminalSource) => completeReconciliationGeneration(db, occurrenceId, bridgeSessionId, terminalAtMs, terminalSource),
+    completeReconciliationGeneration: (occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalReason) => completeReconciliationGeneration(db, occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalReason),
     appendReconciliationBridgeEvent: (occurrenceId, event) => appendReconciliationBridgeEvent(db, occurrenceId, event),
     appendReconciliationLiveSegment: (occurrenceId, segment) => appendReconciliationLiveSegment(db, occurrenceId, segment),
     getReconciliationEvidence: (occurrenceId, recordingHandle) => getReconciliationEvidence(db, occurrenceId, recordingHandle),
@@ -2530,12 +2530,32 @@ function setReconciliationRuntimeSession(db: Database.Database, occurrenceId: st
   if (changed !== 1) throw new OrchestrationError("constraint_violation", "reconciliation generation is unknown or already has a runtime session");
 }
 
-function completeReconciliationGeneration(db: Database.Database, occurrenceId: string, bridgeSessionId: string, terminalAtMs: number, terminalSource: "bridge_observed" | "local_clock"): void {
-  const changed = db.prepare(
-    `UPDATE reconciliation_generations SET terminal_at_ms = ?, terminal_source = ?, expires_at_ms = ?
+const GENERATION_TERMINAL_REASONS: ReadonlySet<string> = new Set(["ended", "removed", "bridge_failure"]);
+
+/** D027: a bridge_observed completion carries the bridge's own reason; a
+ * local_clock completion carries none. `finalizeSession` may already have
+ * written the same bridge_observed terminal without a reason (the session's
+ * `finally` completes the generation afterwards), so the reason is also
+ * filled onto that exact terminal when it is still NULL. */
+function completeReconciliationGeneration(db: Database.Database, occurrenceId: string, bridgeSessionId: string, terminalAtMs: number,
+  terminalSource: "bridge_observed" | "local_clock", terminalReason?: "ended" | "removed" | "bridge_failure"): void {
+  if (terminalSource === "bridge_observed"
+    ? (typeof terminalReason !== "string" || !GENERATION_TERMINAL_REASONS.has(terminalReason))
+    : terminalReason !== undefined) {
+    throw new OrchestrationError("constraint_violation", "reconciliation terminal reason must accompany exactly a bridge-observed terminal");
+  }
+  const generationId = reconciliationGenerationId(occurrenceId, bridgeSessionId);
+  let changed = db.prepare(
+    `UPDATE reconciliation_generations SET terminal_at_ms = ?, terminal_source = ?, terminal_reason = ?, expires_at_ms = ?
      WHERE generation_id = ? AND occurrence_id = ? AND terminal_at_ms IS NULL`,
-  ).run(terminalAtMs, terminalSource, terminalAtMs + RECONCILIATION_EVIDENCE_RETENTION_MS,
-    reconciliationGenerationId(occurrenceId, bridgeSessionId), occurrenceId).changes;
+  ).run(terminalAtMs, terminalSource, terminalReason ?? null, terminalAtMs + RECONCILIATION_EVIDENCE_RETENTION_MS,
+    generationId, occurrenceId).changes;
+  if (changed !== 1 && terminalReason !== undefined) {
+    changed = db.prepare(
+      `UPDATE reconciliation_generations SET terminal_reason = ?
+       WHERE generation_id = ? AND occurrence_id = ? AND terminal_at_ms = ? AND terminal_source = 'bridge_observed' AND terminal_reason IS NULL`,
+    ).run(terminalReason, generationId, occurrenceId, terminalAtMs).changes;
+  }
   if (changed !== 1) {
     const existing = db.prepare("SELECT 1 FROM reconciliation_generations WHERE generation_id = ? AND occurrence_id = ?")
       .get(reconciliationGenerationId(occurrenceId, bridgeSessionId), occurrenceId);
@@ -3275,18 +3295,22 @@ function inspectUnknownEndSource(canonicalPath: string): { readonly bytes: numbe
   }
 }
 
-/** Only a bridge-observed terminal is an authoritative end. Removed, bridge
- * failure, local-clock and finalization instants are not ends; a legacy
- * terminal of unknown provenance is ambiguous and refused. The canonical
- * source answers to the occurrence's generations; a failed attempt answers to
- * the generation bound to its own handle, because its generation ended in a
- * bridge failure rather than an observed end. */
+/** Only a positively observed meeting end is an authoritative end (D027). The
+ * session terminates EVERY bridge `left` as a bridge_observed terminal
+ * whatever its reason, so the persisted generation `terminal_reason` decides:
+ * `ended` is a known end; `removed` and `bridge_failure` are not, regardless
+ * of the session's advance/fail split; a pre-027 bridge_observed row with a
+ * NULL reason stays fail-closed. Local-clock and finalization instants are not
+ * ends. A failed attempt's own recording row proves its generation ended in
+ * bridge failure, so no observed end is possible for it. A legacy terminal of
+ * unknown provenance is ambiguous and refused. */
 function refuseUnknownEndIfKnownOrOwned(db: Database.Database, key: UnknownEndCustodyKey, handle: string): void {
   const terminals = (key.kind === "final"
-    ? db.prepare("SELECT terminal_source FROM reconciliation_generations WHERE occurrence_id=? AND terminal_source IS NOT NULL").all(key.occurrenceId)
-    : db.prepare("SELECT terminal_source FROM reconciliation_generations WHERE occurrence_id=? AND recording_handle=? AND terminal_source IS NOT NULL")
-      .all(key.occurrenceId, handle)) as Array<{ terminal_source: string }>;
-  if (terminals.some((row) => row.terminal_source === "bridge_observed")) {
+    ? db.prepare("SELECT terminal_source, terminal_reason FROM reconciliation_generations WHERE occurrence_id=? AND terminal_source IS NOT NULL").all(key.occurrenceId)
+    : db.prepare("SELECT terminal_source, terminal_reason FROM reconciliation_generations WHERE occurrence_id=? AND recording_handle=? AND terminal_source IS NOT NULL")
+      .all(key.occurrenceId, handle)) as Array<{ terminal_source: string; terminal_reason: string | null }>;
+  if (key.kind === "final" && terminals.some((row) => row.terminal_source === "bridge_observed" &&
+      (row.terminal_reason === "ended" || row.terminal_reason === null))) {
     throw custodyViolation("unknown-end custody refuses a source with an authoritative known end");
   }
   if (terminals.some((row) => row.terminal_source === "legacy_unknown")) {
