@@ -21,7 +21,9 @@
 //
 // What this file deliberately does not do: reimplement the accepted SDK
 // adapter, bridge child adapter, ingress, metadata resolver or discovery
-// worker; read provider or recording keys; schedule maintenance lanes (Cut C).
+// worker; read provider or recording keys; own the maintenance lanes' logic
+// (src/application-maintenance.ts, Cut C, is constructed here and started/
+// closed in the accepted order).
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import path from "node:path";
@@ -36,8 +38,10 @@ import { createFeishuOrganizerMetadata } from "./adapters/feishu-organizer-metad
 import { createFeishuSocketOwner, type FeishuSocketOwner } from "./adapters/feishu-sdk-connection.ts";
 import { createFeishuSdkHttp, type FeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
 import { openSessionStore } from "./adapters/sqlite-session-store.ts";
+import { createApplicationMaintenance, type MaintenanceLane, type MaintenanceOptions, type MaintenanceStatus } from "./application-maintenance.ts";
 import { createMeetingAgentApplication, type MeetingAgentApplication } from "./application.ts";
 import { RedactedSecret, type MeetingAgentConfig } from "./config.ts";
+import type { NotificationSender } from "./delivery/notification-worker.ts";
 import { buildMeetingIdentity, type MeetingIdentity } from "./domain/meeting.ts";
 import type { BridgeProcessSlot, OwnedBridgeProcess } from "./ports/bridge-process.ts";
 import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "./ports/conversation-runtime.ts";
@@ -87,6 +91,9 @@ export type ComposeApplicationOptions = {
   readonly metadata?: FeishuOrganizerLookup;
   readonly organizerReferences?: readonly OrganizerReferenceEntry[];
   readonly discoveryJitter?: () => number;
+  /** Cut C lane seams (cadence, jitter, backfill peer, sink); the sender seam
+   * replaces the accepted Feishu sender only in tests. */
+  readonly maintenance?: MaintenanceOptions & { readonly notificationSender?: NotificationSender };
   /** Static lifecycle codes only; never paths, identities or secrets. */
   readonly log?: (code: string) => void;
 };
@@ -120,6 +127,10 @@ export type ComposedApplication = {
   liveOccurrenceIds(): readonly string[];
   occurrenceOutcomes(): readonly OccurrenceOutcome[];
   awaitOccurrence(occurrenceId: string): Promise<OccurrenceOutcome>;
+  /** Cut C: static per-lane counters (cadence, delay, outcomes, custody settlements). */
+  maintenanceStatus(): MaintenanceStatus;
+  /** Cut C: run (or join) one lane tick now; resolves to its static outcome code. */
+  maintenanceTick(lane: MaintenanceLane): Promise<string>;
   close(): Promise<void>;
 };
 
@@ -548,6 +559,30 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     } catch { store.close(); storeOpen = false; throw new Error("feishu_scope_invalid"); }
   }
 
+  // Cut C: the organizer sender is composed only when supplied. The tenant
+  // token credential operation belongs in an exact Feishu adapter (the
+  // boundary scanner admits the SDK nowhere else) and Meeting holds no
+  // accepted REST endpoint binding; until both exist the notification lane
+  // claims nothing and reports `notification_sender_unavailable`.
+  const notificationSender = options.maintenance?.notificationSender;
+  if (notificationSender === undefined) log("notification_sender_unavailable");
+  let maintenance: ReturnType<typeof createApplicationMaintenance>;
+  try { maintenance = createApplicationMaintenance({
+    store, clock, dataPaths: { recordingsDir: dataPaths.recordingsDir, outboxDir: dataPaths.outboxDir, receiptsDir: dataPaths.receiptsDir },
+    runtime: { launcherPath: config.runtime.launcherPath, gatewayConfigPath: config.runtime.gatewayConfigPath },
+    env: allowlistedEnvironment(), log, ...(notificationSender === undefined ? {} : { notificationSender }),
+    discover: () => discoverTick(),
+    supervisor: {
+      assertOwnership: () => owner.assertCurrentOwnership(),
+      occurrenceIsLive: (occurrenceId) => { const entry = entries.get(occurrenceId); return entry !== undefined && entry.phase !== "settled"; },
+      holdsFinalizedRecording: () => [...entries.values()].some((entry) => entry.phase !== "settled" && entry.session !== null && entry.session.state().recording !== null),
+    },
+    ...(options.maintenance ? { options: options.maintenance } : {}),
+  }); } catch (error) {
+    if (ownsHttp) void http.close().catch(() => undefined);
+    store.close(); storeOpen = false; throw error;
+  }
+
   function freeSlot(): BridgeProcessSlot | null {
     const latest = new Map<string, { claimedAtMs: number; state: "quarantined" | "cleared" }>();
     for (const row of store.listPhysicalCustody()) {
@@ -681,10 +716,14 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       if (closing) throw new Error("composition_closed");
       if (started) throw new Error("composition_already_started");
       started = true;
+      // Maintenance lanes start before, and never wait on, Feishu ingress readiness.
+      maintenance.start();
       if (ingress !== null) await ingress.start();
       log("composition_started");
     },
     discover: discoverTick,
+    maintenanceStatus: () => maintenance.status(),
+    maintenanceTick: (lane) => maintenance.tick(lane),
     retryInviteMetadata(occurrenceId, operator) {
       if (closing) throw new Error("composition_closed");
       return store.retryInviteMetadata(occurrenceId, operator, clock.now());
@@ -703,6 +742,13 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
         options.shutdownSignal?.removeEventListener("abort", onExternalShutdown);
         ingress?.dispatcher.fence();
         log("shutdown_fenced");
+        // Cut C: fence ticks, cancel/await every lane and its worker (backfill
+        // awaits its child cleanup) before any other owner or the store closes.
+        try { await maintenance.close(); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          for (const code of (/^maintenance_close_failed:(.+)$/.exec(message)?.[1] ?? "maintenance_close_failed").split(",")) failures.add(code);
+        }
         if (discoveryInFlight !== null) await discoveryInFlight.catch(() => undefined);
         if (!await discovery.close()) failures.add("discovery_close_unconfirmed");
         log("shutdown_owned_work_settled");
