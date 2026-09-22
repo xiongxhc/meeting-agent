@@ -54,6 +54,7 @@
 // warnings (a conflicted cluster, a straddling segment) are on the record but
 // are not incompleteness: re-running the reconciliation would not change them.
 
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import { createOwnedUiExactMs } from "../domain/attribution-evidence.ts";
 import { reduceAttendance, type AttendanceInterval } from "../domain/participants.ts";
 import {
@@ -320,12 +321,14 @@ export async function reconcilePersistedSpeakers(input: {
 
 /** Read-only final consumer. The caller must already have closed/reaped live
  * ownership; this function never recovers a writer or starts an alignment read. */
-export async function reconcilePersistedTimedSpeakers(input: {
+type ClosedTimedEvidenceInput = {
   readonly occurrenceId: string; readonly bridgeSessionId: string; readonly recordingHandle: string;
   readonly store: Pick<SessionStore, "getRecordingRecovery" | "getTimedEvidenceBinding" | "getTimedEvidenceStatus" |
     "getSelectedAlignment" | "readSelectedAlignmentPage" | "readTimedUi" | "readTimedFinal" | "getRecording" | "getBridgeFailureRecording">;
-  readonly runtime: FinalizedRecordingRuntime; readonly nowMs: () => number; readonly signal?: AbortSignal;
-}): Promise<TimedReconciledTranscript> {
+  readonly nowMs: () => number; readonly signal?: AbortSignal;
+};
+
+function closedTimedEvidence(input: ClosedTimedEvidenceInput) {
   const { store } = input;
   const recovery = store.getRecordingRecovery(input.occurrenceId, input.bridgeSessionId, input.recordingHandle);
   if (!recovery) throw new Error("final recording recovery unavailable");
@@ -351,6 +354,56 @@ export async function reconcilePersistedTimedSpeakers(input: {
     return { binding: descriptor.binding, status, now };
   }
   check();
+  return { recovery, recording, selected, check };
+}
+
+/** Repeats the complete closed binding/selection fence without reading payloads. */
+export function assertClosedTimedEvidence(input: ClosedTimedEvidenceInput) {
+  const fence = closedTimedEvidence(input);
+  fence.check();
+  return fence.selected;
+}
+
+/** Streams only bounded participant join/leave projections from closed UI
+ * evidence. Active-speaker and all other potentially large payloads are
+ * discarded page-by-page. */
+export async function readClosedTimedAttendance(input: ClosedTimedEvidenceInput): Promise<{
+  readonly attendance: readonly AttendanceInterval[];
+  readonly selectedAlignment: ReturnType<typeof assertClosedTimedEvidence>;
+}> {
+  const fence = closedTimedEvidence(input);
+  const projected: Parameters<typeof reduceAttendance>[0][number][] = [];
+  let after = 0, rows = 0;
+  for (;;) {
+    const { binding, now } = fence.check();
+    const page = input.store.readTimedUi(binding, after, now);
+    if (page.length === 0) break;
+    if (page.length > 8) throw new Error("invalid bounded UI page");
+    for (const event of page) {
+      fence.check();
+      if (event.sequence <= after || ++rows > 65_536) throw new Error("invalid bounded UI keyset cursor");
+      after = event.sequence;
+      if (event.type === "participant_joined" && event.feishuUserId !== null && event.displayName !== null) {
+        projected.push({ type: "participant_joined", feishuUserId: event.feishuUserId,
+          displayName: event.displayName, occurredAt: event.observedAt, sequence: event.sequence,
+          bridgeSessionId: event.sessionId });
+      } else if (event.type === "participant_left" && event.feishuUserId !== null) {
+        projected.push({ type: "participant_left", feishuUserId: event.feishuUserId,
+          occurredAt: event.observedAt, sequence: event.sequence, bridgeSessionId: event.sessionId });
+      }
+    }
+    await yieldImmediate(undefined, input.signal ? { signal: input.signal } : undefined);
+  }
+  fence.check();
+  return { attendance: reduceAttendance(projected), selectedAlignment: fence.selected };
+}
+
+export async function reconcilePersistedTimedSpeakers(input: ClosedTimedEvidenceInput & {
+  readonly runtime: FinalizedRecordingRuntime;
+}): Promise<TimedReconciledTranscript> {
+  const { store } = input;
+  const fence = closedTimedEvidence(input);
+  const { recovery, recording, selected, check } = fence;
   const live: VersionFourVoiceTranscriptFinalEvent[] = [];
   let after = "";
   for (;;) {

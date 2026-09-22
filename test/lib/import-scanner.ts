@@ -89,6 +89,7 @@ const WRITE_LIKE_METHOD_NAMES = new Set([
   "rmdirSync",
   "unlink",
   "unlinkSync",
+  "linkSync",
   "createWriteStream",
   "mkdir",
   "mkdirSync",
@@ -578,15 +579,17 @@ export function findOpaqueConstructs(
 }
 
 /** Explicit owners of filesystem writes. The application may create its own
- * outbox directory; the future outbox adapter owns durable publication. No
- * Team Vault module appears here, so its read-only git index cannot gain an
- * fs write capability by renaming a path variable. */
+ * outbox directory; the filesystem adapters own durable publication and
+ * private operator warnings. No Team Vault module appears here, so its
+ * read-only git index cannot gain an fs write capability by renaming a path
+ * variable. */
 export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string>>> = {
   "src/adapters/child-bridge-process.ts": new Set(["mkdtempSync", "writeFileSync", "unlinkSync", "rmdirSync"]),
   "src/application.ts": new Set(["mkdir", "mkdirSync"]),
   "src/adapters/filesystem-outbox.ts": new Set([
     "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "rmdirSync", "writeFile", "writeFileSync",
   ]),
+  "src/adapters/filesystem-operator-warning.ts": new Set(["linkSync", "mkdirSync", "unlinkSync", "writeFileSync"]),
 };
 
 /** Direct HTTP is an adapter capability, never an endpoint-text exception. */

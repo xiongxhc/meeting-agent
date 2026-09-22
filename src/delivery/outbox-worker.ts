@@ -2,44 +2,23 @@
 // receipt is deliberately the only thing this worker ever does beyond it.
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
-import { deleteDeliveredEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
+import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
 import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
 import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { notificationRequestUuid } from "./notification-worker.ts";
-import type { AcceptPublicationInput } from "../ports/session-store.ts";
+import type { AcceptPublicationInput, BackfillDeliveryAuthority, BackfillSeedCleanupClaim, DeliveryRow as StoreDeliveryRow, SavePendingDeliveryResult } from "../ports/session-store.ts";
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
-export type DeliveryRow = {
-  readonly occurrenceId: string;
-  readonly revision: number;
-  readonly artifactHash: string;
-  readonly recordingPath: string;
-  readonly bundlePath: string;
-  readonly endedAtMs: number;
-  readonly transcriptComplete: boolean;
-  readonly retryCount: number;
-  readonly nextRetryAtMs: number;
-  readonly retryReason: "receipt_unavailable" | "recovery_unavailable" | null;
-  readonly publishedAtMs: number | null;
-  readonly deletedAtMs: number | null;
-  readonly publicationUrl: string | null;
-  readonly vaultCommit: string | null;
-  /** Exact canonical bytes retained only until this occurrence is deleted. */
-  readonly recoveryArtifact: string | null;
-  /** Durable capability that owns the private pre-READY stage. */
-  readonly stageToken: string | null;
-  /** Persisted Runtime handle binding the direct-child encrypted recording. */
-  readonly recordingHandle?: string | null;
-};
+export type DeliveryRow = StoreDeliveryRow;
 
 /** R68's storage seam: the SQLite adapter is the production implementation. */
 export type DeliveryJournal = {
-  savePending(row: DeliveryRow): void;
+  savePending(row: DeliveryRow, authority?: BackfillDeliveryAuthority): SavePendingDeliveryResult;
   pending(): readonly DeliveryRow[];
   /** Audio is already deleted, but canonical metadata remains until an intent
    * or honest terminal classification commits. */
@@ -48,6 +27,9 @@ export type DeliveryJournal = {
   /** Publication evidence, legal state transition and notification intent
    * must commit as one operation before cleanup is allowed. */
   acceptPublication(input: AcceptPublicationInput): void;
+  claimExpiredBackfillSeedCleanup(input: { readonly nowMs: number; readonly claimToken: string }): BackfillSeedCleanupClaim | null;
+  completeBackfillSeedCleanup(input: { readonly occurrenceId: string; readonly claimToken: string; readonly nowMs: number }): void;
+  authorizeDeliveryEvidenceCleanup(input: { readonly occurrenceId: string; readonly nowMs: number }): boolean;
 };
 
 export type OutboxWorker = {
@@ -56,6 +38,7 @@ export type OutboxWorker = {
     readonly serializedArtifact: string;
     readonly artifactHash: string;
     readonly recordingPath: string;
+    readonly backfillAuthority?: BackfillDeliveryAuthority;
   }): string;
   reconcile(): void;
 };
@@ -70,56 +53,65 @@ export function createOutboxWorker(options: {
   readonly random: () => number;
   readonly session: { state(occurrenceId: string): string | null; publish(occurrenceId: string): void };
   readonly reconciliationEvidence: { purgeExpiredReconciliationEvidence(nowMs: number): number };
-  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed") => void;
+  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed" | "backfill_seed_cleanup_failed") => void;
 }): OutboxWorker {
   if (options.reconciliationEvidence === undefined) throw new Error("reconciliation purge dependency is required");
   if (typeof options.journal.acceptPublication !== "function") throw new Error("atomic publication and notification intent journal capability is required");
   const recordingOwners = new Map<string, string>();
   return {
     enqueue(input): string {
-      const existing = options.journal.pending().find((row) => row.occurrenceId === input.artifact.occurrence_id && row.revision === input.artifact.revision);
-      if (existing !== undefined) {
-        if (existing.artifactHash !== input.artifactHash) throw new Error("artifact revision is immutable: conflicting content");
+      let requestedArtifact: SupportedTeamMemMeetingArtifact;
+      try { requestedArtifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(input.serializedArtifact)); }
+      catch { throw new Error("delivery recovery artifact is invalid"); }
+      if (canonicalArtifactJson(requestedArtifact) !== input.serializedArtifact ||
+          canonicalArtifactJson(input.artifact) !== input.serializedArtifact ||
+          canonicalArtifactHash(requestedArtifact) !== input.artifactHash) {
+        throw new Error("delivery artifact bytes or hash are not canonical");
       }
       const bundlePath = path.join(path.resolve(options.outboxDir), occurrencePathSegment(input.artifact.occurrence_id as `${string}@${string}`), String(input.artifact.revision));
-      if (existing === undefined) {
-        const owner = recordingOwners.get(path.resolve(input.recordingPath));
-        if (owner !== undefined && owner !== input.artifact.occurrence_id) throw new Error("recording is owned by another occurrence");
-        if (Buffer.byteLength(input.serializedArtifact, "utf8") > MAX_RECOVERY_ARTIFACT_BYTES) throw new Error("recovery artifact exceeds retention bound");
-        const stageToken = randomUUID().replaceAll("-", "");
-        // The journal intent precedes the filesystem visibility commit. A
-        // save failure therefore cannot strand a READY bundle undiscoverable
-        // to polling, retry, or deadline cleanup after restart.
-        options.journal.savePending({
-          occurrenceId: input.artifact.occurrence_id,
-          revision: input.artifact.revision,
-          artifactHash: input.artifactHash,
-          recordingPath: input.recordingPath,
-          bundlePath,
-          endedAtMs: Date.parse(input.artifact.ended_at),
-          transcriptComplete: input.artifact.transcript_complete,
-          retryCount: 0,
-          nextRetryAtMs: options.clock.now(),
-          retryReason: null,
-          publishedAtMs: null,
-          deletedAtMs: null,
-          publicationUrl: null,
-          vaultCommit: null,
-          recoveryArtifact: input.serializedArtifact,
-          stageToken,
-          recordingHandle: recordingHandleFromPath(input.recordingPath),
-        });
-        recordingOwners.set(path.resolve(input.recordingPath), input.artifact.occurrence_id);
+      const owner = recordingOwners.get(path.resolve(input.recordingPath));
+      if (owner !== undefined && owner !== input.artifact.occurrence_id) throw new Error("recording is owned by another occurrence");
+      if (Buffer.byteLength(input.serializedArtifact, "utf8") > MAX_RECOVERY_ARTIFACT_BYTES) throw new Error("recovery artifact exceeds retention bound");
+      // The journal validates/fences the canonical intent before filesystem
+      // visibility. Its returned row is also replay authority after a crash;
+      // caller bytes are never substituted for persisted bytes.
+      const saved = options.journal.savePending({
+        occurrenceId: requestedArtifact.occurrence_id,
+        revision: requestedArtifact.revision,
+        artifactHash: input.artifactHash,
+        recordingPath: input.recordingPath,
+        bundlePath,
+        endedAtMs: Date.parse(requestedArtifact.ended_at),
+        transcriptComplete: requestedArtifact.transcript_complete,
+        retryCount: 0,
+        nextRetryAtMs: options.clock.now(),
+        retryReason: null,
+        publishedAtMs: null,
+        deletedAtMs: null,
+        publicationUrl: null,
+        vaultCommit: null,
+        recoveryArtifact: input.serializedArtifact,
+        stageToken: randomUUID().replaceAll("-", ""),
+        recordingHandle: recordingHandleFromPath(input.recordingPath),
+      }, input.backfillAuthority);
+      const row = saved.row;
+      if (row.deletedAtMs !== null || row.recoveryArtifact === null || row.stageToken === null ||
+          row.occurrenceId !== requestedArtifact.occurrence_id || row.revision !== requestedArtifact.revision ||
+          row.bundlePath !== bundlePath) throw new Error("delivery journal returned an unsafe canonical intent");
+      let persistedArtifact: SupportedTeamMemMeetingArtifact;
+      try { persistedArtifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact)); }
+      catch { throw new Error("delivery journal retained invalid canonical bytes"); }
+      if (canonicalArtifactJson(persistedArtifact) !== row.recoveryArtifact || canonicalArtifactHash(persistedArtifact) !== row.artifactHash) {
+        throw new Error("delivery journal retained conflicting canonical bytes");
       }
-      const row = existing ?? options.journal.pending().find((candidate) => candidate.occurrenceId === input.artifact.occurrence_id && candidate.revision === input.artifact.revision);
-      if (row === undefined) throw new Error("delivery journal did not retain pending intent");
+      recordingOwners.set(path.resolve(row.recordingPath), row.occurrenceId);
       const written = writeMeetingBundle({
         recordingsDir: options.recordingsDir,
         outboxDir: options.outboxDir,
-        artifact: input.artifact,
-        serializedArtifact: input.serializedArtifact,
-        artifactHash: input.artifactHash,
-        recordingPath: input.recordingPath,
+        artifact: persistedArtifact,
+        serializedArtifact: row.recoveryArtifact,
+        artifactHash: row.artifactHash,
+        recordingPath: row.recordingPath,
         ...(row.recordingHandle === null || row.recordingHandle === undefined ? {} : { recordingHandle: row.recordingHandle }),
         ...(row.stageToken === null ? {} : { stageToken: row.stageToken }),
       });
@@ -130,6 +122,22 @@ export function createOutboxWorker(options: {
     reconcile(): void {
       const now = options.clock.now();
       try { options.reconciliationEvidence.purgeExpiredReconciliationEvidence(now); } catch { options.onMaintenanceFailure?.("reconciliation_evidence_purge_failed"); }
+      const cleanupToken = randomUUID().replaceAll("-", "");
+      const seedCleanup = options.journal.claimExpiredBackfillSeedCleanup({ nowMs: now, claimToken: cleanupToken });
+      if (seedCleanup !== null) {
+        try {
+          deleteSeedRecordingEvidence({ recordingsDir: options.recordingsDir,
+            recordingPath: seedCleanup.recordingPath, recordingHandle: seedCleanup.recordingHandle,
+            recordingBytes: seedCleanup.recordingBytes, recordingDevice: seedCleanup.recordingDevice,
+            recordingInode: seedCleanup.recordingInode });
+          options.journal.completeBackfillSeedCleanup({ occurrenceId: seedCleanup.occurrenceId,
+            claimToken: seedCleanup.claimToken, nowMs: now });
+        } catch {
+          // Retain the fixed lease and exact tombstone for reopen/reclaim, but
+          // keep the blocked custody operation visible to the existing owner.
+          options.onMaintenanceFailure?.("backfill_seed_cleanup_failed");
+        }
+      }
       for (const current of [...options.journal.pending(), ...options.journal.recoverablePublications()]) {
         let publicationAccepted = current.publishedAtMs !== null;
         try {
@@ -267,6 +275,7 @@ function deleteOccurrenceEvidence(
   rows: readonly DeliveryRow[],
   retainRecoveryArtifact = false,
 ): void {
+  if (!options.journal.authorizeDeliveryEvidenceCleanup({ occurrenceId: accepted.occurrenceId, nowMs: now })) return;
   const owned = options.journal.pending().filter((candidate) => candidate.occurrenceId === accepted.occurrenceId);
   const selected = new Set(rows.map((row) => `${row.occurrenceId}:${row.revision}`));
   const deleteRecording = owned.every((row) => selected.has(`${row.occurrenceId}:${row.revision}`));

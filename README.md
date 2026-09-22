@@ -45,23 +45,26 @@ export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if need
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive dbcd440924bd0bf7ed7f6ffe8c3d3c6b2dbf80ac | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive 4c9dc85ddbb513c61abc738d06ea10e61ab8c885 | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
 npm ci --no-audit --no-fund
-npm install --save-dev --no-save --no-audit --no-fund "$SDK_STAGE/conversation-runtime-0.1.0.tgz"
+npm install --save-dev --ignore-scripts --no-save --package-lock=false --no-audit --no-fund \
+  "$SDK_STAGE/conversation-runtime-0.1.0.tgz"
 node scripts/check-runtime-sdk.mjs
 ```
 
 Do not commit the tarball or a machine-specific dependency path; the tracked lock
 contains only optional peer metadata. The check pins reviewed built file digests,
-not just version0.1.0. Registry publication and future Runtime process ownership
-are separate gates. The package's `start` still intentionally refuses to compose
+not just version0.1.0. Registry publication remains a separate gate. Runtime13's
+`StdioGatewayTransport` owns bounded EOF/TERM/KILL/reap cleanup and reports its
+cleanup outcome; Meeting application composition remains separate. The package's `start` still intentionally refuses to compose
 unconfigured live adapters; a successful prerequisite check does not start a meeting.
-Both install flags are intentional: `--save-dev` selects a local dependency rather
-than re-inferring the existing optional peer, while `--no-save` preserves the
-manifest and lock. Plain `--no-save` may leave that optional peer uninstalled.
+The install flags are intentional: `--save-dev` selects the optional peer in
+npm's in-memory ideal tree, scripts stay disabled, `--no-save` preserves the
+manifest, and `--package-lock=false` preserves the lock while installing the real
+package bytes instead of a copied tree or source alias.
 
 Recovery capabilities and alignment staging belong in an owned private0700 state
 directory outside shared/Git/TeamMem roots. SQL projections alone do not encrypt
@@ -118,11 +121,12 @@ the separate selected-evidence path below.
 Use one shared `RecordingAlignmentOwner`, and await `owner.close()` **before**
 closing its Runtime/SQLite dependencies. A failed cleanup retains ownership.
 Reopen, age and absent in-memory state do not authorize takeover. Recovery needs
-an awaited trusted application/supervisor exclusive-owner proof; the controlled
-test actually terminates/reaps its owned child. A future host-restart app must
-establish exclusive ownership, not attempt to reap an unrelated historical PID.
-The proof callback must own and bound its cleanup; it is not a cryptographic
-guarantee. Runtime-validated one-use permits and exact-token CAS enforce binding.
+an awaited trusted application/supervisor exclusive-owner proof. An application
+that owns the gateway through Runtime13's `StdioGatewayTransport` must await close
+and require a successful cleanup outcome before issuing that proof; failed or
+unknown cleanup is not authority. Never attempt to reap an unrelated historical
+PID. The proof is not cryptographic; Runtime-validated one-use permits and
+exact-token CAS enforce binding.
 Reclaim deletes at most64 pages per transaction; selected evidence survives failed
 replacement and a bounded static last-failure reason remains durable.
 Successful replacement atomically retires the previous selection as non-owner
@@ -196,7 +200,7 @@ provider/device/TeamMem or whole-application E2E proof is implied here.
 
 ### Timed live evidence library
 
-The reviewed SDK dbcd440 adapter accepts the discriminated
+The reviewed SDK 4c9dc85 adapter accepts the discriminated
 `{ timingContract: "capture-clock/v1", bridgeSessionId, profile: "online",
 responseMode: "external_gate" }` start. Its typed lease proves command admission,
 not provider/native health. `createMeetingSession` accepts a bridge-v2 transport

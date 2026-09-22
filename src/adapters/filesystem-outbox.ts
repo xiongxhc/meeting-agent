@@ -167,6 +167,57 @@ export function deleteDeliveredEvidence(input: {
   removeEmptyOccurrence(outbox, path.dirname(expected));
 }
 
+/** Seed-only expiry cleanup. It has no artifact/bundle authority and validates
+ * only the immutable encrypted-source identity before the same detach/remove
+ * custody operation used by delivery cleanup. */
+export function deleteSeedRecordingEvidence(input: {
+  readonly recordingsDir: string;
+  readonly recordingPath: string;
+  readonly recordingHandle: string;
+  readonly recordingBytes: number;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+  readonly fault?: (step: DeleteFaultPoint) => void;
+}): void {
+  const root = safeDirectory(input.recordingsDir, false, "recordings");
+  const target = path.resolve(input.recordingPath);
+  const handle = requireRecordingHandle(target, input.recordingHandle);
+  if (!/^[0-9]+$/.test(input.recordingDevice) || !/^[0-9]+$/.test(input.recordingInode) ||
+      !Number.isSafeInteger(input.recordingBytes) || input.recordingBytes < 1) {
+    throw new Error("invalid seed recording identity");
+  }
+  const tombstoneName = `.recording-delete-seed-${handle}-${input.recordingDevice}-${input.recordingInode}`;
+  const tombstone = path.join(root, tombstoneName);
+  assertPathUnderRoot(root, tombstone, false);
+  if (existsSync(tombstone)) {
+    requireSeedRecordingIdentity(tombstone, input);
+    rmSync(tombstone);
+    if (!existsSync(target)) return;
+  }
+  try {
+    assertPathUnderRoot(root, target, true);
+    if (path.dirname(target) !== root) throw new Error("recording must be a direct child of the configured recordings root");
+    requireSeedRecordingIdentity(target, input);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  renameSync(target, tombstone);
+  input.fault?.("after_recording_detach");
+  requireSeedRecordingIdentity(tombstone, input);
+  rmSync(tombstone);
+}
+
+function requireSeedRecordingIdentity(filename: string, input: {
+  readonly recordingBytes: number; readonly recordingDevice: string; readonly recordingInode: string;
+}): void {
+  const stat = lstatSync(filename, { bigint: true });
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== BigInt(input.recordingBytes) ||
+      stat.dev.toString() !== input.recordingDevice || stat.ino.toString() !== input.recordingInode) {
+    throw new Error("seed recording identity or size changed");
+  }
+}
+
 function safeDirectory(directory: string, create: boolean, label: string): string {
   const resolved = path.resolve(directory);
   if (create) mkdirSync(resolved, { recursive: true, mode: 0o700 });

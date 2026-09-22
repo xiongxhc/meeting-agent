@@ -15,9 +15,11 @@
 // SQLite driver, and no other database concern, lives here.
 
 import type { CustodyBinding, BridgeProcessOutcome } from "../contracts/bridge-process-outcome-v1.ts";
+import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { AlignmentRecoveryPermit } from "./recording-alignment-authority.ts";
 import type { BridgeShutdownResult, BridgeProcessFailure } from "./bridge-process.ts";
 import type { FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete } from "./conversation-runtime.ts";
+import type { OperatorWarningPayload } from "./operator-warning.ts";
 
 /** Private application authority. Never returned by ordinary recording/evidence getters. */
 export type RecordingRecovery = {
@@ -251,6 +253,152 @@ export type RecordingInput = {
   }>;
 };
 
+/** Immutable, non-secret build configuration available at the exact
+ * finalization boundary. `processedAt` is deliberately absent: it belongs to
+ * each later revision, not to the original seed. */
+export type BackfillSeedConfig = {
+  readonly provider: string;
+  readonly encryption: string;
+  readonly processingWarnings: readonly { readonly code: string; readonly detail: string }[];
+  readonly provenance: {
+    readonly runtimeProfile: "offline" | "online";
+    readonly sttProvider: string;
+    readonly sttModel: string;
+    readonly liveStreamModel: string;
+    readonly finalBatchModel: string;
+    readonly textProvider: string;
+    readonly textModel: string;
+    readonly agentVersion: string;
+  };
+};
+
+/** Supplied only by the bridge-observed `left(reason:"ended")` path. The
+ * store revalidates this discriminant and its exact timestamp against the
+ * reconciliation terminal association before committing a seed. */
+export type BackfillSeedFinalizationInput = BackfillSeedConfig & {
+  readonly terminalReason: "ended";
+  readonly terminalSource: "bridge_observed";
+  readonly endedAt: string;
+  readonly identity: MeetingIdentity;
+};
+
+export type BackfillSeed = {
+  readonly occurrenceId: string;
+  readonly provider: string;
+  readonly providerMeetingId: string;
+  readonly meetingNo: string;
+  readonly occurrenceStartedAt: string;
+  readonly title: string;
+  readonly organizer: MeetingIdentity["organizer"];
+  readonly endedAt: string;
+  readonly endedAtMs: number;
+  readonly stopAtMs: number;
+  readonly expiresAtMs: number;
+  readonly bridgeSessionId: string;
+  readonly generationId: string;
+  readonly capability: FinalizedRecordingCapability;
+  readonly recordingPath: string;
+  readonly recordingFormat: string;
+  readonly recordingEncryption: string;
+  readonly recordingBytes: number;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+  readonly recordingDurationMs: number;
+  readonly recordingSha256: string;
+  readonly recordingKeyId: string;
+  readonly bridgeGaps: RecordingInput["gaps"];
+  readonly runtimeGaps: RecordingInput["runtimeGaps"];
+  readonly processingWarnings: BackfillSeedConfig["processingWarnings"];
+  readonly provenance: BackfillSeedConfig["provenance"];
+};
+
+export type ClaimBackfillSeedBuildInput = {
+  readonly nowMs: number;
+  readonly claimToken: string;
+  /** Accepted Runtime operation budget. The store derives the lease as this
+   * value plus 60 seconds; callers cannot configure a shorter independent
+   * lease. */
+  readonly operationBudgetMs: number;
+};
+
+export type BackfillSeedBuildClaim = {
+  readonly seed: BackfillSeed;
+  readonly claimToken: string;
+  readonly claimExpiresAtMs: number;
+  readonly attempt: number;
+  readonly targetRevision: number;
+  readonly observedAtMs: number;
+};
+
+export type BackfillDeliveryAuthority =
+  | { readonly kind: "initial"; readonly claimToken: string; readonly nowMs: number }
+  | { readonly kind: "retry"; readonly claimToken: string; readonly targetRevision: number; readonly nowMs: number };
+
+export type SavePendingDeliveryResult = {
+  readonly kind: "inserted" | "replay";
+  /** The persisted canonical intent. On replay this deliberately ignores all
+   * mutable caller fields and is the only authority for READY materialization. */
+  readonly row: DeliveryRow;
+};
+
+export type ClaimBackfillJobInput = {
+  readonly nowMs: number;
+  readonly claimToken: string;
+  /** The store derives a lease of operationBudgetMs + 60 seconds. */
+  readonly operationBudgetMs: number;
+};
+
+export type BackfillJobClaim = {
+  readonly seed: BackfillSeed;
+  readonly claimToken: string;
+  readonly claimExpiresAtMs: number;
+  readonly attempt: number;
+  readonly targetRevision: number;
+  readonly stopAtMs: number;
+  readonly observedAtMs: number;
+};
+
+export type BackfillFailureReason = "runtime_failed" | "alignment_failed" | "build_failed" | "cleanup_failed";
+export type BackfillBuildFailure =
+  | { readonly kind: "initial"; readonly occurrenceId: string; readonly claimToken: string;
+      readonly nowMs: number; readonly retryDelayMs: number; readonly reason: BackfillFailureReason }
+  | { readonly kind: "retry"; readonly occurrenceId: string; readonly claimToken: string;
+      readonly targetRevision: number; readonly nowMs: number; readonly retryDelayMs: number;
+      readonly reason: BackfillFailureReason };
+export type BackfillFailureResult = { readonly kind: "rescheduled" | "stopped" };
+
+export type BeginBackfillProcessInput =
+  | { readonly kind: "initial"; readonly occurrenceId: string; readonly claimToken: string; readonly nowMs: number }
+  | { readonly kind: "retry"; readonly occurrenceId: string; readonly claimToken: string;
+      readonly targetRevision: number; readonly nowMs: number };
+
+export type SettleBackfillProcessInput = {
+  readonly occurrenceId: string;
+  readonly processOwnerToken: string;
+  readonly outcome: "confirmed" | "failed";
+  readonly nowMs: number;
+};
+
+export type BackfillWarningClaim = {
+  readonly occurrenceId: string;
+  readonly claimToken: string;
+  readonly claimExpiresAtMs: number;
+  readonly attempt: number;
+  readonly payload: OperatorWarningPayload;
+  readonly key: string;
+};
+
+export type BackfillSeedCleanupClaim = {
+  readonly occurrenceId: string;
+  readonly claimToken: string;
+  readonly claimExpiresAtMs: number;
+  readonly recordingPath: string;
+  readonly recordingHandle: string;
+  readonly recordingBytes: number;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+};
+
 export type FinalizeSessionInput = {
   readonly transition: TransitionInput;
   readonly recording: RecordingInput;
@@ -260,6 +408,7 @@ export type FinalizeSessionInput = {
   /** Observed bridge terminal instant when available; never generation start. */
   readonly reconciliationTerminalAtMs?: number;
   readonly reconciliationTerminalSource?: "bridge_observed" | "local_clock";
+  readonly backfillSeed?: BackfillSeedFinalizationInput;
 };
 
 export type FinalizeSessionResult = {
@@ -477,6 +626,23 @@ export type SessionStore = {
    * may land alone. */
   finalizeSession(input: FinalizeSessionInput): FinalizeSessionResult;
   getRecording(occurrenceId: string): RecordingRow | null;
+  getBackfillSeed(occurrenceId: string): BackfillSeed | null;
+  claimBackfillSeedBuild(input: ClaimBackfillSeedBuildInput): BackfillSeedBuildClaim | null;
+  claimBackfillJob(input: ClaimBackfillJobInput): BackfillJobClaim | null;
+  beginBackfillProcess(input: BeginBackfillProcessInput): { readonly processOwnerToken: string };
+  settleBackfillProcess(input: SettleBackfillProcessInput): { readonly outcome: "confirmed" | "failed" };
+  failBackfillBuild(input: BackfillBuildFailure): BackfillFailureResult;
+  stopDueBackfill(input: { readonly nowMs: number }): { readonly occurrenceId: string } | null;
+  claimBackfillWarning(input: { readonly nowMs: number; readonly claimToken: string }): BackfillWarningClaim | null;
+  acceptBackfillWarning(input: { readonly occurrenceId: string; readonly claimToken: string;
+    readonly key: string; readonly nowMs: number }): void;
+  failBackfillWarning(input: { readonly occurrenceId: string; readonly claimToken: string;
+    readonly nowMs: number; readonly retryDelayMs: number; readonly reason: "sink_failed" }): void;
+  claimExpiredBackfillSeedCleanup(input: { readonly nowMs: number;
+    readonly claimToken: string }): BackfillSeedCleanupClaim | null;
+  completeBackfillSeedCleanup(input: { readonly occurrenceId: string;
+    readonly claimToken: string; readonly nowMs: number }): void;
+  authorizeDeliveryEvidenceCleanup(input: { readonly occurrenceId: string; readonly nowMs: number }): boolean;
   getRecordingRecovery(occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null;
   beginRecordingAlignment(generationId: string, ownerId: string, replace?: boolean):
     { readonly kind: "selected"; readonly selected: SelectedAlignment } | { readonly kind: "claimed"; readonly attempt: AlignmentAttempt };
@@ -521,7 +687,7 @@ export type SessionStore = {
   }): BridgeRecoveryResult;
   getBridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
 
-  savePending(row: DeliveryRow): void;
+  savePending(row: DeliveryRow, authority?: BackfillDeliveryAuthority): SavePendingDeliveryResult;
   pending(): readonly DeliveryRow[];
   recoverablePublications(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;

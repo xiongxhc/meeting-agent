@@ -16,7 +16,7 @@
 //      a TeamMem ledger/data path handed straight to a driver or path-join
 //      call, not only an import.
 //   3. fs write-capability ownership -- permits only the application outbox
-//      mkdir and the explicitly reserved filesystem-outbox adapter.
+//      mkdir and the explicitly reserved filesystem outbox/warning adapters.
 //   4. dependency-level SQLite gate (findForbiddenSqliteDependencies /
 //      findUnconfinedSqliteImports) -- a rule a renamed variable cannot evade.
 // Plus a catch-all: any require()/computed dynamic import() is itself flagged
@@ -358,6 +358,17 @@ test("negative control: flags a destructured teamVaultDir reaching createWriteSt
   });
 });
 
+test("negative control: linkSync is a write capability outside an exact owner", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "bad-link.ts"),
+      'import { linkSync } from "node:fs"; export const publish = (source: string, target: string) => linkSync(source, target);\n',
+    );
+    const violations = findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir);
+    assert.ok(violations.some((value) => value.specifier === "linkSync"));
+  });
+});
+
 test("reading from the Team Vault directory is never flagged (only write-shaped calls are)", () => {
   withTempDir((dir) => {
     writeFileSync(
@@ -593,7 +604,7 @@ test("private child config writes and stdin do not grant general filesystem or p
   });
 });
 
-test("application mkdir and filesystem outbox are explicit write owners, while the Vault index remains read-only", () => {
+test("application mkdir and exact filesystem adapters are explicit write owners, while renamed or broader writers and the Vault index remain forbidden", () => {
   withTempDir((dir) => {
     const adapters = path.join(dir, "src", "adapters");
     mkdirSync(adapters, { recursive: true });
@@ -605,11 +616,23 @@ test("application mkdir and filesystem outbox are explicit write owners, while t
       path.join(adapters, "filesystem-outbox.ts"),
       'import { writeFileSync } from "node:fs"; export const publish = (file: string) => writeFileSync(file, "ok");\n',
     );
+    const warningOwner = 'import { linkSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs"; export const publish = (source: string, target: string) => { mkdirSync(target); writeFileSync(source, "ok"); linkSync(source, target); unlinkSync(source); };\n';
+    writeFileSync(path.join(adapters, "filesystem-operator-warning.ts"), warningOwner);
     writeFileSync(
       path.join(adapters, "team-vault-index.ts"),
       'import { readFileSync } from "node:fs"; export const read = (file: string) => readFileSync(file, "utf8");\n',
     );
     assert.deepEqual(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir), []);
+
+    writeFileSync(path.join(adapters, "renamed-warning.ts"), warningOwner);
+    assert.ok(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir).some((value) => value.file.endsWith("renamed-warning.ts")));
+    rmSync(path.join(adapters, "renamed-warning.ts"));
+
+    writeFileSync(
+      path.join(adapters, "filesystem-operator-warning.ts"),
+      'import { rmSync } from "node:fs"; export const remove = (file: string) => rmSync(file);\n',
+    );
+    assert.ok(findForbiddenFilesystemWriteCapabilities(scanProductionTree(dir), dir).some((value) => value.specifier === "rmSync"));
   });
 });
 

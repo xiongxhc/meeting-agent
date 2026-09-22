@@ -59,7 +59,7 @@ import {
 import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
 import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2 } from "../contracts/bridge-session-v2.ts";
 import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
-import type { SessionStore } from "../ports/session-store.ts";
+import type { BackfillSeedConfig, SessionStore } from "../ports/session-store.ts";
 import { LiveProvisionalCorrelator, type LiveCatchupClock, type ProvisionalResolution } from "./live-provisional.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import type { MeetingIdentity } from "../domain/meeting.ts";
@@ -268,6 +268,9 @@ export type CreateMeetingSessionOptions = {
   readonly disclosureText: string;
   readonly maxQueuedEvents?: number;
   readonly bridgeFailureRetryLimit?: number;
+  /** Exact immutable inputs for post-meeting rebuilds. Composition must supply
+   * these truthfully; absence means no seed, never invented defaults. */
+  readonly backfillSeedConfig?: BackfillSeedConfig;
   /** Injected so command ids are deterministic under test. Defaults to a
    * per-session counter, which is already deterministic. */
   readonly nextCommandId?: () => string;
@@ -738,7 +741,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         return;
 
       case "left":
-        await terminate(event.reason, Date.parse(event.observedAt), "bridge_observed");
+        await terminate(event.reason, Date.parse(event.observedAt), "bridge_observed", event.observedAt);
         return;
 
       case "media_connected":
@@ -958,6 +961,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     reason: "ended" | "removed" | "bridge_failure",
     terminalAtMs?: number,
     terminalSource: "bridge_observed" | "local_clock" = "local_clock",
+    terminalObservedAt?: string,
   ): Promise<void> {
     if (terminalReason !== null) return;
     terminalReason = reason;
@@ -984,7 +988,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // fresh one; its local wording must not remain a live generation.
         coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource);
       } else {
-        applyTerminalTransition(reason, terminalAtMs, terminalSource);
+        applyTerminalTransition(reason, terminalAtMs, terminalSource, terminalObservedAt);
       }
     } finally {
       // In a `finally`, because a finalization that throws must not leave the
@@ -1023,6 +1027,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     reason: "ended" | "removed" | "bridge_failure",
     terminalAtMs?: number,
     terminalSource: "bridge_observed" | "local_clock" = "local_clock",
+    terminalObservedAt?: string,
   ): void {
     try {
       const state = coordinator.get(identity.occurrenceId)?.state ?? null;
@@ -1036,7 +1041,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             : { kind: "fail", terminalReason: reason };
 
       if (recording !== null) {
-        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId), bridgeSessionId, terminalAtMs, terminalSource);
+        const backfillSeed = outcome.kind === "advance" && outcome.toState === "finalizing" &&
+          reason === "ended" && terminalSource === "bridge_observed" && terminalObservedAt !== undefined && options.backfillSeedConfig !== undefined
+          ? { ...options.backfillSeedConfig, terminalReason: "ended" as const, terminalSource: "bridge_observed" as const,
+              endedAt: terminalObservedAt, identity }
+          : undefined;
+        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId),
+          bridgeSessionId, terminalAtMs, terminalSource, backfillSeed);
         return;
       }
       if (outcome.kind === "fail") {

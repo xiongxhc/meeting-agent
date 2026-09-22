@@ -35,6 +35,9 @@ import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime
 import { parseEventV2, type BridgeEventMessageV2 } from "../contracts/bridge-session-v2.ts";
 import { encodeLiveEvidence, decodeLiveEvidence, encodeProvisionalResult, decodeProvisionalResult } from "../sessions/live-evidence-codec.ts";
 import { consumeLiveRecoveryPermit, type LiveRecoveryPermit } from "../ports/live-evidence-authority.ts";
+import { canonicalArtifactHash, canonicalArtifactJson, isUnicodeScalarString } from "../contracts/teammem-meeting-v1.ts";
+import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
+import { operatorWarningKey } from "../ports/operator-warning.ts";
 
 import { occurrencePathSegment, type OccurrenceId } from "../domain/occurrence-id.ts";
 import {
@@ -50,6 +53,20 @@ import {
   type RecordingRow,
   type RecordingRecovery,
   type RecordingInput,
+  type BackfillSeed,
+  type BackfillSeedBuildClaim,
+  type BackfillDeliveryAuthority,
+  type SavePendingDeliveryResult,
+  type ClaimBackfillJobInput,
+  type BackfillJobClaim,
+  type BackfillBuildFailure,
+  type BackfillFailureResult,
+  type BeginBackfillProcessInput,
+  type SettleBackfillProcessInput,
+  type BackfillWarningClaim,
+  type BackfillSeedCleanupClaim,
+  type BackfillSeedFinalizationInput,
+  type ClaimBackfillSeedBuildInput,
   type AlignmentAttempt,
   type AlignmentFailure,
   type SelectedAlignment,
@@ -96,6 +113,9 @@ export type OpenSessionStoreOptions = {
   /** Test-only checkpoint between two observations of a durable recording
    * path. Production callers leave this unset. */
   readonly deliveryIdentityCheckpoint?: (canonicalPath: string) => void;
+  /** Test-only checkpoint after the seed transaction has staged every row and
+   * immediately before its final filesystem identity observation. */
+  readonly seedIdentityCheckpoint?: (canonicalPath: string) => void;
 };
 
 const DEFAULT_MIGRATIONS_DIR = path.resolve(import.meta.dirname, "..", "..", "migrations");
@@ -165,8 +185,21 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     transition: (input) => transition(db, input),
     listTransitions: (occurrenceId) => listTransitions(db, occurrenceId),
 
-    finalizeSession: (input) => finalizeSession(db, input),
+    finalizeSession: (input) => finalizeSession(db, input, options.seedIdentityCheckpoint),
     getRecording: (occurrenceId) => getRecording(db, occurrenceId),
+    getBackfillSeed: (occurrenceId) => getBackfillSeed(db, occurrenceId),
+    claimBackfillSeedBuild: (input) => claimBackfillSeedBuild(db, input),
+    claimBackfillJob: (input) => claimBackfillJob(db, input),
+    beginBackfillProcess: (input) => beginBackfillProcess(db, input),
+    settleBackfillProcess: (input) => settleBackfillProcess(db, input),
+    failBackfillBuild: (input) => failBackfillBuild(db, input),
+    stopDueBackfill: (input) => stopDueBackfill(db, input.nowMs),
+    claimBackfillWarning: (input) => claimBackfillWarning(db, input.nowMs, input.claimToken),
+    acceptBackfillWarning: (input) => acceptBackfillWarning(db, input),
+    failBackfillWarning: (input) => failBackfillWarning(db, input),
+    claimExpiredBackfillSeedCleanup: (input) => claimExpiredBackfillSeedCleanup(db, input.nowMs, input.claimToken),
+    completeBackfillSeedCleanup: (input) => completeBackfillSeedCleanup(db, input),
+    authorizeDeliveryEvidenceCleanup: (input) => authorizeDeliveryEvidenceCleanup(db, input.occurrenceId, input.nowMs),
     getRecordingRecovery: (occurrenceId, bridgeSessionId, recordingHandle) => getRecordingRecovery(db, occurrenceId, bridgeSessionId, recordingHandle),
     beginRecordingAlignment: (generationId, ownerId, replace) => beginRecordingAlignment(db, generationId, ownerId, replace),
     appendRecordingAlignment: (attempt, page) => appendRecordingAlignment(db, attempt, page),
@@ -225,7 +258,7 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     purgeExpiredTimedEvidenceBatch: (nowMs) => purgeExpiredTimedEvidenceBatch(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
-    savePending: (row) => savePendingDelivery(db, row, options.deliveryIdentityCheckpoint),
+    savePending: (row, authority) => savePendingDelivery(db, row, authority, options.deliveryIdentityCheckpoint),
     pending: () => deliveryRows(db, "active"),
     recoverablePublications: () => deliveryRows(db, "deleted_with_recovery"),
     update: (row) => updateDelivery(db, row),
@@ -722,8 +755,10 @@ function transition(db: Database.Database, input: TransitionInput): SessionRow {
 function finalizeSession(
   db: Database.Database,
   input: FinalizeSessionInput,
+  seedIdentityCheckpoint?: (canonicalPath: string) => void,
 ): FinalizeSessionResult {
   const { occurrenceId, nowMs } = input.transition;
+  const preparedSeed = input.backfillSeed === undefined ? null : prepareBackfillSeed(db, input);
   const run = db.transaction(() => {
     const session = transition(db, input.transition);
     withConstraintTranslation(() => {
@@ -761,6 +796,11 @@ function finalizeSession(
         ).run(input.recording.handle, input.reconciliationTerminalAtMs ?? nowMs, input.reconciliationTerminalSource ?? "local_clock", (input.reconciliationTerminalAtMs ?? nowMs) + RECONCILIATION_EVIDENCE_RETENTION_MS,
           reconciliationGenerationId(occurrenceId, input.reconciliationBridgeSessionId), occurrenceId).changes;
         if (associated !== 1) throw new OrchestrationError("constraint_violation", "reconciliation generation cannot be associated with finalized recording");
+      }
+      if (preparedSeed !== null) {
+        insertBackfillSeed(db, preparedSeed);
+        seedIdentityCheckpoint?.(preparedSeed.binding.canonicalPath);
+        assertBackfillRecordingBindingUnchanged(preparedSeed.binding);
       }
     });
     return session;
@@ -868,6 +908,733 @@ function getRecordingRecovery(db: Database.Database, occurrenceId: string, bridg
   }
   return { generationId: row.generation_id, occurrenceId, bridgeSessionId, recordingKind: row.recording_kind, failureAttempt: row.failure_attempt,
     capability: { sourceSessionId: BigInt(row.source_session_id), recordingHandle: row.recording_handle, sha256: row.sha256, keyId: row.key_id, authorization: row.authorization } };
+}
+
+const BACKFILL_STOP_MS = 11 * 24 * 60 * 60 * 1000;
+const BACKFILL_EXPIRY_MS = 14 * 24 * 60 * 60 * 1000;
+const MAX_RECORDING_BYTES = 8n * 1024n * 1024n * 1024n;
+const MIN_OPERATION_BUDGET_MS = 1_000;
+const MAX_OPERATION_BUDGET_MS = 900_000;
+const BUILD_CLAIM_MARGIN_MS = 60_000;
+
+type BackfillRecordingBinding = {
+  readonly canonicalPath: string;
+  readonly device: string;
+  readonly inode: string;
+  readonly bytes: number;
+  readonly handle: string;
+};
+
+type PreparedBackfillSeed = {
+  readonly input: BackfillSeedFinalizationInput;
+  readonly recording: RecordingInput;
+  readonly occurrenceId: string;
+  readonly bridgeSessionId: string;
+  readonly generationId: string;
+  readonly endedAtMs: number;
+  readonly stopAtMs: number;
+  readonly expiresAtMs: number;
+  readonly binding: BackfillRecordingBinding;
+  readonly bridgeGapsJson: string;
+  readonly runtimeGapsJson: string;
+  readonly warningsJson: string;
+};
+
+function seedViolation(message: string): OrchestrationError {
+  return new OrchestrationError("constraint_violation", message);
+}
+
+function boundedSeedText(value: unknown, field: string, max: number, maxBytes = max * 4): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > max || Buffer.byteLength(value, "utf8") > maxBytes || !isUnicodeScalarString(value)) {
+    throw seedViolation(`invalid backfill seed ${field}`);
+  }
+  return value;
+}
+
+function exactUtcMillis(value: unknown): number {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) {
+    throw seedViolation("invalid backfill seed endedAt");
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw seedViolation("invalid backfill seed endedAt");
+  const canonical = new Date(parsed).toISOString();
+  if (value !== canonical && value !== canonical.replace(".000Z", "Z")) throw seedViolation("invalid backfill seed endedAt");
+  return parsed;
+}
+
+function boundedSeedJson(value: unknown, field: string): string {
+  const encoded = JSON.stringify(value);
+  if (typeof encoded !== "string" || Buffer.byteLength(encoded, "utf8") > 262_144) {
+    throw seedViolation(`invalid backfill seed ${field}`);
+  }
+  return encoded;
+}
+
+function backfillRecordingBinding(recording: Pick<RecordingInput, "handle" | "encryptedPath">): BackfillRecordingBinding {
+  const canonicalPath = path.resolve(recording.encryptedPath);
+  if (!/^[0-9a-f]{32}$/.test(recording.handle) || path.basename(canonicalPath) !== `${recording.handle}.crsr`) {
+    throw seedViolation("backfill ciphertext path does not match its Runtime handle");
+  }
+  try {
+    const stat = lstatSync(canonicalPath, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isFile()) throw seedViolation("backfill ciphertext is not a regular Runtime child");
+    if (stat.size < 1n || stat.size > MAX_RECORDING_BYTES) throw seedViolation("backfill ciphertext size is outside 1..8GiB");
+    return { canonicalPath, device: stat.dev.toString(), inode: stat.ino.toString(), bytes: Number(stat.size), handle: recording.handle };
+  } catch (error) {
+    if (error instanceof OrchestrationError) throw error;
+    throw seedViolation(`backfill ciphertext cannot be inspected: ${(error as Error).message}`);
+  }
+}
+
+function assertBackfillRecordingBindingUnchanged(expected: BackfillRecordingBinding): void {
+  const current = backfillRecordingBinding({ handle: expected.handle, encryptedPath: expected.canonicalPath });
+  if (current.canonicalPath !== expected.canonicalPath || current.device !== expected.device ||
+      current.inode !== expected.inode || current.bytes !== expected.bytes) {
+    throw seedViolation("backfill ciphertext identity or size changed during finalization; retry");
+  }
+}
+
+function prepareBackfillSeed(db: Database.Database, value: FinalizeSessionInput): PreparedBackfillSeed {
+  const input = value.backfillSeed;
+  if (input === undefined || (input as { terminalReason?: unknown }).terminalReason !== "ended" ||
+      (input as { terminalSource?: unknown }).terminalSource !== "bridge_observed" ||
+      value.transition.toState !== "finalizing" || value.transition.terminalReason !== null ||
+      value.reconciliationTerminalSource !== "bridge_observed" || value.reconciliationTerminalAtMs === undefined ||
+      value.reconciliationBridgeSessionId === undefined || value.recording.recovery === undefined) {
+    throw seedViolation("backfill seed requires exact ended and bridge-observed finalization");
+  }
+  const endedAtMs = exactUtcMillis(input.endedAt);
+  if (endedAtMs !== value.reconciliationTerminalAtMs || input.identity.occurrenceId !== value.transition.occurrenceId ||
+      value.recording.recovery.bridgeSessionId !== value.reconciliationBridgeSessionId) {
+    throw seedViolation("backfill seed end, occurrence or generation mismatch");
+  }
+  const stopAtMs = endedAtMs + BACKFILL_STOP_MS;
+  const expiresAtMs = endedAtMs + BACKFILL_EXPIRY_MS;
+  if (!Number.isSafeInteger(stopAtMs) || !Number.isSafeInteger(expiresAtMs)) throw seedViolation("backfill seed deadline overflow");
+  const session = selectSessionRaw(db, value.transition.occurrenceId);
+  if (session === undefined || session.provider_meeting_id !== input.identity.providerMeetingId ||
+      session.occurrence_started_at !== input.identity.occurrenceStartedAt) {
+    throw seedViolation("backfill seed provider identity mismatch");
+  }
+  if (!/^[a-z][a-z0-9_]{0,39}$/.test(input.provider)) throw seedViolation("invalid backfill seed provider");
+  boundedSeedText(input.identity.providerMeetingId, "providerMeetingId", 4096, 4096);
+  boundedSeedText(input.identity.meetingNo, "meetingNo", 4096, 4096);
+  boundedSeedText(input.identity.occurrenceStartedAt, "occurrenceStartedAt", 40, 40);
+  boundedSeedText(input.identity.title, "title", 200, 800);
+  if (input.identity.organizer !== null) {
+    boundedSeedText(input.identity.organizer.feishuUserId, "organizer id", 200, 800);
+    boundedSeedText(input.identity.organizer.displayName, "organizer display name", 200, 800);
+    if (input.identity.organizer.source !== "reservation" && input.identity.organizer.source !== "calendar_event") {
+      throw seedViolation("invalid backfill seed organizer source");
+    }
+  }
+  boundedSeedText(input.encryption, "encryption", 200, 800);
+  boundedSeedText(value.recording.format, "recording format", 200, 800);
+  for (const [field, fieldValue] of Object.entries(input.provenance)) boundedSeedText(fieldValue, `provenance ${field}`, 200, 800);
+  if (input.provenance.runtimeProfile !== "offline" && input.provenance.runtimeProfile !== "online") throw seedViolation("invalid backfill seed runtime profile");
+  if (!Array.isArray(input.processingWarnings) || input.processingWarnings.length > 500) throw seedViolation("invalid backfill seed processing warnings");
+  for (const warning of input.processingWarnings) {
+    if (typeof warning !== "object" || warning === null || Object.keys(warning).sort().join(",") !== "code,detail" ||
+        !/^[a-z][a-z0-9_]{0,39}$/.test(warning.code)) throw seedViolation("invalid backfill seed processing warning");
+    boundedSeedText(warning.detail, "processing warning detail", 500, 2000);
+  }
+  const bridgeGapsJson = boundedSeedJson(value.recording.gaps, "bridge gaps");
+  const runtimeGapsJson = boundedSeedJson(value.recording.runtimeGaps.map((gap) => ({
+    startedAtMs: gap.startedAtMs.toString(), endedAtMs: gap.endedAtMs?.toString() ?? null, reason: gap.reason,
+  })), "runtime gaps");
+  const warningsJson = boundedSeedJson(input.processingWarnings, "processing warnings");
+  return { input, recording: value.recording, occurrenceId: value.transition.occurrenceId,
+    bridgeSessionId: value.reconciliationBridgeSessionId,
+    generationId: reconciliationGenerationId(value.transition.occurrenceId, value.reconciliationBridgeSessionId),
+    endedAtMs, stopAtMs, expiresAtMs, binding: backfillRecordingBinding(value.recording),
+    bridgeGapsJson, runtimeGapsJson, warningsJson };
+}
+
+function insertBackfillSeed(db: Database.Database, seed: PreparedBackfillSeed): void {
+  const organizer = seed.input.identity.organizer;
+  const capability = seed.recording.recovery!.capability;
+  withConstraintTranslation(() => db.prepare(`INSERT INTO backfill_seeds (
+    occurrence_id,provider,provider_meeting_id,meeting_no,occurrence_started_at,title,
+    organizer_person_id,organizer_display_name,organizer_source,ended_at,ended_at_ms,stop_at_ms,expires_at_ms,
+    bridge_session_id,generation_id,source_session_id,capability_recording_handle,capability_sha256,capability_key_id,capability_authorization,
+    recording_path,recording_format,recording_encryption,recording_bytes,recording_device,recording_inode,recording_duration_ms,
+    recording_sha256,recording_key_id,bridge_gaps_json,runtime_gaps_json,processing_warnings_json,runtime_profile,
+    stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version
+  ) VALUES (
+    @occurrenceId,@provider,@providerMeetingId,@meetingNo,@occurrenceStartedAt,@title,
+    @organizerPersonId,@organizerDisplayName,@organizerSource,@endedAt,@endedAtMs,@stopAtMs,@expiresAtMs,
+    @bridgeSessionId,@generationId,@sourceSessionId,@capabilityRecordingHandle,@capabilitySha256,@capabilityKeyId,@capabilityAuthorization,
+    @recordingPath,@recordingFormat,@recordingEncryption,@recordingBytes,@recordingDevice,@recordingInode,@recordingDurationMs,
+    @recordingSha256,@recordingKeyId,@bridgeGapsJson,@runtimeGapsJson,@warningsJson,@runtimeProfile,
+    @sttProvider,@sttModel,@liveStreamModel,@finalBatchModel,@textProvider,@textModel,@agentVersion
+  )`).run({
+    occurrenceId: seed.occurrenceId, provider: seed.input.provider,
+    providerMeetingId: seed.input.identity.providerMeetingId, meetingNo: seed.input.identity.meetingNo,
+    occurrenceStartedAt: seed.input.identity.occurrenceStartedAt, title: seed.input.identity.title,
+    organizerPersonId: organizer?.feishuUserId ?? null, organizerDisplayName: organizer?.displayName ?? null,
+    organizerSource: organizer?.source ?? null, endedAt: seed.input.endedAt, endedAtMs: seed.endedAtMs,
+    stopAtMs: seed.stopAtMs, expiresAtMs: seed.expiresAtMs, bridgeSessionId: seed.bridgeSessionId,
+    generationId: seed.generationId, sourceSessionId: capability.sourceSessionId.toString(),
+    capabilityRecordingHandle: capability.recordingHandle, capabilitySha256: capability.sha256,
+    capabilityKeyId: capability.keyId, capabilityAuthorization: capability.authorization,
+    recordingPath: seed.binding.canonicalPath, recordingFormat: seed.recording.format,
+    recordingEncryption: seed.input.encryption, recordingBytes: seed.binding.bytes,
+    recordingDevice: seed.binding.device, recordingInode: seed.binding.inode,
+    recordingDurationMs: seed.recording.durationMs, recordingSha256: seed.recording.sha256,
+    recordingKeyId: seed.recording.keyId, bridgeGapsJson: seed.bridgeGapsJson,
+    runtimeGapsJson: seed.runtimeGapsJson, warningsJson: seed.warningsJson,
+    runtimeProfile: seed.input.provenance.runtimeProfile, sttProvider: seed.input.provenance.sttProvider,
+    sttModel: seed.input.provenance.sttModel, liveStreamModel: seed.input.provenance.liveStreamModel,
+    finalBatchModel: seed.input.provenance.finalBatchModel, textProvider: seed.input.provenance.textProvider,
+    textModel: seed.input.provenance.textModel, agentVersion: seed.input.provenance.agentVersion,
+  }));
+  withConstraintTranslation(() => db.prepare(`INSERT INTO backfill_seed_lifecycle
+    (occurrence_id,owner,state,stop_at_ms,expires_at_ms,initial_build_next_attempt_at_ms,last_observed_at_ms)
+    VALUES (?,'seed','pending',?,?,?,?)`)
+    .run(seed.occurrenceId, seed.stopAtMs, seed.expiresAtMs, seed.endedAtMs, seed.endedAtMs));
+}
+
+type BackfillSeedRaw = {
+  occurrence_id: string; provider: string; provider_meeting_id: string; meeting_no: string; occurrence_started_at: string; title: string;
+  organizer_person_id: string | null; organizer_display_name: string | null; organizer_source: "reservation" | "calendar_event" | null;
+  ended_at: string; ended_at_ms: number; stop_at_ms: number; expires_at_ms: number; bridge_session_id: string; generation_id: string;
+  source_session_id: string; capability_recording_handle: string; capability_sha256: string; capability_key_id: string; capability_authorization: string;
+  recording_path: string; recording_format: string; recording_encryption: string; recording_bytes: number; recording_device: string; recording_inode: string;
+  recording_duration_ms: number; recording_sha256: string; recording_key_id: string; bridge_gaps_json: string; runtime_gaps_json: string;
+  processing_warnings_json: string; runtime_profile: "offline" | "online"; stt_provider: string; stt_model: string; live_stream_model: string;
+  final_batch_model: string; text_provider: string; text_model: string; agent_version: string;
+};
+
+function getBackfillSeed(db: Database.Database, occurrenceId: string): BackfillSeed | null {
+  if (currentSchemaVersion(db) < 23) return null;
+  requirePrivateState(db);
+  const row = db.prepare("SELECT * FROM backfill_seeds WHERE occurrence_id=?").get(occurrenceId) as BackfillSeedRaw | undefined;
+  if (!row) return null;
+  const runtimeGaps = JSON.parse(row.runtime_gaps_json) as Array<{ startedAtMs: string; endedAtMs: string | null; reason: string }>;
+  return {
+    occurrenceId: row.occurrence_id, provider: row.provider, providerMeetingId: row.provider_meeting_id,
+    meetingNo: row.meeting_no, occurrenceStartedAt: row.occurrence_started_at, title: row.title,
+    organizer: row.organizer_person_id === null ? null : { feishuUserId: row.organizer_person_id,
+      displayName: row.organizer_display_name!, source: row.organizer_source! },
+    endedAt: row.ended_at, endedAtMs: row.ended_at_ms, stopAtMs: row.stop_at_ms, expiresAtMs: row.expires_at_ms,
+    bridgeSessionId: row.bridge_session_id, generationId: row.generation_id,
+    capability: { sourceSessionId: BigInt(row.source_session_id), recordingHandle: row.capability_recording_handle,
+      sha256: row.capability_sha256, keyId: row.capability_key_id, authorization: row.capability_authorization },
+    recordingPath: row.recording_path, recordingFormat: row.recording_format, recordingEncryption: row.recording_encryption,
+    recordingBytes: row.recording_bytes, recordingDevice: row.recording_device, recordingInode: row.recording_inode,
+    recordingDurationMs: row.recording_duration_ms, recordingSha256: row.recording_sha256, recordingKeyId: row.recording_key_id,
+    bridgeGaps: JSON.parse(row.bridge_gaps_json) as RecordingInput["gaps"],
+    runtimeGaps: runtimeGaps.map((gap) => ({ startedAtMs: BigInt(gap.startedAtMs),
+      endedAtMs: gap.endedAtMs === null ? null : BigInt(gap.endedAtMs), reason: gap.reason })),
+    processingWarnings: JSON.parse(row.processing_warnings_json) as BackfillSeed["processingWarnings"],
+    provenance: { runtimeProfile: row.runtime_profile, sttProvider: row.stt_provider, sttModel: row.stt_model,
+      liveStreamModel: row.live_stream_model, finalBatchModel: row.final_batch_model,
+      textProvider: row.text_provider, textModel: row.text_model, agentVersion: row.agent_version },
+  };
+}
+
+function claimBackfillSeedBuild(db: Database.Database, input: ClaimBackfillSeedBuildInput): BackfillSeedBuildClaim | null {
+  if (!Number.isSafeInteger(input.nowMs) || input.nowMs < 0) throw seedViolation("invalid initial-build claim clock");
+  if (!/^[0-9a-f]{32}$/.test(input.claimToken)) throw seedViolation("invalid initial-build claim token");
+  if (!Number.isSafeInteger(input.operationBudgetMs) || input.operationBudgetMs < MIN_OPERATION_BUDGET_MS || input.operationBudgetMs > MAX_OPERATION_BUDGET_MS) {
+    throw seedViolation("invalid initial-build operation budget");
+  }
+  return db.transaction(() => {
+    if (stopDueBackfillInTransaction(db, input.nowMs) !== null) return null;
+    const candidate = db.prepare(`SELECT occurrence_id,MAX(?,last_observed_at_ms) AS observed_at_ms
+      FROM backfill_seed_lifecycle
+      WHERE owner='seed' AND state='pending' AND initial_build_attempts<1000000
+        AND process_cleanup_state IS NULL
+        AND initial_build_next_attempt_at_ms<=MAX(?,last_observed_at_ms)
+        AND MAX(?,last_observed_at_ms)<stop_at_ms
+        AND (build_claim_token IS NULL OR build_claim_expires_at_ms<=MAX(?,last_observed_at_ms))
+      ORDER BY initial_build_next_attempt_at_ms,stop_at_ms,occurrence_id LIMIT 1`)
+      .get(input.nowMs, input.nowMs, input.nowMs, input.nowMs) as { occurrence_id: string; observed_at_ms: number } | undefined;
+    if (!candidate) return null;
+    const claimExpiresAtMs = candidate.observed_at_ms + input.operationBudgetMs + BUILD_CLAIM_MARGIN_MS;
+    if (!Number.isSafeInteger(claimExpiresAtMs)) throw seedViolation("initial-build claim deadline overflow");
+    const next = (db.prepare("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM delivery_journal WHERE occurrence_id=?")
+      .get(candidate.occurrence_id) as { revision: number }).revision;
+    if (!Number.isSafeInteger(next) || next < 1 || next > 1_000_000) throw seedViolation("backfill target revision exhausted");
+    const changed = db.prepare(`UPDATE backfill_seed_lifecycle
+      SET build_claim_token=?,build_claim_expires_at_ms=?,initial_build_attempts=initial_build_attempts+1,
+          last_observed_at_ms=?
+      WHERE occurrence_id=? AND owner='seed' AND state='pending' AND stop_at_ms>?
+        AND process_cleanup_state IS NULL
+        AND initial_build_next_attempt_at_ms<=? AND initial_build_attempts<1000000
+        AND (build_claim_token IS NULL OR build_claim_expires_at_ms<=?)`)
+      .run(input.claimToken, claimExpiresAtMs, candidate.observed_at_ms, candidate.occurrence_id,
+        candidate.observed_at_ms, candidate.observed_at_ms, candidate.observed_at_ms).changes;
+    if (changed !== 1) return null;
+    const lifecycle = db.prepare("SELECT initial_build_attempts FROM backfill_seed_lifecycle WHERE occurrence_id=?")
+      .get(candidate.occurrence_id) as { initial_build_attempts: number };
+    const seed = getBackfillSeed(db, candidate.occurrence_id);
+    if (seed === null) throw new Error("claimed backfill seed is missing");
+    return { seed, claimToken: input.claimToken, claimExpiresAtMs, attempt: lifecycle.initial_build_attempts,
+      targetRevision: next, observedAtMs: candidate.observed_at_ms };
+  }).immediate();
+}
+
+function claimBackfillJob(db: Database.Database, input: ClaimBackfillJobInput): BackfillJobClaim | null {
+  if (!Number.isSafeInteger(input.nowMs) || input.nowMs < 0) throw seedViolation("invalid backfill-job claim clock");
+  if (!/^[0-9a-f]{32}$/.test(input.claimToken)) throw seedViolation("invalid backfill-job claim token");
+  if (!Number.isSafeInteger(input.operationBudgetMs) || input.operationBudgetMs < MIN_OPERATION_BUDGET_MS || input.operationBudgetMs > MAX_OPERATION_BUDGET_MS) {
+    throw seedViolation("invalid backfill-job operation budget");
+  }
+  return db.transaction(() => {
+    if (stopDueBackfillInTransaction(db, input.nowMs) !== null) return null;
+    const candidate = db.prepare(`SELECT job.occurrence_id,job.target_revision,
+        MAX(?,lifecycle.last_observed_at_ms) AS observed_at_ms FROM backfill_jobs AS job
+      JOIN backfill_seed_lifecycle AS lifecycle ON lifecycle.occurrence_id=job.occurrence_id
+        AND lifecycle.owner='delivery' AND lifecycle.state='pending' AND lifecycle.deleted_at_ms IS NULL
+        AND lifecycle.process_cleanup_state IS NULL
+        AND lifecycle.stop_at_ms=job.stop_at_ms
+      WHERE MAX(?,lifecycle.last_observed_at_ms)<job.stop_at_ms AND job.attempt_count<1000000
+        AND ((job.state='due' AND job.next_attempt_at_ms<=MAX(?,lifecycle.last_observed_at_ms))
+          OR (job.state='claimed' AND job.claim_expires_at_ms<=MAX(?,lifecycle.last_observed_at_ms)))
+      ORDER BY job.next_attempt_at_ms,job.occurrence_id LIMIT 1`)
+      .get(input.nowMs, input.nowMs, input.nowMs, input.nowMs) as {
+        occurrence_id: string; target_revision: number | null; observed_at_ms: number;
+      } | undefined;
+    if (!candidate) return null;
+    const claimExpiresAtMs = candidate.observed_at_ms + input.operationBudgetMs + BUILD_CLAIM_MARGIN_MS;
+    if (!Number.isSafeInteger(claimExpiresAtMs)) throw seedViolation("backfill-job claim deadline overflow");
+    const next = candidate.target_revision ?? ((db.prepare(
+      "SELECT COALESCE(MAX(revision),0)+1 AS revision FROM delivery_journal WHERE occurrence_id=?",
+    ).get(candidate.occurrence_id) as { revision: number }).revision);
+    if (!Number.isSafeInteger(next) || next < 1 || next > 1_000_000) throw seedViolation("backfill target revision exhausted");
+    const changed = db.prepare(`UPDATE backfill_jobs
+      SET state='claimed',claim_token=?,claim_expires_at_ms=?,target_revision=?,attempt_count=attempt_count+1
+      WHERE occurrence_id=? AND stop_at_ms>? AND attempt_count<1000000
+        AND ((state='due' AND next_attempt_at_ms<=?) OR (state='claimed' AND claim_expires_at_ms<=?))
+        AND EXISTS (SELECT 1 FROM backfill_seed_lifecycle AS lifecycle
+          WHERE lifecycle.occurrence_id=backfill_jobs.occurrence_id
+            AND lifecycle.owner='delivery' AND lifecycle.state='pending' AND lifecycle.deleted_at_ms IS NULL
+            AND lifecycle.process_cleanup_state IS NULL
+            AND lifecycle.stop_at_ms=backfill_jobs.stop_at_ms)`)
+      .run(input.claimToken, claimExpiresAtMs, next, candidate.occurrence_id,
+        candidate.observed_at_ms, candidate.observed_at_ms, candidate.observed_at_ms).changes;
+    if (changed !== 1) return null;
+    db.prepare("UPDATE backfill_seed_lifecycle SET last_observed_at_ms=? WHERE occurrence_id=?")
+      .run(candidate.observed_at_ms, candidate.occurrence_id);
+    const row = db.prepare("SELECT attempt_count,stop_at_ms FROM backfill_jobs WHERE occurrence_id=?")
+      .get(candidate.occurrence_id) as { attempt_count: number; stop_at_ms: number };
+    const seed = getBackfillSeed(db, candidate.occurrence_id);
+    if (seed === null) throw new Error("claimed backfill job seed is missing");
+    return { seed, claimToken: input.claimToken, claimExpiresAtMs, attempt: row.attempt_count,
+      targetRevision: next, stopAtMs: row.stop_at_ms, observedAtMs: candidate.observed_at_ms };
+  }).immediate();
+}
+
+function beginBackfillProcess(db: Database.Database, input: BeginBackfillProcessInput): { readonly processOwnerToken: string } {
+  validBackfillClock(input.nowMs);
+  if (!/^[0-9a-f]{32}$/.test(input.claimToken)) throw seedViolation("invalid backfill process token");
+  const deadlineClosed = Symbol("backfill process deadline closed");
+  const claimExpired = Symbol("backfill process claim expired");
+  const result = db.transaction((): { readonly processOwnerToken: string } | typeof deadlineClosed | typeof claimExpired => {
+    const lifecycle = db.prepare(`SELECT owner,state,stop_at_ms,build_claim_token,build_claim_expires_at_ms,
+      process_owner_token,process_cleanup_state FROM backfill_seed_lifecycle WHERE occurrence_id=?`)
+      .get(input.occurrenceId) as { owner: string; state: string; stop_at_ms: number;
+        build_claim_token: string | null; build_claim_expires_at_ms: number | null;
+        process_owner_token: string | null; process_cleanup_state: string | null } | undefined;
+    if (!lifecycle || lifecycle.state !== "pending" || lifecycle.process_owner_token !== null ||
+        lifecycle.process_cleanup_state !== null) throw seedViolation("backfill process owner is unavailable");
+    let claimExpiresAtMs: number;
+    if (input.kind === "initial") {
+      if (lifecycle.owner !== "seed" || lifecycle.build_claim_token !== input.claimToken ||
+          lifecycle.build_claim_expires_at_ms === null) {
+        throw seedViolation("initial backfill process claim is stale");
+      }
+      claimExpiresAtMs = lifecycle.build_claim_expires_at_ms;
+    } else {
+      const job = db.prepare(`SELECT state,claim_token,claim_expires_at_ms,target_revision
+        FROM backfill_jobs WHERE occurrence_id=?`).get(input.occurrenceId) as { state: string;
+          claim_token: string | null; claim_expires_at_ms: number | null; target_revision: number | null } | undefined;
+      if (lifecycle.owner !== "delivery" || !job || job.state !== "claimed" ||
+          job.claim_token !== input.claimToken || job.claim_expires_at_ms === null ||
+          job.target_revision !== input.targetRevision) {
+        throw seedViolation("retry backfill process claim is stale");
+      }
+      claimExpiresAtMs = job.claim_expires_at_ms;
+    }
+    const effective = observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    if (effective >= lifecycle.stop_at_ms) {
+      stopBackfillOccurrence(db, input.occurrenceId, null);
+      return deadlineClosed;
+    }
+    if (claimExpiresAtMs <= effective) return claimExpired;
+    const changed = db.prepare(`UPDATE backfill_seed_lifecycle SET process_owner_token=?,process_cleanup_state='active'
+      WHERE occurrence_id=? AND state='pending' AND process_cleanup_state IS NULL`)
+      .run(input.claimToken, input.occurrenceId).changes;
+    if (changed !== 1) throw seedViolation("backfill process owner is unavailable");
+    return { processOwnerToken: input.claimToken };
+  }).immediate();
+  if (result === deadlineClosed) throw seedViolation("backfill process is past its original stop deadline");
+  if (result === claimExpired) throw seedViolation("backfill process claim is stale or expired");
+  return result;
+}
+
+function settleBackfillProcess(db: Database.Database, input: SettleBackfillProcessInput): { readonly outcome: "confirmed" | "failed" } {
+  validBackfillClock(input.nowMs);
+  if (!/^[0-9a-f]{32}$/.test(input.processOwnerToken)) throw seedViolation("invalid backfill process token");
+  return db.transaction(() => {
+    observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    const marker = db.prepare(`SELECT process_owner_token,process_cleanup_state
+      FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(input.occurrenceId) as {
+        process_owner_token: string | null; process_cleanup_state: string | null;
+      } | undefined;
+    if (!marker || marker.process_cleanup_state !== "active" || marker.process_owner_token !== input.processOwnerToken) {
+      throw seedViolation("backfill process owner is not active");
+    }
+    if (input.outcome === "confirmed") {
+      db.prepare(`UPDATE backfill_seed_lifecycle SET process_owner_token=NULL,process_cleanup_state=NULL
+        WHERE occurrence_id=? AND process_cleanup_state='active' AND process_owner_token=?`)
+        .run(input.occurrenceId, input.processOwnerToken);
+    } else {
+      db.prepare(`UPDATE backfill_seed_lifecycle SET process_cleanup_state='failed'
+        WHERE occurrence_id=? AND process_cleanup_state='active' AND process_owner_token=?`)
+        .run(input.occurrenceId, input.processOwnerToken);
+      stopBackfillOccurrence(db, input.occurrenceId, "cleanup_failed");
+    }
+    return { outcome: input.outcome };
+  }).immediate();
+}
+
+function validBackfillClock(nowMs: number): void {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw seedViolation("invalid backfill clock");
+}
+
+function observeBackfillWall(db: Database.Database, occurrenceId: string, nowMs: number): number {
+  validBackfillClock(nowMs);
+  const row = db.prepare("SELECT last_observed_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=?")
+    .get(occurrenceId) as { last_observed_at_ms: number } | undefined;
+  if (!row) throw seedViolation("backfill lifecycle is missing");
+  const effective = Math.max(nowMs, row.last_observed_at_ms);
+  db.prepare("UPDATE backfill_seed_lifecycle SET last_observed_at_ms=? WHERE occurrence_id=?")
+    .run(effective, occurrenceId);
+  return effective;
+}
+
+function registerBackfillWarning(db: Database.Database, occurrenceId: string): void {
+  const lifecycle = db.prepare("SELECT stop_at_ms,expires_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=?")
+    .get(occurrenceId) as { stop_at_ms: number; expires_at_ms: number };
+  db.prepare(`INSERT OR IGNORE INTO backfill_warning_intents
+    (occurrence_id,stop_at_ms,expires_at_ms,reason,state,attempt_count,next_attempt_at_ms)
+    VALUES (?,?,?,'backfill_stopped','pending',0,?)`)
+    .run(occurrenceId, lifecycle.stop_at_ms, lifecycle.expires_at_ms, lifecycle.stop_at_ms);
+}
+
+function stopBackfillOccurrence(db: Database.Database, occurrenceId: string, reason: "cleanup_failed" | "attempts_exhausted" | null): void {
+  db.prepare(`UPDATE backfill_seed_lifecycle SET state='stopped',build_claim_token=NULL,
+    build_claim_expires_at_ms=NULL,initial_build_last_reason=COALESCE(?,initial_build_last_reason)
+    WHERE occurrence_id=? AND state='pending'`).run(reason, occurrenceId);
+  db.prepare(`UPDATE backfill_jobs SET state='stopped',claim_token=NULL,claim_expires_at_ms=NULL,
+    last_reason=COALESCE(?,last_reason) WHERE occurrence_id=? AND state!='complete'`)
+    .run(reason, occurrenceId);
+  registerBackfillWarning(db, occurrenceId);
+}
+
+function failBackfillBuild(db: Database.Database, input: BackfillBuildFailure): BackfillFailureResult {
+  validBackfillClock(input.nowMs);
+  if (!/^[0-9a-f]{32}$/.test(input.claimToken)) {
+    throw seedViolation("invalid backfill failure input");
+  }
+  validateBackfillRetryDelay(input.retryDelayMs);
+  const expiredClaim = Symbol("expired backfill claim");
+  const result = db.transaction((): BackfillFailureResult | typeof expiredClaim => {
+    const effective = observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    const lifecycle = db.prepare(`SELECT owner,state,stop_at_ms,initial_build_attempts,
+      build_claim_token,build_claim_expires_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=?`)
+      .get(input.occurrenceId) as { owner: string; state: string; stop_at_ms: number; initial_build_attempts: number;
+        build_claim_token: string | null; build_claim_expires_at_ms: number | null };
+    if (input.kind === "initial") {
+      if (lifecycle.owner !== "seed" || lifecycle.state !== "pending" || lifecycle.build_claim_token !== input.claimToken ||
+          lifecycle.build_claim_expires_at_ms === null) {
+        throw seedViolation("initial backfill claim is stale");
+      }
+      if (input.reason !== "cleanup_failed" && lifecycle.build_claim_expires_at_ms <= effective) return expiredClaim;
+      if (input.reason === "cleanup_failed" || lifecycle.initial_build_attempts >= 1_000_000) {
+        stopBackfillOccurrence(db, input.occurrenceId, input.reason === "cleanup_failed" ? "cleanup_failed" : "attempts_exhausted");
+        return { kind: "stopped" as const };
+      }
+      const nextAttemptAtMs = backfillRetryAt(effective, input.retryDelayMs, lifecycle.stop_at_ms);
+      db.prepare(`UPDATE backfill_seed_lifecycle SET build_claim_token=NULL,build_claim_expires_at_ms=NULL,
+        initial_build_next_attempt_at_ms=?,initial_build_last_reason=? WHERE occurrence_id=?`)
+        .run(nextAttemptAtMs, input.reason, input.occurrenceId);
+      return { kind: "rescheduled" as const };
+    }
+    const job = db.prepare(`SELECT state,attempt_count,claim_token,claim_expires_at_ms,target_revision,stop_at_ms
+      FROM backfill_jobs WHERE occurrence_id=?`).get(input.occurrenceId) as { state: string; attempt_count: number;
+        claim_token: string | null; claim_expires_at_ms: number | null; target_revision: number | null; stop_at_ms: number } | undefined;
+    if (lifecycle.owner !== "delivery" || lifecycle.state !== "pending" || !job || job.state !== "claimed" ||
+        job.claim_token !== input.claimToken || job.claim_expires_at_ms === null ||
+        job.target_revision !== input.targetRevision) throw seedViolation("retry backfill claim is stale");
+    if (input.reason !== "cleanup_failed" && job.claim_expires_at_ms <= effective) return expiredClaim;
+    if (input.reason === "cleanup_failed" || job.attempt_count >= 1_000_000) {
+      stopBackfillOccurrence(db, input.occurrenceId, input.reason === "cleanup_failed" ? "cleanup_failed" : "attempts_exhausted");
+      return { kind: "stopped" as const };
+    }
+    const nextAttemptAtMs = backfillRetryAt(effective, input.retryDelayMs, job.stop_at_ms);
+    db.prepare(`UPDATE backfill_jobs SET state='due',next_attempt_at_ms=?,claim_token=NULL,
+      claim_expires_at_ms=NULL,last_reason=? WHERE occurrence_id=?`)
+      .run(nextAttemptAtMs, input.reason, input.occurrenceId);
+    return { kind: "rescheduled" as const };
+  }).immediate();
+  if (result === expiredClaim) throw seedViolation("backfill claim is stale or expired");
+  return result;
+}
+
+function validateBackfillRetryDelay(retryDelayMs: number): void {
+  if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 1_000 || retryDelayMs > 60_000) {
+    throw seedViolation("invalid backfill retry delay");
+  }
+}
+
+function backfillRetryAt(nowMs: number, retryDelayMs: number, stopAtMs: number): number {
+  validateBackfillRetryDelay(retryDelayMs);
+  const scheduledAtMs = nowMs + retryDelayMs;
+  if (!Number.isSafeInteger(scheduledAtMs)) throw seedViolation("invalid backfill retry delay");
+  return Math.min(stopAtMs, scheduledAtMs);
+}
+
+function stopDueBackfill(db: Database.Database, nowMs: number): { readonly occurrenceId: string } | null {
+  validBackfillClock(nowMs);
+  return db.transaction(() => stopDueBackfillInTransaction(db, nowMs)).immediate();
+}
+
+function stopDueBackfillInTransaction(db: Database.Database, nowMs: number): { readonly occurrenceId: string } | null {
+  const row = db.prepare(`SELECT lifecycle.occurrence_id,
+      MAX(?,lifecycle.last_observed_at_ms) AS observed_at_ms,
+      CASE WHEN lifecycle.owner='seed' THEN lifecycle.initial_build_attempts
+           ELSE COALESCE(job.attempt_count,0) END AS attempts
+    FROM backfill_seed_lifecycle AS lifecycle
+    LEFT JOIN backfill_jobs AS job ON job.occurrence_id=lifecycle.occurrence_id
+    WHERE lifecycle.state='pending'
+      AND ((lifecycle.owner='seed' AND (MAX(?,lifecycle.last_observed_at_ms)>=lifecycle.stop_at_ms OR lifecycle.initial_build_attempts>=1000000))
+        OR (lifecycle.owner='delivery' AND (
+          (job.state!='complete'
+            AND (MAX(?,lifecycle.last_observed_at_ms)>=lifecycle.stop_at_ms OR job.attempt_count>=1000000))
+          OR (job.occurrence_id IS NULL AND MAX(?,lifecycle.last_observed_at_ms)>=lifecycle.stop_at_ms
+            AND EXISTS (SELECT 1 FROM delivery_journal AS delivery
+              WHERE delivery.occurrence_id=lifecycle.occurrence_id
+                AND delivery.transcript_complete=1 AND delivery.published_at_ms IS NULL
+                AND delivery.deleted_at_ms IS NULL)))))
+    ORDER BY lifecycle.stop_at_ms,lifecycle.occurrence_id LIMIT 1`)
+    .get(nowMs, nowMs, nowMs, nowMs) as { occurrence_id: string; observed_at_ms: number; attempts: number } | undefined;
+  if (!row) return null;
+  observeBackfillWall(db, row.occurrence_id, row.observed_at_ms);
+  stopBackfillOccurrence(db, row.occurrence_id, row.attempts >= 1_000_000 ? "attempts_exhausted" : null);
+  return { occurrenceId: row.occurrence_id };
+}
+
+const WARNING_CLAIM_MS = 30_000;
+function claimBackfillWarning(db: Database.Database, nowMs: number, claimToken: string): BackfillWarningClaim | null {
+  validBackfillClock(nowMs);
+  if (!/^[0-9a-f]{32}$/.test(claimToken)) throw seedViolation("invalid warning claim token");
+  return db.transaction(() => {
+    db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='expired',
+      claim_token=NULL,claim_expires_at_ms=NULL
+      WHERE state IN ('pending','claimed') AND expires_at_ms<=MAX(?,
+        (SELECT last_observed_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=backfill_warning_intents.occurrence_id))`).run(nowMs);
+    db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='attempts_exhausted',
+      claim_token=NULL,claim_expires_at_ms=NULL
+      WHERE attempt_count>=1000000 AND (state='pending' OR (state='claimed' AND claim_expires_at_ms<=MAX(?,
+        (SELECT last_observed_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=backfill_warning_intents.occurrence_id))))`).run(nowMs);
+    const row = db.prepare(`SELECT warning.occurrence_id,warning.stop_at_ms,warning.expires_at_ms,warning.attempt_count,
+        MAX(?,lifecycle.last_observed_at_ms) AS observed_at_ms
+      FROM backfill_warning_intents AS warning JOIN backfill_seed_lifecycle AS lifecycle USING(occurrence_id)
+      WHERE warning.state IN ('pending','claimed') AND warning.attempt_count<1000000
+        AND MAX(?,lifecycle.last_observed_at_ms)>=warning.stop_at_ms
+        AND MAX(?,lifecycle.last_observed_at_ms)<warning.expires_at_ms
+        AND warning.next_attempt_at_ms<=MAX(?,lifecycle.last_observed_at_ms)
+        AND (warning.state='pending' OR warning.claim_expires_at_ms<=MAX(?,lifecycle.last_observed_at_ms))
+      ORDER BY warning.next_attempt_at_ms,warning.occurrence_id LIMIT 1`)
+      .get(nowMs, nowMs, nowMs, nowMs, nowMs) as { occurrence_id: string; stop_at_ms: number;
+        expires_at_ms: number; attempt_count: number; observed_at_ms: number } | undefined;
+    if (!row) return null;
+    const claimExpiresAtMs = row.observed_at_ms + WARNING_CLAIM_MS;
+    if (!Number.isSafeInteger(claimExpiresAtMs)) throw seedViolation("warning claim deadline overflow");
+    const changed = db.prepare(`UPDATE backfill_warning_intents SET state='claimed',claim_token=?,
+      claim_expires_at_ms=?,attempt_count=attempt_count+1 WHERE occurrence_id=? AND state IN ('pending','claimed')
+      AND attempt_count<1000000 AND (state='pending' OR claim_expires_at_ms<=?)`)
+      .run(claimToken, claimExpiresAtMs, row.occurrence_id, row.observed_at_ms).changes;
+    if (changed !== 1) return null;
+    observeBackfillWall(db, row.occurrence_id, row.observed_at_ms);
+    const payload = { schema: "meeting-operator-warning/v1" as const, occurrenceId: row.occurrence_id,
+      stopAt: new Date(row.stop_at_ms).toISOString(), expiresAt: new Date(row.expires_at_ms).toISOString(),
+      reason: "backfill_stopped" as const };
+    return { occurrenceId: row.occurrence_id, claimToken, claimExpiresAtMs,
+      attempt: row.attempt_count + 1, payload, key: operatorWarningKey(payload) };
+  }).immediate();
+}
+
+function acceptBackfillWarning(db: Database.Database, input: {
+  occurrenceId: string; claimToken: string; key: string; nowMs: number;
+}): void {
+  const expiredClaim = Symbol("expired warning claim");
+  const result = db.transaction((): void | typeof expiredClaim => {
+    const effective = observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    const row = db.prepare(`SELECT state,stop_at_ms,expires_at_ms,claim_token,claim_expires_at_ms
+      FROM backfill_warning_intents WHERE occurrence_id=?`)
+      .get(input.occurrenceId) as { state: string; stop_at_ms: number; expires_at_ms: number;
+        claim_token: string | null; claim_expires_at_ms: number | null } | undefined;
+    if (!row) throw seedViolation("warning intent is missing");
+    const payload = { schema: "meeting-operator-warning/v1" as const, occurrenceId: input.occurrenceId,
+      stopAt: new Date(row.stop_at_ms).toISOString(), expiresAt: new Date(row.expires_at_ms).toISOString(),
+      reason: "backfill_stopped" as const };
+    if (input.key !== operatorWarningKey(payload)) throw seedViolation("warning receipt key mismatch");
+    if (row.state === "accepted") return;
+    if (row.state !== "claimed" || row.claim_token !== input.claimToken || row.claim_expires_at_ms === null) {
+      throw seedViolation("warning claim is stale or expired");
+    }
+    if (row.expires_at_ms <= effective) {
+      db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='expired',
+        claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state='claimed' AND claim_token=?`)
+        .run(input.occurrenceId, input.claimToken);
+      return expiredClaim;
+    }
+    if (row.claim_expires_at_ms <= effective) return expiredClaim;
+    const changed = db.prepare(`UPDATE backfill_warning_intents SET state='accepted',accepted_at_ms=?,
+      claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state='claimed'
+      AND claim_token=? AND claim_expires_at_ms>? AND expires_at_ms>?`)
+      .run(effective, input.occurrenceId, input.claimToken, effective, effective).changes;
+    if (changed !== 1) throw seedViolation("warning claim is stale or expired");
+  }).immediate();
+  if (result === expiredClaim) throw seedViolation("warning claim is stale or expired");
+}
+
+function failBackfillWarning(db: Database.Database, input: {
+  occurrenceId: string; claimToken: string; nowMs: number; retryDelayMs: number; reason: "sink_failed";
+}): void {
+  validateBackfillRetryDelay(input.retryDelayMs);
+  const expiredClaim = Symbol("expired warning claim");
+  const result = db.transaction((): void | typeof expiredClaim => {
+    const effective = observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    const row = db.prepare(`SELECT state,attempt_count,claim_token,claim_expires_at_ms,expires_at_ms
+      FROM backfill_warning_intents WHERE occurrence_id=?`)
+      .get(input.occurrenceId) as { state: string; attempt_count: number; claim_token: string | null;
+        claim_expires_at_ms: number | null; expires_at_ms: number } | undefined;
+    if (!row) throw seedViolation("warning intent is missing");
+    if (row.state !== "claimed" || row.claim_token !== input.claimToken || row.claim_expires_at_ms === null) {
+      throw seedViolation("warning claim is stale or expired");
+    }
+    if (row.expires_at_ms <= effective) {
+      db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='expired',
+        claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state='claimed' AND claim_token=?`)
+        .run(input.occurrenceId, input.claimToken);
+      return;
+    }
+    if (row.claim_expires_at_ms <= effective) return expiredClaim;
+    if (row.attempt_count >= 1_000_000) {
+      db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='attempts_exhausted',
+        claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state='claimed' AND claim_token=?`)
+        .run(input.occurrenceId, input.claimToken);
+      return;
+    }
+    const nextAttemptAtMs = backfillRetryAt(effective, input.retryDelayMs, row.expires_at_ms);
+    const changed = db.prepare(`UPDATE backfill_warning_intents SET state='pending',next_attempt_at_ms=?,
+      claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state='claimed'
+      AND claim_token=? AND claim_expires_at_ms>? AND expires_at_ms>?`)
+      .run(nextAttemptAtMs, input.occurrenceId, input.claimToken, effective, effective).changes;
+    if (changed !== 1) throw seedViolation("warning claim is stale or expired");
+  }).immediate();
+  if (result === expiredClaim) throw seedViolation("warning claim is stale or expired");
+}
+
+function claimExpiredBackfillSeedCleanup(db: Database.Database, nowMs: number, claimToken: string): BackfillSeedCleanupClaim | null {
+  validBackfillClock(nowMs);
+  if (!/^[0-9a-f]{32}$/.test(claimToken)) throw seedViolation("invalid seed cleanup token");
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT lifecycle.occurrence_id,seed.recording_path,seed.capability_recording_handle,
+        seed.recording_bytes,seed.recording_device,seed.recording_inode,
+        MAX(?,lifecycle.last_observed_at_ms) AS observed_at_ms
+      FROM backfill_seed_lifecycle AS lifecycle JOIN backfill_seeds AS seed USING(occurrence_id)
+      WHERE lifecycle.owner='seed' AND lifecycle.state IN ('pending','stopped','cleanup_claimed')
+        AND COALESCE(lifecycle.initial_build_last_reason,'')!='cleanup_failed'
+        AND lifecycle.process_cleanup_state IS NULL
+        AND MAX(?,lifecycle.last_observed_at_ms)>=lifecycle.expires_at_ms
+        AND (lifecycle.state!='cleanup_claimed' OR lifecycle.cleanup_claim_expires_at_ms<=MAX(?,lifecycle.last_observed_at_ms))
+      ORDER BY lifecycle.expires_at_ms,lifecycle.occurrence_id LIMIT 1`)
+      .get(nowMs, nowMs, nowMs) as { occurrence_id: string; recording_path: string;
+        capability_recording_handle: string; recording_bytes: number; recording_device: string;
+        recording_inode: string; observed_at_ms: number } | undefined;
+    if (!row) return null;
+    const claimExpiresAtMs = row.observed_at_ms + WARNING_CLAIM_MS;
+    if (!Number.isSafeInteger(claimExpiresAtMs)) throw seedViolation("seed cleanup deadline overflow");
+    const changed = db.prepare(`UPDATE backfill_seed_lifecycle SET state='cleanup_claimed',
+      build_claim_token=NULL,build_claim_expires_at_ms=NULL,cleanup_claim_token=?,
+      cleanup_claim_expires_at_ms=?,last_observed_at_ms=? WHERE occurrence_id=? AND owner='seed'
+      AND state IN ('pending','stopped','cleanup_claimed')
+      AND process_cleanup_state IS NULL AND COALESCE(initial_build_last_reason,'')!='cleanup_failed'
+      AND (state!='cleanup_claimed' OR cleanup_claim_expires_at_ms<=?)`)
+      .run(claimToken, claimExpiresAtMs, row.observed_at_ms, row.occurrence_id, row.observed_at_ms).changes;
+    if (changed !== 1) return null;
+    registerBackfillWarning(db, row.occurrence_id);
+    db.prepare(`UPDATE backfill_warning_intents SET state='terminal',terminal_reason='expired',
+      claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=? AND state IN ('pending','claimed')`)
+      .run(row.occurrence_id);
+    return { occurrenceId: row.occurrence_id, claimToken, claimExpiresAtMs,
+      recordingPath: row.recording_path, recordingHandle: row.capability_recording_handle,
+      recordingBytes: row.recording_bytes, recordingDevice: row.recording_device, recordingInode: row.recording_inode };
+  }).immediate();
+}
+
+function completeBackfillSeedCleanup(db: Database.Database, input: {
+  occurrenceId: string; claimToken: string; nowMs: number;
+}): void {
+  const expiredClaim = Symbol("expired seed cleanup claim");
+  const result = db.transaction((): void | typeof expiredClaim => {
+    const effective = observeBackfillWall(db, input.occurrenceId, input.nowMs);
+    const owner = db.prepare(`SELECT owner,state,cleanup_claim_token,cleanup_claim_expires_at_ms
+      FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(input.occurrenceId) as {
+        owner: string; state: string; cleanup_claim_token: string | null; cleanup_claim_expires_at_ms: number | null;
+      } | undefined;
+    if (!owner || owner.owner !== "seed" || owner.state !== "cleanup_claimed" ||
+        owner.cleanup_claim_token !== input.claimToken || owner.cleanup_claim_expires_at_ms === null) {
+      throw seedViolation("seed cleanup claim is stale");
+    }
+    if (owner.cleanup_claim_expires_at_ms <= effective) return expiredClaim;
+    const changed = db.prepare(`UPDATE backfill_seed_lifecycle SET state='deleted',deleted_at_ms=?,
+      cleanup_claim_token=NULL,cleanup_claim_expires_at_ms=NULL WHERE occurrence_id=? AND owner='seed'
+      AND state='cleanup_claimed' AND cleanup_claim_token=? AND cleanup_claim_expires_at_ms>?
+      AND expires_at_ms<=?`)
+      .run(effective, input.occurrenceId, input.claimToken, effective, effective).changes;
+    if (changed !== 1) throw seedViolation("seed cleanup claim is stale");
+  }).immediate();
+  if (result === expiredClaim) throw seedViolation("seed cleanup claim is stale or expired");
+}
+
+function authorizeDeliveryEvidenceCleanup(db: Database.Database, occurrenceId: string, nowMs: number): boolean {
+  validBackfillClock(nowMs);
+  return db.transaction(() => {
+    const lifecycle = db.prepare(`SELECT owner,state,expires_at_ms,initial_build_last_reason,
+      process_cleanup_state FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(occurrenceId) as {
+        owner: string; state: string; expires_at_ms: number; initial_build_last_reason: string | null;
+        process_cleanup_state: string | null;
+      } | undefined;
+    if (!lifecycle) {
+      const seeded = db.prepare("SELECT 1 FROM backfill_seeds WHERE occurrence_id=?").get(occurrenceId);
+      return seeded === undefined;
+    }
+    const effective = observeBackfillWall(db, occurrenceId, nowMs);
+    if (effective >= lifecycle.expires_at_ms && lifecycle.state === "pending") {
+      stopBackfillOccurrence(db, occurrenceId, null);
+    }
+    const current = db.prepare(`SELECT owner,state,expires_at_ms,initial_build_last_reason,
+      process_cleanup_state FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(occurrenceId) as {
+        owner: string; state: string; expires_at_ms: number; initial_build_last_reason: string | null;
+        process_cleanup_state: string | null;
+      };
+    const acceptedComplete = db.prepare(`SELECT 1 FROM delivery_journal WHERE occurrence_id=?
+      AND transcript_complete=1 AND published_at_ms IS NOT NULL AND deleted_at_ms IS NULL LIMIT 1`).get(occurrenceId) !== undefined;
+    const job = db.prepare("SELECT last_reason FROM backfill_jobs WHERE occurrence_id=?").get(occurrenceId) as {
+      last_reason: string | null;
+    } | undefined;
+    const closed = effective >= current.expires_at_ms || acceptedComplete;
+    return closed && current.owner === "delivery" && ["pending", "stopped"].includes(current.state) &&
+      current.process_cleanup_state === null && current.initial_build_last_reason !== "cleanup_failed" &&
+      job?.last_reason !== "cleanup_failed";
+  }).immediate();
 }
 
 type AlignmentHeader = {
@@ -1100,12 +1867,45 @@ function reclaimRecordingAlignment(db: Database.Database, attempt: AlignmentAtte
 function savePendingDelivery(
   db: Database.Database,
   row: DeliveryRow,
+  authority?: BackfillDeliveryAuthority,
   identityCheckpoint?: (canonicalPath: string) => void,
-): void {
-  const save = db.transaction(() => {
+): SavePendingDeliveryResult {
+  const deadlineClosed = Symbol("backfill deadline closed");
+  const claimExpired = Symbol("backfill claim expired");
+  const save = db.transaction((): SavePendingDeliveryResult | null | typeof deadlineClosed | typeof claimExpired => {
+    const existing = selectDeliveryRow(db, row.occurrenceId, row.revision);
+    if (existing !== null) {
+      if (existing.deletedAtMs !== null) {
+        throw new OrchestrationError("constraint_violation", "deleted delivery intent cannot be replayed after governed cleanup");
+      }
+      if (row.artifactHash !== existing.artifactHash || row.recoveryArtifact !== existing.recoveryArtifact) {
+        throw new OrchestrationError("constraint_violation", "delivery revision has conflicting canonical bytes");
+      }
+      if (existing.recoveryArtifact === null) {
+        throw new OrchestrationError("constraint_violation", "delivery replay has no retained canonical bytes");
+      }
+      const seed = getBackfillSeed(db, row.occurrenceId);
+      if (seed !== null) {
+        assertReplayableBackfillLifecycle(db, seed);
+        validateSeededDelivery(db, existing, seed);
+        assertSeedRecordingBinding(seed);
+      }
+      return { kind: "replay", row: existing };
+    }
     const recording = db.prepare("SELECT handle, encrypted_path FROM recordings WHERE occurrence_id = ?").get(row.occurrenceId) as { handle: string; encrypted_path: string | null } | undefined;
     if (recording === undefined || path.resolve(recording.encrypted_path ?? "") !== path.resolve(row.recordingPath)) {
       throw new OrchestrationError("constraint_violation", "delivery recording is not the finalized occurrence recording");
+    }
+    const seed = getBackfillSeed(db, row.occurrenceId);
+    if (seed !== null) {
+      validateSeededDelivery(db, row, seed);
+      const authorityState = validateBackfillAuthority(db, row, seed, authority);
+      assertSeedRecordingBinding(seed);
+      if (authorityState === "deadline_closed") return deadlineClosed;
+      if (authorityState === "claim_expired") return claimExpired;
+      authority = authorityState;
+    } else if (authority !== undefined) {
+      throw new OrchestrationError("constraint_violation", "backfill delivery authority has no immutable seed");
     }
     const binding = claimDeliveryRecordingOwner(
       db,
@@ -1114,7 +1914,7 @@ function savePendingDelivery(
       recording.encrypted_path ?? "",
       identityCheckpoint,
     );
-    if (binding === null) return false;
+    if (binding === null) return null;
     withConstraintTranslation(() => db.prepare(
     `INSERT INTO delivery_journal
        (occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
@@ -1125,9 +1925,193 @@ function savePendingDelivery(
     row.endedAtMs, row.transcriptComplete ? 1 : 0, row.retryCount, row.nextRetryAtMs,
     row.retryReason, row.publishedAtMs, row.deletedAtMs, row.publicationUrl, row.vaultCommit,
     row.recoveryArtifact, row.stageToken, binding.handle));
-    return true;
+    if (seed !== null) {
+      commitBackfillHandoff(db, row, seed, authority!);
+      assertSeedRecordingBinding(seed);
+    }
+    return { kind: "inserted", row: selectDeliveryRow(db, row.occurrenceId, row.revision)! };
   });
-  if (!save()) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
+  const result = save.immediate();
+  if (result === null) throw new OrchestrationError("constraint_violation", "delivery recording belongs to another occurrence");
+  if (result === deadlineClosed) throw seedViolation("backfill delivery is past its original stop deadline");
+  if (result === claimExpired) throw seedViolation("backfill delivery claim is stale or expired");
+  return result;
+}
+
+function selectDeliveryRow(db: Database.Database, occurrenceId: string, revision: number): DeliveryRow | null {
+  const row = db.prepare(
+    `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
+            transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
+            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle
+       FROM delivery_journal WHERE occurrence_id=? AND revision=?`,
+  ).get(occurrenceId, revision) as { occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null } | undefined;
+  if (!row) return null;
+  return { occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
+    recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
+    transcriptComplete: row.transcript_complete === 1, retryCount: row.retry_count,
+    nextRetryAtMs: row.next_retry_at_ms, retryReason: row.retry_reason, publishedAtMs: row.published_at_ms,
+    deletedAtMs: row.deleted_at_ms, publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
+    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token, recordingHandle: row.recording_handle };
+}
+
+function seededArtifact(row: DeliveryRow): SupportedTeamMemMeetingArtifact {
+  if (row.recoveryArtifact === null) throw seedViolation("seeded delivery requires canonical recovery bytes");
+  let artifact: SupportedTeamMemMeetingArtifact;
+  try { artifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact)); }
+  catch { throw seedViolation("seeded delivery recovery artifact is invalid"); }
+  if (canonicalArtifactJson(artifact) !== row.recoveryArtifact || canonicalArtifactHash(artifact) !== row.artifactHash) {
+    throw seedViolation("seeded delivery canonical bytes or hash mismatch");
+  }
+  if (artifact.occurrence_id !== row.occurrenceId || artifact.revision !== row.revision ||
+      artifact.transcript_complete !== row.transcriptComplete || Date.parse(artifact.ended_at) !== row.endedAtMs) {
+    throw seedViolation("seeded delivery row does not match its canonical artifact");
+  }
+  return artifact;
+}
+
+function validateSeededDelivery(db: Database.Database, row: DeliveryRow, seed: BackfillSeed): void {
+  const artifact = seededArtifact(row);
+  const organizer = seed.organizer === null ? null : { person_id: seed.organizer.feishuUserId, display_name: seed.organizer.displayName };
+  const sameOrganizer = JSON.stringify(artifact.organizer) === JSON.stringify(organizer)
+    && artifact.organizer_source === (seed.organizer?.source ?? null)
+    && artifact.organizer_unresolved_reason === (seed.organizer === null ? "instant_meeting" : null);
+  const provenance = artifact.provenance;
+  const audio = artifact.audio;
+  if (artifact.provider !== seed.provider || artifact.provider_meeting_id !== seed.providerMeetingId ||
+      artifact.title !== seed.title || artifact.started_at !== seed.occurrenceStartedAt || artifact.ended_at !== seed.endedAt ||
+      !sameOrganizer || row.recordingPath !== seed.recordingPath || row.recordingHandle !== seed.capability.recordingHandle ||
+      audio.format !== seed.recordingFormat || audio.encryption !== seed.recordingEncryption ||
+      audio.bytes !== seed.recordingBytes || audio.duration_seconds !== seed.recordingDurationMs / 1000 ||
+      audio.sha256 !== `sha256:${seed.recordingSha256}` || audio.expires_at !== new Date(seed.expiresAtMs).toISOString() ||
+      provenance.runtime_profile !== seed.provenance.runtimeProfile || provenance.stt_provider !== seed.provenance.sttProvider ||
+      provenance.stt_model !== seed.provenance.sttModel || provenance.text_provider !== seed.provenance.textProvider ||
+      provenance.text_model !== seed.provenance.textModel || provenance.agent_version !== seed.provenance.agentVersion) {
+    throw seedViolation("seeded delivery static metadata mismatch");
+  }
+  for (const [index, warning] of seed.processingWarnings.entries()) {
+    const actual = artifact.processing_warnings[index];
+    if (actual === undefined || actual.code !== warning.code || actual.detail !== warning.detail) {
+      throw seedViolation("seeded delivery base processing warnings mismatch");
+    }
+  }
+  for (const segment of artifact.transcript) {
+    const expected = segment.provenance.stage === "live_stream" ? seed.provenance.liveStreamModel : seed.provenance.finalBatchModel;
+    if (segment.provenance.model !== expected) throw seedViolation("seeded delivery transcript model provenance mismatch");
+  }
+  let gapCursor = 0;
+  for (const gap of seed.bridgeGaps) {
+    const expectedEnd = gap.endedAt ?? seed.endedAt;
+    while (gapCursor < artifact.recording_gaps.length &&
+      (artifact.recording_gaps[gapCursor]!.started_at !== gap.startedAt || artifact.recording_gaps[gapCursor]!.ended_at !== expectedEnd)) gapCursor += 1;
+    if (gapCursor === artifact.recording_gaps.length) throw seedViolation("seeded delivery recording gaps mismatch");
+    gapCursor += 1;
+  }
+  const recovery = db.prepare(`SELECT generation_id,bridge_session_id,source_session_id,recording_handle,sha256,key_id,authorization
+    FROM recording_recovery_bindings WHERE occurrence_id=? AND generation_id=?`).get(seed.occurrenceId, seed.generationId) as {
+      generation_id: string; bridge_session_id: string; source_session_id: string; recording_handle: string;
+      sha256: string; key_id: string; authorization: string;
+    } | undefined;
+  if (!recovery || recovery.bridge_session_id !== seed.bridgeSessionId || recovery.source_session_id !== seed.capability.sourceSessionId.toString() ||
+      recovery.recording_handle !== seed.capability.recordingHandle || recovery.sha256 !== seed.capability.sha256 ||
+      recovery.key_id !== seed.capability.keyId || recovery.authorization !== seed.capability.authorization) {
+    throw seedViolation("seeded delivery recovery capability mismatch");
+  }
+}
+
+function assertReplayableBackfillLifecycle(db: Database.Database, seed: BackfillSeed): void {
+  const lifecycle = db.prepare(`SELECT owner,state,stop_at_ms,expires_at_ms,deleted_at_ms
+    FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(seed.occurrenceId) as {
+      owner: "seed" | "delivery"; state: string; stop_at_ms: number; expires_at_ms: number; deleted_at_ms: number | null;
+    } | undefined;
+  if (!lifecycle || lifecycle.owner !== "delivery" || !["pending", "stopped"].includes(lifecycle.state) ||
+      lifecycle.deleted_at_ms !== null || lifecycle.stop_at_ms !== seed.stopAtMs || lifecycle.expires_at_ms !== seed.expiresAtMs) {
+    throw seedViolation("backfill lifecycle cleanup or deletion forbids delivery replay");
+  }
+}
+
+function assertSeedRecordingBinding(seed: BackfillSeed): void {
+  const current = backfillRecordingBinding({ handle: seed.capability.recordingHandle, encryptedPath: seed.recordingPath });
+  if (current.canonicalPath !== seed.recordingPath || current.bytes !== seed.recordingBytes ||
+      current.device !== seed.recordingDevice || current.inode !== seed.recordingInode) {
+    throw seedViolation("seeded delivery recording identity or size changed");
+  }
+}
+
+function validateBackfillAuthority(
+  db: Database.Database,
+  row: DeliveryRow,
+  seed: BackfillSeed,
+  authority: BackfillDeliveryAuthority | undefined,
+): BackfillDeliveryAuthority | "deadline_closed" | "claim_expired" {
+  if (authority === undefined) throw seedViolation("seeded delivery requires live backfill authority");
+  if (!Number.isSafeInteger(authority.nowMs) || authority.nowMs < 0 || !/^[0-9a-f]{32}$/.test(authority.claimToken)) {
+    throw seedViolation("invalid backfill delivery authority");
+  }
+  if (row.retryCount !== 0 || row.retryReason !== null || row.publishedAtMs !== null || row.deletedAtMs !== null ||
+      row.publicationUrl !== null || row.vaultCommit !== null || row.stageToken === null) {
+    throw seedViolation("new seeded delivery intent is not pending canonical state");
+  }
+  const lifecycle = db.prepare(`SELECT owner,state,stop_at_ms,expires_at_ms,build_claim_token,build_claim_expires_at_ms,deleted_at_ms,
+    process_owner_token,process_cleanup_state
+    FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(seed.occurrenceId) as {
+      owner: "seed" | "delivery"; state: string; stop_at_ms: number; expires_at_ms: number;
+      build_claim_token: string | null; build_claim_expires_at_ms: number | null; deleted_at_ms: number | null;
+      process_owner_token: string | null; process_cleanup_state: string | null;
+    } | undefined;
+  if (!lifecycle || lifecycle.state !== "pending" || lifecycle.deleted_at_ms !== null || lifecycle.stop_at_ms !== seed.stopAtMs || lifecycle.expires_at_ms !== seed.expiresAtMs) {
+    throw seedViolation("backfill lifecycle is stopped or deleted");
+  }
+  if (lifecycle.process_owner_token !== null || lifecycle.process_cleanup_state !== null) {
+    throw seedViolation("backfill process owner must settle before delivery handoff");
+  }
+  if (authority.kind === "initial") {
+    const next = (db.prepare("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM delivery_journal WHERE occurrence_id=?")
+      .get(seed.occurrenceId) as { revision: number }).revision;
+    if (lifecycle.owner !== "seed" || lifecycle.build_claim_token !== authority.claimToken ||
+        lifecycle.build_claim_expires_at_ms === null || row.revision !== next) {
+      throw seedViolation("initial backfill claim or first revision is stale");
+    }
+    const effective = observeBackfillWall(db, seed.occurrenceId, authority.nowMs);
+    if (effective >= seed.stopAtMs || effective >= seed.expiresAtMs) return "deadline_closed";
+    if (lifecycle.build_claim_expires_at_ms <= effective) return "claim_expired";
+    return { ...authority, nowMs: effective };
+  }
+  const job = db.prepare("SELECT state,claim_token,claim_expires_at_ms,target_revision,stop_at_ms FROM backfill_jobs WHERE occurrence_id=?")
+    .get(seed.occurrenceId) as { state: string; claim_token: string | null; claim_expires_at_ms: number | null; target_revision: number | null; stop_at_ms: number } | undefined;
+  if (lifecycle.owner !== "delivery" || !job || job.state !== "claimed" || job.stop_at_ms !== seed.stopAtMs ||
+      job.claim_token !== authority.claimToken || job.claim_expires_at_ms === null ||
+      job.target_revision !== authority.targetRevision || row.revision !== authority.targetRevision) {
+    throw seedViolation("retry backfill claim, lease or target revision is stale");
+  }
+  const effective = observeBackfillWall(db, seed.occurrenceId, authority.nowMs);
+  if (effective >= seed.stopAtMs || effective >= seed.expiresAtMs) return "deadline_closed";
+  if (job.claim_expires_at_ms <= effective) return "claim_expired";
+  return { ...authority, nowMs: effective };
+}
+
+function commitBackfillHandoff(db: Database.Database, row: DeliveryRow, seed: BackfillSeed, authority: BackfillDeliveryAuthority): void {
+  if (authority.kind === "initial") {
+    const changed = db.prepare(`UPDATE backfill_seed_lifecycle
+      SET owner='delivery',build_claim_token=NULL,build_claim_expires_at_ms=NULL
+      WHERE occurrence_id=? AND owner='seed' AND state='pending' AND build_claim_token=? AND build_claim_expires_at_ms>? AND stop_at_ms>?`)
+      .run(seed.occurrenceId, authority.claimToken, authority.nowMs, authority.nowMs).changes;
+    if (changed !== 1) throw seedViolation("initial backfill ownership transfer lost its claim");
+    if (!row.transcriptComplete) {
+      withConstraintTranslation(() => db.prepare(`INSERT INTO backfill_jobs
+        (occurrence_id,state,attempt_count,next_attempt_at_ms,claim_token,claim_expires_at_ms,target_revision,last_reason,stop_at_ms,completion_revision,completion_artifact_hash)
+        VALUES (?,'due',0,?,NULL,NULL,NULL,NULL,?,NULL,NULL)`)
+        .run(seed.occurrenceId, authority.nowMs, seed.stopAtMs));
+    }
+    return;
+  }
+  const state = row.transcriptComplete ? "awaiting_complete_receipt" : "due";
+  const changed = db.prepare(`UPDATE backfill_jobs
+    SET state=?,next_attempt_at_ms=?,claim_token=NULL,claim_expires_at_ms=NULL,
+        target_revision=CASE WHEN ? THEN target_revision ELSE NULL END,last_reason=NULL
+    WHERE occurrence_id=? AND state='claimed' AND claim_token=? AND claim_expires_at_ms>? AND target_revision=? AND stop_at_ms>?`)
+    .run(state, authority.nowMs, row.transcriptComplete ? 1 : 0, seed.occurrenceId, authority.claimToken,
+      authority.nowMs, authority.targetRevision, authority.nowMs).changes;
+  if (changed !== 1) throw seedViolation("retry backfill handoff lost its claim");
 }
 
 function deliveryRows(db: Database.Database, selection: "active" | "deleted_with_recovery"): DeliveryRow[] {
@@ -1198,14 +2182,21 @@ function acceptPublication(db: Database.Database, input: AcceptPublicationInput)
   const run = db.transaction(() => {
     const deliverable = "recipientId" in input.notification;
     const delivery = db.prepare(
-      "SELECT artifact_hash, published_at_ms, publication_url, vault_commit FROM delivery_journal WHERE occurrence_id = ? AND revision = ?",
-    ).get(input.occurrenceId, input.revision) as { artifact_hash: string; published_at_ms: number | null; publication_url: string | null; vault_commit: string | null } | undefined;
+      "SELECT artifact_hash, transcript_complete, published_at_ms, publication_url, vault_commit FROM delivery_journal WHERE occurrence_id = ? AND revision = ?",
+    ).get(input.occurrenceId, input.revision) as { artifact_hash: string; transcript_complete: 0 | 1; published_at_ms: number | null; publication_url: string | null; vault_commit: string | null } | undefined;
     if (delivery === undefined || delivery.artifact_hash !== input.artifactHash) {
       throw new OrchestrationError("constraint_violation", "publication delivery identity is unknown or immutable fields changed");
     }
     const session = selectSessionRaw(db, input.occurrenceId);
     if (session === undefined || !["awaiting_teammem", "published", "notified"].includes(session.state)) {
       throw new OrchestrationError("state_conflict", "publication receipt is not legal for the current session state");
+    }
+    if (delivery.transcript_complete === 1 && currentSchemaVersion(db) >= 24) {
+      db.prepare(`UPDATE backfill_jobs
+        SET state='complete',claim_token=NULL,claim_expires_at_ms=NULL,
+            target_revision=COALESCE(target_revision,?),completion_revision=?,completion_artifact_hash=?
+        WHERE occurrence_id=? AND state!='complete'`)
+        .run(input.revision, input.revision, input.artifactHash, input.occurrenceId);
     }
     if (delivery.published_at_ms !== null) {
       if (delivery.publication_url !== input.publicationUrl || delivery.vault_commit !== input.vaultCommit) {

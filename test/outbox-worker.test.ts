@@ -16,7 +16,7 @@ import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurren
 import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../src/delivery/outbox-worker.ts";
 import { createNotificationWorker } from "../src/delivery/notification-worker.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
-import type { AcceptPublicationInput } from "../src/ports/session-store.ts";
+import type { AcceptPublicationInput, SavePendingDeliveryResult } from "../src/ports/session-store.ts";
 import { buildTimedTeamMemMeetingArtifactV2 } from "../src/delivery/artifact-builder.ts";
 import { createOwnedTimedSampleEvidence } from "../src/domain/attribution-evidence.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
@@ -104,13 +104,24 @@ class FakeJournal implements DeliveryJournal {
     this.onFirstPublication = onFirstPublication;
   }
 
-  savePending(row: DeliveryRow): void {
+  savePending(row: DeliveryRow): SavePendingDeliveryResult {
     if (this.failSave) throw new Error("synthetic journal failure");
+    const key = `${row.occurrenceId}:${row.revision}`;
+    const existing = this.rows.get(key);
+    if (existing !== undefined) {
+      if (existing.deletedAtMs !== null) throw new Error("deleted delivery intent cannot be replayed");
+      if (existing.artifactHash !== row.artifactHash || existing.recoveryArtifact !== row.recoveryArtifact) throw new Error("artifact revision is immutable: conflicting content");
+      return { kind: "replay", row: existing };
+    }
     this.rows.set(`${row.occurrenceId}:${row.revision}`, row);
+    return { kind: "inserted", row };
   }
   pending(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs === null); }
   recoverablePublications(): readonly DeliveryRow[] { return [...this.rows.values()].filter((row) => row.deletedAtMs !== null && row.publishedAtMs !== null && row.recoveryArtifact !== null); }
-  update(row: DeliveryRow): void { this.savePending(row); }
+  claimExpiredBackfillSeedCleanup(): null { return null; }
+  completeBackfillSeedCleanup(): void { /* This fake owns no seed lifecycle. */ }
+  authorizeDeliveryEvidenceCleanup(): boolean { return true; }
+  update(row: DeliveryRow): void { this.rows.set(`${row.occurrenceId}:${row.revision}`, row); }
   acceptPublication(input: AcceptPublicationInput): void {
     const row = this.rows.get(`${input.occurrenceId}:${input.revision}`);
     if (row === undefined) throw new Error("unknown delivery");

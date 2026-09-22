@@ -18,6 +18,7 @@ import {
   OrchestrationError,
   SESSION_STATE_VALUES,
   type RecordingInput,
+  type BackfillSeedFinalizationInput,
   type RecordingRow,
   type ReconciliationBridgeEventRow,
   type ReconciliationEvidenceRow,
@@ -45,6 +46,8 @@ export type {
   OrchestrationErrorCode,
   RecordingGapRow,
   RecordingInput,
+  BackfillSeedConfig,
+  BackfillSeedFinalizationInput,
   RecordingRow,
   BridgeRecoveryResult,
   BridgeFailureRecordingRow,
@@ -171,6 +174,7 @@ export type SessionCoordinator = {
     reconciliationBridgeSessionId?: string,
     reconciliationTerminalAtMs?: number,
     reconciliationTerminalSource?: "bridge_observed" | "local_clock",
+    backfillSeed?: BackfillSeedFinalizationInput,
   ): SessionRow;
 
   /** The persisted recording for an occurrence, or null if it never finalized
@@ -332,6 +336,7 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
     reconciliationBridgeSessionId?: string,
     reconciliationTerminalAtMs?: number,
     reconciliationTerminalSource?: "bridge_observed" | "local_clock",
+    backfillSeed?: BackfillSeedFinalizationInput,
     ): SessionRow {
       return store.finalizeSession({
         transition: transitionFor(occurrenceId, outcome),
@@ -339,6 +344,7 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
         ...(reconciliationBridgeSessionId === undefined ? {} : { reconciliationBridgeSessionId }),
         ...(reconciliationTerminalAtMs === undefined ? {} : { reconciliationTerminalAtMs }),
         ...(reconciliationTerminalSource === undefined ? {} : { reconciliationTerminalSource }),
+        ...(backfillSeed === undefined ? {} : { backfillSeed }),
       }).session;
     },
 
