@@ -12,10 +12,14 @@ public struct TimedMediaLease: Sendable {
     public let credential: String
     public let expiresAtMs: UInt64
     public let reconnectWindowMs: UInt64
+    /// 2 or 3 only. Media v3 (drainable timed capture) is an explicit server
+    /// declaration; there is no negotiation and no fallback between them.
+    public let mediaProtocolVersion: UInt8
     public static let captureFormat = "pcm_s16le/24000/1/20ms"
     init(_ value: [String: Any], bridgeSessionId: String) throws {
         guard Set(value.keys) == ["sessionId", "bridgeSessionId", "connectEndpoint", "credential", "expiresAtMs", "reconnectWindowMs", "mediaProtocolVersion", "captureFormat", "timingContract"],
-              let version = value["mediaProtocolVersion"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(), version == 2,
+              let version = value["mediaProtocolVersion"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(),
+              version == 2 || version == 3,
               value["captureFormat"] as? String == Self.captureFormat,
               value["timingContract"] as? String == "capture-clock/v1",
               let bridge = value["bridgeSessionId"] as? String, bridge == bridgeSessionId,
@@ -27,6 +31,7 @@ public struct TimedMediaLease: Sendable {
         expiresAtMs = try Self.integer(value["expiresAtMs"])
         reconnectWindowMs = try Self.integer(value["reconnectWindowMs"])
         guard sessionId > 0, expiresAtMs > 0, reconnectWindowMs > 0 else { throw BridgeProcessError.invalidInput }
+        mediaProtocolVersion = version == 3 ? 3 : 2
         self.bridgeSessionId = bridge; connectEndpoint = endpoint; credential = token
     }
     static func integer(_ value: Any?) throws -> UInt64 {
