@@ -38,14 +38,16 @@ prerequisite optional. `npm ci` removes a prior local bootstrap.
 ### Local SDK bootstrap
 
 Use an existing Runtime checkout path, but package only the immutable reviewed
-commit; never copy a concurrent worktree's `dist` or install a source alias.
+tree; never copy a concurrent worktree's `dist` or install a source alias. The
+pin is Runtime commit `b03b3d6` (tree `bac9e388`) on `feat/meeting-online-profile`,
+a reviewed local commit not yet on a reviewed remote.
 
 ```sh
 export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if needed
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive 4c9dc85ddbb513c61abc738d06ea10e61ab8c885 | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive b03b3d6314f03855adc8f2d060283483737fc444 | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
@@ -57,10 +59,11 @@ node scripts/check-runtime-sdk.mjs
 
 Do not commit the tarball or a machine-specific dependency path; the tracked lock
 contains only optional peer metadata. The check pins reviewed built file digests,
-not just version0.1.0. Registry publication remains a separate gate. Runtime13's
+not just version0.1.0, and requires both timed start commands and the SDK's
+`stopIfActive`. Registry publication remains a separate gate. The
 `StdioGatewayTransport` owns bounded EOF/TERM/KILL/reap cleanup and reports its
-cleanup outcome; Meeting application composition remains separate. The package's `start` still intentionally refuses to compose
-unconfigured live adapters; a successful prerequisite check does not start a meeting.
+cleanup outcome; Meeting application composition remains separate. `start --standalone-config <file>` composes the live graph,
+while the no-argument legacy entry still fails closed; a successful prerequisite check does not start a meeting.
 The install flags are intentional: `--save-dev` selects the optional peer in
 npm's in-memory ideal tree, scripts stay disabled, `--no-save` preserves the
 manifest, and `--package-lock=false` preserves the lock while installing the real
@@ -73,7 +76,8 @@ before opening the store; no helper changes permissions on existing user paths.
 Recording/provider keys and plaintext audio remain exclusively outside Meeting.
 
 The hardware-free encrypted restart test also needs a prebuilt gateway from that
-same immutable source. Build it before starting the unchanged test deadlines:
+same immutable source, built from the same `b03b3d6` commit staged above. Build
+it before starting the unchanged test deadlines:
 
 ```sh
 RUNTIME_TARGET=$(mktemp -d)
@@ -200,7 +204,7 @@ provider/device/TeamMem or whole-application E2E proof is implied here.
 
 ### Timed live evidence library
 
-The reviewed SDK 4c9dc85 adapter accepts the discriminated
+The reviewed SDK adapter accepts the discriminated
 `{ timingContract: "capture-clock/v1", bridgeSessionId, profile: "online",
 responseMode: "external_gate" }` start. Its typed lease proves command admission,
 not provider/native health. `createMeetingSession` accepts a bridge-v2 transport

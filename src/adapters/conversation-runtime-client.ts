@@ -1,5 +1,5 @@
 // The installed reviewed SDK owns framing, validation and credit/cancellation.
-import { RuntimeClient, type RuntimeTransport } from "@conversation/runtime";
+import { RuntimeClient, type RuntimeTransport, type TimedVoiceSession } from "@conversation/runtime";
 
 import type {
   ConversationContextExchange,
@@ -16,7 +16,13 @@ export async function connectPostmeetingRuntime(transport: RuntimeTransport): Pr
   return createConversationRuntimeClient(await RuntimeClient.connect(transport, 4));
 }
 
-export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): ConversationRuntimePort & FinalizedRecordingRuntime {
+export type ConversationRuntimeClientOptions = {
+  /** Receives the SDK's own timed session so an owner can call its
+   * authoritative stopIfActive; the adapter never reimplements that state. */
+  readonly onTimedSession?: (session: TimedVoiceSession) => void;
+};
+
+export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk, options: ConversationRuntimeClientOptions = {}): ConversationRuntimePort & FinalizedRecordingRuntime {
   if (!(sdk instanceof RuntimeClient) || typeof sdk.currentSessionId !== "bigint") {
     throw new Error("Postmeeting Runtime requires an open SDK protocol version 4 client");
   }
@@ -36,6 +42,7 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk): Co
       if (input.profile !== "online" || input.responseMode !== "external_gate") throw new Error("Meeting timed admission requires online/external_gate");
       admitted = true; // One generation per adapter, including failed starts.
       const session = await sdk.startTimedVoiceSession({ bridgeSessionId: input.bridgeSessionId, profile: "online", responseMode: "external_gate" });
+      options.onTimedSession?.(session);
       if (closing) throw new Error("Runtime live owner closed during admission");
       pump = (async () => {
         try {

@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { RuntimeEvent } from "../src/ports/conversation-runtime.ts";
 import { connectPostmeetingRuntime, createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
+import { CommandRejectedError, type ClientCommand, type TimedVoiceSession } from "@conversation/runtime";
 import { finalizedWire, RuntimeTestTransport, runtimeTestClient, testCapability } from "./lib/runtime-sdk.ts";
 
 test("public connected postmeeting runtime retains its actual finalized recovery surface", async () => {
@@ -187,4 +188,74 @@ test("early actual v4 voice failure is routed without claiming healthy media and
     if (events[0]?.type === "timed_voice_event") assert.equal(events[0].event.type, "voice_session_failed");
     await runtime.close(); assert.throws(() => runtime.subscribe(() => {}), /closed/); await runtime.close();
   } finally { await runtime.close(); }
+});
+
+/** The adapter exposes the SDK's own timed handle so the composition owner can
+ * call the SDK's authoritative stopIfActive instead of reimplementing
+ * already-ended detection behind a Proxy over the client. */
+test("the adapter hands out the SDK's own timed session handle and its stopIfActive semantics are the SDK's", async () => {
+  const started = (transport: RuntimeTestTransport) => (command: ClientCommand) => {
+    if (command.type === "stop_voice_session") return;
+    transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+    if (command.type !== "start_timed_voice_session") return;
+    transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
+      media_lease: { media_protocol_version: 2, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+        expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
+    transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_started", session_id: "42",
+      privacy: { privacy_mode: "local_only", components: ["speech_recognition", "language_model", "speech_synthesis", "audio_io"]
+        .map((kind) => ({ kind, execution_location: "local", provider_label: "Synthetic" })) } } });
+  };
+  const admit = async (react: (transport: RuntimeTestTransport, requestId: string) => void) => {
+    const { client, transport } = await runtimeTestClient(4);
+    const sessions: TimedVoiceSession[] = [];
+    const runtime = createConversationRuntimeClient(client, { onTimedSession: (session) => sessions.push(session) });
+    const accept = started(transport);
+    transport.onSend = (command) => {
+      accept(command);
+      if (command.type === "stop_voice_session") react(transport, command.requestId);
+    };
+    await runtime.startVoiceSession({ timingContract: "capture-clock/v1", bridgeSessionId: "bridge-1", profile: "online", responseMode: "external_gate" });
+    assert.equal(sessions.length, 1, "the SDK's returned timed session is handed to the owner exactly once");
+    const session = sessions[0]!;
+    assert.equal(typeof session.stopIfActive, "function");
+    return { runtime, transport, session };
+  };
+
+  // Accepted stop on an active session is "stopped".
+  {
+    const { runtime, session } = await admit((transport, requestId) => {
+      transport.push({ type: "command_accepted", protocol_version: 4, request_id: requestId });
+      transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_ended", session_id: "42" } });
+    });
+    try { assert.equal(await session.stopIfActive(), "stopped"); } finally { await runtime.close(); }
+  }
+
+  // A correlated rejection after this exact handle's routed terminal is "already_terminal".
+  {
+    const { runtime, session } = await admit((transport, requestId) => {
+      transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_ended", session_id: "42" } });
+      transport.push({ type: "command_rejected", protocol_version: 4, request_id: requestId,
+        error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "voice session is no longer active" } });
+    });
+    try { assert.equal(await session.stopIfActive(), "already_terminal"); } finally { await runtime.close(); }
+  }
+
+  // A correlated rejection with no routed terminal stays a failure, whatever it says.
+  {
+    const { runtime, session } = await admit((transport, requestId) => {
+      transport.push({ type: "command_rejected", protocol_version: 4, request_id: requestId,
+        error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "voice session is no longer active" } });
+    });
+    try { await assert.rejects(session.stopIfActive(), CommandRejectedError); } finally { await runtime.close(); }
+  }
+
+  // A transport failure after a routed terminal is still a failure, never already_terminal.
+  {
+    const { runtime, transport, session } = await admit((peer) => {
+      peer.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_ended", session_id: "42" } });
+    });
+    const pending = session.stopIfActive();
+    transport.messages.destroy(new Error("synthetic transport failure"));
+    try { await assert.rejects(pending); } finally { await runtime.close(); }
+  }
 });

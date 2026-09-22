@@ -91,7 +91,9 @@ type RuntimeScript = {
   /** already_ended: the gateway ends the voice session before stop is asked. */
   /** reject_as_inactive: the gateway rejects stop with the SDK's own "no longer
    * active" wording but never routed a terminal; that is a stop failure. */
-  stopMode?: "accept" | "reject" | "reject_as_inactive" | "hang" | "already_ended";
+  /** terminal_then_reject: the terminal for this exact handle is routed first and
+   * the same stop request is then rejected; the SDK reports already_terminal. */
+  stopMode?: "accept" | "reject" | "reject_as_inactive" | "terminal_then_reject" | "hang" | "already_ended";
   finalizeMode?: "accept" | "reject";
   closeFails?: boolean;
   recordingsDir: string;
@@ -142,6 +144,12 @@ function scriptedRuntimes(script: RuntimeScript) {
           return;
         case "stop_voice_session":
           if (script.stopMode === "hang") return;
+          if (script.stopMode === "terminal_then_reject") {
+            voiceEnded = true;
+            deliver({ type: "voice_session_ended", session_id: id });
+            transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime",
+              message: "voice session is no longer active" } }); return;
+          }
           if (script.stopMode === "reject" || script.stopMode === "reject_as_inactive") {
             transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime",
               message: script.stopMode === "reject" ? "scripted stop rejection" : "voice session is no longer active" } }); return;
@@ -540,7 +548,15 @@ test("real v2 children: the timed join reaches joined, the owner lock descriptor
     await until(() => existsSync(path.join(f.dir, "bridge-v2-hung", "child.pid")) && existsSync(path.join(f.dir, "bridge-v2-clean", "child.pid")) && existsSync(path.join(f.dir, "bridge-v2-view", "child.json")), 8000);
     const bySlot = (bridgeId: string) => app.occurrenceOutcomes().find((outcome) => outcome.bridgeId === bridgeId)!;
     // The clean v2 child answers the timed join: the occurrence reaches listening with timed evidence bound to the connected control id.
-    await until(() => { const store = f.reopen(); try { return store.getSession(bySlot("bridge-2").occurrenceId)?.state === "listening"; } finally { store.close(); } }, 8000);
+    // The wait is the assertion below, exactly: `listening` alone lands before the ui_snapshot row is written.
+    await until(() => { const store = f.reopen(); try {
+      const clean = bySlot("bridge-2");
+      if (store.getSession(clean.occurrenceId)?.state !== "listening" || clean.controlSessionId === null) return false;
+      const custody = store.listPhysicalCustody().find((row) => row.physicalClientId === "mac-2");
+      if (custody === undefined) return false;
+      const binding = { occurrenceId: clean.occurrenceId, bridgeSessionId: custody.bridgeSessionId, runtimeSessionId: clean.controlSessionId };
+      return store.getTimedEvidenceStatus(binding, 10_000)?.state === "active" && store.readTimedUi(binding, 0, 10_000).length >= 2;
+    } finally { store.close(); } }, 8000);
     {
       const store = f.reopen();
       try {
@@ -861,10 +877,11 @@ test("a positively observed meeting-ended notice yields endedAt and the immutabl
 });
 
 test("only the routed terminal means already-ended; a stop rejection (even in the SDK's own wording) and a finalize failure never invent an end, a recording or a seed", async () => {
-  for (const variant of ["already_ended", "reject_stop", "reject_as_inactive", "reject_finalize"] as const) {
+  for (const variant of ["already_ended", "terminal_then_reject", "reject_stop", "reject_as_inactive", "reject_finalize"] as const) {
     const f = fixture();
     try {
       const { app, slot, runtimes, id } = await liveOccurrence(f, variant === "already_ended" ? { stopMode: "already_ended" }
+        : variant === "terminal_then_reject" ? { stopMode: "terminal_then_reject" }
         : variant === "reject_stop" ? { stopMode: "reject" } : variant === "reject_as_inactive" ? { stopMode: "reject_as_inactive" } : { finalizeMode: "reject" });
       slot.left("ended");
       const outcome = await app.awaitOccurrence(id);
@@ -874,6 +891,11 @@ test("only the routed terminal means already-ended; a stop rejection (even in th
         if (variant === "already_ended") {
           assert.equal(commands.includes("stop_voice_session"), false, "no stop is asked of a session the gateway already ended");
           assert.ok(store.getBackfillSeed(id), "the terminal acknowledgement already arrived, so finalize proceeds");
+        } else if (variant === "terminal_then_reject") {
+          assert.equal(commands.filter((type) => type === "stop_voice_session").length, 1, "stop asked once");
+          assert.equal(commands.includes("finalize_recording"), true, "a correlated rejection after this handle's routed terminal is already_terminal, so finalize proceeds");
+          assert.ok(store.getBackfillSeed(id), "already_terminal seeds the observed end");
+          assert.equal(outcome.finalization, "seeded");
         } else {
           assert.equal(store.getBackfillSeed(id), null);
           assert.equal(store.getRecording(id), null);

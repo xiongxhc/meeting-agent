@@ -308,23 +308,6 @@ type RuntimeOwner = {
   finalization(): OccurrenceOutcome["finalization"];
 };
 
-/** Observes the accepted SDK's own returned TimedVoiceSession so its EXISTING
- * stop() can be retained and awaited before finalize. Every other member is
- * the real client bound to itself; nothing is reimplemented or fabricated. */
-function observeTimedSessions(client: RuntimeClient<4>, retain: (session: TimedVoiceSession) => void): RuntimeClient<4> {
-  return new Proxy(client, {
-    get(target, key) {
-      const value: unknown = Reflect.get(target, key, target);
-      if (typeof value !== "function") return value;
-      if (key === "startTimedVoiceSession") {
-        return (...args: unknown[]) => (value as (...input: unknown[]) => Promise<TimedVoiceSession>).apply(target, args)
-          .then((session) => { retain(session); return session; });
-      }
-      return (value as (...input: unknown[]) => unknown).bind(target);
-    },
-  }) as RuntimeClient<4>;
-}
-
 async function startRuntimeOwner(input: {
   readonly occurrenceId: string; readonly shutdown: AbortSignal; readonly budgetMs: number; readonly version: string;
   readonly startTransport: NonNullable<ComposeApplicationOptions["startRuntimeTransport"]>;
@@ -365,17 +348,11 @@ async function startRuntimeOwner(input: {
 
 function createRuntimeOwner(client: RuntimeClient<4>, transport: OwnedRuntimeTransport, controlSessionId: bigint, seedConfig: BackfillSeedConfig): RuntimeOwner {
   let voice: TimedVoiceSession | null = null;
-  let voiceEnded = false, stopAsked = false;
   let finalization: OccurrenceOutcome["finalization"] = "none";
   let closeOutcome: "pending" | "closed" | "failed" = "pending";
   let closePromise: Promise<void> | undefined;
   const closeRequested = new Deferred<void>();
-  const inner = createConversationRuntimeClient(observeTimedSessions(client, (session) => { voice = session; }));
-  inner.subscribe((event) => {
-    if (event.type !== "timed_voice_event") return;
-    const value = event.event;
-    if (value.type === "voice_session_ended" || (value.type === "voice_session_failed" && value.recovery === "new_session")) voiceEnded = true;
-  });
+  const inner = createConversationRuntimeClient(client, { onTimedSession: (session) => { voice = session; } });
   const port: ConversationRuntimePort & FinalizedRecordingRuntime = {
     get currentSessionId(): bigint { return controlSessionId; },
     startVoiceSession: (value) => inner.startVoiceSession(value),
@@ -387,19 +364,18 @@ function createRuntimeOwner(client: RuntimeClient<4>, transport: OwnedRuntimeTra
     reconcileRecording: (value) => inner.reconcileRecording(value),
     reconcileFinalizedRecording: (value) => inner.reconcileFinalizedRecording(value),
     subscribe: (listener) => inner.subscribe(listener),
-    /** D025: the EXISTING SDK stop acknowledgement is awaited before finalize.
-     * Already-ended is decided ONLY by this owner's routed terminal
-     * (voice_session_ended / voice_session_failed new_session), never by an
-     * error string; a rejected stop without that terminal is stop_failed: no
-     * finalize, no retry, failure visible. Stop is asked at most once. The
-     * Runtime14 SDK's stopIfActive replaces this owner-side check at repin. */
+    /** D025: the SDK's authoritative stopIfActive is awaited before finalize.
+     * Only a correlated rejection on that exact handle after its own routed
+     * terminal is already_terminal; both that and a normal stop acceptance let
+     * finalize proceed. Every other rejection (transport, close, protocol,
+     * uncorrelated) is stop_failed: no finalize, no retry, failure visible.
+     * Stop is asked at most once; nothing here re-derives session state. */
     async finalizeRecording(value) {
-      if (voice !== null && !voiceEnded && !stopAsked) {
-        stopAsked = true;
-        try { await voice.stop(); }
-        catch (error) {
-          if (!voiceEnded) { finalization = "stop_failed"; throw error; }
-        }
+      const session = voice;
+      if (session !== null) {
+        voice = null;
+        try { await session.stopIfActive(); }
+        catch (error) { finalization = "stop_failed"; throw error; }
       }
       try { const result = await inner.finalizeRecording(value); finalization = "recorded"; return result; }
       catch (error) { finalization = "finalize_failed"; throw error; }
