@@ -2230,6 +2230,10 @@ test("maxRetries zero persists terminal bridge failure evidence and refuses ever
         format: "ogg/opus",
         keyId: "runtime-key-20260902",
         finalizedAtMs: BASE_MS,
+        // Migration 028 covers `recordings`; a bridge failure recording makes
+        // no drain claim, which is exactly what `unavailable` says.
+        captureDrain: null,
+        captureIntegrity: "unavailable",
         gaps: [{
           ordinal: 0,
           direction: "capture",

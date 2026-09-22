@@ -33,6 +33,7 @@ import type { PhysicalCustodyRow, PhysicalClientClear } from "../ports/session-s
 import type { TimedEvidenceBinding, TimedEvidenceBindingResult, TimedEvidenceOwner, TimedEvidenceStatus, ProvisionalResult, TimedAppendResult, TimedLiveRow, TimedPurgeProgress } from "../ports/session-store.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import { parseEventV2, type BridgeEventMessageV2 } from "../contracts/bridge-session-v2.ts";
+import { parseEventShape, type CaptureDrain } from "../contracts/bridge-session-v1.ts";
 import { encodeLiveEvidence, decodeLiveEvidence, encodeProvisionalResult, decodeProvisionalResult } from "../sessions/live-evidence-codec.ts";
 import { consumeLiveRecoveryPermit, type LiveRecoveryPermit } from "../ports/live-evidence-authority.ts";
 import { canonicalArtifactHash, canonicalArtifactJson, isUnicodeScalarString } from "../contracts/teammem-meeting-v1.ts";
@@ -773,10 +774,19 @@ function finalizeSession(
   const run = db.transaction(() => {
     const session = transition(db, input.transition);
     withConstraintTranslation(() => {
+      // A database opened against a pre-028 migration set has no drain
+      // columns. Writing none of them leaves the legacy insert exactly as it
+      // was; an actual claim on such a database is refused rather than
+      // silently dropped, because losing the evidence is the whole failure.
+      const drain = captureDrainAvailable(db) ? captureDrainColumns(input.recording.captureDrain) : null;
+      if (drain === null && input.recording.captureDrain !== undefined) {
+        throw new OrchestrationError("constraint_violation", "capture drain requires migration 028");
+      }
       db.prepare(
         `INSERT INTO recordings
-           (occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms${
+             drain === null ? "" : `, ${CAPTURE_DRAIN_COLUMNS}`})
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?${drain === null ? "" : ", ?, ?, ?, ?, ?, ?"})`,
       ).run(
         occurrenceId,
         input.recording.handle,
@@ -786,6 +796,14 @@ function finalizeSession(
         input.recording.format,
         input.recording.keyId,
         nowMs,
+        ...(drain === null ? [] : [
+          drain.capture_drain,
+          drain.capture_drain_reason,
+          drain.capture_drain_epoch,
+          drain.capture_drain_last_frame_sequence,
+          drain.capture_drain_output_end_sample,
+          drain.capture_drain_final_pair_sequence,
+        ]),
       );
       const insertGap = db.prepare(
         `INSERT INTO recording_gaps (occurrence_id, ordinal, direction, started_at, ended_at)
@@ -820,14 +838,80 @@ function finalizeSession(
   return { session, recording: getRecording(db, occurrenceId)! };
 }
 
+/** D029 §2. The whole object is validated by the bridge grammar that produced
+ * it -- one definition of "a legal drain claim", not a second one that could
+ * drift -- and then spread across the columns. The correlations SQLite's ALTER
+ * cannot express as a table CHECK are exactly what that grammar enforces, so a
+ * contradictory claim never reaches the row. */
+function captureDrainColumns(drain: CaptureDrain | undefined): CaptureDrainColumns {
+  if (drain === undefined) return NO_CAPTURE_DRAIN;
+  const checked = parseEventShape({ schema: "bridge-session/v1", sessionId: "capture-drain", sequence: 1,
+    observedAt: "1970-01-01T00:00:00Z", type: "media_disconnected", reason: "media_stopped", captureDrain: drain });
+  if (!checked.ok) {
+    throw new OrchestrationError("constraint_violation", `capture drain violates D029: ${checked.rejection.path}`);
+  }
+  return drain.drain === "confirmed"
+    ? { capture_drain: "confirmed", capture_drain_reason: null,
+        capture_drain_epoch: drain.boundary.captureEpoch,
+        capture_drain_last_frame_sequence: drain.boundary.lastFrameSequence,
+        capture_drain_output_end_sample: drain.boundary.outputEndSample,
+        capture_drain_final_pair_sequence: drain.boundary.finalClockPairSequence }
+    : { capture_drain: "unconfirmed", capture_drain_reason: drain.reason, capture_drain_epoch: null,
+        capture_drain_last_frame_sequence: null, capture_drain_output_end_sample: null,
+        capture_drain_final_pair_sequence: null };
+}
+type CaptureDrainColumns = {
+  capture_drain: "confirmed" | "unconfirmed" | null;
+  capture_drain_reason: string | null;
+  capture_drain_epoch: string | null;
+  capture_drain_last_frame_sequence: string | null;
+  capture_drain_output_end_sample: string | null;
+  capture_drain_final_pair_sequence: string | null;
+};
+
+/** The inverse. A row whose outcome is NULL made no claim at all; a row whose
+ * members contradict its outcome is a corrupted row, refused rather than
+ * repaired into whichever half looks more plausible. */
+function captureDrainOf(row: CaptureDrainColumns): CaptureDrain | null {
+  if (row.capture_drain === null) return null;
+  const drain: CaptureDrain = row.capture_drain === "confirmed"
+    ? { drain: "confirmed", reason: null,
+        boundary: { captureEpoch: row.capture_drain_epoch!, lastFrameSequence: row.capture_drain_last_frame_sequence!,
+          outputEndSample: row.capture_drain_output_end_sample!, finalClockPairSequence: row.capture_drain_final_pair_sequence! } }
+    : { drain: "unconfirmed", reason: row.capture_drain_reason!, boundary: null };
+  const checked = parseEventShape({ schema: "bridge-session/v1", sessionId: "capture-drain", sequence: 1,
+    observedAt: "1970-01-01T00:00:00Z", type: "media_disconnected", reason: "media_stopped", captureDrain: drain });
+  if (!checked.ok) {
+    throw new OrchestrationError("constraint_violation", `stored capture drain violates D029: ${checked.rejection.path}`);
+  }
+  return drain;
+}
+
+const CAPTURE_DRAIN_COLUMNS = `capture_drain, capture_drain_reason, capture_drain_epoch,
+  capture_drain_last_frame_sequence, capture_drain_output_end_sample, capture_drain_final_pair_sequence`;
+
+const NO_CAPTURE_DRAIN: CaptureDrainColumns = { capture_drain: null, capture_drain_reason: null,
+  capture_drain_epoch: null, capture_drain_last_frame_sequence: null,
+  capture_drain_output_end_sample: null, capture_drain_final_pair_sequence: null };
+
+/** Whether migration 028 has been applied to THIS database. Callers may hold a
+ * store opened against an older migration set, which is a legal configuration
+ * and must keep working, reading and writing exactly the columns it has. */
+function captureDrainAvailable(db: Database.Database): boolean {
+  return (db.prepare("SELECT COUNT(*) AS present FROM pragma_table_info('recordings') WHERE name = 'capture_drain'")
+    .get() as { present: number }).present === 1;
+}
+
 function getRecording(db: Database.Database, occurrenceId: string): RecordingRow | null {
+  const available = captureDrainAvailable(db);
   const raw = db
     .prepare(
-      `SELECT occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms
+      `SELECT occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms${
+        available ? `, ${CAPTURE_DRAIN_COLUMNS}` : ""}
          FROM recordings WHERE occurrence_id = ?`,
     )
     .get(occurrenceId) as
-    | {
+    | ({
         occurrence_id: string;
         handle: string;
         encrypted_path: string | null;
@@ -836,7 +920,7 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
         format: string | null;
         key_id: string | null;
         finalized_at_ms: number;
-      }
+      } & CaptureDrainColumns)
     | undefined;
   if (raw === undefined) return null;
 
@@ -863,6 +947,8 @@ function getRecording(db: Database.Database, occurrenceId: string): RecordingRow
     format: raw.format,
     keyId: raw.key_id,
     finalizedAtMs: raw.finalized_at_ms,
+    captureDrain: captureDrainOf(available ? raw : NO_CAPTURE_DRAIN),
+    captureIntegrity: (available ? raw.capture_drain : null) ?? "unavailable",
     gaps: gaps.map(
       (gap): RecordingGapRow => ({
         ordinal: gap.ordinal,
@@ -2900,6 +2986,10 @@ function getBridgeFailureRecording(
   );
   return { occurrenceId, attempt, handle: row.handle, encryptedPath: row.encrypted_path, sha256: row.sha256,
     durationMs: row.duration_ms, format: row.format, keyId: row.key_id, finalizedAtMs: row.finalized_at_ms,
+    // Migration 028 added the drain columns to `recordings` only. A bridge
+    // failure recording carries no drain claim at all, which is what
+    // `unavailable` says; nothing here infers one from the failure.
+    captureDrain: null, captureIntegrity: "unavailable",
     gaps: gaps.map((gap) => ({ ordinal: gap.ordinal, direction: gap.direction as RecordingGapRow["direction"], startedAt: gap.started_at, endedAt: gap.ended_at })),
     runtimeGaps };
 }

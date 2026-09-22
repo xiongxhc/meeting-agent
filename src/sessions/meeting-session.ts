@@ -55,6 +55,7 @@ import {
   BRIDGE_SESSION_SCHEMA,
   createBridgeSessionValidator,
   type BridgeEventMessage,
+  type CaptureDrain,
 } from "../contracts/bridge-session-v1.ts";
 import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
 import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2 } from "../contracts/bridge-session-v2.ts";
@@ -348,6 +349,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let reconciliationGenerationStarted = false;
   let bridgeConnected = true;
   let mediaConnected = false;
+  /** D029: the last capture-drain claim this bridge session made. Retained,
+   * never derived: a media-v2 lease and a bridge that never reported one both
+   * leave it null, and no local fact fills it in. */
+  let captureDrain: CaptureDrain | null = null;
   let reconnectAttempts = 0;
   let disclosure: "pending" | DisclosureOutcome = "pending";
   let recording: RecordingSummary | null = null;
@@ -750,6 +755,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
       case "media_disconnected":
         mediaConnected = false;
+        // The claim rides on the terminal event, so the last one seen is the
+        // one that describes the capture this recording finalizes.
+        if (event.captureDrain !== undefined) captureDrain = event.captureDrain;
         return;
 
       case "chat_disclosure":
@@ -977,7 +985,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // two have to be written together. See applyTerminalTransition.
       await finalizeRecording();
       if (reason === "bridge_failure") {
-        const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId);
+        const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId, captureDrain);
         coordinator.recordBridgeFailure(
           identity.occurrenceId,
           bridgeFailureRetryLimit,
@@ -1046,7 +1054,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           ? { ...options.backfillSeedConfig, terminalReason: "ended" as const, terminalSource: "bridge_observed" as const,
               endedAt: terminalObservedAt, identity }
           : undefined;
-        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId),
+        coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId, captureDrain),
           bridgeSessionId, terminalAtMs, terminalSource, backfillSeed);
         return;
       }
@@ -1260,7 +1268,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       const handle = await runtimeAdmission;
       if (options.timedEvidence && (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId ||
         handle.bridgeSessionId !== bridgeSessionId || handle.mediaLease.sessionId !== evidenceControlId ||
-        handle.mediaLease.mediaProtocolVersion !== 2 || handle.mediaLease.timingContract !== "capture-clock/v1" ||
+        (handle.mediaLease.mediaProtocolVersion !== 2 && handle.mediaLease.mediaProtocolVersion !== 3) ||
+        handle.mediaLease.timingContract !== "capture-clock/v1" ||
         handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms")) throw new Error("timed media lease changed admitted binding or format");
       runtimeSessionId = handle.sessionId;
       if (!options.timedEvidence) coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, handle.sessionId);
@@ -1272,7 +1281,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         await issue({ type: "connect_media", mediaLease: { sessionId: handle.sessionId.toString(), bridgeSessionId,
           connectEndpoint: handle.mediaLease.connectEndpoint, credential: handle.mediaLease.credential,
           expiresAtMs: handle.mediaLease.expiresAtMs.toString(), reconnectWindowMs: handle.mediaLease.reconnectWindowMs.toString(),
-          mediaProtocolVersion: 2, captureFormat: "pcm_s16le/24000/1/20ms", timingContract: "capture-clock/v1" } });
+          // D029 §3: passed through, never chosen here. The Runtime declared the
+          // media version when it issued the lease; there is no fallback between
+          // them, and a producer that cannot speak it must fail to authenticate.
+          mediaProtocolVersion: handle.mediaLease.mediaProtocolVersion,
+          captureFormat: "pcm_s16le/24000/1/20ms", timingContract: "capture-clock/v1" } });
       } else {
         if (handle.timingContract !== undefined) throw new Error("timed Runtime lease requires explicit bridge v2 composition");
         if (handle.profile !== PINNED_PROFILE) {
@@ -1394,12 +1407,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 /** The orchestration schema currently stores a SQLite number. Refuse a value
  * outside JavaScript's exact integer range rather than silently truncating an
  * SDK bigint; the complete bigint remains in MeetingSessionState regardless. */
-function recordingInput(summary: RecordingSummary, bridgeGaps: readonly ObservedAudioGap[], capability: FinalizedRecordingCapability | null, bridgeSessionId: string): RecordingInput {
+function recordingInput(summary: RecordingSummary, bridgeGaps: readonly ObservedAudioGap[], capability: FinalizedRecordingCapability | null, bridgeSessionId: string, captureDrain: CaptureDrain | null = null): RecordingInput {
   if (summary.durationMs > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new RangeError("runtime recording duration exceeds SQLite's exact numeric representation");
   }
   return {
     ...(capability === null ? {} : { recovery: { bridgeSessionId, capability } }),
+    ...(captureDrain === null ? {} : { captureDrain }),
     handle: summary.recordingHandle,
     encryptedPath: summary.encryptedPath,
     sha256: summary.sha256,

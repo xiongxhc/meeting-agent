@@ -1,7 +1,7 @@
 // Actual SDK types own postmeeting and opt-in timed live boundaries. The
 // injected legacy UTC path remains distinct; no live timestamps are invented.
 import type { RuntimeClient, RecordingSummary as SdkRecordingSummary, ProcessedText as SdkProcessedText, FinalizedRecordingCapability,
-  RecordingAlignmentPage, RecordingAlignmentComplete, TimedMediaLease, VersionFourVoiceSessionEvent } from "@conversation/runtime";
+  RecordingAlignmentPage, RecordingAlignmentComplete, TimedMediaLease, DrainableTimedMediaLease, VersionFourVoiceSessionEvent } from "@conversation/runtime";
 export type { ConversationContextExchange, RecordingGap, DiarizedSegment, RecordingReconciliation,
   FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete,
   AlignmentPolicy, RecordingAlignmentEntry, RuntimeProfile, VersionFourVoiceTranscriptFinalEvent,
@@ -48,7 +48,10 @@ export type VoiceSessionHandle = {
   readonly timingContract: "capture-clock/v1";
   readonly bridgeSessionId: string;
   readonly sessionId: bigint;
-  readonly mediaLease: TimedMediaLease;
+  /** Media v2 or v3, exactly as the SDK issued it (D029 §3). The composition
+   * starts the drainable session, so a live lease is v3; the v2 shape stays
+   * admissible for the legacy timed path and its tests. */
+  readonly mediaLease: TimedMediaLease | DrainableTimedMediaLease;
 };
 
 /** Exact SDK context shape. It is a conversation exchange, not an ad-hoc

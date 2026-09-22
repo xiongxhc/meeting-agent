@@ -21,12 +21,18 @@ async function bounded<T>(work: Promise<T>): Promise<T> {
     timer = setTimeout(() => reject(new Error("synthetic Runtime integration deadline")), DEADLINE_MS);
   })]); } finally { clearTimeout(timer); }
 }
+/** Media v3 reuses every media-v2 body for kinds 1, 2, 6, 7, 8 and 9 under the
+ * `MED3\x03` envelope, so the immutable v2 fixtures are retagged rather than
+ * re-cut: same ten-byte header layout, same body, bytes 3 and 4 only. */
+function med3(bytes: Buffer): Buffer {
+  bytes[3] = 0x33; bytes[4] = 3; return bytes;
+}
 function packet(kind: number, body: Buffer): Buffer {
-  const header = Buffer.from([77, 69, 68, 50, 2, kind, 0, 0, 0, 0]); header.writeUInt32BE(body.length, 6);
+  const header = Buffer.from([77, 69, 68, 51, 3, kind, 0, 0, 0, 0]); header.writeUInt32BE(body.length, 6);
   return Buffer.concat([header, body]);
 }
 function sourcePacket(hex: string, source: bigint): Buffer {
-  const bytes = Buffer.from(hex, "hex"); bytes.writeBigUInt64BE(source, 10); return bytes;
+  const bytes = med3(Buffer.from(hex, "hex")); bytes.writeBigUInt64BE(source, 10); return bytes;
 }
 /** Only counts complete opaque ciphertext chunks, never decrypts or interprets
  * plaintext. Accepted 4c97 session_recording.rs documents 48-byte header/u32len. */
@@ -164,7 +170,7 @@ capture_format = "pcm_s16le/24000/1/20ms"
     const first = await start();
     clients.push(first); const firstId = first.currentSessionId; assert.ok(firstId);
     stage = "timed-start";
-    const voice = await bounded(first.startTimedVoiceSession({ bridgeSessionId: "bridge-independent", profile: "offline", responseMode: "external_gate" }));
+    const voice = await bounded(first.startDrainableTimedVoiceSession({ bridgeSessionId: "bridge-independent", profile: "offline", responseMode: "external_gate" }));
     const lease = voice.mediaLease, target = new URL(lease.connectEndpoint);
     stage = "media-authentication";
     media = createConnection({ host: target.hostname, port: Number(target.port) }); await bounded(once(media, "connect"));

@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { RuntimeEvent } from "../src/ports/conversation-runtime.ts";
 import { connectPostmeetingRuntime, createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
-import { CommandRejectedError, type ClientCommand, type TimedVoiceSession } from "@conversation/runtime";
+import { CommandRejectedError, type ClientCommand, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
 import { finalizedWire, RuntimeTestTransport, runtimeTestClient, testCapability } from "./lib/runtime-sdk.ts";
 
 test("public connected postmeeting runtime retains its actual finalized recovery surface", async () => {
@@ -56,8 +56,8 @@ test("actual SDK timed admission preserves source evidence and never invents UTC
   const { client, transport } = await runtimeTestClient(4);
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
-    if (command.type === "start_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4,
-      request_id: command.requestId, media_lease: { media_protocol_version: 2, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001",
+    if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4,
+      request_id: command.requestId, media_lease: { media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001",
         credential: "a".repeat(64), expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
   };
   const runtime = createConversationRuntimeClient(client);
@@ -77,7 +77,7 @@ test("actual SDK timed admission preserves source evidence and never invents UTC
       type: "voice_transcript_final", sessionId: 42n, segmentId: "9", turnId: null, text: "Agent, remember this",
       captureUnavailableReason: "provider_offsets_unavailable" } });
     assert.deepEqual(transport.commands.map(({ requestId, ...command }) => { assert.ok(requestId); return command; }), [
-      { type: "start_timed_voice_session", bridgeSessionId: "bridge-1", profile: "online", responseMode: "external_gate" },
+      { type: "start_drainable_timed_voice_session", bridgeSessionId: "bridge-1", profile: "online", responseMode: "external_gate" },
     ]);
   } finally { await runtime.close(); }
 });
@@ -126,7 +126,7 @@ test("accepted v4 literal source locator/envelope and missing reasons survive ac
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
     transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
-      media_lease: { media_protocol_version: 2, session_id: "7", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+      media_lease: { media_protocol_version: 3, session_id: "7", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
         expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
   };
   try {
@@ -159,7 +159,7 @@ test("actual SDK mismatched lease fails admission without leaking credentials or
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
     transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
-      media_lease: { media_protocol_version: 2, session_id: "43", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+      media_lease: { media_protocol_version: 3, session_id: "43", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
         expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
   };
   try {
@@ -176,7 +176,7 @@ test("early actual v4 voice failure is routed without claiming healthy media and
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
     transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
-      media_lease: { media_protocol_version: 2, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+      media_lease: { media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
         expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
     transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_failed", session_id: "42", recovery: "new_session",
       error: { code: "adapter_failure", kind: "adapter", stage: "speech_recognizer", message: "synthetic failure" } } });
@@ -197,9 +197,9 @@ test("the adapter hands out the SDK's own timed session handle and its stopIfAct
   const started = (transport: RuntimeTestTransport) => (command: ClientCommand) => {
     if (command.type === "stop_voice_session") return;
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
-    if (command.type !== "start_timed_voice_session") return;
+    if (command.type !== "start_drainable_timed_voice_session") return;
     transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
-      media_lease: { media_protocol_version: 2, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+      media_lease: { media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
         expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
     transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_started", session_id: "42",
       privacy: { privacy_mode: "local_only", components: ["speech_recognition", "language_model", "speech_synthesis", "audio_io"]
@@ -207,7 +207,7 @@ test("the adapter hands out the SDK's own timed session handle and its stopIfAct
   };
   const admit = async (react: (transport: RuntimeTestTransport, requestId: string) => void) => {
     const { client, transport } = await runtimeTestClient(4);
-    const sessions: TimedVoiceSession[] = [];
+    const sessions: (TimedVoiceSession | DrainableTimedVoiceSession)[] = [];
     const runtime = createConversationRuntimeClient(client, { onTimedSession: (session) => sessions.push(session) });
     const accept = started(transport);
     transport.onSend = (command) => {

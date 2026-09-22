@@ -151,7 +151,7 @@ function initialAuthority(token: string, nowMs = ENDED_AT_MS + 1): BackfillDeliv
 test("migration 025 and initial fenced handoff atomically transfer only exact canonical revision one", () => {
   const f = harness();
   try {
-    assert.equal(f.store.schemaVersion, 27);
+    assert.equal(f.store.schemaVersion, 28);
     const claim = f.store.claimBackfillSeedBuild({ nowMs: ENDED_AT_MS + 1, claimToken: "a".repeat(32), operationBudgetMs: 1_000 })!;
     assert.equal(claim.targetRevision, 1);
     assert.equal(claim.observedAtMs, ENDED_AT_MS + 1);

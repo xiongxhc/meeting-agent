@@ -31,7 +31,7 @@ function storeFixture(events: readonly BridgeEventMessageV2[]) {
       capability: testCapability, recordingKind: "final", failureAttempt: null }),
     getRecording: () => ({ occurrenceId: "occurrence", handle: testCapability.recordingHandle, encryptedPath: "/private/audio.enc",
       sha256: testCapability.sha256, durationMs: 1, format: "pcm_s16le/24000/1/20ms", keyId: testCapability.keyId,
-      finalizedAtMs: 1, gaps: [], runtimeGaps: [] }),
+      finalizedAtMs: 1, gaps: [], runtimeGaps: [], captureDrain: null, captureIntegrity: "unavailable" }),
     getBridgeFailureRecording: () => null,
     getSelectedAlignment: () => current,
     getTimedEvidenceBinding: () => ({ kind: "timed", generationId: "generation", binding,

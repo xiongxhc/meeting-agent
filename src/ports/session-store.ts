@@ -15,6 +15,7 @@
 // SQLite driver, and no other database concern, lives here.
 
 import type { CustodyBinding, BridgeProcessOutcome } from "../contracts/bridge-process-outcome-v1.ts";
+import type { CaptureDrain } from "../contracts/bridge-session-v1.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { AlignmentRecoveryPermit } from "./recording-alignment-authority.ts";
 import type { BridgeShutdownResult, BridgeProcessFailure } from "./bridge-process.ts";
@@ -167,6 +168,13 @@ export type RecordingRow = {
   readonly finalizedAtMs: number;
   readonly gaps: readonly RecordingGapRow[];
   readonly runtimeGaps: readonly RuntimeRecordingGapRow[];
+  /** D029 §2: exactly what the bridge said on `media_disconnected`, or null
+   * when it said nothing -- a media-v2 lease, or a pre-028 row. */
+  readonly captureDrain: CaptureDrain | null;
+  /** The same fact as one token. `unavailable` is the absence of a claim, not
+   * a claim of absence: it is never derived from a local fact such as an
+   * intact PCM stream or an accepted stop. */
+  readonly captureIntegrity: "confirmed" | "unconfirmed" | "unavailable";
 };
 
 /** Local-only reconciliation input. It is deliberately separate from the
@@ -251,6 +259,9 @@ export type RecordingInput = {
     readonly endedAtMs: bigint | null;
     readonly reason: string;
   }>;
+  /** D029 §2. Omitted when the bridge made no drain claim; written in the same
+   * transaction as the recording row, and never a gate on writing it. */
+  readonly captureDrain?: CaptureDrain;
 };
 
 /** Immutable, non-secret build configuration available at the exact

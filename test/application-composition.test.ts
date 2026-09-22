@@ -129,13 +129,13 @@ function scriptedRuntimes(script: RuntimeScript) {
         case "status":
           accept();
           transport.push({ type: "status", protocol_version: 4, request_id: command.requestId, status: readyStatus }); return;
-        case "start_timed_voice_session":
+        case "start_drainable_timed_voice_session":
           if ((script.startMode ?? "accept") === "hang") return;
           if (script.startMode === "reject") {
             transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "scripted start rejection" } }); return;
           }
           accept();
-          transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId, media_lease: { media_protocol_version: 2, session_id: id,
+          transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId, media_lease: { media_protocol_version: 3, session_id: id,
             connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000",
             capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
           deliver({ type: "voice_session_started", session_id: id, privacy: { privacy_mode: "local_only",
@@ -308,7 +308,7 @@ test("one application-owned store opens inside the private root after the lock; 
     assert.equal(f.owner.closed(), 0, "the caller closes the lock last");
     await assert.rejects(app.discover(), /closed/);
     const reopened = f.reopen();
-    try { assert.equal(reopened.schemaVersion, 27); } finally { reopened.close(); }
+    try { assert.equal(reopened.schemaVersion, 28); } finally { reopened.close(); }
   } finally { f.close(); }
 });
 

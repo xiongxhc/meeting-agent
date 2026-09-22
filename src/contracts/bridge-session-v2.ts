@@ -4,7 +4,11 @@ import { parseCommandShape, parseEventShape } from "./bridge-session-v1.ts";
 export const BRIDGE_SESSION_SCHEMA_V2 = "bridge-session/v2";
 export type TimedMediaLease = {
   sessionId: string; bridgeSessionId: string; connectEndpoint: string; credential: string;
-  expiresAtMs: string; reconnectWindowMs: string; mediaProtocolVersion: 2;
+  expiresAtMs: string; reconnectWindowMs: string;
+  /** 2 or 3 only (D029 §3). Media v3 -- the drainable timed capture -- is an
+   * explicit server declaration carried through unchanged; there is no
+   * negotiation here and no fallback between the two. */
+  mediaProtocolVersion: 2 | 3;
   captureFormat: "pcm_s16le/24000/1/20ms"; timingContract: "capture-clock/v1";
 };
 export type ObservationTiming = { clockDomainId: string; hostBeforeNs: string; hostAfterNs: string };
@@ -62,7 +66,7 @@ export function parseCommandV2(input: unknown): BridgeCommandMessageV2 {
     const lease = object(value.mediaLease);
     exact(lease, ["sessionId", "bridgeSessionId", "connectEndpoint", "credential", "expiresAtMs", "reconnectWindowMs", "mediaProtocolVersion", "captureFormat", "timingContract"]);
     if (!text(value.commandId) || !identifier(lease.bridgeSessionId) || lease.bridgeSessionId !== value.sessionId || !text(lease.connectEndpoint, 2048)
-        || !text(lease.credential, 128) || /[\p{Cc}\p{Cf}]/u.test(lease.credential) || lease.mediaProtocolVersion !== 2
+        || !text(lease.credential, 128) || /[\p{Cc}\p{Cf}]/u.test(lease.credential) || (lease.mediaProtocolVersion !== 2 && lease.mediaProtocolVersion !== 3)
         || lease.captureFormat !== "pcm_s16le/24000/1/20ms" || lease.timingContract !== "capture-clock/v1"
         || uint(lease.sessionId) === 0n || uint(lease.expiresAtMs) === 0n || uint(lease.reconnectWindowMs) === 0n) fail();
   }

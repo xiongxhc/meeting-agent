@@ -133,7 +133,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
   mkdirSync(oldMigrations);
   cpSync(path.resolve("migrations"), oldMigrations, {
     recursive: true,
-    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027)_/.test(path.basename(source)),
+    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028)_/.test(path.basename(source)),
   });
   try {
     const oldStore = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
@@ -144,7 +144,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
 
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 27);
+      assert.equal(upgraded.schemaVersion, 28);
       assert.equal(upgraded.getBackfillSeed(identity.occurrenceId), null);
       const schema = new Map(upgraded.describeSchema().map((table) => [table.name, table]));
       assert.match(schema.get("backfill_seeds")?.sql ?? "", /STRICT/);
@@ -483,6 +483,8 @@ test("meeting session seeds only exact bridge-observed ended with supplied prove
           occurrenceId: identity.occurrenceId, handle: testCapability.recordingHandle, encryptedPath: recordingPath,
           sha256: testCapability.sha256, durationMs: 10, format: "pcm_s16le/24000/1/20ms", keyId: testCapability.keyId,
           finalizedAtMs: ENDED_AT_MS, gaps: [], runtimeGaps: [],
+          // A media-v2 lease makes no drain claim (D029 §1).
+          captureDrain: null, captureIntegrity: "unavailable",
         });
         assert.equal(session.state().finalizationError, null);
         assert.deepEqual(session.state().routingErrors, []);

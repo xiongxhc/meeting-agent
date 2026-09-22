@@ -10,6 +10,16 @@ public enum TimedMediaDrainOutcome: Equatable, Sendable {
     case notApplicable
     case confirmed(CaptureFinishBoundary)
     case unconfirmed(reason: String)
+
+    /// The wire view (D029 §1). `notApplicable` has no wire spelling at all:
+    /// the member is omitted rather than nulled.
+    public var report: CaptureDrainReport? {
+        switch self {
+        case .notApplicable: nil
+        case .confirmed(let boundary): .confirmed(CaptureDrainReport.Boundary(boundary))
+        case .unconfirmed(let reason): .unconfirmed(reason: reason)
+        }
+    }
 }
 
 public struct TimedMediaStopResult: Equatable, Sendable {
@@ -202,7 +212,13 @@ public actor TimedMediaSession {
             case .unconfirmed: diagnostic("capture_drain_unconfirmed")
             }
         } else { result = true }
-        if firstStop, cycle != nil { event(.mediaDisconnected(reason: result ? "media_stopped" : "media_cleanup_unconfirmed")) }
+        // D029 §1: the terminal event is the one moment the drain outcome exists,
+        // so it carries it. A v2 lease reports `.notApplicable` and the member is
+        // omitted, leaving the v1 bytes exactly as they were.
+        if firstStop, cycle != nil {
+            event(.mediaDisconnected(reason: result ? "media_stopped" : "media_cleanup_unconfirmed",
+                captureDrain: drain.report))
+        }
         stopped = TimedMediaStopResult(cleanupConfirmed: result, drain: drain)
         return result
     }

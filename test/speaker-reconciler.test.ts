@@ -668,6 +668,8 @@ const RECORDING_ROW: RecordingRow = {
   finalizedAtMs: Date.parse(ENDED_AT),
   gaps: [],
   runtimeGaps: [],
+  captureDrain: null,
+  captureIntegrity: "unavailable",
 };
 
 function recordings(row: RecordingRow | null): { recording(occurrenceId: string): RecordingRow | null } {

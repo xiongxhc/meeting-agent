@@ -27,6 +27,29 @@ export type BridgeCommand =
   | { type: "leave"; reason: "meeting_ended" | "coordinator_stop" }
   | { type: "release_lease"; leaseId: string };
 
+/**
+ * D029 §1: the producer's claim that the encrypted recorder drained every
+ * ordered record through its declared boundary. Two shapes, not a struct with
+ * three independent members: a boundary exists exactly when the drain is
+ * confirmed, a reason exactly when it is not, so the combination the validator
+ * rejects is unrepresentable here too.
+ *
+ * Integers travel as canonical decimal strings, the spelling the timed lease
+ * already uses, because a capture epoch or output sample can exceed 2^53. An
+ * absent final capture frame is spelled `"0"` in both frame members, exactly
+ * the zero-frame body the media-v3 codec puts on the wire; a real frame
+ * sequence is never 0.
+ */
+export type CaptureDrainBoundary = {
+  captureEpoch: string;
+  lastFrameSequence: string;
+  outputEndSample: string;
+  finalClockPairSequence: string;
+};
+export type CaptureDrain =
+  | { drain: "confirmed"; reason: null; boundary: CaptureDrainBoundary }
+  | { drain: "unconfirmed"; reason: string; boundary: null };
+
 export type BridgeEvent =
   | { type: "joined"; meetingOccurrenceId: string }
   | { type: "left"; reason: "ended" | "removed" | "bridge_failure" }
@@ -39,7 +62,7 @@ export type BridgeEvent =
   | { type: "audio_gap"; direction: "capture" | "playback"; startedAt: string; endedAt: string | null }
   | { type: "chat_disclosure"; outcome: "sent" | "unavailable" | "failed" }
   | { type: "media_connected"; endpoint: string }
-  | { type: "media_disconnected"; reason: string }
+  | { type: "media_disconnected"; reason: string; captureDrain?: CaptureDrain }
   | { type: "command_result"; commandId: string; outcome: "ok" | "rejected" | "failed"; detail: string | null }
   | { type: "reconnecting"; attempt: number }
   | { type: "reconnected"; attempt: number };
@@ -95,6 +118,7 @@ type FieldSpec =
   | "nullable_utc_timestamp"
   | "positive_int"
   | "media_format"
+  | "capture_drain"
   | readonly string[];
 
 /**
@@ -103,9 +127,25 @@ type FieldSpec =
  * an extra variant, or a renamed field is a type error rather than a silent
  * drift the `as` casts in the parsers would hide.
  */
+type RequiredPayloadKeys<T> = {
+  [K in keyof T]-?: object extends Pick<T, K> ? never : K;
+}[keyof T];
+type OptionalPayloadKeys<T> = {
+  [K in keyof T]-?: object extends Pick<T, K> ? K : never;
+}[keyof T];
 type PayloadFieldSpecs<U extends { type: string }> = {
   [K in U["type"]]: Record<
-    Exclude<keyof Extract<U, { type: K }>, "type">,
+    Exclude<RequiredPayloadKeys<Extract<U, { type: K }>>, "type">,
+    FieldSpec
+  >;
+};
+/** The same tie for members a variant declares optional: a payload that omits
+ * one is complete, but a payload that carries one is still checked, and an
+ * undeclared optional member is a type error rather than a silently ignored
+ * field. */
+type OptionalPayloadFieldSpecs<U extends { type: string }> = {
+  [K in U["type"]]: Record<
+    Exclude<OptionalPayloadKeys<Extract<U, { type: K }>>, "type">,
     FieldSpec
   >;
 };
@@ -154,6 +194,20 @@ const EVENT_PAYLOADS = {
   reconnecting: { attempt: "positive_int" },
   reconnected: { attempt: "positive_int" },
 } as const satisfies PayloadFieldSpecs<BridgeEvent>;
+
+// D029 §1: additive and optional. A media-v2 producer omits the member and its
+// bytes stay exactly the frozen fixtures/contracts/bridge-session-v1.json shape;
+// an explicit null is a different wire shape and is not admitted.
+const EVENT_OPTIONAL_PAYLOADS = {
+  joined: {}, left: {}, participant_joined: {}, participant_left: {},
+  active_speaker: {}, audio_gap: {}, chat_disclosure: {}, media_connected: {},
+  media_disconnected: { captureDrain: "capture_drain" },
+  command_result: {}, reconnecting: {}, reconnected: {},
+} as const satisfies OptionalPayloadFieldSpecs<BridgeEvent>;
+
+const COMMAND_OPTIONAL_PAYLOADS = {
+  join: {}, connect_media: {}, post_disclosure: {}, leave: {}, release_lease: {},
+} as const satisfies OptionalPayloadFieldSpecs<BridgeCommand>;
 
 const COMMAND_ENVELOPE = {
   sessionId: "string",
@@ -245,6 +299,7 @@ function checkField(
     }
     return null;
   }
+  if (spec === "capture_drain") return checkCaptureDrain(value, path);
   if (spec === "positive_int") {
     if (!Number.isInteger(value) || (value as number) < 1) {
       return { code: "field_type", path, detail: "expected an integer >= 1" };
@@ -255,10 +310,86 @@ function checkField(
   throw new Error(`unhandled field spec: ${String(unreachable)}`);
 }
 
+/** A canonical decimal u64 as a string: the timed lease's own spelling. A JSON
+ * number is refused outright rather than range-checked, because above 2^53 it
+ * is already lossy by the time this sees it. */
+const CANONICAL_UINT64 = /^(0|[1-9][0-9]*)$/;
+function boundaryInteger(value: unknown): bigint | null {
+  if (typeof value !== "string" || !CANONICAL_UINT64.test(value) || value.length > 20) return null;
+  const parsed = BigInt(value);
+  return parsed > 18_446_744_073_709_551_615n ? null : parsed;
+}
+
+function checkCaptureDrain(value: unknown, path: string): BridgeRejection | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { code: "field_type", path, detail: "expected a JSON object" };
+  }
+  const drain = value as Record<string, unknown>;
+  for (const key of ["drain", "reason", "boundary"]) {
+    if (!Object.hasOwn(drain, key)) {
+      return { code: "missing_field", path: `${path}/${key}`, detail: `${key} is required` };
+    }
+  }
+  for (const key of Object.keys(drain)) {
+    if (key !== "drain" && key !== "reason" && key !== "boundary") {
+      return { code: "unknown_field", path: `${path}/${key}`, detail: "unknown fields are rejected, not ignored" };
+    }
+  }
+  if (drain["drain"] !== "confirmed" && drain["drain"] !== "unconfirmed") {
+    return { code: "enum_value", path: `${path}/drain`, detail: "expected one of: confirmed, unconfirmed" };
+  }
+  const confirmed = drain["drain"] === "confirmed";
+  // Boundary non-null iff confirmed, reason non-null iff not: the persisted row
+  // is then unambiguous, and no producer can report a half-confirmed drain.
+  if (confirmed !== (drain["boundary"] !== null)) {
+    return { code: "field_type", path: `${path}/boundary`, detail: "boundary is present exactly when the drain is confirmed" };
+  }
+  if (confirmed !== (drain["reason"] === null)) {
+    return { code: "field_type", path: `${path}/reason`, detail: "reason is present exactly when the drain is unconfirmed" };
+  }
+  if (!confirmed) {
+    return typeof drain["reason"] === "string" && drain["reason"] !== ""
+      ? null
+      : { code: "field_type", path: `${path}/reason`, detail: "expected a non-empty string" };
+  }
+  const boundary = drain["boundary"];
+  if (typeof boundary !== "object" || boundary === null || Array.isArray(boundary)) {
+    return { code: "field_type", path: `${path}/boundary`, detail: "expected a JSON object" };
+  }
+  const members = boundary as Record<string, unknown>;
+  const declared = ["captureEpoch", "lastFrameSequence", "outputEndSample", "finalClockPairSequence"] as const;
+  for (const key of Object.keys(members)) {
+    if (!(declared as readonly string[]).includes(key)) {
+      return { code: "unknown_field", path: `${path}/boundary/${key}`, detail: "unknown fields are rejected, not ignored" };
+    }
+  }
+  const parsed: Record<string, bigint> = {};
+  for (const key of declared) {
+    if (!Object.hasOwn(members, key)) {
+      return { code: "missing_field", path: `${path}/boundary/${key}`, detail: `${key} is required` };
+    }
+    const number = boundaryInteger(members[key]);
+    if (number === null) {
+      return { code: "field_type", path: `${path}/boundary/${key}`, detail: "expected a canonical decimal unsigned integer as a string" };
+    }
+    parsed[key] = number;
+  }
+  if (parsed["captureEpoch"] === 0n || parsed["finalClockPairSequence"] === 0n) {
+    return { code: "field_type", path: `${path}/boundary`, detail: "the capture epoch and final clock pair are >= 1" };
+  }
+  // Either the whole final frame or neither half of it; "0" is the codec's own
+  // zero-frame spelling, never a partially observed frame.
+  if ((parsed["lastFrameSequence"] === 0n) !== (parsed["outputEndSample"] === 0n)) {
+    return { code: "field_type", path: `${path}/boundary/lastFrameSequence`, detail: "the final frame is either wholly present or spelled 0" };
+  }
+  return null;
+}
+
 function checkShape(
   input: unknown,
   envelope: Record<string, FieldSpec>,
   payloads: Record<string, Record<string, FieldSpec>>,
+  optionals: Record<string, Record<string, FieldSpec>>,
 ): BridgeRejection | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { code: "not_an_object", path: "", detail: "expected a JSON object" };
@@ -288,6 +419,7 @@ function checkShape(
     };
   }
   const payload = payloads[type] as Record<string, FieldSpec>;
+  const optional = (optionals[type] ?? {}) as Record<string, FieldSpec>;
 
   // Object.hasOwn throughout: `in` walks the prototype chain, which would let a
   // field named toString, constructor or __proto__ pass as a declared one.
@@ -302,9 +434,18 @@ function checkShape(
     if (failure !== null) return failure;
   }
 
+  // Optional members are checked when present. An omitted member is a producer
+  // making no claim; an explicitly null one is a claim this grammar has no
+  // spelling for, so it is refused by the member's own check.
+  for (const [key, spec] of Object.entries(optional)) {
+    if (!Object.hasOwn(record, key)) continue;
+    const failure = checkField(spec, record[key], `/${key}`);
+    if (failure !== null) return failure;
+  }
+
   for (const key of Object.keys(record)) {
     if (key === "schema" || key === "type") continue;
-    if (Object.hasOwn(envelope, key) || Object.hasOwn(payload, key)) continue;
+    if (Object.hasOwn(envelope, key) || Object.hasOwn(payload, key) || Object.hasOwn(optional, key)) continue;
     return {
       code: "unknown_field",
       path: `/${key}`,
@@ -337,14 +478,14 @@ function checkShape(
 export function parseCommandShape(
   input: unknown,
 ): BridgeResult<BridgeCommandMessage> {
-  const failure = checkShape(input, COMMAND_ENVELOPE, COMMAND_PAYLOADS);
+  const failure = checkShape(input, COMMAND_ENVELOPE, COMMAND_PAYLOADS, COMMAND_OPTIONAL_PAYLOADS);
   if (failure !== null) return { ok: false, rejection: failure };
   return { ok: true, value: input as BridgeCommandMessage };
 }
 
 /** Pure per-message shape check for a bridge-to-coordinator event. */
 export function parseEventShape(input: unknown): BridgeResult<BridgeEventMessage> {
-  const failure = checkShape(input, EVENT_ENVELOPE, EVENT_PAYLOADS);
+  const failure = checkShape(input, EVENT_ENVELOPE, EVENT_PAYLOADS, EVENT_OPTIONAL_PAYLOADS);
   if (failure !== null) return { ok: false, rejection: failure };
   return { ok: true, value: input as BridgeEventMessage };
 }

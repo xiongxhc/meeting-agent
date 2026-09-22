@@ -26,6 +26,50 @@
     }
   },
   "$defs": {
+    "captureDrainUint64": {
+      "description": "A canonical decimal unsigned 64-bit integer as a string. A JSON number is refused outright: above 2^53 it is already lossy by the time a reader sees it.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 20,
+      "format": "uint64-decimal"
+    },
+    "captureDrainUint64Positive": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "maxLength": 20,
+      "format": "uint64-decimal"
+    },
+    "captureDrainBoundary": {
+      "description": "The exact capture-finish boundary the recorder acknowledged. An absent final capture frame is spelled \"0\" in both frame members, exactly the zero-frame body the media-v3 codec puts on the wire; a real frame sequence is never 0.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["captureEpoch", "lastFrameSequence", "outputEndSample", "finalClockPairSequence"],
+      "properties": {
+        "captureEpoch": { "$ref": "#/$defs/captureDrainUint64Positive" },
+        "lastFrameSequence": { "$ref": "#/$defs/captureDrainUint64" },
+        "outputEndSample": { "$ref": "#/$defs/captureDrainUint64" },
+        "finalClockPairSequence": { "$ref": "#/$defs/captureDrainUint64Positive" }
+      },
+      "oneOf": [
+        { "type": "object", "properties": { "lastFrameSequence": { "const": "0" }, "outputEndSample": { "const": "0" } } },
+        { "type": "object", "properties": { "lastFrameSequence": { "$ref": "#/$defs/captureDrainUint64Positive" }, "outputEndSample": { "$ref": "#/$defs/captureDrainUint64Positive" } } }
+      ]
+    },
+    "captureDrain": {
+      "description": "D029 \u00a71. The producer's claim that the encrypted recorder drained every ordered record through its declared boundary. Present only for a media-v3 lease; a media-v2 producer omits the member entirely, which is not the same wire shape as a null. A boundary is present exactly when the drain is confirmed and a reason exactly when it is not, so no producer can report a half-confirmed drain.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["drain", "reason", "boundary"],
+      "properties": {
+        "drain": { "enum": ["confirmed", "unconfirmed"] },
+        "reason": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/nonEmptyString" }] },
+        "boundary": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/captureDrainBoundary" }] }
+      },
+      "oneOf": [
+        { "type": "object", "properties": { "drain": { "const": "confirmed" }, "reason": { "type": "null" }, "boundary": { "type": "object" } } },
+        { "type": "object", "properties": { "drain": { "const": "unconfirmed" }, "reason": { "type": "string" }, "boundary": { "type": "null" } } }
+      ]
+    },
     "schemaVersion": {
       "const": "bridge-session/v2"
     },
@@ -805,6 +849,9 @@
             },
             "reason": {
               "$ref": "#/$defs/nonEmptyString"
+            },
+            "captureDrain": {
+              "$ref": "#/$defs/captureDrain"
             }
           }
         },

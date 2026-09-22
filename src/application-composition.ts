@@ -28,7 +28,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type TimedVoiceSession } from "@conversation/runtime";
+import { RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
 
 import type { ApplicationOwnerLock } from "./adapters/application-owner-lock.ts";
 import { createChildBridgeSlot } from "./adapters/child-bridge-process.ts";
@@ -347,7 +347,9 @@ async function startRuntimeOwner(input: {
 }
 
 function createRuntimeOwner(client: RuntimeClient<4>, transport: OwnedRuntimeTransport, controlSessionId: bigint, seedConfig: BackfillSeedConfig): RuntimeOwner {
-  let voice: TimedVoiceSession | null = null;
+  // Whichever timed session the SDK handed back. Only stopIfActive is used
+  // here, which both shapes declare identically.
+  let voice: TimedVoiceSession | DrainableTimedVoiceSession | null = null;
   let finalization: OccurrenceOutcome["finalization"] = "none";
   let closeOutcome: "pending" | "closed" | "failed" = "pending";
   let closePromise: Promise<void> | undefined;

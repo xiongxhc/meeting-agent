@@ -144,6 +144,41 @@ public enum BridgeCommand: Equatable, Sendable {
 
 // MARK: - events
 
+/// D029 §1: what the producer claims about the encrypted recorder having
+/// drained through its declared boundary, as it rides on `media_disconnected`.
+/// The two cases are the whole contract -- a boundary exists exactly when the
+/// drain is confirmed, and a reason exists exactly when it is not -- so no
+/// encoder or decoder can spell a half-confirmed outcome. Present only for a
+/// media-v3 lease; a v2 lease omits the member and its bytes stay identical to
+/// the frozen `fixtures/contracts/bridge-session-v1.json` shape.
+public enum CaptureDrainReport: Equatable, Sendable {
+    /// Integers that may exceed 2^53 travel as canonical decimal strings, the
+    /// same spelling `TimedMediaLease` uses. An absent final capture frame is
+    /// `lastFrameSequence`/`outputEndSample` "0", exactly the zero-frame body
+    /// `RuntimeMediaCodecV3` puts on the wire: a real frame sequence is never 0.
+    public struct Boundary: Equatable, Sendable {
+        public let captureEpoch: UInt64
+        public let lastFrameSequence: UInt64, outputEndSample: UInt64
+        public let finalClockPairSequence: UInt64
+        public init(captureEpoch: UInt64, lastFrameSequence: UInt64, outputEndSample: UInt64,
+                    finalClockPairSequence: UInt64) {
+            self.captureEpoch = captureEpoch; self.lastFrameSequence = lastFrameSequence
+            self.outputEndSample = outputEndSample; self.finalClockPairSequence = finalClockPairSequence
+        }
+        public init(_ boundary: CaptureFinishBoundary) {
+            self.init(captureEpoch: boundary.captureEpoch, lastFrameSequence: boundary.frame?.sequence ?? 0,
+                outputEndSample: boundary.frame?.outputEndSample ?? 0,
+                finalClockPairSequence: boundary.finalClockPairSequence)
+        }
+        var valid: Bool {
+            captureEpoch > 0 && finalClockPairSequence > 0
+                && (lastFrameSequence > 0) == (outputEndSample > 0)
+        }
+    }
+    case confirmed(Boundary)
+    case unconfirmed(reason: String)
+}
+
 public enum BridgeEvent: Equatable, Sendable {
     case joined(meetingOccurrenceId: String)
     case left(reason: LeftReason)
@@ -153,7 +188,8 @@ public enum BridgeEvent: Equatable, Sendable {
     case audioGap(direction: AudioDirection, startedAt: String, endedAt: String?)
     case chatDisclosure(outcome: DisclosureOutcome)
     case mediaConnected(endpoint: String)
-    case mediaDisconnected(reason: String)
+    /// `captureDrain` is additive and optional: nil for a media-v2 lease.
+    case mediaDisconnected(reason: String, captureDrain: CaptureDrainReport? = nil)
     case commandResult(commandId: String, outcome: CommandOutcome, detail: String?)
     case reconnecting(attempt: Int)
     case reconnected(attempt: Int)
@@ -192,7 +228,7 @@ public enum BridgeEvent: Equatable, Sendable {
         case .audioGap: [.direction, .startedAt, .endedAt]
         case .chatDisclosure: [.outcome]
         case .mediaConnected: [.endpoint]
-        case .mediaDisconnected: [.reason]
+        case .mediaDisconnected(_, let drain): drain == nil ? [.reason] : [.reason, .captureDrain]
         case .commandResult: [.commandId, .outcome, .detail]
         case .reconnecting: [.attempt]
         case .reconnected: [.attempt]
@@ -290,8 +326,12 @@ extension BridgeEventMessage {
                 ?? endedAt.flatMap { contractUtcTimestamp($0, "/endedAt") }
         case .mediaConnected(let endpoint):
             return contractNonEmpty(endpoint, "/endpoint")
-        case .mediaDisconnected(let reason):
-            return contractNonEmpty(reason, "/reason")
+        case .mediaDisconnected(let reason, let drain):
+            if let failure = contractNonEmpty(reason, "/reason") { return failure }
+            switch drain {
+            case nil, .confirmed: return nil
+            case .unconfirmed(let reason): return contractNonEmpty(reason, "/captureDrain/reason")
+            }
         case .commandResult(let commandId, _, let detail):
             return contractNonEmpty(commandId, "/commandId")
                 ?? detail.flatMap { contractNonEmpty($0, "/detail") }
@@ -359,6 +399,8 @@ enum BridgeCodingKey: String, CodingKey {
     case feishuUserId, displayName, confidence
     case direction, startedAt, endedAt
     case outcome, detail, attempt
+    case captureDrain, drain, boundary
+    case captureEpoch, lastFrameSequence, outputEndSample, finalClockPairSequence
 }
 
 /// A key that accepts anything, so the decoder can see the members the JSON
@@ -436,11 +478,94 @@ extension KeyedDecodingContainer where Key == BridgeCodingKey {
         return value
     }
 
+    /// A u64 in the canonical decimal spelling the timed lease already uses:
+    /// no sign, no leading zero, no JSON number (which would be lossy above 2^53).
+    fileprivate func canonicalUInt64(_ key: Key) throws -> UInt64 {
+        let text = try nonEmptyString(key)
+        guard let value = UInt64(text), String(value) == text else {
+            throw BridgeContractError(
+                code: .fieldType, path: "/\(key.stringValue)",
+                detail: "expected a canonical decimal unsigned integer as a string")
+        }
+        return value
+    }
+
+    /// The optional D029 §1 member: an absent key is a media-v2 producer making
+    /// no claim, which is different from a claim of null.
+    fileprivate func captureDrain() throws -> CaptureDrainReport? {
+        guard contains(.captureDrain) else { return nil }
+        return try decode(CaptureDrainReport.self, forKey: .captureDrain)
+    }
+
     fileprivate func checkedSchema() throws {
         guard try nonEmptyString(.schema) == bridgeSessionSchema else {
             throw BridgeContractError(
                 code: .schemaUnknown, path: "/schema", detail: "expected \(bridgeSessionSchema)")
         }
+    }
+}
+
+/// Encodes and decodes D029 §1's object without ever admitting a shape the
+/// enum cannot represent: `boundary` is non-null exactly when `drain` is
+/// `confirmed`, `reason` is non-null exactly when it is not, both members are
+/// always present, and every unknown member is refused.
+extension CaptureDrainReport: Codable {
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: BridgeCodingKey.self)
+        let drain = try container.nonEmptyString(.drain)
+        let reason = try container.nullableNonEmptyString(.reason)
+        _ = try container.present(.boundary)
+        let boundary = try container.decodeNil(forKey: .boundary)
+            ? nil : try container.decode(Boundary.self, forKey: .boundary)
+        switch (drain, reason, boundary) {
+        case ("confirmed", nil, .some(let boundary)): self = .confirmed(boundary)
+        case ("unconfirmed", .some(let reason), nil): self = .unconfirmed(reason: reason)
+        case ("confirmed", _, _), ("unconfirmed", _, _):
+            throw BridgeContractError(code: .fieldType, path: "/captureDrain/boundary",
+                detail: "boundary is present exactly when the drain is confirmed, reason exactly when it is not")
+        case let (other, _, _):
+            throw BridgeContractError(code: .enumValue, path: "/captureDrain/drain",
+                detail: "expected one of: confirmed, unconfirmed (got \(other))")
+        }
+        try decoder.rejectUnknownMembers(allowing: [.drain, .reason, .boundary])
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: BridgeCodingKey.self)
+        switch self {
+        case .confirmed(let boundary):
+            try container.encode("confirmed", forKey: .drain)
+            try container.encodeNil(forKey: .reason)
+            try container.encode(boundary, forKey: .boundary)
+        case .unconfirmed(let reason):
+            try container.encode("unconfirmed", forKey: .drain)
+            try container.encode(reason, forKey: .reason)
+            try container.encodeNil(forKey: .boundary)
+        }
+    }
+}
+
+extension CaptureDrainReport.Boundary: Codable {
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: BridgeCodingKey.self)
+        self.init(captureEpoch: try container.canonicalUInt64(.captureEpoch),
+            lastFrameSequence: try container.canonicalUInt64(.lastFrameSequence),
+            outputEndSample: try container.canonicalUInt64(.outputEndSample),
+            finalClockPairSequence: try container.canonicalUInt64(.finalClockPairSequence))
+        guard valid else {
+            throw BridgeContractError(code: .fieldType, path: "/captureDrain/boundary",
+                detail: "epoch and final pair are >= 1; the final frame is either wholly present or spelled 0")
+        }
+        try decoder.rejectUnknownMembers(
+            allowing: [.captureEpoch, .lastFrameSequence, .outputEndSample, .finalClockPairSequence])
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: BridgeCodingKey.self)
+        try container.encode(String(captureEpoch), forKey: .captureEpoch)
+        try container.encode(String(lastFrameSequence), forKey: .lastFrameSequence)
+        try container.encode(String(outputEndSample), forKey: .outputEndSample)
+        try container.encode(String(finalClockPairSequence), forKey: .finalClockPairSequence)
     }
 }
 
@@ -575,7 +700,8 @@ extension BridgeEventMessage: Codable {
         case "media_connected":
             event = .mediaConnected(endpoint: try container.nonEmptyString(.endpoint))
         case "media_disconnected":
-            event = .mediaDisconnected(reason: try container.nonEmptyString(.reason))
+            event = .mediaDisconnected(reason: try container.nonEmptyString(.reason),
+                captureDrain: try container.captureDrain())
         case "command_result":
             event = .commandResult(
                 commandId: try container.nonEmptyString(.commandId),
@@ -633,8 +759,9 @@ extension BridgeEventMessage: Codable {
             try container.encode(outcome.rawValue, forKey: .outcome)
         case .mediaConnected(let endpoint):
             try container.encode(endpoint, forKey: .endpoint)
-        case .mediaDisconnected(let reason):
+        case .mediaDisconnected(let reason, let drain):
             try container.encode(reason, forKey: .reason)
+            if let drain { try container.encode(drain, forKey: .captureDrain) }
         case .commandResult(let commandId, let outcome, let detail):
             try container.encode(commandId, forKey: .commandId)
             try container.encode(outcome.rawValue, forKey: .outcome)

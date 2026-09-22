@@ -64,6 +64,9 @@ const schemaDoc = JSON.parse(schemaSource) as SchemaDoc;
 // regression in a pattern, a minimum, an additionalProperties or the never-guess
 // if/then block has to fail here rather than pass silently.
 const ajv = new Ajv2020({ strict: true, allErrors: true });
+// D029 §1 added a uint64-decimal member; the pattern already bounds the digits,
+// so this only adds the >2^64 refusal the pattern alone cannot express.
+ajv.addFormat("uint64-decimal", (value: string) => BigInt(value) <= 18446744073709551615n);
 ajv.addSchema(JSON.parse(schemaSource) as object);
 const validateDocument = ajv.getSchema(schemaDoc.$id);
 if (validateDocument === undefined) {

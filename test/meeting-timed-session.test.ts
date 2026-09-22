@@ -51,8 +51,8 @@ test("actual SDK/v2 session retains synchronous join evidence and authorizes tex
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId,
       ...(command.type === "authorize_voice_response" ? { turn_id: "99" } : {}) });
-    if (command.type === "start_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
-      media_lease: { media_protocol_version: 2, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+    if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
+      media_lease: { media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
         expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
     if (command.type === "finalize_recording") transport.push({ ...finalizedWire, request_id: command.requestId,
       recovery_capability: { ...finalizedWire.recovery_capability, source_session_id: "42" } });
@@ -122,14 +122,14 @@ for (const variant of ["invalid_control", "start_rejected", "lease_mismatch", "c
         mediaLease: { mediaProtocolVersion: 2 as const, sessionId: 43n, connectEndpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expiresAtMs: BigInt(Date.now() + 60000),
           reconnectWindowMs: 10000n, captureFormat: "pcm_s16le/24000/1/20ms" as const, timingContract: "capture-clock/v1" as const } }; } } : {}) };
     transport.onSend = (command) => {
-      if (command.type === "start_timed_voice_session" && variant === "left_during_start") {
+      if (command.type === "start_drainable_timed_voice_session" && variant === "left_during_start") {
         // Leave the actual SDK start promise unresolved. An early final cannot
         // block the same reader from observing left and closing that SDK owner.
         queueMicrotask(() => { runtimeListener?.(prematureFinal); bridgeListener?.({ schema: "bridge-session/v2", sessionId: "bridge-one", sequence: 1,
           observedAt: "2026-09-02T14:00:00Z", type: "left", reason: "ended", observationTiming: null, observationTimingReason: "timing_unavailable" }); });
         return;
       }
-      if (command.type === "start_timed_voice_session") transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId,
+      if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId,
         error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "synthetic rejected" } });
       else { transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
         if (command.type === "finalize_recording") transport.push({ ...finalizedWire, request_id: command.requestId }); }
@@ -281,8 +281,8 @@ for (const firstEvent of ["final", "failure"] as const) {
     const { client, transport } = await runtimeTestClient(4), runtime = createConversationRuntimeClient(client), transcripts: string[] = [];
     transport.onSend = (command) => {
       transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId, ...(command.type === "authorize_voice_response" ? { turn_id: "99" } : {}) });
-      if (command.type === "start_timed_voice_session") {
-        transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId, media_lease: { media_protocol_version: 2, session_id: "42",
+      if (command.type === "start_drainable_timed_voice_session") {
+        transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId, media_lease: { media_protocol_version: 3, session_id: "42",
           connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
         if (firstEvent === "failure") transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_failed", session_id: "42", recovery: "new_session",
           error: { code: "adapter_failure", kind: "adapter", stage: "speech_recognizer", message: "synthetic early failure" } } });

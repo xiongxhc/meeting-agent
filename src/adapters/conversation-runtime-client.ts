@@ -1,5 +1,5 @@
 // The installed reviewed SDK owns framing, validation and credit/cancellation.
-import { RuntimeClient, type RuntimeTransport, type TimedVoiceSession } from "@conversation/runtime";
+import { RuntimeClient, type DrainableTimedVoiceSession, type RuntimeTransport, type TimedVoiceSession } from "@conversation/runtime";
 
 import type {
   ConversationContextExchange,
@@ -19,7 +19,7 @@ export async function connectPostmeetingRuntime(transport: RuntimeTransport): Pr
 export type ConversationRuntimeClientOptions = {
   /** Receives the SDK's own timed session so an owner can call its
    * authoritative stopIfActive; the adapter never reimplements that state. */
-  readonly onTimedSession?: (session: TimedVoiceSession) => void;
+  readonly onTimedSession?: (session: TimedVoiceSession | DrainableTimedVoiceSession) => void;
 };
 
 export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk, options: ConversationRuntimeClientOptions = {}): ConversationRuntimePort & FinalizedRecordingRuntime {
@@ -41,7 +41,11 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk, opt
       if (closing || admitted) throw new Error("Runtime live owner is closed or already admitted");
       if (input.profile !== "online" || input.responseMode !== "external_gate") throw new Error("Meeting timed admission requires online/external_gate");
       admitted = true; // One generation per adapter, including failed starts.
-      const session = await sdk.startTimedVoiceSession({ bridgeSessionId: input.bridgeSessionId, profile: "online", responseMode: "external_gate" });
+      // D029 §3: the live timed path is the DRAINABLE start, so the lease the
+      // Runtime issues is media v3 and the producer can finish its capture.
+      // There is no negotiation and no fallback to the media-v2 start: the
+      // lease version this adapter reports is whatever the SDK returned.
+      const session = await sdk.startDrainableTimedVoiceSession({ bridgeSessionId: input.bridgeSessionId, profile: "online", responseMode: "external_gate" });
       options.onTimedSession?.(session);
       if (closing) throw new Error("Runtime live owner closed during admission");
       pump = (async () => {
