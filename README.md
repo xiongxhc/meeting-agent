@@ -28,6 +28,38 @@ docs/feasibility/   the client matrix and the Mac language decision — both
 docs/HUMAN-CHECKLIST.md  steps deliberately not attempted by an agent
 ```
 
+## Running the built end-to-end spine
+
+One command stages a fresh private root, builds the package, and drives the
+SHIPPED standalone admission and composition against scripted local peers:
+
+```sh
+export PATH=/opt/homebrew/opt/node@24/bin:$PATH
+npm run e2e -- --out /absolute/evidence/dir            # add --keep to retain the temp root
+npm run e2e -- --out /absolute/evidence/dir --only-refusals
+```
+
+It needs the pinned Runtime gateway and SDK tarball recorded in `e2e/pins.mjs`,
+and refuses to run when either SHA256 differs. Network is used only to build and
+install the TeamMem wheel. Set `E2E_ALLOW_LOCAL_BARE_PUSH=1` to let the real
+TeamMem consumer publish; the push target is a bare repository the harness
+creates inside its own temp root, never a real remote. Nothing outside that root
+is written: `~/.local/share/teammem`, `~/.config/teammem` and any deployed hub
+are untouched.
+
+`--out` receives `bundle.json` (commands and exits with load averages, source
+tree id, Runtime digests, the redacted static-code trace, the reopened state
+database, the process tree at peak and every oracle) and `NEGATIVE-PROOFS.md`.
+
+What the evidence is: scripted local application test readiness. It is not a
+Feishu, provider, acoustic, Linux or remote-split acceptance. The shipped client
+pins the Runtime profile to `online`, which requires remote HTTPS/WSS providers,
+so the live lane runs against unreachable `.invalid` endpoints: audio is captured
+and recorded, and no transcript turn is produced or faked. The post-meeting lane
+runs the same gateway binary in the `offline` profile against a local fixture
+provider so the alignment traversal and the one synthesis call are answered
+rather than invented.
+
 ## Running the tests
 
 Node24 is the verified local environment. SDK-dependent test/typecheck/build/start
