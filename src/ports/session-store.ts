@@ -399,6 +399,69 @@ export type BackfillSeedCleanupClaim = {
   readonly recordingInode: string;
 };
 
+/** The EXACT stopped encrypted source (D007): the canonical final recording,
+ * or one failed bridge generation's own finalized recording. Never an
+ * occurrence-wide selector. */
+export type UnknownEndCustodySource =
+  | { readonly kind: "final"; readonly occurrenceId: string }
+  | { readonly kind: "bridge_failure"; readonly occurrenceId: string; readonly attempt: number };
+
+/** The Runtime finalization descriptor the caller holds for that source. The
+ * store refuses any value that does not match the persisted descriptor; it is
+ * never a bridge departure, physical-slot outcome or local-clock instant. */
+export type UnknownEndCustodyIdentity = {
+  readonly recordingHandle: string;
+  readonly encryptedPath: string;
+  readonly sha256: string;
+  readonly keyId: string;
+};
+
+export type UnknownEndCustodyState = "assigned" | "cleanup_claimed" | "cleanup_failed" | "deleted";
+export type UnknownEndCustodyFailureReason =
+  | "identity_mismatch" | "source_missing" | "unsafe_source" | "detach_failed" | "reader_active" | "quiescence_unproven";
+
+/** One immutable detection `T` and deadline `T + 14d` (D002) for one exact
+ * source, plus the identity captured at first detection and the cleanup fence
+ * state. It is not an occurrence end and carries no deletion authority. */
+export type UnknownEndCustody = {
+  readonly source: UnknownEndCustodySource;
+  readonly recordingHandle: string;
+  readonly recordingPath: string;
+  readonly recordingSha256: string;
+  readonly recordingKeyId: string;
+  readonly recordingBytes: number;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+  readonly detectedAtMs: number;
+  readonly deadlineMs: number;
+  readonly state: UnknownEndCustodyState;
+  readonly cleanupFailureReason: UnknownEndCustodyFailureReason | null;
+  readonly deletedAtMs: number | null;
+};
+
+/** "existing" returns the stored assignment unchanged; a retry, reopen, clock
+ * regression or later trustworthy end never moves `T` or the deadline. */
+export type UnknownEndCustodyAssignment = {
+  readonly outcome: "assigned" | "existing";
+  readonly custody: UnknownEndCustody;
+};
+
+/** A fenced lease on one due exact source. It does not claim quiescence: the
+ * later owner must still prove exact-source closure and recheck this identity
+ * against the filesystem before the existing tombstone deletion runs. */
+export type UnknownEndCustodyCleanupClaim = {
+  readonly source: UnknownEndCustodySource;
+  readonly claimToken: string;
+  readonly claimExpiresAtMs: number;
+  readonly recordingPath: string;
+  readonly recordingHandle: string;
+  readonly recordingBytes: number;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+  readonly detectedAtMs: number;
+  readonly deadlineMs: number;
+};
+
 export type FinalizeSessionInput = {
   readonly transition: TransitionInput;
   readonly recording: RecordingInput;
@@ -642,6 +705,27 @@ export type SessionStore = {
     readonly claimToken: string }): BackfillSeedCleanupClaim | null;
   completeBackfillSeedCleanup(input: { readonly occurrenceId: string;
     readonly claimToken: string; readonly nowMs: number }): void;
+  /** Explicit unknown-end classification of ONE exact stopped source (D002/
+   * D007). Immediate transaction. Refuses a source without a persisted Runtime
+   * finalization descriptor, a descriptor mismatch, an authoritative
+   * bridge-observed end, an ambiguous legacy end, a seeded or delivery-owned
+   * source, or a file that is not the exact regular Runtime child. Returns the
+   * stored assignment unchanged or the one new `T / T + 14d` assignment. It is
+   * never called implicitly by opening the store, lease repair, a retry,
+   * receipt handling or a cleanup clock read. */
+  assignUnknownEndCustody(source: UnknownEndCustodySource, detectedAtMs: number,
+    exactIdentity: UnknownEndCustodyIdentity): UnknownEndCustodyAssignment;
+  getUnknownEndCustody(source: UnknownEndCustodySource): UnknownEndCustody | null;
+  /** Leases one specific due source. It manufactures no delivery/job and does
+   * not assert quiescence; a source with a retained durable alignment claim or
+   * a fail-closed cleanup outcome is never returned. */
+  claimDueUnknownEndCustodyCleanup(nowMs: number, claimToken: string): UnknownEndCustodyCleanupClaim | null;
+  /** Fenced, monotonic completion after the exact tombstone deletion. */
+  completeUnknownEndCustodyCleanup(claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, deletedAtMs: number): void;
+  /** Fenced, monotonic fail-closed outcome. The source stays visible; no retry
+   * resets `T` or the deadline. */
+  failUnknownEndCustodyCleanup(claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, failedAtMs: number,
+    reason: UnknownEndCustodyFailureReason): void;
   authorizeDeliveryEvidenceCleanup(input: { readonly occurrenceId: string; readonly nowMs: number }): boolean;
   getRecordingRecovery(occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null;
   beginRecordingAlignment(generationId: string, ownerId: string, replace?: boolean):

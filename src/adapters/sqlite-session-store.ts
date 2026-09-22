@@ -65,6 +65,12 @@ import {
   type SettleBackfillProcessInput,
   type BackfillWarningClaim,
   type BackfillSeedCleanupClaim,
+  type UnknownEndCustody,
+  type UnknownEndCustodyAssignment,
+  type UnknownEndCustodyCleanupClaim,
+  type UnknownEndCustodyFailureReason,
+  type UnknownEndCustodyIdentity,
+  type UnknownEndCustodySource,
   type BackfillSeedFinalizationInput,
   type ClaimBackfillSeedBuildInput,
   type AlignmentAttempt,
@@ -199,6 +205,11 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     failBackfillWarning: (input) => failBackfillWarning(db, input),
     claimExpiredBackfillSeedCleanup: (input) => claimExpiredBackfillSeedCleanup(db, input.nowMs, input.claimToken),
     completeBackfillSeedCleanup: (input) => completeBackfillSeedCleanup(db, input),
+    assignUnknownEndCustody: (source, detectedAtMs, exactIdentity) => assignUnknownEndCustody(db, source, detectedAtMs, exactIdentity),
+    getUnknownEndCustody: (source) => getUnknownEndCustody(db, source),
+    claimDueUnknownEndCustodyCleanup: (nowMs, claimToken) => claimDueUnknownEndCustodyCleanup(db, nowMs, claimToken),
+    completeUnknownEndCustodyCleanup: (claim, deletedAtMs) => completeUnknownEndCustodyCleanup(db, claim, deletedAtMs),
+    failUnknownEndCustodyCleanup: (claim, failedAtMs, reason) => failUnknownEndCustodyCleanup(db, claim, failedAtMs, reason),
     authorizeDeliveryEvidenceCleanup: (input) => authorizeDeliveryEvidenceCleanup(db, input.occurrenceId, input.nowMs),
     getRecordingRecovery: (occurrenceId, bridgeSessionId, recordingHandle) => getRecordingRecovery(db, occurrenceId, bridgeSessionId, recordingHandle),
     beginRecordingAlignment: (generationId, ownerId, replace) => beginRecordingAlignment(db, generationId, ownerId, replace),
@@ -3142,4 +3153,282 @@ function withConstraintTranslation<T>(fn: () => T): T {
     }
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-end custody (D002/D007): one immutable detection per EXACT stopped
+// encrypted source. Store-only. Nothing here is an occurrence end, an artifact,
+// a delivery/job/receipt, or deletion authority; the store only records the
+// write-once T / T + 14d and fences the later exact tombstone deletion.
+// ---------------------------------------------------------------------------
+
+const UNKNOWN_END_CUSTODY_MS = 14 * 24 * 60 * 60 * 1000;
+const UNKNOWN_END_CLEANUP_CLAIM_MS = 30_000;
+const UNKNOWN_END_FAILURE_REASONS: ReadonlySet<string> = new Set<UnknownEndCustodyFailureReason>([
+  "identity_mismatch", "source_missing", "unsafe_source", "detach_failed", "reader_active", "quiescence_unproven",
+]);
+
+type UnknownEndCustodyKey = { readonly occurrenceId: string; readonly kind: UnknownEndCustodySource["kind"]; readonly attempt: number };
+
+type UnknownEndCustodyRaw = {
+  occurrence_id: string; source_kind: UnknownEndCustodySource["kind"]; failure_attempt: number;
+  recording_handle: string; recording_path: string; recording_sha256: string; recording_key_id: string;
+  recording_bytes: number; recording_device: string; recording_inode: string;
+  unknown_end_detected_at_ms: number; unknown_end_deadline_ms: number; state: UnknownEndCustody["state"];
+  cleanup_claim_token: string | null; cleanup_claim_expires_at_ms: number | null;
+  cleanup_failure_reason: UnknownEndCustodyFailureReason | null; deleted_at_ms: number | null; last_observed_at_ms: number;
+};
+
+const UNKNOWN_END_CUSTODY_COLUMNS = `occurrence_id,source_kind,failure_attempt,recording_handle,recording_path,recording_sha256,
+  recording_key_id,recording_bytes,recording_device,recording_inode,unknown_end_detected_at_ms,unknown_end_deadline_ms,state,
+  cleanup_claim_token,cleanup_claim_expires_at_ms,cleanup_failure_reason,deleted_at_ms,last_observed_at_ms`;
+const UNKNOWN_END_CUSTODY_KEY = "occurrence_id=? AND source_kind=? AND failure_attempt=?";
+
+function custodyViolation(message: string): OrchestrationError {
+  return new OrchestrationError("constraint_violation", message);
+}
+
+/** The exact source key. The canonical final source is attempt 0; a failed
+ * generation is its own attempt >= 1. Never an occurrence-wide selector. */
+function unknownEndCustodyKey(source: UnknownEndCustodySource): UnknownEndCustodyKey {
+  if (typeof source !== "object" || source === null || typeof source.occurrenceId !== "string" || source.occurrenceId.length === 0) {
+    throw custodyViolation("invalid unknown-end custody source");
+  }
+  if (source.kind === "final") return { occurrenceId: source.occurrenceId, kind: "final", attempt: 0 };
+  if (source.kind === "bridge_failure" && Number.isSafeInteger(source.attempt) && source.attempt >= 1) {
+    return { occurrenceId: source.occurrenceId, kind: "bridge_failure", attempt: source.attempt };
+  }
+  throw custodyViolation("invalid unknown-end custody source");
+}
+
+function validUnknownEndClock(nowMs: number): void {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw custodyViolation("invalid unknown-end custody clock");
+}
+
+function validUnknownEndClaimToken(claimToken: string): void {
+  if (typeof claimToken !== "string" || !/^[0-9a-f]{32}$/.test(claimToken)) throw custodyViolation("invalid unknown-end custody cleanup token");
+}
+
+function selectUnknownEndCustodyRaw(db: Database.Database, key: UnknownEndCustodyKey): UnknownEndCustodyRaw | undefined {
+  return db.prepare(`SELECT ${UNKNOWN_END_CUSTODY_COLUMNS} FROM unknown_end_custody WHERE ${UNKNOWN_END_CUSTODY_KEY}`)
+    .get(key.occurrenceId, key.kind, key.attempt) as UnknownEndCustodyRaw | undefined;
+}
+
+function toUnknownEndCustody(raw: UnknownEndCustodyRaw): UnknownEndCustody {
+  const source: UnknownEndCustodySource = raw.source_kind === "final"
+    ? { kind: "final", occurrenceId: raw.occurrence_id }
+    : { kind: "bridge_failure", occurrenceId: raw.occurrence_id, attempt: raw.failure_attempt };
+  return { source, recordingHandle: raw.recording_handle, recordingPath: raw.recording_path, recordingSha256: raw.recording_sha256,
+    recordingKeyId: raw.recording_key_id, recordingBytes: raw.recording_bytes, recordingDevice: raw.recording_device,
+    recordingInode: raw.recording_inode, detectedAtMs: raw.unknown_end_detected_at_ms, deadlineMs: raw.unknown_end_deadline_ms,
+    state: raw.state, cleanupFailureReason: raw.cleanup_failure_reason, deletedAtMs: raw.deleted_at_ms };
+}
+
+function getUnknownEndCustody(db: Database.Database, source: UnknownEndCustodySource): UnknownEndCustody | null {
+  const raw = selectUnknownEndCustodyRaw(db, unknownEndCustodyKey(source));
+  return raw === undefined ? null : toUnknownEndCustody(raw);
+}
+
+type FinalizedSourceDescriptor = { readonly handle: string; readonly canonicalPath: string; readonly sha256: string; readonly keyId: string };
+
+/** Stopped-writing evidence is the persisted Runtime finalization descriptor
+ * for that exact source: the canonical `recordings` row with its Runtime
+ * locator, or the `recordBridgeFailure(... recording ...)` row for that
+ * attempt. A failure recorded without a recording, or a legacy canonical row
+ * without a locator, is a live/unknown writer and yields null. */
+function selectFinalizedSourceDescriptor(db: Database.Database, key: UnknownEndCustodyKey): FinalizedSourceDescriptor | null {
+  const row = (key.kind === "final"
+    ? db.prepare("SELECT handle, encrypted_path, sha256, key_id FROM recordings WHERE occurrence_id=?").get(key.occurrenceId)
+    : db.prepare("SELECT handle, encrypted_path, sha256, key_id FROM bridge_failure_recordings WHERE occurrence_id=? AND attempt=?")
+      .get(key.occurrenceId, key.attempt)) as { handle: string; encrypted_path: string | null; sha256: string; key_id: string | null } | undefined;
+  if (row === undefined || row.encrypted_path === null || row.key_id === null) return null;
+  return { handle: row.handle, canonicalPath: path.resolve(row.encrypted_path), sha256: row.sha256, keyId: row.key_id };
+}
+
+function validUnknownEndIdentity(value: UnknownEndCustodyIdentity): void {
+  if (typeof value !== "object" || value === null || Object.keys(value).sort().join(",") !== "encryptedPath,keyId,recordingHandle,sha256" ||
+      typeof value.recordingHandle !== "string" || !/^[0-9a-f]{32}$/.test(value.recordingHandle) ||
+      typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.sha256) ||
+      typeof value.keyId !== "string" || !/^[0-9a-f]{16}$/.test(value.keyId) ||
+      typeof value.encryptedPath !== "string" || value.encryptedPath.length === 0) {
+    throw custodyViolation("invalid unknown-end custody identity");
+  }
+}
+
+function assertUnknownEndIdentityMatches(expected: { handle: string; canonicalPath: string; sha256: string; keyId: string }, value: UnknownEndCustodyIdentity): void {
+  if (value.recordingHandle !== expected.handle || value.sha256 !== expected.sha256 || value.keyId !== expected.keyId ||
+      path.resolve(value.encryptedPath) !== expected.canonicalPath) {
+    throw custodyViolation("unknown-end custody identity does not match the persisted Runtime source");
+  }
+}
+
+/** Exact regular-child filesystem identity at first detection. */
+function inspectUnknownEndSource(canonicalPath: string): { readonly bytes: number; readonly device: string; readonly inode: string } {
+  try {
+    const stat = lstatSync(canonicalPath, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isFile()) throw custodyViolation("unknown-end custody source is not a regular Runtime child");
+    if (stat.size < 1n || stat.size > MAX_RECORDING_BYTES) throw custodyViolation("unknown-end custody source size is outside 1..8GiB");
+    return { bytes: Number(stat.size), device: stat.dev.toString(), inode: stat.ino.toString() };
+  } catch (error) {
+    if (error instanceof OrchestrationError) throw error;
+    throw custodyViolation(`unknown-end custody source cannot be inspected: ${(error as Error).message}`);
+  }
+}
+
+/** Only a bridge-observed terminal is an authoritative end. Removed, bridge
+ * failure, local-clock and finalization instants are not ends; a legacy
+ * terminal of unknown provenance is ambiguous and refused. The canonical
+ * source answers to the occurrence's generations; a failed attempt answers to
+ * the generation bound to its own handle, because its generation ended in a
+ * bridge failure rather than an observed end. */
+function refuseUnknownEndIfKnownOrOwned(db: Database.Database, key: UnknownEndCustodyKey, handle: string): void {
+  const terminals = (key.kind === "final"
+    ? db.prepare("SELECT terminal_source FROM reconciliation_generations WHERE occurrence_id=? AND terminal_source IS NOT NULL").all(key.occurrenceId)
+    : db.prepare("SELECT terminal_source FROM reconciliation_generations WHERE occurrence_id=? AND recording_handle=? AND terminal_source IS NOT NULL")
+      .all(key.occurrenceId, handle)) as Array<{ terminal_source: string }>;
+  if (terminals.some((row) => row.terminal_source === "bridge_observed")) {
+    throw custodyViolation("unknown-end custody refuses a source with an authoritative known end");
+  }
+  if (terminals.some((row) => row.terminal_source === "legacy_unknown")) {
+    throw custodyViolation("unknown-end custody refuses an ambiguous legacy end");
+  }
+  if (key.kind !== "final") return;
+  if (db.prepare("SELECT 1 FROM backfill_seeds WHERE occurrence_id=?").get(key.occurrenceId) !== undefined) {
+    throw custodyViolation("unknown-end custody refuses a seeded known-ended source");
+  }
+  if (db.prepare("SELECT 1 FROM delivery_journal WHERE occurrence_id=? LIMIT 1").get(key.occurrenceId) !== undefined) {
+    throw custodyViolation("unknown-end custody refuses a delivery-owned source");
+  }
+}
+
+function assignUnknownEndCustody(
+  db: Database.Database, source: UnknownEndCustodySource, detectedAtMs: number, exactIdentity: UnknownEndCustodyIdentity,
+): UnknownEndCustodyAssignment {
+  const key = unknownEndCustodyKey(source);
+  validUnknownEndClock(detectedAtMs);
+  validUnknownEndIdentity(exactIdentity);
+  const deadlineMs = detectedAtMs + UNKNOWN_END_CUSTODY_MS;
+  if (!Number.isSafeInteger(deadlineMs)) throw custodyViolation("unknown-end custody deadline overflow");
+  const existingOf = (raw: UnknownEndCustodyRaw): UnknownEndCustodyAssignment => {
+    assertUnknownEndIdentityMatches({ handle: raw.recording_handle, canonicalPath: raw.recording_path, sha256: raw.recording_sha256, keyId: raw.recording_key_id }, exactIdentity);
+    return { outcome: "existing", custody: toUnknownEndCustody(raw) };
+  };
+  const stored = selectUnknownEndCustodyRaw(db, key);
+  if (stored !== undefined) return existingOf(stored);
+  const descriptor = selectFinalizedSourceDescriptor(db, key);
+  if (descriptor === null) throw custodyViolation("unknown-end custody requires a finalized Runtime source descriptor");
+  assertUnknownEndIdentityMatches(descriptor, exactIdentity);
+  if (path.basename(descriptor.canonicalPath) !== `${descriptor.handle}.crsr`) {
+    throw custodyViolation("unknown-end custody source path does not match its Runtime handle");
+  }
+  const identity = inspectUnknownEndSource(descriptor.canonicalPath);
+  return db.transaction((): UnknownEndCustodyAssignment => {
+    const raced = selectUnknownEndCustodyRaw(db, key);
+    if (raced !== undefined) return existingOf(raced);
+    if (selectFinalizedSourceDescriptor(db, key)?.handle !== descriptor.handle) {
+      throw custodyViolation("unknown-end custody requires a finalized Runtime source descriptor");
+    }
+    refuseUnknownEndIfKnownOrOwned(db, key, descriptor.handle);
+    withConstraintTranslation(() => db.prepare(`INSERT INTO unknown_end_custody (occurrence_id,source_kind,failure_attempt,
+        final_occurrence_id,failure_occurrence_id,recording_handle,recording_path,recording_sha256,recording_key_id,
+        recording_bytes,recording_device,recording_inode,unknown_end_detected_at_ms,unknown_end_deadline_ms,state,last_observed_at_ms)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'assigned',?)`)
+      .run(key.occurrenceId, key.kind, key.attempt, key.kind === "final" ? key.occurrenceId : null, key.kind === "final" ? null : key.occurrenceId,
+        descriptor.handle, descriptor.canonicalPath, descriptor.sha256, descriptor.keyId, identity.bytes, identity.device, identity.inode,
+        detectedAtMs, deadlineMs, detectedAtMs));
+    return { outcome: "assigned", custody: toUnknownEndCustody(selectUnknownEndCustodyRaw(db, key)!) };
+  }).immediate();
+}
+
+/** Persists the nondecreasing wall for one custody row and returns it. */
+function observeUnknownEndWall(db: Database.Database, key: UnknownEndCustodyKey, nowMs: number): number {
+  validUnknownEndClock(nowMs);
+  const row = db.prepare(`SELECT last_observed_at_ms FROM unknown_end_custody WHERE ${UNKNOWN_END_CUSTODY_KEY}`)
+    .get(key.occurrenceId, key.kind, key.attempt) as { last_observed_at_ms: number } | undefined;
+  if (row === undefined) throw custodyViolation("unknown-end custody cleanup claim is stale");
+  const effective = Math.max(nowMs, row.last_observed_at_ms);
+  db.prepare(`UPDATE unknown_end_custody SET last_observed_at_ms=? WHERE ${UNKNOWN_END_CUSTODY_KEY}`)
+    .run(effective, key.occurrenceId, key.kind, key.attempt);
+  return effective;
+}
+
+function claimDueUnknownEndCustodyCleanup(db: Database.Database, nowMs: number, claimToken: string): UnknownEndCustodyCleanupClaim | null {
+  validUnknownEndClock(nowMs);
+  validUnknownEndClaimToken(claimToken);
+  return db.transaction((): UnknownEndCustodyCleanupClaim | null => {
+    // One due exact source. A retained durable alignment claim on that source,
+    // or a canonical source that meanwhile became seeded/delivery-owned, is
+    // fail-closed: it is never leased, and its assignment is never touched.
+    const row = db.prepare(`SELECT ${UNKNOWN_END_CUSTODY_COLUMNS}, MAX(?,last_observed_at_ms) AS observed_at_ms
+      FROM unknown_end_custody AS custody
+      WHERE custody.state IN ('assigned','cleanup_claimed')
+        AND MAX(?,custody.last_observed_at_ms)>=custody.unknown_end_deadline_ms
+        AND (custody.state!='cleanup_claimed' OR custody.cleanup_claim_expires_at_ms<=MAX(?,custody.last_observed_at_ms))
+        AND NOT EXISTS (
+          SELECT 1 FROM recording_recovery_bindings AS binding
+          JOIN recording_alignment_attempts AS alignment ON alignment.generation_id=binding.generation_id
+          WHERE binding.occurrence_id=custody.occurrence_id AND binding.recording_handle=custody.recording_handle
+            AND alignment.state IN ('staging','cleanup_failed'))
+        AND (custody.source_kind!='final' OR (
+          NOT EXISTS (SELECT 1 FROM backfill_seeds WHERE occurrence_id=custody.occurrence_id)
+          AND NOT EXISTS (SELECT 1 FROM delivery_journal WHERE occurrence_id=custody.occurrence_id)))
+      ORDER BY custody.unknown_end_deadline_ms, custody.occurrence_id, custody.source_kind, custody.failure_attempt LIMIT 1`)
+      .get(nowMs, nowMs, nowMs) as (UnknownEndCustodyRaw & { observed_at_ms: number }) | undefined;
+    if (row === undefined) return null;
+    const claimExpiresAtMs = row.observed_at_ms + UNKNOWN_END_CLEANUP_CLAIM_MS;
+    if (!Number.isSafeInteger(claimExpiresAtMs)) throw custodyViolation("unknown-end custody claim deadline overflow");
+    const changed = db.prepare(`UPDATE unknown_end_custody SET state='cleanup_claimed',cleanup_claim_token=?,
+      cleanup_claim_expires_at_ms=?,last_observed_at_ms=? WHERE ${UNKNOWN_END_CUSTODY_KEY}
+      AND state IN ('assigned','cleanup_claimed') AND (state!='cleanup_claimed' OR cleanup_claim_expires_at_ms<=?)`)
+      .run(claimToken, claimExpiresAtMs, row.observed_at_ms, row.occurrence_id, row.source_kind, row.failure_attempt, row.observed_at_ms).changes;
+    if (changed !== 1) return null;
+    return { source: toUnknownEndCustody(row).source, claimToken, claimExpiresAtMs, recordingPath: row.recording_path,
+      recordingHandle: row.recording_handle, recordingBytes: row.recording_bytes, recordingDevice: row.recording_device,
+      recordingInode: row.recording_inode, detectedAtMs: row.unknown_end_detected_at_ms, deadlineMs: row.unknown_end_deadline_ms };
+  }).immediate();
+}
+
+/** Fenced transition out of `cleanup_claimed`. The wall observation persists
+ * on an expired claim so a clock regression cannot revive it; a stale claim
+ * rolls back without touching the row. */
+function settleUnknownEndCustodyCleanup(
+  db: Database.Database, claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, nowMs: number,
+  update: (effective: number, key: UnknownEndCustodyKey) => number,
+): void {
+  const key = unknownEndCustodyKey(claim.source);
+  validUnknownEndClaimToken(claim.claimToken);
+  const expiredClaim = Symbol("expired unknown-end custody cleanup claim");
+  const result = db.transaction((): void | typeof expiredClaim => {
+    const effective = observeUnknownEndWall(db, key, nowMs);
+    const row = selectUnknownEndCustodyRaw(db, key);
+    if (row === undefined || row.state !== "cleanup_claimed" || row.cleanup_claim_token !== claim.claimToken ||
+        row.cleanup_claim_expires_at_ms === null) {
+      throw custodyViolation("unknown-end custody cleanup claim is stale");
+    }
+    if (row.cleanup_claim_expires_at_ms <= effective) return expiredClaim;
+    if (update(effective, key) !== 1) throw custodyViolation("unknown-end custody cleanup claim is stale");
+  }).immediate();
+  if (result === expiredClaim) throw custodyViolation("unknown-end custody cleanup claim is stale or expired");
+}
+
+function completeUnknownEndCustodyCleanup(
+  db: Database.Database, claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, deletedAtMs: number,
+): void {
+  settleUnknownEndCustodyCleanup(db, claim, deletedAtMs, (effective, key) => withConstraintTranslation(() =>
+    db.prepare(`UPDATE unknown_end_custody SET state='deleted',deleted_at_ms=?,cleanup_claim_token=NULL,
+      cleanup_claim_expires_at_ms=NULL WHERE ${UNKNOWN_END_CUSTODY_KEY} AND state='cleanup_claimed'
+      AND cleanup_claim_token=? AND cleanup_claim_expires_at_ms>? AND unknown_end_deadline_ms<=?`)
+      .run(effective, key.occurrenceId, key.kind, key.attempt, claim.claimToken, effective, effective).changes));
+}
+
+function failUnknownEndCustodyCleanup(
+  db: Database.Database, claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, failedAtMs: number,
+  reason: UnknownEndCustodyFailureReason,
+): void {
+  if (!UNKNOWN_END_FAILURE_REASONS.has(reason)) throw custodyViolation("invalid unknown-end custody failure reason");
+  settleUnknownEndCustodyCleanup(db, claim, failedAtMs, (effective, key) => withConstraintTranslation(() =>
+    db.prepare(`UPDATE unknown_end_custody SET state='cleanup_failed',cleanup_failure_reason=?,cleanup_claim_token=NULL,
+      cleanup_claim_expires_at_ms=NULL WHERE ${UNKNOWN_END_CUSTODY_KEY} AND state='cleanup_claimed'
+      AND cleanup_claim_token=? AND cleanup_claim_expires_at_ms>?`)
+      .run(reason, key.occurrenceId, key.kind, key.attempt, claim.claimToken, effective).changes));
 }
