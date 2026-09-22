@@ -1,32 +1,55 @@
 import Foundation
 
+/// What the producer can truthfully claim about the encrypted recorder having
+/// drained every ordered record through its declared boundary. Only an exact
+/// echoed kind 11 on the same authenticated connection is `confirmed`; nothing
+/// local — a completed socket write, a confirmed native cleanup, a closed
+/// connection — may be promoted to it.
+public enum TimedMediaDrainOutcome: Equatable, Sendable {
+    /// A media-v2 lease. The v2 wire makes no drain claim at all.
+    case notApplicable
+    case confirmed(CaptureFinishBoundary)
+    case unconfirmed(reason: String)
+}
+
+public struct TimedMediaStopResult: Equatable, Sendable {
+    public let cleanupConfirmed: Bool
+    public let drain: TimedMediaDrainOutcome
+}
+
 public protocol TimedMediaControl: AnyObject {
     func start(_ lease: TimedMediaLease) -> Bool
     func stop() -> Bool
+    /// The typed stop result, available once `stop` has returned.
+    func stopResult() -> TimedMediaStopResult?
     func takeEvents() -> [BridgeEvent]
 }
 public final class TimedMediaControlOwner: TimedMediaControl {
     private let session: TimedMediaSession
     private let cancellation: BridgeCancellation
     private var pending: Task<Void, Never>?
-    private var stopResult: Bool?
+    private var cleanupResult: Bool?
+    private var typedStopResult: TimedMediaStopResult?
     public init(session: TimedMediaSession, cancellation: BridgeCancellation) {
         self.session = session; self.cancellation = cancellation
     }
+    public func stopResult() -> TimedMediaStopResult? { typedStopResult }
     public func start(_ lease: TimedMediaLease) -> Bool {
-        guard pending == nil, stopResult == nil, !cancellation.isCancelled else { return false }
+        guard pending == nil, cleanupResult == nil, !cancellation.isCancelled else { return false }
         return perform(seconds: 18, observeCancellation: true) { [session] in await session.start(lease) } ?? false
     }
     public func stop() -> Bool {
-        if let stopResult { return stopResult }
+        if let cleanupResult { return cleanupResult }
         let old = pending; old?.cancel()
         let deadline = ProcessInfo.processInfo.systemUptime + TimedMediaSession.maximumCloseSeconds
-        let result = perform(seconds: TimedMediaSession.maximumCloseSeconds, observeCancellation: false) { [session] in
+        let typed = perform(seconds: TimedMediaSession.maximumCloseSeconds, observeCancellation: false) { [session] in
             let clean = await session.stop(deadline: deadline)
             await old?.value
-            return clean
-        } ?? false
-        stopResult = result; return result
+            return await session.stopResult() ?? TimedMediaStopResult(cleanupConfirmed: clean, drain: .unconfirmed(reason: "drain_not_attempted"))
+        }
+        typedStopResult = typed
+        let result = typed?.cleanupConfirmed ?? false
+        cleanupResult = result; return result
     }
     public func takeEvents() -> [BridgeEvent] {
         guard pending == nil else { return [] }
@@ -73,6 +96,8 @@ public actor TimedMediaSession {
     private var reconnectDeadline: TimeInterval?
     private var attempts = 0
     public private(set) var diagnostics: Set<String> = []
+    private var stopped: TimedMediaStopResult?
+    public func stopResult() -> TimedMediaStopResult? { stopped }
     private var events: [BridgeEvent] = []
     public func takeEvents() -> [BridgeEvent] { let values = events; events.removeAll(); return values }
     private func event(_ value: BridgeEvent) {
@@ -164,13 +189,21 @@ public actor TimedMediaSession {
         _ = await cycle?.stop(deadline: deadline)
         await supervisor?.value
         let result: Bool
+        var drain = TimedMediaDrainOutcome.notApplicable
         if let cycle {
             let ended = await cycle.waitEnded()
             if !ended.deliveryComplete { diagnostic("capture_delivery_interrupted") }
             if ended.finalPairUndelivered { diagnostic("final_clock_pair_undelivered") }
             result = ended.nativeCleanupConfirmed
+            drain = ended.drain
+            switch drain {
+            case .notApplicable: break
+            case .confirmed: diagnostic("capture_drain_confirmed")
+            case .unconfirmed: diagnostic("capture_drain_unconfirmed")
+            }
         } else { result = true }
         if firstStop, cycle != nil { event(.mediaDisconnected(reason: result ? "media_stopped" : "media_cleanup_unconfirmed")) }
+        stopped = TimedMediaStopResult(cleanupConfirmed: result, drain: drain)
         return result
     }
 }
@@ -179,6 +212,7 @@ private struct TimedCycleEnd: Sendable {
     let nativeCleanupConfirmed: Bool, deliveryComplete: Bool, transportFailure: Bool
     let finalPairUndelivered: Bool
     let disconnectedAt: TimeInterval, captureEpoch: UInt64
+    let drain: TimedMediaDrainOutcome
 }
 
 private actor TimedMetadataBudget {
@@ -214,7 +248,20 @@ private actor TimedMediaCycle {
     private var reading: Task<Void, Never>?
     private var maintenance: Task<Void, Never>?
     private var cleanup: Task<Bool, Never>?
-    private var terminal = false, pairStarted = false
+    /// `running -> finishingCapture -> terminal`. The old boolean terminated the
+    /// sole read loop before an acknowledgement could ever arrive, so media v3
+    /// needs the intermediate state in which admission is closed but the one
+    /// reader stays alive.
+    private enum CycleState { case running, finishingCapture, terminal }
+    private var state = CycleState.running
+    private var terminal: Bool { state == .terminal }
+    private var pairStarted = false
+    private var mediaVersion: UInt8 = 2
+    private var lastFrame: CaptureFinishBoundary.Frame?
+    private var finishOutcome: TimedMediaDrainOutcome?
+    private var finishWaiter: CheckedContinuation<TimedMediaDrainOutcome, Never>?
+    private var expectedBoundary: CaptureFinishBoundary?
+    private var readingEnded = false
     private var decoder = RuntimeMediaDecoder()
     private var afterAuthentication: [RuntimeMediaInbound] = []
     private struct PlaybackReceipt {
@@ -269,13 +316,15 @@ private actor TimedMediaCycle {
             guard !terminal else { throw RuntimeMediaConnectionError.closed }
             try checkAdmissionDeadline()
             self.lease = lease
+            mediaVersion = lease.mediaProtocolVersion
+            decoder = RuntimeMediaDecoder(version: mediaVersion)
             let connection = try connectionFactory(lease.connectEndpoint); self.connection = connection
             let writer = TimedMediaWriter(connection) { [weak self] error in await self?.noteFailure(error) }; self.writer = writer
             let deadline = min(ProcessInfo.processInfo.systemUptime + 2, admissionDeadline ?? .infinity)
             try await connection.open(deadline: deadline)
             try checkActive()
             try checkAdmissionDeadline()
-            try await writer.send(RuntimeMediaCodecV2.authentication(session: lease.sessionId, bridge: lease.bridgeSessionId, token: lease.credential), deadline: deadline)
+            try await writer.send(try tagged(RuntimeMediaCodecV2.authentication(session: lease.sessionId, bridge: lease.bridgeSessionId, token: lease.credential)), deadline: deadline)
             var accepted = false
             while !accepted {
                 let bytes = try await connection.read(maximum: decoder.nextReadMaximum, deadline: deadline)
@@ -324,6 +373,11 @@ private actor TimedMediaCycle {
     private func checkAdmissionDeadline() throws {
         if let admissionDeadline, nowMonotonic() >= admissionDeadline { throw RuntimeMediaConnectionError.timedOut }
     }
+    /// Media v3 reuses every v2 timed body under the v3 envelope; media-v1
+    /// playback and flush acknowledgements are never retagged.
+    private func tagged(_ bytes: Data) throws -> Data {
+        mediaVersion == 3 ? try RuntimeMediaCodecV3.envelope(bytes) : bytes
+    }
     private func noteFailure(_ error: Error) {
         guard !terminal, disconnectedAt == nil else { return }
         disconnectedAt = nowMonotonic()
@@ -341,11 +395,17 @@ private actor TimedMediaCycle {
                 guard !epoch.overflow, epoch.partialValue >= captureEpoch else { throw BridgeProcessError.invalidInput }
                 if epoch.partialValue != captureEpoch {
                     captureEpoch = epoch.partialValue
+                    // Runtime resets its frame watermark on every epoch advance,
+                    // so the producer's retained boundary must reset with it.
+                    lastFrame = nil
                     try await metadata(RuntimeMediaCodecV2.epoch(session: lease.sessionId, bridge: lease.bridgeSessionId, domain: clock.clockDomainId, epoch: captureEpoch))
                 }
                 var timing = try RuntimeMediaCodecV2.timing(packet)
                 timing.replaceSubrange(4..<12, with: RuntimeMediaCodecV2.be(captureEpoch))
-                try await writer.send(RuntimeMediaCodecV2.capture(session: lease.sessionId, timing: timing, pcm: packet.pcm), deadline: ProcessInfo.processInfo.systemUptime + 2)
+                try await writer.send(try tagged(RuntimeMediaCodecV2.capture(session: lease.sessionId, timing: timing, pcm: packet.pcm)), deadline: ProcessInfo.processInfo.systemUptime + 2)
+                let outputEnd = UInt64(packet.outputRange.lowerBound).addingReportingOverflow(UInt64(packet.sampleCount))
+                guard !outputEnd.overflow else { throw BridgeProcessError.invalidInput }
+                lastFrame = CaptureFinishBoundary.Frame(sequence: packet.sequence, outputEndSample: outputEnd.partialValue)
             case .discontinuity(let loss):
                 let epoch = loss.epoch.addingReportingOverflow(epochOffset)
                 guard !epoch.overflow, epoch.partialValue == captureEpoch else { throw BridgeProcessError.invalidInput }
@@ -371,7 +431,7 @@ private actor TimedMediaCycle {
         guard let writer else { throw RuntimeMediaConnectionError.closed }
         let now = ProcessInfo.processInfo.systemUptime
         try await metadataBudget.reserve(now)
-        try await writer.send(bytes, deadline: min(now + 2, deadline ?? now + 2))
+        try await writer.send(try tagged(bytes), deadline: min(now + 2, deadline ?? now + 2))
     }
     private func maintain() async {
         do {
@@ -385,15 +445,15 @@ private actor TimedMediaCycle {
         } catch { if !terminal { noteFailure(error); _ = beginCleanup() } }
     }
     private func readLoop() async {
-        guard let connection else { return }
+        guard let connection else { readingEnded = true; return }
         var partialDeadline: TimeInterval?
         do {
             let initial = afterAuthentication; afterAuthentication.removeAll()
             for message in initial { try await receive(message) }
             while !terminal {
-                if decoder.awaitingPlaybackBody {
+                if decoder.awaitingPlaybackBody, state == .running {
                     var heldForCredit = false
-                    while !terminal && (pendingPlayback != nil || receipts.count >= 12) {
+                    while state == .running && (pendingPlayback != nil || receipts.count >= 12) {
                         heldForCredit = true
                         await withCheckedContinuation { playbackCredit = $0 }
                     }
@@ -402,22 +462,60 @@ private actor TimedMediaCycle {
                     // malicious slow fragment. Body progress gets its own bound.
                     if heldForCredit { partialDeadline = ProcessInfo.processInfo.systemUptime + 2 }
                 }
-                let bytes = try await connection.read(maximum: decoder.nextReadMaximum, deadline: partialDeadline)
+                // The finish wait has no deadline of its own: the cleanup
+                // watchdog already cancels this connection at the one close
+                // deadline, which is what wakes a blocked read.
+                let bytes = try await connection.read(maximum: decoder.nextReadMaximum,
+                    deadline: state == .finishingCapture ? nil : partialDeadline)
                 if terminal { break }
                 guard !bytes.isEmpty else { throw RuntimeMediaConnectionError.closed }
                 let messages = try decoder.append(bytes)
                 for message in messages { try await receive(message) }
+                // An exact acknowledgement ends the sole reader cleanly; it
+                // never reads again and never awaits the cleanup task.
+                if finishOutcome != nil { break }
                 if decoder.hasIncompletePacket {
                     if partialDeadline == nil { partialDeadline = ProcessInfo.processInfo.systemUptime + 2 }
                 } else { partialDeadline = nil }
             }
-        } catch { if !terminal { noteFailure(error); _ = await beginCleanup().value } }
+        } catch {
+            // The sole reader signals its own failure and returns. It must never
+            // await the cleanup task that is awaiting its waiter.
+            readingEnded = true
+            if state == .finishingCapture {
+                settleFinish(error is RuntimeMediaConnectionError ? .unconfirmed(reason: "drain_ack_absent")
+                    : .unconfirmed(reason: "drain_read_failed"))
+            } else if !terminal { noteFailure(error); _ = await beginCleanup().value }
+        }
+        readingEnded = true
+        if state == .finishingCapture { settleFinish(.unconfirmed(reason: "drain_ack_absent")) }
+    }
+    /// Resolves the one finish waiter exactly once. Nothing local may promote a
+    /// settled negative to `confirmed`.
+    private func settleFinish(_ outcome: TimedMediaDrainOutcome) {
+        guard finishOutcome == nil else { return }
+        finishOutcome = outcome
+        let reply = finishWaiter; finishWaiter = nil; reply?.resume(returning: outcome)
+    }
+    private func awaitFinish() async -> TimedMediaDrainOutcome {
+        if let finishOutcome { return finishOutcome }
+        if readingEnded { return .unconfirmed(reason: "drain_ack_absent") }
+        return await withCheckedContinuation { finishWaiter = $0 }
     }
     private func receive(_ message: RuntimeMediaInbound) async throws {
+        if case .captureFinishAcknowledged(let boundary) = message {
+            guard state == .finishingCapture, let expectedBoundary else { throw BridgeProcessError.invalidInput }
+            settleFinish(boundary == expectedBoundary ? .confirmed(boundary) : .unconfirmed(reason: "drain_ack_mismatch"))
+            return
+        }
+        // A playback or flush message decoded after the transition is discarded
+        // and gets no Accepted, Rendered or flush acknowledgement. Absence of a
+        // receipt plus the gateway's planned detach is the bounded outcome.
+        guard state == .running else { return }
         try checkActive()
         guard let renderer, let lease, let writer else { throw RuntimeMediaConnectionError.closed }
         switch message {
-        case .authenticated: throw BridgeProcessError.invalidInput
+        case .authenticated, .captureFinishAcknowledged: throw BridgeProcessError.invalidInput
         case .flush(let source, let generation):
             guard source == lease.sessionId, generation > 0 else { throw BridgeProcessError.invalidInput }
             guard generation > lastFlushedGeneration else { return }
@@ -445,7 +543,9 @@ private actor TimedMediaCycle {
         }
     }
     private func played(generation: UInt64, sequence: UInt64) async {
-        guard !terminal, renderer?.generation == generation else { return }
+        // Receipt clearing plus this gate stop a late native callback from
+        // manufacturing a Rendered acknowledgement after cleanup began.
+        guard state == .running, renderer?.generation == generation else { return }
         playbackProgressDeadline = ProcessInfo.processInfo.systemUptime + 2
         if receipts[sequence]?.generation == generation { receipts[sequence]?.played = true }
         do { try await acknowledgePlayed(sequence); try await pumpPlayback(); signalPlaybackCredit() }
@@ -453,10 +553,10 @@ private actor TimedMediaCycle {
     }
     private func signalPlaybackCredit() { let reply = playbackCredit; playbackCredit = nil; reply?.resume() }
     private func pumpPlayback() async throws {
-        guard !playbackPumping, !terminal, let renderer, let writer, let lease else { return }
+        guard !playbackPumping, state == .running, let renderer, let writer, let lease else { return }
         playbackPumping = true
         defer { playbackPumping = false }
-        while let current = pendingPlayback, !terminal {
+        while let current = pendingPlayback, state == .running {
             let count = min(960, current.frame.pcm.count - current.offset)
             let sequence = playbackSequence + 1
             let part = Data(current.frame.pcm[current.offset..<current.offset + count])
@@ -495,8 +595,15 @@ private actor TimedMediaCycle {
     public func resumeCapture() -> Bool { !terminal && capture?.resumeCapture() == true }
     private func beginCleanup(deadline externalDeadline: TimeInterval? = nil) -> Task<Bool, Never> {
         if let cleanup { return cleanup }
-        terminal = true
-        pendingPlayback = nil; receipts.removeAll(); signalPlaybackCredit()
+        // Media v3 closes admission without terminating the socket reader, so
+        // the one read loop can still receive the acknowledgement; media v2 goes
+        // straight to terminal exactly as before. Only a live sole reader can
+        // ever receive that acknowledgement, so the transition is refused when
+        // there is none rather than parking cleanup on an unresolvable waiter.
+        let draining = mediaVersion == 3 && pairStarted && lease != nil && connection != nil
+            && reading != nil && !readingEnded
+        state = draining ? .finishingCapture : .terminal
+        pendingPlayback = nil; receipts.removeAll(); playbackProgressDeadline = nil; signalPlaybackCredit()
         maintenance?.cancel()
         let deadline = min(ProcessInfo.processInfo.systemUptime + Self.maximumCloseSeconds, externalDeadline ?? .infinity)
         let capture = capture, delivery = delivery, renderer = renderer, connection = connection, writer = writer, lease = lease, finalPair = pairStarted, clock = clock, maintenance = maintenance
@@ -510,28 +617,67 @@ private actor TimedMediaCycle {
             var confirmed = true
             var nativeConfirmed = true
             var finalPairUndelivered = false
+            // A v3 lease that never reaches the exchange still claims nothing.
+            var drain = mediaVersion == 3 ? TimedMediaDrainOutcome.unconfirmed(reason: "drain_not_attempted") : .notApplicable
             await maintenance?.value
             if let capture, await capture.stop() != .stopped { confirmed = false; nativeConfirmed = false }
             if let delivery, await delivery.finish() == false { confirmed = false }
+            var finalPairSequence: UInt64?
             if finalPair, let lease {
-                do { try await self.metadata(RuntimeMediaCodecV2.clockPair(session: lease.sessionId, pair: clock.sample()), deadline: deadline) }
-                catch { confirmed = false; finalPairUndelivered = true }
+                do {
+                    let pair = try clock.sample()
+                    try await self.metadata(RuntimeMediaCodecV2.clockPair(session: lease.sessionId, pair: pair), deadline: deadline)
+                    finalPairSequence = pair.sequence
+                } catch { confirmed = false; finalPairUndelivered = true }
             }
+            // An unconfirmed drain is its own explicit fact. Exactly like an
+            // undelivered final pair, it does not veto confirmed native cleanup
+            // and it must not be spelled as interrupted capture delivery.
+            if draining { drain = await self.finishCapture(pairSequence: finalPairSequence, deadline: deadline) }
             if let renderer, await renderer.stop() != .stopped { confirmed = false; nativeConfirmed = false }
             if let connection, await connection.close() == false { confirmed = false; nativeConfirmed = false }
             await writer?.finish()
             watchdog.cancel(); await watchdog.value
             let withinBudget = ProcessInfo.processInfo.systemUptime <= deadline
-            self.complete(nativeConfirmed: nativeConfirmed && withinBudget, delivered: confirmed && withinBudget, finalPairUndelivered: finalPairUndelivered)
+            self.complete(nativeConfirmed: nativeConfirmed && withinBudget, delivered: confirmed && withinBudget,
+                finalPairUndelivered: finalPairUndelivered, drain: drain)
             return confirmed && withinBudget
         }
         cleanup = task
         return task
     }
-    private func complete(nativeConfirmed: Bool, delivered: Bool, finalPairUndelivered: Bool) {
+    /// Sends the one capture-finish record carrying the exact retained boundary
+    /// and awaits the byte-matching acknowledgement on the same connection. The
+    /// wait adds no sleep, retry, poll or deadline: the cleanup watchdog above
+    /// is what eventually wakes a blocked read.
+    private func finishCapture(pairSequence: UInt64?, deadline: TimeInterval) async -> TimedMediaDrainOutcome {
+        guard let lease, let writer, let pairSequence,
+              let boundary = try? CaptureFinishBoundary(session: lease.sessionId, captureEpoch: captureEpoch,
+                  frame: lastFrame, finalClockPairSequence: pairSequence) else {
+            state = .terminal
+            return .unconfirmed(reason: "drain_not_attempted")
+        }
+        expectedBoundary = boundary
+        do {
+            try await writer.send(RuntimeMediaCodecV3.captureFinish(boundary), deadline: deadline)
+        } catch {
+            settleFinish(.unconfirmed(reason: "drain_write_failed"))
+        }
+        var outcome = await awaitFinish()
+        // Past the one close deadline the deadline is the truthful cause, not
+        // whatever transport error the watchdog's cancellation produced.
+        if case .unconfirmed = outcome, ProcessInfo.processInfo.systemUptime > deadline {
+            outcome = .unconfirmed(reason: "drain_deadline")
+        }
+        state = .terminal
+        signalPlaybackCredit()
+        return outcome
+    }
+    private func complete(nativeConfirmed: Bool, delivered: Bool, finalPairUndelivered: Bool,
+                          drain: TimedMediaDrainOutcome) {
         let value = TimedCycleEnd(nativeCleanupConfirmed: nativeConfirmed, deliveryComplete: delivered,
             transportFailure: transportFailure, finalPairUndelivered: finalPairUndelivered,
-            disconnectedAt: disconnectedAt ?? nowMonotonic(), captureEpoch: captureEpoch)
+            disconnectedAt: disconnectedAt ?? nowMonotonic(), captureEpoch: captureEpoch, drain: drain)
         ended = value; let reply = endWaiter; endWaiter = nil; reply?.resume(returning: value)
     }
 }

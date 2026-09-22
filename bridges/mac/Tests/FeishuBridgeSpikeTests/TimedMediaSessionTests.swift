@@ -463,12 +463,14 @@ func playbackBytes(network: UInt64, generation: UInt64, count: Int = 960) -> Dat
     return bytes + Data([1]) + RuntimeMediaCodecV2.be(UInt32(24_000)) + RuntimeMediaCodecV2.be(UInt16(1)) + RuntimeMediaCodecV2.be(UInt32(count)) + Data(count: count)
 }
 
-func timedFixtureLease(reconnectMs: UInt64? = nil, endpoint: String? = nil) throws -> TimedMediaLease {
+func timedFixtureLease(reconnectMs: UInt64? = nil, endpoint: String? = nil,
+                       mediaProtocolVersion: Int? = nil) throws -> TimedMediaLease {
     let object = try JSONSerialization.jsonObject(with: meetingFixture("fixtures/contracts/bridge-session-v2.json")) as! [String: Any]
     let media = (object["commands"] as! [[String: Any]])[1]
     var lease = media["mediaLease"] as! [String: Any]
     if let reconnectMs { lease["reconnectWindowMs"] = String(reconnectMs) }
     if let endpoint { lease["connectEndpoint"] = endpoint }
+    if let mediaProtocolVersion { lease["mediaProtocolVersion"] = mediaProtocolVersion }
     return try TimedMediaLease(lease, bridgeSessionId: "bridge-independent")
 }
 
@@ -610,6 +612,13 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
     func releaseWrite() { let reply = lock.withLock { let value = heldWrite; heldWrite = nil; return value }; reply?.resume() }
     var writes: [Data] { lock.withLock { outbound } }
     var closed: Bool { lock.withLock { terminal } }
+    private var readOverlap = false
+    /// Proof that the cycle never runs a second socket reader.
+    var concurrentRead: Bool { lock.withLock { readOverlap } }
+    private var unreadAtClose = 0
+    /// Bytes fed but never asked for when the peer went away, so a reader that
+    /// stopped reading early is visible after the connection closed.
+    var unreadBytesAtClose: Int { lock.withLock { unreadAtClose } }
     func open(deadline: TimeInterval) async throws {
         if let openFailureDelay { try await Task.sleep(for: .seconds(openFailureDelay)); throw RuntimeMediaConnectionError.unavailable }
     }
@@ -633,6 +642,7 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
                 if next.count > maximum { inbound.insert(Data(next.dropFirst(maximum)), at: 0) }
                 lock.unlock(); continuation.resume(returning: part); return
             }
+            if reader != nil { readOverlap = true }
             reader = continuation; readMaximum = maximum; lock.unlock()
         }
     }
@@ -649,7 +659,7 @@ final class ScriptedTimedConnection: RuntimeMediaConnection, @unchecked Sendable
     func cancel() {
         lock.lock(); terminal = true; let callback = holdReaderUntilClose ? nil : reader, write = heldWrite
         if !holdReaderUntilClose { reader = nil }
-        heldWrite = nil; inbound.removeAll(); lock.unlock()
+        heldWrite = nil; unreadAtClose = inbound.reduce(0) { $0 + $1.count }; inbound.removeAll(); lock.unlock()
         callback?.resume(throwing: RuntimeMediaConnectionError.closed)
         write?.resume(throwing: RuntimeMediaConnectionError.closed)
     }

@@ -130,12 +130,19 @@ public enum RuntimeMediaInbound: Equatable, Sendable {
     case authenticated(session: UInt64, bridge: String)
     case playback(RuntimePlaybackFrame)
     case flush(session: UInt64, generation: UInt64)
+    /// Media v3 only: the success-only echo of the exact capture boundary.
+    case captureFinishAcknowledged(CaptureFinishBoundary)
 }
 
 /// One bounded incomplete packet; the caller feeds at most 4 KiB per read and
 /// handles the returned packets before requesting more bytes.
 public struct RuntimeMediaDecoder {
     private var pending = Data()
+    /// 2 or 3. The timed envelope is chosen once, from the lease, and never
+    /// mixed: a v2 lease cannot decode a v3 record and vice versa.
+    private let version: UInt8
+    private let timedTag: UInt8
+    private var finishAcknowledged = false
     public var hasIncompletePacket: Bool { !pending.isEmpty }
     public var awaitingPlaybackBody: Bool { pending.count >= 6 && pending.prefix(6) == Data([77, 69, 68, 49, 1, 2]) }
     /// Stop exactly at packet boundaries. A following flush header may be read
@@ -143,7 +150,7 @@ public struct RuntimeMediaDecoder {
     /// second playback body or hiding a coalesced control packet behind it.
     public var nextReadMaximum: Int {
         if pending.count < 6 { return 6 - pending.count }
-        if pending[3] == 50 {
+        if pending[3] == timedTag {
             if pending.count < 10 { return 10 - pending.count }
             return max(1, min(4096, 10 + Int(RuntimeMediaCodecV2.uint(pending, 6, UInt32.self)) - pending.count))
         }
@@ -151,13 +158,28 @@ public struct RuntimeMediaDecoder {
         if pending.count < header { return header - pending.count }
         return max(1, min(4096, header + Int(RuntimeMediaCodecV2.uint(pending, 62, UInt32.self)) - pending.count))
     }
-    public init() {}
+    public init(version: UInt8 = 2) {
+        self.version = version == 3 ? 3 : 2
+        timedTag = self.version == 3 ? 51 : 50
+    }
     public mutating func append(_ data: Data) throws -> [RuntimeMediaInbound] {
         guard data.count <= 4096, pending.count + data.count <= 65_536 + 66 + 4096 else { throw BridgeProcessError.inputTooLarge }
         pending += data
         var output: [RuntimeMediaInbound] = []
         while pending.count >= 6 {
-            if pending.prefix(5) == Data([77, 69, 68, 50, 2]) {
+            if pending.prefix(5) == Data([77, 69, 68, timedTag, version]) {
+                if version == 3, pending[5] == RuntimeMediaCodecV3.acknowledgementKind {
+                    // Exactly one finish acknowledgement is legal per
+                    // authenticated connection; a second is a protocol fault.
+                    guard !finishAcknowledged else { throw BridgeProcessError.invalidInput }
+                    if pending.count < 10 { break }
+                    guard Int(RuntimeMediaCodecV2.uint(pending, 6, UInt32.self)) == RuntimeMediaCodecV3.bodyBytes else { throw BridgeProcessError.invalidInput }
+                    if pending.count < 10 + RuntimeMediaCodecV3.bodyBytes { break }
+                    let boundary = try RuntimeMediaCodecV3.decodeCaptureFinishBody(Data(pending[10..<10 + RuntimeMediaCodecV3.bodyBytes]))
+                    finishAcknowledged = true
+                    output.append(.captureFinishAcknowledged(boundary))
+                    pending = Data(pending.dropFirst(10 + RuntimeMediaCodecV3.bodyBytes)); continue
+                }
                 guard pending[5] == 9 else { throw BridgeProcessError.invalidInput }
                 if pending.count < 10 { break }
                 let length = Int(RuntimeMediaCodecV2.uint(pending, 6, UInt32.self))
