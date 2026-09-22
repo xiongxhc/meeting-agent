@@ -3,6 +3,7 @@
 
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { CLIENT_PROTOCOL_VERSION, validateClientCommand } from "@conversation/runtime";
 
 import {
   addMillisecondsToUtcInstant,
@@ -28,7 +29,10 @@ import type { SelectedAlignment } from "../ports/session-store.ts";
 const text = z.string().min(1).max(20_000);
 const evidence = z.array(z.string().min(1).max(200)).min(1).max(100);
 
-const textSynthesis = z.object({
+/** The authority for bounds (D031). The Runtime checks structure only, so
+ * every length, count and `null | object` member is enforced here, on the
+ * answer, and a violation is a visible build failure. */
+export const textSynthesisContract = z.object({
   summary: text,
   projects: z.array(z.object({ name: z.string().min(1).max(200), evidence_segment_ids: evidence }).strict()).max(500),
   decisions: z.array(z.object({ text, evidence_segment_ids: evidence }).strict()).max(500),
@@ -42,37 +46,67 @@ const textSynthesis = z.object({
   person_summaries: z.array(z.object({ person_id: z.string().min(1).max(200), display_name: z.string().min(1).max(200), text }).strict()).max(500),
 }).strict();
 
+/** The SDK enforces `maxOutputBytes <= MAX_PROCESSED_OUTPUT_BYTES` inside
+ * `validateClientCommand`, but its package index does not re-export the
+ * constant, so it cannot be imported. Asking the installed SDK for the largest
+ * bound it admits keeps the two in step across a repin without restating the
+ * number here; a bound the SDK refuses would be a refused build, never a
+ * truncated answer. */
+export const MAX_PROCESSED_OUTPUT_BYTES = largestAdmittedOutputBytes();
+
+function largestAdmittedOutputBytes(): number {
+  const admits = (maxOutputBytes: number): boolean => {
+    try {
+      validateClientCommand({ type: "process_text", requestId: "output-bound-probe", sessionId: 1n,
+        instructions: ".", input: ".", outputSchema: { type: "object" }, maxOutputBytes }, CLIENT_PROTOCOL_VERSION);
+      return true;
+    } catch { return false; }
+  };
+  let low = 1, high = 1 << 30;
+  if (!admits(low)) throw new Error("the installed Runtime SDK admits no text processing output bound");
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (admits(middle)) low = middle; else high = middle;
+  }
+  return low;
+}
+
+/** The WIRE schema (D031): the Runtime enforces exactly `type` (one string),
+ * `properties`, `required`, `items`, `enum` and `additionalProperties`, and
+ * refuses any other keyword outright, so the bounds above are not spelled
+ * here. A `null | object` member is an unconstrained `{}` that stays in
+ * `required`; the contract above decides which of the two it was. */
 export const TEAMMEM_TEXT_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
   required: ["summary", "projects", "decisions", "action_items", "discussion_points", "person_summaries"],
   properties: {
-    summary: { type: "string", minLength: 1, maxLength: 20_000 },
-    projects: { type: "array", maxItems: 500, items: evidenceItemSchema("name") },
-    decisions: { type: "array", maxItems: 500, items: evidenceItemSchema("text") },
+    summary: { type: "string" },
+    projects: { type: "array", items: evidenceItemSchema("name") },
+    decisions: { type: "array", items: evidenceItemSchema("text") },
     action_items: {
-      type: "array", maxItems: 500,
+      type: "array",
       items: {
         type: "object", additionalProperties: false,
         required: ["text", "owner", "due_date", "evidence_segment_ids"],
         properties: {
-          text: { type: "string", minLength: 1, maxLength: 20_000 },
-          owner: { anyOf: [{ type: "null" }, explicitOwnerSchema()] },
-          due_date: { anyOf: [{ type: "null" }, explicitDueDateSchema()] },
+          text: { type: "string" },
+          owner: {},
+          due_date: {},
           evidence_segment_ids: evidenceSchema(),
         },
       },
     },
-    discussion_points: { type: "array", maxItems: 500, items: evidenceItemSchema("text") },
+    discussion_points: { type: "array", items: evidenceItemSchema("text") },
     person_summaries: {
-      type: "array", maxItems: 500,
+      type: "array",
       items: {
         type: "object", additionalProperties: false,
         required: ["person_id", "display_name", "text"],
         properties: {
-          person_id: { type: "string", minLength: 1, maxLength: 200 },
-          display_name: { type: "string", minLength: 1, maxLength: 200 },
-          text: { type: "string", minLength: 1, maxLength: 20_000 },
+          person_id: { type: "string" },
+          display_name: { type: "string" },
+          text: { type: "string" },
         },
       },
     },
@@ -243,9 +277,9 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
       : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.",
     input: canonicalTranscriptInput(transcript, version),
     outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
-    maxOutputBytes: 1_000_000,
+    maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES,
   });
-  const synthesis = textSynthesis.parse(processed.output);
+  const synthesis = textSynthesisContract.parse(processed.output);
   const runtimeWarnings = processed.warnings.map(runtimeTextWarning);
   if (input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length > 500) {
     throw new Error("processing warning limit exceeded");
@@ -457,29 +491,13 @@ function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript
 }
 
 function evidenceSchema(): Record<string, unknown> {
-  return { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 } };
+  return { type: "array", items: { type: "string" } };
 }
 
 function evidenceItemSchema(field: "name" | "text"): Record<string, unknown> {
   return {
     type: "object", additionalProperties: false,
     required: [field, "evidence_segment_ids"],
-    properties: { [field]: { type: "string", minLength: 1, maxLength: field === "name" ? 200 : 20_000 }, evidence_segment_ids: evidenceSchema() },
-  };
-}
-
-function explicitOwnerSchema(): Record<string, unknown> {
-  return {
-    type: "object", additionalProperties: false,
-    required: ["person_id", "display_name", "explicitly_stated"],
-    properties: { person_id: { type: "string", minLength: 1, maxLength: 200 }, display_name: { type: "string", minLength: 1, maxLength: 200 }, explicitly_stated: { const: true } },
-  };
-}
-
-function explicitDueDateSchema(): Record<string, unknown> {
-  return {
-    type: "object", additionalProperties: false,
-    required: ["date", "explicitly_stated"],
-    properties: { date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" }, explicitly_stated: { const: true } },
+    properties: { [field]: { type: "string" }, evidence_segment_ids: evidenceSchema() },
   };
 }

@@ -39,8 +39,10 @@ export const RUNTIME_PROFILES = {
   runtime14b: {
     name: "runtime14b",
     root: path.join(ARTIFACTS, "runtime14b"),
-    /** Working tree of the Runtime worktree at HEAD 78b6e8a plus the reopen-proof files. */
-    revision: "78b6e8a+reopen-proof",
+    /** Reviewed Runtime b03b3d6314f03855adc8f2d060283483737fc444 on
+     * feat/meeting-online-profile, the commit `scripts/check-runtime-sdk.mjs`
+     * verifies in this tree. */
+    revision: "b03b3d6314f03855adc8f2d060283483737fc444",
     gateway: {
       path: path.join(ARTIFACTS, "runtime14b/target/debug/conversation-runtime-gateway"),
       sha256: "30dcde79d9cc1dd8a7ea47d1d3ad068b104f76d08f93af801922d9f5c3fb4a08",
@@ -53,12 +55,13 @@ export const RUNTIME_PROFILES = {
 };
 
 /** The selected build. Swap this one line to move the whole harness. */
-export const RUNTIME_PIN = RUNTIME_PROFILES["runtime13-pin"];
+export const RUNTIME_PIN = RUNTIME_PROFILES.runtime14b;
 
 /** The accepted TeamMem staged tree the wheel is built from (D003 scope). */
 export const TEAMMEM_SOURCE = {
   repository: "<teammem-checkout>",
-  tree: "e32ddbb447a46167390737abb9adbcb0ed69a9a1",
+  /** Tree of 1ebf774, the accepted head of the TeamMem meeting-storage lane. */
+  tree: "6ad2443462a283a4a66e33389068f70b5984df5a",
 };
 
 export async function sha256File(filename) {

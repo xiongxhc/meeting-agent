@@ -231,7 +231,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
   try {
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 28);
+      assert.equal(store.schemaVersion, 29);
       assert.deepEqual(store.appliedMigrations(), [
         { version: 1, name: "001_orchestration.sql", appliedAtMs: BASE_MS },
         { version: 2, name: "002_recordings.sql", appliedAtMs: BASE_MS },
@@ -261,6 +261,7 @@ test("the migrations apply in order, report the latest schema version, and pass 
         { version: 26, name: "026_unknown_end_custody.sql", appliedAtMs: BASE_MS },
         { version: 27, name: "027_generation_terminal_reason.sql", appliedAtMs: BASE_MS },
         { version: 28, name: "028_recording_capture_drain.sql", appliedAtMs: BASE_MS },
+        { version: 29, name: "029_alignment_page_private_bound.sql", appliedAtMs: BASE_MS },
       ]);
       assert.equal(store.foreignKeysEnabled(), true);
       assert.deepEqual(store.foreignKeyCheck(), []);
@@ -305,7 +306,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
 
     const second = h.open(BASE_MS + 999_999);
     try {
-      assert.equal(second.schemaVersion, 28);
+      assert.equal(second.schemaVersion, 29);
       // applied_at is the FIRST application's stamp, proving the migrations
       // did not run a second time.
       assert.deepEqual(second.appliedMigrations(), [
@@ -337,6 +338,7 @@ test("reopening an existing database does not re-apply the migrations", () => {
         { version: 26, name: "026_unknown_end_custody.sql", appliedAtMs: BASE_MS },
         { version: 27, name: "027_generation_terminal_reason.sql", appliedAtMs: BASE_MS },
         { version: 28, name: "028_recording_capture_drain.sql", appliedAtMs: BASE_MS },
+        { version: 29, name: "029_alignment_page_private_bound.sql", appliedAtMs: BASE_MS },
       ]);
       assert.deepEqual(second.getSession(created.occurrenceId), created);
     } finally {
@@ -400,7 +402,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const store = h.open(BASE_MS + 2);
         try {
-          assert.equal(store.schemaVersion, 28);
+          assert.equal(store.schemaVersion, 29);
           assert.deepEqual(store.foreignKeyCheck(), []);
           const migrated = store.pending().find((row) => row.occurrenceId === reserved.occurrenceId)!;
           assert.equal(migrated.retryReason, "recovery_unavailable");
@@ -511,7 +513,7 @@ test("schema 13 and 14 missing recording owners fail closed and reserve later ph
 
         const reopened = h.open(BASE_MS + 3);
         try {
-          assert.equal(reopened.schemaVersion, 28);
+          assert.equal(reopened.schemaVersion, 29);
           assert.deepEqual(reopened.foreignKeyCheck(), []);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === reserved.occurrenceId).length, 2);
           assert.equal(reopened.pending().filter((row) => row.occurrenceId === unrelated.occurrenceId).length, 1);
@@ -838,7 +840,7 @@ test("a schema-10 terminal recording generation upgrades with honest legacy prov
     }
 
     const upgraded = h.open(BASE_MS + 1);
-    assert.equal(upgraded.schemaVersion, 28);
+    assert.equal(upgraded.schemaVersion, 29);
     upgraded.close();
 
     const reopened = h.open(BASE_MS + 2);
@@ -939,7 +941,7 @@ test("a schema-11 database upgrades to the current constraints without losing re
 
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 28);
+      assert.equal(store.schemaVersion, 29);
       const evidence = store.getReconciliationEvidence(id.occurrenceId, "schema11recording");
       assert.equal(evidence?.runtimeSessionId, 45n);
       assert.equal(evidence?.terminalSource, "bridge_observed");
@@ -1085,7 +1087,7 @@ test("migration 004 represents pre-runtime recording metadata as unavailable, ne
     } finally { raw.close(); }
     const store = h.open();
     try {
-      assert.equal(store.schemaVersion, 28);
+      assert.equal(store.schemaVersion, 29);
       const legacy = store.getRecording(id.occurrenceId);
       assert.equal(legacy?.encryptedPath, null);
       assert.equal(legacy?.format, null);

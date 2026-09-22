@@ -106,6 +106,17 @@ export const meetingArtifactBase = z.object({
   }).strict(),
 }).strict();
 
+/** D032 §3. The consumer's `audio.format` vocabulary is a token
+ * (`[a-z][a-z0-9_-]*`), while the Runtime spells a capture format with
+ * slashes (`pcm_s16le/24000/1/20ms`). The one mapping between them is this
+ * lossless respelling; a format that is already a token passes through. The
+ * seed keeps the Runtime's exact spelling, the artifact carries the token. */
+export function audioFormatToken(captureFormat: string): string {
+  const token = captureFormat.replaceAll("/", "-");
+  if (!/^[a-z][a-z0-9_-]*$/.test(token)) throw new Error("recording format is not representable as a published audio format token");
+  return token;
+}
+
 export type TeamMemMeetingArtifact = z.infer<typeof meetingArtifactBase>;
 
 /** Parse the exact frozen wire format, including all relationships that a

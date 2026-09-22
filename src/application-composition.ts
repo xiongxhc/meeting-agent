@@ -28,7 +28,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
+import { FINALIZED_RECORDING_PROTOCOL_VERSION, RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
 
 import type { ApplicationOwnerLock } from "./adapters/application-owner-lock.ts";
 import { createChildBridgeSlot } from "./adapters/child-bridge-process.ts";
@@ -66,6 +66,12 @@ const MAX_METADATA_RESOLUTIONS_PER_TICK = 256;
 /** The accepted SDK v4 status exposes no STT/live/batch model or cipher name;
  * the seed records that explicitly instead of inventing a value. */
 const UNAVAILABLE_CURRENT_SDK = "unavailable_current_sdk";
+/** D032 §2. The cipher of the Runtime's finalized recording container is a
+ * pinned engine fact of the protocol version this client speaks, not an
+ * unavailable one: v4's container header is AES-256-GCM. A protocol bump
+ * fails the test that ties these two together rather than publishing a
+ * silently stale claim. */
+export const RECORDING_CONTAINER_ENCRYPTION = FINALIZED_RECORDING_PROTOCOL_VERSION === 4 ? "aes-256-gcm" : UNAVAILABLE_CURRENT_SDK;
 
 export function stateDatabasePath(config: Pick<StandaloneConfigV1, "stateRoot">): string {
   return path.join(config.stateRoot, STATE_DATABASE_NAME);
@@ -286,7 +292,7 @@ function agentVersion(): string {
 function seedConfigFor(status: RuntimeStatus, version: string): BackfillSeedConfig {
   const label = (kind: RuntimeStatus["components"][number]["kind"]) => status.components.find((component) => component.kind === kind)?.providerLabel ?? UNAVAILABLE_CURRENT_SDK;
   return {
-    provider: "feishu", encryption: UNAVAILABLE_CURRENT_SDK, processingWarnings: [],
+    provider: "feishu", encryption: RECORDING_CONTAINER_ENCRYPTION, processingWarnings: [],
     provenance: { runtimeProfile: status.profile, sttProvider: label("speech_recognition"), sttModel: UNAVAILABLE_CURRENT_SDK,
       liveStreamModel: UNAVAILABLE_CURRENT_SDK, finalBatchModel: UNAVAILABLE_CURRENT_SDK, textProvider: label("language_model"),
       textModel: status.modelId, agentVersion: version },

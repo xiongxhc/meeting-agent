@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_ALIGNMENT_PAGE_BYTES } from "@conversation/runtime";
 import type { RecordingAlignmentPage, RecordingAlignmentComplete, RecordingAlignmentEntry } from "@conversation/runtime";
 import { randomUUID } from "node:crypto";
 import { setImmediate as yieldImmediate } from "node:timers/promises";
@@ -6,7 +7,13 @@ import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 import type { AlignmentAttempt, RecordingRecovery, SelectedAlignment, SessionStore } from "../ports/session-store.ts";
 import { mintAlignmentRecoveryPermit } from "../ports/recording-alignment-authority.ts";
 
-export const ALIGNMENT_LIMITS = Object.freeze({ pageBytes: 32 * 1024, pageEntries: 64,
+/** D032 §1. `pageBytes` is the gateway's WIRE page bound, imported rather than
+ * restated, so a Runtime that moves it moves this. `privatePageBytes` bounds
+ * the bigint-tagged re-encoding below, which runs about 1.4x the wire bytes
+ * for a page of frames; two wire pages is the bound it is held to. No page is
+ * ever truncated: an encoding past the bound is a refused page. */
+export const ALIGNMENT_LIMITS = Object.freeze({ pageBytes: MAX_ALIGNMENT_PAGE_BYTES,
+  privatePageBytes: 2 * MAX_ALIGNMENT_PAGE_BYTES, pageEntries: 64,
   attemptBytes: 256 * 1024 * 1024, attemptEntries: 2_000_000, attemptPages: 250_000 });
 export const ALIGNMENT_POLICY = Object.freeze({ id: "local-wall-estimate/v1" as const,
   cadenceTargetNs: 1_000_000_000n, maximumBracketNs: 5_000_000n,
@@ -69,14 +76,14 @@ export function encodeAlignmentPage(page: RecordingAlignmentPage): string {
     const checked = pageSchema.parse(page);
     const encoded = JSON.stringify({ schema: 1, page: checked }, (_key, value: unknown) => typeof value === "bigint"
       ? { bigint: value < 0n ? "i64" : "u64", decimal: value.toString() } : value);
-    if (Buffer.byteLength(encoded) > ALIGNMENT_LIMITS.pageBytes) throw new Error();
+    if (Buffer.byteLength(encoded) > ALIGNMENT_LIMITS.privatePageBytes) throw new Error();
     return encoded;
   } catch { throw new Error("invalid private alignment page"); }
 }
 
 export function decodeAlignmentPage(encoded: string): RecordingAlignmentPage {
   try {
-    if (typeof encoded !== "string" || encoded.length > ALIGNMENT_LIMITS.pageBytes || Buffer.byteLength(encoded) > ALIGNMENT_LIMITS.pageBytes) throw new Error();
+    if (typeof encoded !== "string" || encoded.length > ALIGNMENT_LIMITS.privatePageBytes || Buffer.byteLength(encoded) > ALIGNMENT_LIMITS.privatePageBytes) throw new Error();
     const parsed: unknown = JSON.parse(encoded, (_key, value: unknown) => {
       if (value !== null && typeof value === "object" && Object.hasOwn(value, "bigint")) {
         const tag = z.strictObject({ bigint: z.enum(["u64", "i64"]), decimal: z.string().max(20) }).parse(value);

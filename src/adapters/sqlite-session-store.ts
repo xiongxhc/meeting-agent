@@ -36,7 +36,7 @@ import { parseEventV2, type BridgeEventMessageV2 } from "../contracts/bridge-ses
 import { parseEventShape, type CaptureDrain } from "../contracts/bridge-session-v1.ts";
 import { encodeLiveEvidence, decodeLiveEvidence, encodeProvisionalResult, decodeProvisionalResult } from "../sessions/live-evidence-codec.ts";
 import { consumeLiveRecoveryPermit, type LiveRecoveryPermit } from "../ports/live-evidence-authority.ts";
-import { canonicalArtifactHash, canonicalArtifactJson, isUnicodeScalarString } from "../contracts/teammem-meeting-v1.ts";
+import { audioFormatToken, canonicalArtifactHash, canonicalArtifactJson, isUnicodeScalarString } from "../contracts/teammem-meeting-v1.ts";
 import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { operatorWarningKey } from "../ports/operator-warning.ts";
 
@@ -1174,7 +1174,7 @@ function insertBackfillSeed(db: Database.Database, seed: PreparedBackfillSeed): 
     generationId: seed.generationId, sourceSessionId: capability.sourceSessionId.toString(),
     capabilityRecordingHandle: capability.recordingHandle, capabilitySha256: capability.sha256,
     capabilityKeyId: capability.keyId, capabilityAuthorization: capability.authorization,
-    recordingPath: seed.binding.canonicalPath, recordingFormat: seed.recording.format,
+    recordingPath: seed.binding.canonicalPath, recordingFormat: audioFormatToken(seed.recording.format),
     recordingEncryption: seed.input.encryption, recordingBytes: seed.binding.bytes,
     recordingDevice: seed.binding.device, recordingInode: seed.binding.inode,
     recordingDurationMs: seed.recording.durationMs, recordingSha256: seed.recording.sha256,
@@ -1865,7 +1865,7 @@ function readSelectedAlignmentPage(db: Database.Database, selected: SelectedAlig
   if (!current || current.attemptId !== selected.attemptId || current.source.sourceSessionId !== selected.source.sourceSessionId ||
     current.source.recordingHandle !== selected.source.recordingHandle || current.source.sha256 !== selected.source.sha256) throw new Error("selected alignment generation changed");
   const row = db.prepare(`SELECT page_index,entry_count,
-    CASE WHEN length(CAST(payload AS BLOB)) BETWEEN 1 AND 32768 THEN payload ELSE NULL END AS payload
+    CASE WHEN length(CAST(payload AS BLOB)) BETWEEN 1 AND ${ALIGNMENT_LIMITS.privatePageBytes} THEN payload ELSE NULL END AS payload
     FROM recording_alignment_pages WHERE attempt_id=? AND page_index>? ORDER BY page_index LIMIT 1`)
     .get(selected.attemptId, after) as { page_index: number; entry_count: number; payload: string | null } | undefined;
   if (!row) {

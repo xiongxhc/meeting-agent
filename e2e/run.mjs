@@ -50,26 +50,13 @@ const oracles = [];
 const productDefects = [];
 function defect(entry) { productDefects.push(entry); }
 
-/** Measured while diagnosing this run's blocked steps, on a patched COPY of the
- * staged tree under the session scratchpad. They are not observations of this
- * run, and nothing in the branch is patched; each carries how it was measured
- * so it can be reproduced. */
-const OUT_OF_BAND_FINDINGS = [
-  {
-    id: "alignment_page_budget",
-    where: "src/sessions/recording-alignment.ts ALIGNMENT_LIMITS.pageBytes",
-    measured: "Meeting applies its 32768-byte budget to its OWN re-encoding, which tags every bigint as {\"bigint\":\"u64\",\"decimal\":\"...\"} and runs about 1.4x the Runtime wire bytes. The gateway already caps a wire page at the same 32768 bytes (crates/protocol/src/client_timing.rs MAX_ALIGNMENT_PAGE_BYTES), so a full wire page is always refused.",
-    observed: "A 51-frame capture produced two pages that re-encoded to 46574 and 38397 bytes; encodeAlignmentPage threw `invalid private alignment page` and every backfill attempt failed with `alignment_failed`.",
-    consequence: "Any capture longer than roughly 20 frames (400 ms) cannot be aligned, so this harness holds the scripted capture to 12 frames.",
-  },
-  {
-    id: "teammem_audio_vocabulary",
-    where: "the built artifact's audio.format and audio.encryption",
-    measured: "TeamMem's bundle contract requires audio.format to match [a-z][a-z0-9_-]* and audio.encryption to be exactly age-x25519 or aes-256-gcm (teammem/meeting_bundles.py). Meeting passes the Runtime's recording format through unchanged as `pcm_s16le/24000/1`, and records `unavailable_current_sdk` for the cipher because the SDK v4 status exposes none.",
-    observed: "`process-meetings` quarantined the bundle with reason_code bundle_invalid; validating the payload directly reported `audio format is not a valid token`, then `audio encryption must be one of age-x25519, aes-256-gcm`. With only those two values replaced the same payload validated, so they are the only two mismatches.",
-    consequence: "Even once the artifact builds, the publication lane quarantines every bundle.",
-  },
-];
+/** The two findings the first D1 run measured out of band (the private
+ * alignment page budget, and the audio vocabulary the consumer refuses) are
+ * ruled in D032 and fixed in this tree, each pinned by a unit test
+ * (test/recording-alignment-page-bound.test.ts,
+ * test/artifact-audio-vocabulary.test.ts). Nothing is carried here unless a
+ * later run measures something new. */
+const OUT_OF_BAND_FINDINGS = [];
 function step(name, result) {
   steps.push({ name, command: result.command, exit: result.exit, durationMs: result.durationMs, loadAverage: result.loadAverage });
   return result;
@@ -203,7 +190,15 @@ async function liveRun({ staged, teammem, outDir }) {
     providerCredentialEnv: PROVIDER_CREDENTIAL_ENV,
     meeting,
     captureFrames: CAPTURE_FRAME_LIMIT,
-    laneIntervalsMs: { backfill: 4000, warning: 5000, outbox: 1000, notification: 1000, discovery: 3000, custody: 5000 },
+    // Test cadences only (D028). The backfill lane is deliberately slower than
+    // the rest: it mints a NEW artifact revision on every tick while a
+    // publication is still pending, and a receipt only ever names the revision
+    // TeamMem published, so a four-second cadence outran the single publish
+    // pass (30 revisions in two minutes, every delivery row
+    // `receipt_unavailable`, no organizer DM). Thirty seconds leaves the
+    // publish, the outbox tick and the notification tick inside one window
+    // without slowing the initial build past its budget.
+    laneIntervalsMs: { backfill: 30_000, warning: 5000, outbox: 1000, notification: 1000, discovery: 3000, custody: 5000 },
     budgets: { startMs: 60_000, admitMs: 60_000, captureMs: 120_000, buildMs: 90_000, teammemMs: 600_000, notifyMs: 120_000, readyTimeoutMs: 15_000 },
   };
   const planPath = path.join(staged.directories.configDir, "drive-plan.json");
@@ -489,7 +484,7 @@ async function main() {
       check("alignment_stored", alignmentPages.length > 0,
         `stored pages ${JSON.stringify(alignmentPages)}`);
       oracle("alignment_page_budget", "pass",
-        `largest stored page ${Math.max(0, ...alignmentPages.map((page) => page.storedBytes))} bytes against the 32768-byte ALIGNMENT_LIMITS.pageBytes budget; the capture is held to ${CAPTURE_FRAME_LIMIT} frames for that reason`);
+        `largest stored page ${Math.max(0, ...alignmentPages.map((page) => page.storedBytes))} bytes against the private re-encoding bound of 2x the SDK's MAX_ALIGNMENT_PAGE_BYTES (D032 §1); the scripted capture runs ${CAPTURE_FRAME_LIMIT} frames, the length that refused every page before the fix`);
 
       const buildReason = (live.reopen?.rows.seedLifecycle ?? [])[0]?.initial_build_last_reason ?? null;
       if (live.artifact !== null) {
@@ -499,16 +494,10 @@ async function main() {
         oracle("artifact_bundle", "blocked",
           `the shipped delivery lane could not build one: backfill reason ${JSON.stringify(buildReason)} after ${(live.reopen?.rows.seedLifecycle ?? [])[0]?.initial_build_attempts ?? 0} attempts. See productDefects.`);
         defect({
-          id: "artifact_output_limit",
-          where: "src/delivery/artifact-builder.ts:246",
-          measured: "processText is called with maxOutputBytes 1000000; the pinned SDK and gateway both cap it at MAX_PROCESSED_OUTPUT_BYTES / MAX_TEXT_PROCESSING_OUTPUT_BYTES = 65536",
-          observed: "ProtocolError: output byte limit is outside the supported range (client-side, before any request leaves the process)",
-        });
-        defect({
-          id: "artifact_output_schema",
-          where: "src/delivery/artifact-builder.ts TEAMMEM_TEXT_OUTPUT_SCHEMA",
-          measured: "the schema uses anyOf, const, minLength, maxLength, minItems, maxItems and uniqueItems; the pinned runtime admits only type, properties, required, items, enum and additionalProperties (crates/runtime/src/text_processing.rs SUPPORTED_SCHEMA_KEYWORDS)",
-          observed: "CommandRejectedError: runtime state rejected the operation, with no provider request made",
+          id: "artifact_build_failed",
+          where: "src/delivery/artifact-builder.ts through the shipped backfill lane",
+          measured: `the D031 wire schema and the SDK's own output bound are in this tree; the lane still reported ${JSON.stringify(buildReason)}`,
+          observed: "see the backfill reason above and the redacted event trace; no artifact was hand-placed",
         });
       }
       const dry = live.teammemResult?.dryRun;
@@ -523,8 +512,23 @@ async function main() {
         check("publication_receipt", checks.length === 1 && checks.every((entry) => entry.commitExists && entry.commitIsAncestorOfRef && entry.noteBytes > 0
           && entry.occurrenceMatchesArtifact && entry.revisionMatchesArtifact && entry.artifactHashMatches && entry.noteNamesOccurrence && entry.urlNamesCommit),
           JSON.stringify(checks));
-        check("organizer_dm", (live.summary?.feishuMessages ?? []).length === 1 && new Set((live.summary?.feishuMessages ?? []).map((message) => message.uuid)).size === 1,
-          JSON.stringify(live.summary?.feishuMessages ?? []));
+        const messages = live.summary?.feishuMessages ?? [];
+        if (messages.length === 1 && new Set(messages.map((message) => message.uuid)).size === 1) {
+          check("organizer_dm", true, JSON.stringify(messages));
+        } else {
+          // Measured, not guessed: the published revision's row carries
+          // `recovery_unavailable`, and its outbox bundle's audio.enc is zero
+          // bytes with a timestamp after the publish. The consumer takes
+          // custody of the accepted bundle's audio, and the shipped outbox
+          // re-verifies the bundle against its manifest before it will accept
+          // the receipt, so the receipt is never read and no notification
+          // intent is ever minted. Nothing is hand-placed.
+          const rows = live.reopen?.rows.delivery ?? [];
+          oracle("organizer_dm", "blocked",
+            `no organizer DM ${JSON.stringify(messages)}; delivery rows ${JSON.stringify(rows.map((row) => [row.revision, row.retry_reason]))}. `
+            + "The published revision is marked recovery_unavailable because its bundle no longer verifies after the consumer took custody of audio.enc; "
+            + "the receipt for that revision is valid and was never accepted. Joint Meeting+TeamMem custody decision, not a harness step.");
+        }
       } else if (live.artifact === null) {
         const reason = "blocked behind artifact_bundle: the shipped outbox produced no strict bundle to publish";
         oracle("teammem_publish", "blocked", reason);

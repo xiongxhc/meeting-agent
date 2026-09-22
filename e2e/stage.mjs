@@ -21,7 +21,7 @@ export const PROVIDER_CREDENTIAL_ENV = "E2E_PROVIDER_CREDENTIAL";
 /** The synthetic provider credential; the launcher exports it to the gateway only. */
 export const PROVIDER_CREDENTIAL = "e2e-synthetic-provider-credential-not-real";
 /** See the comment on the bridge static config below. */
-export const CAPTURE_FRAME_LIMIT = 12;
+export const CAPTURE_FRAME_LIMIT = 51;
 
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 
@@ -114,14 +114,13 @@ exec ${quote(gatewayPath)} "$@"
   writeFileSync(bridgeStaticConfigPath, JSON.stringify({
     schema: "feishu-bridge-config/v1", bundleVersion: "e2e-scripted",
     controlDir: directories.control,
-    // The scripted capture is deliberately short. Meeting's private alignment
-    // page budget (ALIGNMENT_LIMITS.pageBytes, 32 KiB) is applied to its OWN
-    // bigint-tagged re-encoding, which is about 1.4x the Runtime wire bytes the
-    // gateway already caps at the same 32 KiB, so a full wire page is always
-    // rejected. See the report's "alignment page budget" gap: at 51 frames the
-    // two pages measured 46574 and 38397 tagged bytes and every backfill
-    // attempt failed with `alignment_failed`. Twelve 20 ms frames keep one
-    // complete page inside the budget without changing any product value.
+    // Fifty-one 20 ms frames: more than twice the roughly twenty frames that
+    // was the old ceiling, and the exact length D032 §1 was measured at. Its
+    // two alignment pages re-encode to 46575 and 37801 private bytes, both
+    // past the 32768-byte budget that used to refuse them, so the run proves
+    // the fixed bound. Two hundred frames were tried and reverted: the child
+    // paces one frame per 20 ms, and on a loaded machine only 101 of them fit
+    // inside the fixed media-capture budget, which may not be widened.
     captureFrameLimit: CAPTURE_FRAME_LIMIT,
     // One observed participant, so the closed-meeting attendance the artifact
     // contract requires comes from real bridge-observed UI events rather than

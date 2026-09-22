@@ -1,5 +1,9 @@
 // Scripted bridge-side media client for the packaged Runtime gateway's
-// authenticated media listener (MED2 timed capture, capture-clock/v1).
+// authenticated media listener (MED3 drainable timed capture, capture-clock/v1).
+// D029 §3: the shipped live path starts the DRAINABLE timed session, so the
+// Runtime issues a media-v3 lease and a MED2 producer cannot authenticate on
+// it. As that decision prescribes for test producers, the v2 bodies below are
+// unchanged and only the envelope is retagged.
 // Wire layout mirrors apps/runtime-gateway/src/media_server.rs read paths.
 import { Buffer } from "node:buffer";
 import { URL } from "node:url";
@@ -37,7 +41,7 @@ export function encodeTiming({ captureEpoch, sequence, outputStartSample, sample
 
 function record(kind, sessionId, body) {
   const payload = Buffer.concat([u64(sessionId), body]);
-  return Buffer.concat([Buffer.from("MED2"), Buffer.from([2, kind]), u32(payload.length), payload]);
+  return Buffer.concat([Buffer.from("MED3"), Buffer.from([3, kind]), u32(payload.length), payload]);
 }
 
 export async function connectMediaClient({ endpoint, credential, sessionId, bridgeSessionId, clockDomainId = "e2e-clock", captureEpoch = 1 }) {
@@ -52,7 +56,7 @@ export async function connectMediaClient({ endpoint, credential, sessionId, brid
   if (token.length === 0 || token.length > MAX_TOKEN_BYTES) throw new Error("media credential out of bounds");
   const id = Buffer.from(bridgeSessionId, "utf8");
   const body = Buffer.concat([u64(sessionId), Buffer.from([token.length]), token, Buffer.from([id.length]), id]);
-  socket.write(Buffer.concat([Buffer.from("MED2"), Buffer.from([2, 1]), u32(body.length), body]));
+  socket.write(Buffer.concat([Buffer.from("MED3"), Buffer.from([3, 1]), u32(body.length), body]));
 
   const inbound = { bytes: 0, packets: 0 };
   socket.on("data", (chunk) => { inbound.bytes += chunk.length; inbound.packets += 1; });

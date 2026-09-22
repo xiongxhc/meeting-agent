@@ -55,7 +55,10 @@ What the evidence is: scripted local application test readiness. It is not a
 Feishu, provider, acoustic, Linux or remote-split acceptance. The shipped client
 pins the Runtime profile to `online`, which requires remote HTTPS/WSS providers,
 so the live lane runs against unreachable `.invalid` endpoints: audio is captured
-and recorded, and no transcript turn is produced or faked. The post-meeting lane
+and recorded, and no transcript turn is produced or faked. Every bundle therefore
+carries an expected speech-recognition failure with `recovery: continue_session`
+from those unreachable providers; it is the configuration working as designed,
+not a fault of the run. The post-meeting lane
 runs the same gateway binary in the `offline` profile against a local fixture
 provider so the alignment traversal and the one synthesis call are answered
 rather than invented.

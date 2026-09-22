@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { RecordingAlignmentPage } from "@conversation/runtime";
-import { decodeAlignmentPage, encodeAlignmentPage } from "../src/sessions/recording-alignment.ts";
+import { ALIGNMENT_LIMITS, decodeAlignmentPage, encodeAlignmentPage } from "../src/sessions/recording-alignment.ts";
 import { testCapability } from "./lib/runtime-sdk.ts";
 
 const policy = { id: "local-wall-estimate/v1", cadenceTargetNs: 1_000_000_000n, maximumBracketNs: 5_000_000n,
@@ -26,15 +26,13 @@ test("private alignment codec rejects corrupt tags, unknown shapes and noncanoni
     encoded.replace('"schema":1', '"schema":2'), encoded.replace('"pageIndex":', '"unexpected":'), '{']) {
     assert.throws(() => decodeAlignmentPage(corrupt), /invalid private alignment page/);
   }
-  assert.throws(() => decodeAlignmentPage(" ".repeat(32 * 1024 + 1)), /invalid private alignment page/);
+  assert.throws(() => decodeAlignmentPage(" ".repeat(ALIGNMENT_LIMITS.privatePageBytes + 1)), /invalid private alignment page/);
 });
 
 test("private alignment codec independently caps entry count and UTF8 stored bytes", () => {
   const value = page();
   assert.throws(() => encodeAlignmentPage({ ...value, entries: Array.from({ length: 65 }, () => ({ kind: "alignment_limit" as const })) }), /invalid private alignment page/);
-  const frame = { kind: "frame" as const, mediaStartSample: 0n, mediaEndSample: 480n, sampleRateHz: 24000, gapOffsetMs: 0n,
-    epoch: null, provenance: null, captureStatus: "capture_alignment_missing" as const, wall: null,
-    reasons: ["capture_alignment_missing", "wall_alignment_missing", "clock_domain_mismatch", "inconsistent_coordinates", "source_discontinuity",
-      "missing_clock_pair", "clock_bracket_exceeded", "clock_pair_gap", "wall_clock_discontinuity", "arithmetic_overflow"] };
-  assert.throws(() => encodeAlignmentPage({ ...value, entries: Array.from({ length: 64 }, () => frame) }), /invalid private alignment page/);
+  // The stored-byte cap is proved against a genuinely maximal page in
+  // test/recording-alignment-page-bound.test.ts; 64 lean frames fit inside
+  // the private bound D032 §1 derives from the SDK's wire page size.
 });

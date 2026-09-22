@@ -133,7 +133,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
   mkdirSync(oldMigrations);
   cpSync(path.resolve("migrations"), oldMigrations, {
     recursive: true,
-    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028)_/.test(path.basename(source)),
+    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028|029)_/.test(path.basename(source)),
   });
   try {
     const oldStore = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
@@ -144,7 +144,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
 
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 28);
+      assert.equal(upgraded.schemaVersion, 29);
       assert.equal(upgraded.getBackfillSeed(identity.occurrenceId), null);
       const schema = new Map(upgraded.describeSchema().map((table) => [table.name, table]));
       assert.match(schema.get("backfill_seeds")?.sql ?? "", /STRICT/);
@@ -246,7 +246,9 @@ test("qualifying finalization atomically persists one exact immutable seed and s
       generationId: "6d656574696e672d7365656440323032362d30392d30325431343a30303a30305a:6272696467652d73656564",
       capability: testCapability,
       recordingPath: path.resolve(f.recordingPath),
-      recordingFormat: "pcm_s16le/24000/1/20ms",
+      // D032 §3: the seed carries the published audio-format token; the
+      // recording row keeps the Runtime's own slashed spelling.
+      recordingFormat: "pcm_s16le-24000-1-20ms",
       recordingEncryption: "aes-256-gcm",
       recordingBytes: Buffer.byteLength("synthetic-ciphertext"),
       recordingDevice: stat.dev.toString(),
