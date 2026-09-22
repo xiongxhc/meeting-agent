@@ -598,6 +598,7 @@ export const NETWORK_CAPABILITY_OWNERS = new Set([
   "src/adapters/feishu-sdk-connection.ts",
   "src/adapters/feishu-invite-ingress.ts",
   "src/adapters/feishu-organizer-metadata.ts",
+  "src/adapters/feishu-organizer-sender.ts",
   "src/adapters/conversation-runtime-client.ts",
   "src/adapters/feishu-api.ts",
 ]);
@@ -626,7 +627,7 @@ export function findForbiddenRuntimeBoundaryAccess(result: ScanResult, repoRoot?
   const violations: Violation[] = [];
   for (const call of result.runtimeBoundaryCalls) {
     const relative = repoRoot === undefined ? "" : normalizeRelative(path.relative(repoRoot,call.file));
-    if (call.capability.endsWith(":@larksuiteoapi/node-sdk") && !["src/adapters/feishu-sdk-http.ts","src/adapters/feishu-invite-ingress.ts","src/adapters/feishu-organizer-metadata.ts"].includes(relative)) {
+    if (call.capability.endsWith(":@larksuiteoapi/node-sdk") && !["src/adapters/feishu-sdk-http.ts","src/adapters/feishu-invite-ingress.ts","src/adapters/feishu-organizer-metadata.ts","src/adapters/feishu-organizer-sender.ts"].includes(relative)) {
       violations.push({file:call.file,specifier:call.capability,rule:"SDK value capability outside exact Feishu adapter"}); continue;
     }
     if (call.capability.endsWith(":ws")) {

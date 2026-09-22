@@ -18,6 +18,7 @@ import Database from "better-sqlite3";
 import type { RecordingAlignmentEntry, RecordingAlignmentPage } from "@conversation/runtime";
 
 import { createFilesystemOperatorWarningSink } from "../src/adapters/filesystem-operator-warning.ts";
+import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { composeApplication, RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST, type ComposedApplication } from "../src/application-composition.ts";
 import { createApplicationMaintenance, DEFAULT_LANE_INTERVALS_MS, MAINTENANCE_LANES, type CreateMaintenanceInput, type MaintenanceOwner, type MaintenanceSupervisor } from "../src/application-maintenance.ts";
@@ -638,7 +639,7 @@ test("composition: maintenance lanes start before Feishu ingress readiness, expo
   } finally { await app?.close().catch(() => undefined); f.close(); }
 });
 
-test("composition: a maintenance close failure is surfaced in the aggregate static code list, never as idle; without a composed sender the notification lane fails closed and visibly", async () => {
+test("composition: a maintenance close failure is surfaced in the aggregate static code list, never as idle; the shipped organizer sender is composed from the Feishu scope and claims nothing without a verified receipt", async () => {
   const f = compositionFixture();
   const log: string[] = [];
   const wall = ENDED_AT_MS + 1;
@@ -646,20 +647,24 @@ test("composition: a maintenance close failure is surfaced in the aggregate stat
   const r: Roots = { dir: f.dir, recordingsDir: f.config.dataPaths.recordingsDir, outboxDir: f.config.dataPaths.outboxDir, receiptsDir: f.config.dataPaths.receiptsDir, filename: "", close() {} };
   seedKnownEnded(seedStore, r, () => wall, false);
   seedStore.close();
+  let feishuRequests = 0;
+  const http = createFeishuSdkHttp({ request: async () => { feishuRequests += 1; throw new Error("must_not_call"); } });
   let app: ComposedApplication | undefined;
   try {
     app = await composeApplication(f.config, f.owner, { inviteIngress: false, bridgeSlots: [f.slot], clock: { now: () => wall },
       metadata: { async resolve() { return { status: "blocked", reason: "reference_missing", retryable: false }; } },
+      feishu: { http },
       log: (code) => log.push(code),
       maintenance: { random: () => 0, intervalsMs: { outbox: 3_600_000, notification: 3_600_000, discovery: 3_600_000, warning: 3_600_000, custody: 3_600_000, backfill: 3_600_000 },
         backfill: { operationBudgetMs: 1_000, cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 },
           startTransport: async () => ({ ...gracefulTransport(), cleanupOutcome: { status: "failed" as const, reason: "process_not_reaped" } } as BackfillGatewayTransport),
           connectRuntime: async () => { throw new Error("synthetic Runtime connect failure"); } } } });
     await app.start();
-    assert.ok(log.includes("notification_sender_unavailable"), "the missing credential owner is a compose-time static code");
-    assert.equal(await app.maintenanceTick("notification"), "notification_sender_unavailable", "no intent is claimed or burned without an accepted sender");
-    assert.ok(app.maintenanceStatus().codes.includes("notification:notification_sender_unavailable"));
+    assert.ok(!log.includes("notification_sender_unavailable"), "production composes the exact Feishu adapter that owns the tenant-token credential");
+    assert.equal(await app.maintenanceTick("notification"), "notification_polled", "the lane always has a sender");
+    assert.ok(!app.maintenanceStatus().codes.some((code) => code.startsWith("notification:")));
+    assert.equal(feishuRequests, 0, "no receipt is verified, so the composed sender is never reached");
     assert.equal(await app.maintenanceTick("backfill"), "backfill_cleanup_unconfirmed");
     await assert.rejects(app.close(), /composition_close_failed:backfill_close_failed/);
-  } finally { await app?.close().catch(() => undefined); f.close(); }
+  } finally { await app?.close().catch(() => undefined); await http.close().catch(() => undefined); f.close(); }
 });

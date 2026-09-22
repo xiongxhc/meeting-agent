@@ -35,6 +35,7 @@ import { createChildBridgeSlot } from "./adapters/child-bridge-process.ts";
 import { createConversationRuntimeClient } from "./adapters/conversation-runtime-client.ts";
 import { createFeishuInviteIngress } from "./adapters/feishu-invite-ingress.ts";
 import { createFeishuOrganizerMetadata } from "./adapters/feishu-organizer-metadata.ts";
+import { createFeishuOrganizerSender } from "./adapters/feishu-organizer-sender.ts";
 import { createFeishuSocketOwner, type FeishuSocketOwner } from "./adapters/feishu-sdk-connection.ts";
 import { createFeishuSdkHttp, type FeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
 import { openSessionStore } from "./adapters/sqlite-session-store.ts";
@@ -543,26 +544,26 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     } catch { store.close(); storeOpen = false; throw new Error("feishu_scope_invalid"); }
   }
 
-  // Cut C: the organizer sender is composed only when supplied. The tenant
-  // token credential operation belongs in an exact Feishu adapter (the
-  // boundary scanner admits the SDK nowhere else) and Meeting holds no
-  // accepted REST endpoint binding; until both exist the notification lane
-  // claims nothing and reports `notification_sender_unavailable`.
-  const notificationSender = options.maintenance?.notificationSender;
-  if (notificationSender === undefined) log("notification_sender_unavailable");
+  // The organizer DM sender is always composed: the exact Feishu adapter owns
+  // the tenant-token credential operation and the endpoint binding, over the
+  // same owned transport as the ingress and the metadata resolver.
+  // `maintenance.notificationSender` remains the scripted test/E2E override.
   let maintenance: ReturnType<typeof createApplicationMaintenance>;
-  try { maintenance = createApplicationMaintenance({
-    store, clock, dataPaths: { recordingsDir: dataPaths.recordingsDir, outboxDir: dataPaths.outboxDir, receiptsDir: dataPaths.receiptsDir },
-    runtime: { launcherPath: config.runtime.launcherPath, gatewayConfigPath: config.runtime.gatewayConfigPath },
-    env: allowlistedEnvironment(), log, ...(notificationSender === undefined ? {} : { notificationSender }),
-    discover: () => discoverTick(),
-    supervisor: {
-      assertOwnership: () => owner.assertCurrentOwnership(),
-      occurrenceIsLive: (occurrenceId) => { const entry = entries.get(occurrenceId); return entry !== undefined && entry.phase !== "settled"; },
-      holdsFinalizedRecording: () => [...entries.values()].some((entry) => entry.phase !== "settled" && entry.session !== null && entry.session.state().recording !== null),
-    },
-    ...(options.maintenance ? { options: options.maintenance } : {}),
-  }); } catch (error) {
+  try {
+    const notificationSender = options.maintenance?.notificationSender
+      ?? createFeishuOrganizerSender({ ...scope, appSecret, http, log });
+    maintenance = createApplicationMaintenance({
+      store, clock, dataPaths: { recordingsDir: dataPaths.recordingsDir, outboxDir: dataPaths.outboxDir, receiptsDir: dataPaths.receiptsDir },
+      runtime: { launcherPath: config.runtime.launcherPath, gatewayConfigPath: config.runtime.gatewayConfigPath },
+      env: allowlistedEnvironment(), log, notificationSender,
+      discover: () => discoverTick(),
+      supervisor: {
+        assertOwnership: () => owner.assertCurrentOwnership(),
+        occurrenceIsLive: (occurrenceId) => { const entry = entries.get(occurrenceId); return entry !== undefined && entry.phase !== "settled"; },
+        holdsFinalizedRecording: () => [...entries.values()].some((entry) => entry.phase !== "settled" && entry.session !== null && entry.session.state().recording !== null),
+      },
+      ...(options.maintenance ? { options: options.maintenance } : {}),
+    }); } catch (error) {
     if (ownsHttp) void http.close().catch(() => undefined);
     store.close(); storeOpen = false; throw error;
   }

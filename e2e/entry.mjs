@@ -9,8 +9,6 @@
 //   feishu.http / feishu.connection  scripted Feishu origin and socket owner
 //   organizerReferences              so the REAL metadata resolver is composed
 //   maintenance.intervalsMs/random   test cadences only
-//   maintenance.notificationSender   the organizer DM peer (see the report's
-//                                    gap: production composes no sender yet)
 //   log                              the redacted static-code trace
 //
 // `startRuntimeTransport` is NOT replaced: the real `StdioGatewayTransport`
@@ -21,10 +19,8 @@
 //
 // Everything this produces is "scripted local application test readiness".
 
-import { Buffer } from "node:buffer";
 import { clearInterval, setInterval } from "node:timers";
 import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
 import { Agent as HttpAgent } from "node:http";
 import path from "node:path";
 import process from "node:process";
@@ -80,33 +76,6 @@ function selectPostmeetingGatewayConfig(fixtureEndpoint) {
   }), { mode: 0o600 });
   renameSync(next, plan.gatewayConfigPath);
   event("gateway_config_postmeeting");
-}
-
-function scriptedNotificationSender(origin) {
-  return {
-    sendText({ receiveId, text, uuid, timeoutMs }) {
-      const body = JSON.stringify({ receive_id: receiveId, msg_type: "text", content: JSON.stringify({ text }), uuid });
-      return new Promise((resolve, reject) => {
-        const call = httpRequest(`${origin}/open-apis/im/v1/messages?receive_id_type=open_id`, {
-          method: "POST", timeout: timeoutMs,
-          headers: { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) },
-        }, (response) => {
-          const chunks = [];
-          response.on("data", (chunk) => chunks.push(chunk));
-          response.on("end", () => {
-            try {
-              const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-              if (parsed.code !== 0 || typeof parsed.data?.message_id !== "string") throw new Error("notification_rejected");
-              resolve({ messageId: parsed.data.message_id });
-            } catch (error) { reject(error); }
-          });
-        });
-        call.on("timeout", () => { call.destroy(new Error("notification_timeout")); });
-        call.on("error", reject);
-        call.end(body);
-      });
-    },
-  };
 }
 
 async function main() {
@@ -201,7 +170,6 @@ async function main() {
       maintenance: {
         intervalsMs: plan.laneIntervalsMs,
         random: () => 0,
-        notificationSender: scriptedNotificationSender(peer.origin),
       },
       log: (code) => { trace.push(code); event("log", { code }); },
     }),

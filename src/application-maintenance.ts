@@ -126,9 +126,10 @@ export type CreateMaintenanceInput = {
   readonly supervisor: MaintenanceSupervisor;
   /** Cut B's durable discovery tick (metadata resolution + bounded launch scan). */
   readonly discover: () => Promise<unknown>;
-  /** The accepted Feishu sender. Until an exact Feishu adapter owns the
-   * tenant-token credential operation, production composes none: the lane
-   * then claims nothing and reports `notification_sender_unavailable`. */
+  /** The accepted Feishu sender. Production composes the exact Feishu adapter
+   * that owns the tenant-token credential operation; a caller that composes
+   * none keeps a lane that claims nothing and reports
+   * `notification_sender_unavailable`. */
   readonly notificationSender?: NotificationSender;
   readonly log?: (code: string) => void;
   readonly options?: MaintenanceOptions;
