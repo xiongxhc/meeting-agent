@@ -491,7 +491,7 @@ async function main() {
         check("artifact_bundle", ["READY", "audio.enc", "manifest.json", "meeting.json"].every((file) => live.artifact.files.includes(file)),
           `files ${JSON.stringify(live.artifact.files)} revision ${live.artifact.revision}`);
       } else {
-        oracle("artifact_bundle", "blocked",
+        oracle("artifact_bundle", "fail",
           `the shipped delivery lane could not build one: backfill reason ${JSON.stringify(buildReason)} after ${(live.reopen?.rows.seedLifecycle ?? [])[0]?.initial_build_attempts ?? 0} attempts. See productDefects.`);
         defect({
           id: "artifact_build_failed",
@@ -524,10 +524,17 @@ async function main() {
           // the receipt, so the receipt is never read and no notification
           // intent is ever minted. Nothing is hand-placed.
           const rows = live.reopen?.rows.delivery ?? [];
-          oracle("organizer_dm", "blocked",
+          const consumedAudio = live.artifact?.audioPath && existsSync(live.artifact.audioPath)
+            && statSync(live.artifact.audioPath).isFile() && statSync(live.artifact.audioPath).size === 0;
+          const knownCustodyBlock = messages.length === 0 && consumedAudio
+            && checks.length === 1 && checks.every((entry) => entry.artifactHashMatches && entry.revisionMatchesArtifact)
+            && rows.some((row) => row.occurrence_id === live.artifact.occurrenceId
+              && row.revision === live.artifact.revision && row.retry_reason === "recovery_unavailable");
+          oracle("organizer_dm", knownCustodyBlock ? "blocked" : "fail",
             `no organizer DM ${JSON.stringify(messages)}; delivery rows ${JSON.stringify(rows.map((row) => [row.revision, row.retry_reason]))}. `
-            + "The published revision is marked recovery_unavailable because its bundle no longer verifies after the consumer took custody of audio.enc; "
-            + "the receipt for that revision is valid and was never accepted. Joint Meeting+TeamMem custody decision, not a harness step.");
+            + (knownCustodyBlock
+              ? "D033: the matching revision is recovery_unavailable, inbox audio is zero bytes, and its receipt matches."
+              : "Unexpected notification failure; the measured D033 custody conditions do not hold."));
         }
       } else if (live.artifact === null) {
         const reason = "blocked behind artifact_bundle: the shipped outbox produced no strict bundle to publish";

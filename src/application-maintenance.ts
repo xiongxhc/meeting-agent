@@ -50,7 +50,8 @@ export const BACKFILL_OPERATION_BUDGET_MS = 900_000;
 export const BACKFILL_CLEANUP_TIMEOUTS: StdioGatewayCleanupTimeouts = { eofGraceMs: 5_000, termGraceMs: 1_000, killGraceMs: 1_000 };
 /** Bounded organizer notification settings: the request timeout plus safety
  * margin stays far inside Feishu's one-hour UUID dedup window; the claim lease
- * covers the request. */
+ * covers the request. The shared Feishu transport caps each HTTP request at
+ * 5 seconds; either timeout is an uncertain send in the notification worker. */
 export const NOTIFICATION_SETTINGS = { requestTimeoutMs: 10_000, claimTtlMs: 60_000, dedupSafetyMarginMs: 300_000 } as const;
 const MAX_LANE_INTERVAL_MS = 3_600_000;
 
