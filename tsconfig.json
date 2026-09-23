@@ -18,6 +18,7 @@
     "spikes/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
+    "e2e/**/*.ts",
     "bridges/linux-browser/**/*.ts"
   ],
   "exclude": [

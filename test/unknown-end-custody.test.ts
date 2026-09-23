@@ -159,7 +159,10 @@ test("migrations 026 and 027 add per-source custody and the generation terminal 
   const filename = path.join(dir, "state.db");
   const oldMigrations = path.join(dir, "migrations-025");
   mkdirSync(oldMigrations);
-  cpSync(path.resolve("migrations"), oldMigrations, { recursive: true, filter: (source) => !/^02[678]_/.test(path.basename(source)) });
+  cpSync(path.resolve("migrations"), oldMigrations, { recursive: true, filter: (source) => {
+    const version = /^(\d+)_/.exec(path.basename(source));
+    return version === null || Number(version[1]) <= 25;
+  } });
   try {
     const old = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
     const identity = buildMeetingIdentity({ providerMeetingId: "legacy", meetingNo: "1", occurrenceStartedAt: STARTED_AT, title: "Legacy", organizer: null });
@@ -176,7 +179,7 @@ test("migrations 026 and 027 add per-source custody and the generation terminal 
     } finally { raw025.close(); }
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 28);
+      assert.equal(upgraded.schemaVersion, 29);
       const raw027 = new Database(filename, { readonly: true });
       try {
         const columns = (raw027.pragma("table_info(reconciliation_generations)") as Array<{ name: string }>).map((column) => column.name);

@@ -16,7 +16,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 const NODE24 = "/opt/homebrew/opt/node@24/bin/node";
-const REPO = path.resolve(import.meta.dirname, "../..");
+const REPO = path.resolve(import.meta.dirname, "..");
 const RUN = path.join(REPO, "e2e/run.mjs");
 
 type Bundle = {

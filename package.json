@@ -21,6 +21,7 @@
     "prebuild": "node scripts/check-runtime-sdk.mjs",
     "prestart": "node scripts/check-runtime-sdk.mjs",
     "test": "node --test \"spikes/**/*.test.ts\" \"bridges/**/*.test.ts\" \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
+    "test:e2e": "node --test --test-concurrency=1 \"e2e/**/*.test.ts\"",
     "e2e": "node e2e/run.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",

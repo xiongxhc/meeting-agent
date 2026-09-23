@@ -37,7 +37,12 @@ SHIPPED standalone admission and composition against scripted local peers:
 export PATH=/opt/homebrew/opt/node@24/bin:$PATH
 npm run e2e -- --out /absolute/evidence/dir            # add --keep to retain the temp root
 npm run e2e -- --out /absolute/evidence/dir --only-refusals
+npm run test:e2e                                    # full spine and refusal assertions
 ```
+
+The application spine is excluded from `npm test`. Run it separately on an idle
+machine, with only one spine running at a time; it builds and launches the whole
+application and its peers.
 
 It needs the pinned Runtime gateway and SDK tarball recorded in `e2e/pins.mjs`,
 and refuses to run when either SHA256 differs. Network is used only to build and
