@@ -492,6 +492,106 @@ test("a complete higher revision accepted after notified cleans retained evidenc
   } finally { d.close(); h.cleanup(); }
 });
 
+for (const legacyMarker of [false, true]) {
+  test(`D033 consumed inbox audio accepts a matching receipt after reopen (legacy marker: ${legacyMarker})`, async () => {
+    const h = harness(), built = await actualTimedV2Artifact();
+    const d = durableWorker(h, built);
+    try {
+      writeFileSync(path.join(d.bundle, "audio.enc"), Buffer.alloc(0));
+      if (legacyMarker) {
+        const raw = new Database(d.filename);
+        try { raw.exec("UPDATE delivery_journal SET retry_reason='recovery_unavailable'"); }
+        finally { raw.close(); }
+      }
+      d.reopen();
+      d.receipt();
+      d.worker().reconcile();
+      assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "published");
+      assert.equal(d.store().notifications().length, 1);
+      assert.equal(d.store().notifications()[0]?.recipientId, built.artifact.organizer?.person_id ?? null);
+      assert.equal(existsSync(d.source), false, "complete receipt authorizes original recording cleanup");
+      assert.equal(existsSync(d.bundle), false);
+      d.reopen(); d.worker().reconcile();
+      assert.equal(d.store().notifications().length, 1, "replay never duplicates the durable intent");
+    } finally { d.close(); h.cleanup(); }
+  });
+}
+
+test("D033 consumed audio waits for the exact receipt and retains incomplete original audio until its deadline", () => {
+  const h = harness(), base = artifactAndAudio();
+  const artifact = { ...base.artifact, transcript_complete: false };
+  const built = { ...base, artifact, serialized: canonicalArtifactJson(artifact), hash: canonicalArtifactHash(artifact) };
+  const d = durableWorker(h, built);
+  try {
+    const audio = path.join(d.bundle, "audio.enc");
+    writeFileSync(audio, Buffer.alloc(0));
+    const wrong = { ...publishedReceipt(artifact, built.hash), artifact_hash: `sha256:${"0".repeat(64)}` };
+    writeFileSync(path.join(h.receipts, `${occurrencePathSegment(artifact.occurrence_id as OccurrenceId)}.json`), `${JSON.stringify(wrong)}\n`);
+    d.worker().reconcile();
+    assert.equal(d.store().pending()[0]?.retryReason, "receipt_unavailable");
+    assert.equal(d.store().getSession(artifact.occurrence_id)?.state, "awaiting_teammem");
+    assert.deepEqual(d.store().notifications(), []);
+    assert.equal(statSync(audio).size, 0, "recovery must not recreate the consumed copy");
+    assert.deepEqual(readFileSync(d.source), built.bytes);
+    d.advance(d.now() + 60_000); d.reopen(); d.receipt(); d.worker().reconcile();
+    assert.equal(d.store().getSession(artifact.occurrence_id)?.state, "published");
+    assert.equal(d.store().notifications().length, 1);
+    assert.deepEqual(readFileSync(d.source), built.bytes);
+    d.advance(Date.parse(artifact.ended_at) + 14 * 24 * 60 * 60 * 1000);
+    d.worker().reconcile();
+    assert.equal(existsSync(d.source), false);
+    assert.equal(existsSync(d.bundle), false);
+  } finally { d.close(); h.cleanup(); }
+});
+
+for (const corruption of ["meeting", "manifest", "ready", "missing_source", "audio_symlink", "nonempty_audio"] as const) {
+  test(`D033 matching receipt never overrides ${corruption}`, () => {
+    const h = harness(), built = artifactAndAudio(), d = durableWorker(h, built);
+    try {
+      const audio = path.join(d.bundle, "audio.enc");
+      writeFileSync(audio, Buffer.alloc(0));
+      if (corruption === "meeting") writeFileSync(path.join(d.bundle, "meeting.json"), built.serialized.replace(built.artifact.title, "tampered"));
+      if (corruption === "manifest") writeFileSync(path.join(d.bundle, "manifest.json"), "{}\n");
+      if (corruption === "ready") writeFileSync(path.join(d.bundle, "READY"), "tampered");
+      if (corruption === "missing_source") unlinkSync(d.source);
+      if (corruption === "audio_symlink") {
+        const empty = path.join(h.root, "empty"); writeFileSync(empty, "");
+        unlinkSync(audio); symlinkSync(empty, audio);
+      }
+      if (corruption === "nonempty_audio") writeFileSync(audio, "different ciphertext");
+      d.receipt(); d.reopen(); d.worker().reconcile();
+      assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
+      assert.deepEqual(d.store().notifications(), []);
+      assert.equal(existsSync(d.bundle), true);
+    } finally { d.close(); h.cleanup(); }
+  });
+}
+
+test("D033 consumed legacy row cannot accept a receipt against another occurrence's original inode", () => {
+  const h = harness(), built = artifactAndAudio(), d = durableWorker(h, built);
+  try {
+    const other = { ...built.artifact, occurrence_id: "vc:other@2026-09-02T14:00:00Z", provider_meeting_id: "vc:other" };
+    const otherSource = runtimeRecordingPath(h, "b");
+    writeFileSync(otherSource, built.bytes);
+    d.store().createSession({ occurrenceId: other.occurrence_id, providerMeetingId: other.provider_meeting_id, occurrenceStartedAt: other.started_at, nowMs: d.now() });
+    d.store().finalizeSession({
+      transition: { occurrenceId: other.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: d.now() },
+      recording: { handle: "b".repeat(32), encryptedPath: otherSource, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
+    });
+    d.worker().enqueue({ artifact: other, serializedArtifact: canonicalArtifactJson(other), artifactHash: canonicalArtifactHash(other), recordingPath: otherSource });
+    renameSync(d.source, path.join(h.root, "original.crsr"));
+    linkSync(otherSource, d.source); // Same bytes, wrong owner: a hash alone is insufficient.
+    writeFileSync(path.join(d.bundle, "audio.enc"), Buffer.alloc(0));
+    d.reopen(); d.receipt();
+    assert.equal(d.store().pending().find((row) => row.occurrenceId === built.artifact.occurrence_id)?.retryReason, "recovery_unavailable");
+    d.worker().reconcile();
+    assert.equal(d.store().getSession(built.artifact.occurrence_id)?.state, "awaiting_teammem");
+    assert.deepEqual(d.store().notifications(), []);
+    assert.deepEqual(readFileSync(otherSource), built.bytes);
+    assert.equal(existsSync(d.bundle), true);
+  } finally { d.close(); h.cleanup(); }
+});
+
 test("SQLite reopen keeps an unpublished missing source fail-closed", () => {
   const h = harness();
   const d = durableWorker(h);

@@ -107,7 +107,8 @@ export async function startFeishuPeer({ meeting }) {
       }
       if (path.endsWith("/im/v1/messages")) {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-        messages.push({ receiveId: body.receive_id, uuid: body.uuid, textBytes: typeof body.content === "string" ? body.content.length : 0, at: Date.now() });
+        messages.push({ receiveId: body.receive_id, uuid: body.uuid, text: JSON.parse(body.content ?? "{}").text,
+          textBytes: typeof body.content === "string" ? body.content.length : 0, at: Date.now() });
         route("im_message");
         json(response, { code: 0, msg: "ok", data: { message_id: `om_e2e_${messages.length}` } });
         return;

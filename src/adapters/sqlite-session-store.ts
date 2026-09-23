@@ -1986,6 +1986,7 @@ function savePendingDelivery(
         assertReplayableBackfillLifecycle(db, seed);
         validateSeededDelivery(db, existing, seed);
         assertSeedRecordingBinding(seed);
+        advanceSeededDeliveryState(db, existing.occurrenceId, existing.nextRetryAtMs);
       }
       return { kind: "replay", row: existing };
     }
@@ -2025,6 +2026,7 @@ function savePendingDelivery(
     if (seed !== null) {
       commitBackfillHandoff(db, row, seed, authority!);
       assertSeedRecordingBinding(seed);
+      advanceSeededDeliveryState(db, row.occurrenceId, authority!.nowMs);
     }
     return { kind: "inserted", row: selectDeliveryRow(db, row.occurrenceId, row.revision)! };
   });
@@ -2033,6 +2035,16 @@ function savePendingDelivery(
   if (result === deadlineClosed) throw seedViolation("backfill delivery is past its original stop deadline");
   if (result === claimExpired) throw seedViolation("backfill delivery claim is stale or expired");
   return result;
+}
+
+// The canonical intent and lifecycle transfer are the publication handoff.
+// Keep its orchestration edge in that same transaction, including old exact
+// replays which committed the intent but never advanced out of finalizing.
+function advanceSeededDeliveryState(db: Database.Database, occurrenceId: string, nowMs: number): void {
+  const session = selectSessionRaw(db, occurrenceId);
+  if (session?.state !== "finalizing") return;
+  transition(db, { occurrenceId, fromState: "finalizing", toState: "awaiting_teammem",
+    reason: "delivery_handoff", terminalReason: null, nowMs: Math.max(nowMs, session.updated_at_ms) });
 }
 
 function selectDeliveryRow(db: Database.Database, occurrenceId: string, revision: number): DeliveryRow | null {
@@ -2283,6 +2295,19 @@ function acceptPublication(db: Database.Database, input: AcceptPublicationInput)
     ).get(input.occurrenceId, input.revision) as { artifact_hash: string; transcript_complete: 0 | 1; published_at_ms: number | null; publication_url: string | null; vault_commit: string | null } | undefined;
     if (delivery === undefined || delivery.artifact_hash !== input.artifactHash) {
       throw new OrchestrationError("constraint_violation", "publication delivery identity is unknown or immutable fields changed");
+    }
+    if (input.consumedInboxAudio && delivery.published_at_ms === null) {
+      const row = selectDeliveryRow(db, input.occurrenceId, input.revision)!;
+      seededArtifact(row); // Canonical bytes must agree with every durable identity field.
+      const recording = db.prepare("SELECT handle, encrypted_path FROM recordings WHERE occurrence_id=?")
+        .get(input.occurrenceId) as { handle: string; encrypted_path: string } | undefined;
+      if (!recording || path.resolve(recording.encrypted_path) !== row.recordingPath || recording.handle !== row.recordingHandle) {
+        throw new OrchestrationError("constraint_violation", "consumed bundle original recording binding changed");
+      }
+      const binding = claimDeliveryRecordingOwner(db, input.occurrenceId, recording.handle, recording.encrypted_path);
+      if (!binding?.physicalIdentity) throw new OrchestrationError("constraint_violation", "consumed bundle original recording ownership unavailable");
+      const seed = getBackfillSeed(db, input.occurrenceId);
+      if (seed !== null) { validateSeededDelivery(db, row, seed); assertSeedRecordingBinding(seed); }
     }
     const session = selectSessionRaw(db, input.occurrenceId);
     if (session === undefined || !["awaiting_teammem", "published", "notified"].includes(session.state)) {

@@ -282,7 +282,7 @@ test("R2: an incomplete revision publishes through the real builder/outbox, noti
   let wall = ENDED_AT_MS + 1;
   let store = openSessionStore({ filename: r.filename, nowMs: ENDED_AT_MS });
   const seeded = seedKnownEnded(store, r, () => wall, true);
-  seeded.coordinator.advance(seeded.identity.occurrenceId, "awaiting_teammem");
+  assert.equal(store.getSession(seeded.identity.occurrenceId)?.state, "finalizing");
   const runtime = scriptedRuntime(seeded.source, 1);
   const organizer = sender();
   let spawns = 0;

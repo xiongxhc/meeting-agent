@@ -133,6 +133,24 @@ export function writeMeetingBundle(input: WriteMeetingBundleInput): string {
   return destination;
 }
 
+/** D033: the consumer may zero its inbox copy after import, before publishing
+ * the receipt. Verify the unchanged metadata and the separate original, but
+ * never recreate that consumed copy. This is not publication authority. */
+export function verifyConsumedMeetingBundle(input: WriteMeetingBundleInput): string {
+  const artifact = parseSupportedTeamMemMeetingArtifact(input.artifact);
+  const canonical = canonicalArtifactJson(artifact), hash = canonicalArtifactHash(artifact);
+  if (canonical !== input.serializedArtifact || hash !== input.artifactHash) throw new Error("invalid recovery artifact");
+  const outbox = safeDirectory(input.outboxDir, false, "outbox");
+  const destination = path.join(outbox, occurrencePathSegment(artifact.occurrence_id as OccurrenceId), String(artifact.revision));
+  assertPathUnderRoot(outbox, destination, true);
+  const consumed = lstatSync(path.join(destination, "audio.enc"));
+  if (!consumed.isFile() || consumed.isSymbolicLink() || consumed.size !== 0) throw new Error("inbox audio is not consumed");
+  const audio = readVerifiedRecording(safeDirectory(input.recordingsDir, false, "recordings"), input.recordingPath,
+    artifact, input.recordingHandle ?? undefined);
+  verifyExistingBundle(destination, canonical, hash, Buffer.alloc(0), canonicalManifest(artifact, hash, audio));
+  return destination;
+}
+
 function checkpoint(input: WriteMeetingBundleInput, step: OutboxFaultPoint): void {
   input.fault?.(step);
 }

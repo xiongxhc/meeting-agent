@@ -331,7 +331,7 @@ function reopenOracles(staged) {
       seeds: query("SELECT occurrence_id, ended_at FROM backfill_seeds"),
       custody: query("SELECT physical_client_id, occurrence_id, state FROM physical_client_custody"),
       delivery: query("SELECT occurrence_id, revision, retry_reason, published_at_ms IS NOT NULL AS published, publication_url IS NOT NULL AS hasUrl FROM delivery_journal"),
-      notifications: query("SELECT occurrence_id, revision, state, attempt_count, provider_message_id IS NOT NULL AS sent FROM notification_intents"),
+      notifications: query("SELECT occurrence_id, revision, state, attempt_count, request_uuid, provider_message_id IS NOT NULL AS sent FROM notification_intents"),
       seedLifecycle: query("SELECT occurrence_id, state, initial_build_attempts, initial_build_last_reason FROM backfill_seed_lifecycle"),
       alignment: query("SELECT generation_id, attempt_id FROM recording_alignment_selected"),
       alignmentPages: query("SELECT page_index, entry_count, length(payload) AS storedBytes FROM recording_alignment_pages ORDER BY page_index"),
@@ -513,29 +513,14 @@ async function main() {
           && entry.occurrenceMatchesArtifact && entry.revisionMatchesArtifact && entry.artifactHashMatches && entry.noteNamesOccurrence && entry.urlNamesCommit),
           JSON.stringify(checks));
         const messages = live.summary?.feishuMessages ?? [];
-        if (messages.length === 1 && new Set(messages.map((message) => message.uuid)).size === 1) {
-          check("organizer_dm", true, JSON.stringify(messages));
-        } else {
-          // Measured, not guessed: the published revision's row carries
-          // `recovery_unavailable`, and its outbox bundle's audio.enc is zero
-          // bytes with a timestamp after the publish. The consumer takes
-          // custody of the accepted bundle's audio, and the shipped outbox
-          // re-verifies the bundle against its manifest before it will accept
-          // the receipt, so the receipt is never read and no notification
-          // intent is ever minted. Nothing is hand-placed.
-          const rows = live.reopen?.rows.delivery ?? [];
-          const consumedAudio = live.artifact?.audioPath && existsSync(live.artifact.audioPath)
-            && statSync(live.artifact.audioPath).isFile() && statSync(live.artifact.audioPath).size === 0;
-          const knownCustodyBlock = messages.length === 0 && consumedAudio
-            && checks.length === 1 && checks.every((entry) => entry.artifactHashMatches && entry.revisionMatchesArtifact)
-            && rows.some((row) => row.occurrence_id === live.artifact.occurrenceId
-              && row.revision === live.artifact.revision && row.retry_reason === "recovery_unavailable");
-          oracle("organizer_dm", knownCustodyBlock ? "blocked" : "fail",
-            `no organizer DM ${JSON.stringify(messages)}; delivery rows ${JSON.stringify(rows.map((row) => [row.revision, row.retry_reason]))}. `
-            + (knownCustodyBlock
-              ? "D033: the matching revision is recovery_unavailable, inbox audio is zero bytes, and its receipt matches."
-              : "Unexpected notification failure; the measured D033 custody conditions do not hold."));
-        }
+        const intents = live.reopen?.rows.notifications ?? [];
+        const intent = intents[0], message = messages[0];
+        check("organizer_dm", messages.length === 1 && intents.length === 1
+          && intent.state === "sent" && intent.sent === 1 && intent.attempt_count === 1
+          && intent.occurrence_id === live.artifact?.occurrenceId && intent.revision === live.artifact?.revision
+          && message.uuid === intent.request_uuid && message.receiveId === live.artifact?.meeting.organizer?.person_id
+          && message.text === `Meeting notes: ${live.artifact?.meeting.title}\n${checks[0]?.markdownUrl}`,
+          JSON.stringify({ messages, intents }));
       } else if (live.artifact === null) {
         const reason = "blocked behind artifact_bundle: the shipped outbox produced no strict bundle to publish";
         oracle("teammem_publish", "blocked", reason);

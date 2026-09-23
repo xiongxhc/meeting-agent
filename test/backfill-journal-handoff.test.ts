@@ -170,8 +170,10 @@ test("migration 025 and initial fenced handoff atomically transfer only exact ca
     try { restore.prepare("UPDATE recording_recovery_bindings SET authorization=? WHERE occurrence_id=?").run(f.seed.capability.authorization, f.seed.occurrenceId); }
     finally { restore.close(); }
 
+    assert.equal(f.store.getSession(f.seed.occurrenceId)?.state, "finalizing", "refused handoffs do not advance state");
     const saved = f.store.savePending(delivery(f.seed, exact, f.recordingPath), initialAuthority(claim.claimToken));
     assert.equal(saved.kind, "inserted");
+    assert.equal(f.store.getSession(f.seed.occurrenceId)?.state, "awaiting_teammem");
     assert.equal(saved.row.recoveryArtifact, canonicalArtifactJson(exact));
     const raw = new Database(f.filename, { readonly: true });
     try {
@@ -179,6 +181,35 @@ test("migration 025 and initial fenced handoff atomically transfer only exact ca
       assert.deepEqual(raw.prepare("SELECT state,attempt_count AS attempts,target_revision AS target FROM backfill_jobs").get(), { state: "due", attempts: 0, target: null });
       assert.deepEqual(raw.prepare("SELECT count(*) AS count FROM delivery_journal").get(), { count: 1 });
     } finally { raw.close(); }
+  } finally { f.close(); }
+});
+
+test("verified seeded delivery replay repairs the old finalizing handoff after reopen exactly once", () => {
+  const f = harness();
+  try {
+    const claim = f.store.claimBackfillSeedBuild({ nowMs: ENDED_AT_MS + 1,
+      claimToken: "a".repeat(32), operationBudgetMs: 1_000 })!;
+    const row = delivery(f.seed, artifact(f.seed, 1, false), f.recordingPath);
+    f.store.savePending(row, initialAuthority(claim.claimToken));
+    const legacy = new Database(f.filename);
+    try {
+      legacy.prepare("UPDATE sessions SET state='finalizing' WHERE occurrence_id=?").run(f.seed.occurrenceId);
+      legacy.prepare("DELETE FROM transitions WHERE occurrence_id=? AND to_state='awaiting_teammem'").run(f.seed.occurrenceId);
+    } finally { legacy.close(); }
+    const reopened = openSessionStore({ filename: f.filename, nowMs: ENDED_AT_MS + 2 });
+    try {
+      assert.equal(reopened.getSession(f.seed.occurrenceId)?.state, "finalizing");
+      assert.throws(() => reopened.savePending({ ...row, artifactHash: "sha256:" + "0".repeat(64) }), /conflicting/);
+      assert.equal(reopened.getSession(f.seed.occurrenceId)?.state, "finalizing");
+      assert.equal(reopened.savePending(row).kind, "replay");
+      assert.equal(reopened.getSession(f.seed.occurrenceId)?.state, "awaiting_teammem");
+      assert.equal(reopened.savePending(row).kind, "replay");
+      const raw = new Database(f.filename, { readonly: true });
+      try {
+        assert.deepEqual(raw.prepare("SELECT count(*) AS count FROM transitions WHERE to_state='awaiting_teammem'").get(), { count: 1 });
+        assert.deepEqual(raw.prepare("SELECT count(*) AS count FROM delivery_journal").get(), { count: 1 });
+      } finally { raw.close(); }
+    } finally { reopened.close(); }
   } finally { f.close(); }
 });
 
@@ -344,7 +375,7 @@ test("accepted complete receipt cannot authorize deletion until its concurrent e
       claimToken: "c".repeat(32), operationBudgetMs: 1_000 })!;
     f.store.beginBackfillProcess({ kind: "retry", occurrenceId: f.seed.occurrenceId,
       claimToken: active.claimToken, targetRevision: active.targetRevision, nowMs: ENDED_AT_MS + 4 });
-    f.coordinator.advance(f.seed.occurrenceId, "awaiting_teammem");
+    assert.equal(f.store.getSession(f.seed.occurrenceId)?.state, "awaiting_teammem");
     f.store.acceptPublication({ occurrenceId: complete.occurrenceId, revision: complete.revision,
       artifactHash: complete.artifactHash, publishedAtMs: ENDED_AT_MS + 5,
       publicationUrl: `https://example.test/-/blob/${"a".repeat(40)}/meeting.md`, vaultCommit: "a".repeat(40),
@@ -787,7 +818,7 @@ test("initial complete intent without a retry job stops only while its authorita
       const complete = delivery(f.seed, artifact(f.seed, claim.targetRevision, true), f.recordingPath);
       f.store.savePending(complete, initialAuthority(claim.claimToken));
       if (accepted) {
-        f.coordinator.advance(f.seed.occurrenceId, "awaiting_teammem");
+        assert.equal(f.store.getSession(f.seed.occurrenceId)?.state, "awaiting_teammem");
         f.store.acceptPublication({ occurrenceId: complete.occurrenceId, revision: complete.revision,
           artifactHash: complete.artifactHash, publishedAtMs: ENDED_AT_MS + 2,
           publicationUrl: `https://example.test/-/blob/${"a".repeat(40)}/meeting.md`,
@@ -1041,7 +1072,7 @@ test("partial publication stays valid while only a locally known complete receip
     const higherPartial = delivery(f.seed, artifact(f.seed, higherClaim.targetRevision, false), f.recordingPath);
     f.store.savePending(higherPartial, { kind: "retry", claimToken: higherClaim.claimToken,
       targetRevision: higherClaim.targetRevision, nowMs: ENDED_AT_MS + 3 });
-    f.coordinator.advance(f.seed.occurrenceId, "awaiting_teammem");
+    assert.equal(f.store.getSession(f.seed.occurrenceId)?.state, "awaiting_teammem");
 
     const accept = (row: DeliveryRow) => f.store.acceptPublication({
       occurrenceId: row.occurrenceId,
@@ -1140,5 +1171,48 @@ test("outbox crash replay materializes READY from the persisted canonical row wi
     assert.equal(worker.enqueue({ artifact: value, serializedArtifact: serialized, artifactHash: hash, recordingPath: f.recordingPath }), bundle);
     assert.equal(f.store.pending()[0]!.stageToken, originalToken);
     assert.equal(readFileSync(path.join(bundle, "meeting.json"), "utf8"), serialized);
+  } finally { f.close(); }
+});
+
+test("D033 reconciliation repairs a consumed seeded legacy handoff and publishes only its exact receipt", () => {
+  const f = harness();
+  try {
+    const outboxDir = path.join(f.dir, "outbox"), receiptsDir = path.join(f.dir, "receipts");
+    mkdirSync(receiptsDir);
+    const value = artifact(f.seed, 1, false), hash = canonicalArtifactHash(value);
+    const workerFor = (store: typeof f.store) => createOutboxWorker({
+      recordingsDir: path.dirname(f.recordingPath), outboxDir, receiptsDir, journal: store,
+      clock: { now: () => ENDED_AT_MS + 2 }, random: () => 0,
+      session: { state: (id) => store.getSession(id)!.state, publish: () => undefined },
+      reconciliationEvidence: { purgeExpiredReconciliationEvidence: () => 0 },
+    });
+    const claim = f.store.claimBackfillSeedBuild({ nowMs: ENDED_AT_MS + 1,
+      claimToken: "a".repeat(32), operationBudgetMs: 1_000 })!;
+    const bundle = workerFor(f.store).enqueue({ artifact: value, serializedArtifact: canonicalArtifactJson(value),
+      artifactHash: hash, recordingPath: f.recordingPath, backfillAuthority: initialAuthority(claim.claimToken) });
+    writeFileSync(path.join(bundle, "audio.enc"), Buffer.alloc(0));
+    const legacy = new Database(f.filename);
+    try {
+      legacy.prepare("UPDATE sessions SET state='finalizing' WHERE occurrence_id=?").run(f.seed.occurrenceId);
+      legacy.prepare("UPDATE delivery_journal SET retry_reason='recovery_unavailable' WHERE occurrence_id=?").run(f.seed.occurrenceId);
+    } finally { legacy.close(); }
+    const reopened = openSessionStore({ filename: f.filename, nowMs: ENDED_AT_MS + 2 });
+    try {
+      const worker = workerFor(reopened);
+      const receipt = (artifactHash: string) => writeFileSync(path.join(receiptsDir, `${occurrencePathSegment(f.identity.occurrenceId)}.json`),
+        JSON.stringify({ artifact_hash: artifactHash, markdown_path: "meeting.md",
+          markdown_url: `https://example.test/vault/-/blob/${"a".repeat(40)}/meeting.md`,
+          occurrence_id: f.seed.occurrenceId, revision: 1, schema: "teammem-meeting-receipt/v1",
+          status: "published", vault_commit: "a".repeat(40) }) + "\n");
+      receipt(`sha256:${"0".repeat(64)}`); worker.reconcile();
+      assert.equal(reopened.getSession(f.seed.occurrenceId)?.state, "finalizing");
+      assert.deepEqual(reopened.notifications(), []);
+      receipt(hash); worker.reconcile(); worker.reconcile();
+      assert.equal(reopened.getSession(f.seed.occurrenceId)?.state, "published");
+      assert.equal(reopened.notifications().length, 1);
+      assert.equal(reopened.notifications()[0]?.recipientId, "ou_owner");
+      assert.equal(readFileSync(path.join(bundle, "audio.enc")).length, 0);
+      assert.equal(existsSync(f.recordingPath), true, "incomplete original retains its existing deadline");
+    } finally { reopened.close(); }
   } finally { f.close(); }
 });

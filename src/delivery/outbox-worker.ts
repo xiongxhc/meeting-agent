@@ -2,7 +2,7 @@
 // receipt is deliberately the only thing this worker ever does beyond it.
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
-import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
+import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, verifyConsumedMeetingBundle, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
 import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
 import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
@@ -181,16 +181,20 @@ export function createOutboxWorker(options: {
             if ((state === "published" || state === "notified") && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
             continue;
           }
-          if (current.retryReason === "recovery_unavailable") continue;
-          const artifact = recoverBundle(options, current);
-          if (artifact === null) continue;
-          if (now < current.nextRetryAtMs) continue;
-          const receipt = readPublicationReceipt({
+          const receipt = now < current.nextRetryAtMs ? null : readPublicationReceipt({
             receiptsDir: options.receiptsDir,
             occurrenceId: current.occurrenceId,
             revision: current.revision,
             artifactHash: current.artifactHash,
           });
+          // Repair only the measured D033 state: an exact receipt plus fully
+          // verified consumed-bundle metadata. Other terminal rows stay inert.
+          const consumedOnly = current.retryReason === "recovery_unavailable";
+          if (consumedOnly && receipt === null) continue;
+          const recovered = recoverBundle(options, current, consumedOnly);
+          if (recovered === null) continue;
+          const { artifact, consumed } = recovered;
+          if (now < current.nextRetryAtMs) continue;
           if (receipt === null) {
             const retryCount = current.retryCount + 1;
             options.journal.update({
@@ -204,7 +208,8 @@ export function createOutboxWorker(options: {
           // A receipt is evidence, not authorization to mutate an arbitrary
           // orchestration state. Only the legal edge and an interrupted replay
           // are allowed to record it or release encrypted evidence.
-          if (state !== "awaiting_teammem" && state !== "published" && state !== "notified") continue;
+          const publicationState = options.session.state(current.occurrenceId);
+          if (publicationState !== "awaiting_teammem" && publicationState !== "published" && publicationState !== "notified") continue;
           publicationAccepted = true;
           const published: DeliveryRow = {
             ...current,
@@ -217,6 +222,7 @@ export function createOutboxWorker(options: {
             occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
             publishedAtMs: now, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit,
             notification: notificationForArtifact(artifact, current, receipt.markdown_url, receipt.vault_commit),
+            ...(consumed ? { consumedInboxAudio: true as const } : {}),
           });
           if (current.transcriptComplete) {
             deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
@@ -294,17 +300,22 @@ function deleteOccurrenceEvidence(
 function recoverBundle(
   options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
   row: DeliveryRow,
-): SupportedTeamMemMeetingArtifact | null {
+  consumedOnly = false,
+): { artifact: SupportedTeamMemMeetingArtifact; consumed: boolean } | null {
   if (row.recoveryArtifact === null || row.stageToken === null) {
-    options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    if (!consumedOnly) options.journal.update({ ...row, retryReason: "recovery_unavailable" });
     return null;
   }
   try {
     const expected = path.join(path.resolve(options.outboxDir), occurrencePathSegment(row.occurrenceId as `${string}@${string}`), String(row.revision));
     if (row.bundlePath !== expected) throw new Error("recovery bundle path differs from durable journal");
     const artifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(row.recoveryArtifact));
+    if (artifact.occurrence_id !== row.occurrenceId || artifact.revision !== row.revision ||
+        artifact.transcript_complete !== row.transcriptComplete || Date.parse(artifact.ended_at) !== row.endedAtMs) {
+      throw new Error("recovery artifact differs from durable journal");
+    }
     const artifactHash = row.artifactHash;
-    const written = writeMeetingBundle({
+    const input = {
       recordingsDir: options.recordingsDir,
       outboxDir: options.outboxDir,
       artifact,
@@ -313,12 +324,19 @@ function recoverBundle(
       recordingPath: row.recordingPath,
       ...(row.recordingHandle === null || row.recordingHandle === undefined ? {} : { recordingHandle: row.recordingHandle }),
       stageToken: row.stageToken,
-    });
+    };
+    let written: string, consumed = false;
+    try { written = verifyConsumedMeetingBundle(input); consumed = true; }
+    catch {
+      if (consumedOnly) return null;
+      written = writeMeetingBundle(input);
+    }
     if (written !== row.bundlePath) throw new Error("recovered bundle path differs from durable journal");
-    return artifact;
+    options.journal.savePending(row);
+    return { artifact, consumed };
   } catch (error) {
     if ((error as Error).message === "recovery bundle path differs from durable journal") throw error;
-    options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    if (!consumedOnly) options.journal.update({ ...row, retryReason: "recovery_unavailable" });
     return null;
   }
 }

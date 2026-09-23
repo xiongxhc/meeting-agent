@@ -149,6 +149,7 @@ export function receiptOracle({ teammem, receiptsDir, artifact }) {
     checks.push({
       receipt: path.basename(receipt.filename),
       schema: receipt.value.schema,
+      markdownUrl: receipt.value.markdown_url,
       commitExists: exists.exit === 0,
       commitIsAncestorOfRef: ancestor.exit === 0,
       noteBytes: Buffer.byteLength(note),

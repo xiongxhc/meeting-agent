@@ -540,6 +540,9 @@ export type NotificationIntent =
   | { readonly terminalReason: "organizer_unresolved" | "notification_inputs_unavailable" };
 
 export type AcceptPublicationInput = {
+  /** D033: caller verified the consumed inbox metadata; the store must also
+   * revalidate original-recording ownership before accepting publication. */
+  readonly consumedInboxAudio?: true;
   readonly occurrenceId: string;
   readonly revision: number;
   readonly artifactHash: string;
