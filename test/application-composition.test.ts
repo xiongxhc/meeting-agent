@@ -33,6 +33,8 @@ import type { BridgeCommandMessageV2 } from "../src/contracts/bridge-session-v2.
 import { STANDALONE_SCHEMA, type StandaloneConfigV1 } from "../src/standalone-config.ts";
 import { RuntimeTestTransport } from "./lib/runtime-sdk.ts";
 import { envelope, scope, httpPeer, eventFrame, framePayload } from "./lib/feishu-fixtures.ts";
+// @ts-expect-error Test-only JavaScript setup helper has no public declaration.
+import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
 
 const NODE24 = "/opt/homebrew/opt/node@24/bin/node";
 const CHILD_FIXTURE = path.resolve("test/fixtures/composition-bridge-child.mjs");
@@ -694,7 +696,8 @@ test("a Runtime close rejection swallowed by the session is still visible as a s
   } finally { f.close(); }
 });
 
-test("actual gateway: the private launcher env is the allowlist, no provider or recording key reaches Meeting, and the offline gateway's refusal of the pinned online admission reaps the Runtime owner and the child", { timeout: 40_000 }, async () => {
+// Only the overall case adds the 60s launcher assessment setup budget.
+test("actual gateway: the private launcher env is the allowlist, no provider or recording key reaches Meeting, and the offline gateway's refusal of the pinned online admission reaps the Runtime owner and the child", { timeout: 40_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, async () => {
   const binary = process.env.MEETING_TEST_RUNTIME_GATEWAY;
   assert.ok(binary && path.isAbsolute(binary), "Prebuild the immutable Runtime gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
   const f = fixture();
@@ -721,6 +724,12 @@ exec ${quote(binary)} "$@"`;
   process.env.OPENAI_API_KEY_CANARY = "synthetic-canary";
   let app: ComposedApplication | undefined;
   try {
+    const env: Record<string, string> = {};
+    for (const name of RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST) {
+      const value = process.env[name];
+      if (value !== undefined) env[name] = value;
+    }
+    preflightLauncher(config.runtime.launcherPath, { env });
     app = await composeApplication(config, f.owner, { inviteIngress: false, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 } });
     await app.start();
     assert.equal((await app.discover()).launched, 1);

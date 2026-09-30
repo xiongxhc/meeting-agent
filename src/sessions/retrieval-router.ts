@@ -145,7 +145,7 @@ export type RetrievalRouter = {
 
 /** The session invalidated this turn after retrieval began. This is not a
  * retrieval failure: it is the expected fail-closed result of a provider
- * outage, overflow, terminal left, or disposal racing a stalled seed call. */
+ * outage, overflow, terminal left, or disposal racing context preparation. */
 export class RetrievalAuthorizationCancelled extends Error {
   constructor() {
     super("retrieval authorization was cancelled before runtime authorization");
@@ -209,7 +209,9 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
       };
 
       const contextExchanges = [{ user: queryText, assistant: context.text }];
-      await sink.seedConversationContext(contextExchanges, `meeting-agent:${invocation.segmentId}`);
+      // Active timed voice takes context on the scoped authorization itself.
+      // Only legacy untimed sinks expose completed-history seeding.
+      await sink.seedConversationContext?.(contextExchanges, `meeting-agent:${invocation.segmentId}`);
       if (answerOptions.mayAuthorize !== undefined && !answerOptions.mayAuthorize()) {
         throw new RetrievalAuthorizationCancelled();
       }

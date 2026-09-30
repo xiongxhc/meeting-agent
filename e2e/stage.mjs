@@ -11,6 +11,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 import { RUNTIME_PIN, TEAMMEM_SOURCE } from "./pins.mjs";
 
@@ -64,7 +65,7 @@ function stageBuiltApplication(repository, appDir) {
   return copies;
 }
 
-export function stage({ repository }) {
+export function stage({ repository, interactive = false }) {
   const root = realpathSync(mkdtempSync(path.join(realpathSync(tmpdir()), "meeting-e2e-")));
   chmodSync(root, 0o700);
 
@@ -73,6 +74,7 @@ export function stage({ repository }) {
     recordingsDir: "data/recordings", outboxDir: "data/outbox", receiptsDir: "data/receipts", teamVaultDir: "data/team-vault",
     runtimeRoot: "runtime", runtimeModelsDir: "runtime/models", runtimeKeyDir: "runtime/key",
     teammem: "teammem", evidence: "evidence",
+    traceBin: "trace-bin",
   });
 
   const copies = stageBuiltApplication(repository, directories.app);
@@ -85,6 +87,12 @@ export function stage({ repository }) {
     if (copied.exit !== 0 && run("/bin/cp", [source, destination]).exit !== 0) throw new Error(`staging ${source} failed`);
   }
   chmodSync(gatewayPath, 0o700);
+  const scriptedGatewayPath = path.join(directories.runtimeRoot, "conversation-runtime-gateway-scripted");
+  if (interactive) {
+    const copied = run("/bin/cp", [RUNTIME_PIN.scriptedGateway.path, scriptedGatewayPath]);
+    if (copied.exit !== 0) throw new Error("staging scripted gateway failed");
+    chmodSync(scriptedGatewayPath, 0o700);
+  }
 
   const keyPath = path.join(directories.runtimeKeyDir, "recording.key");
   const launcherPath = path.join(root, "runtime-launcher");
@@ -104,7 +112,9 @@ export ${RECORDING_KEY_ENV}
 ${PROVIDER_CREDENTIAL_ENV}=${quote(PROVIDER_CREDENTIAL)}
 export ${PROVIDER_CREDENTIAL_ENV}
 printf '%s\\n' "$$" >> ${quote(path.join(directories.runtimeRoot, "gateway-pids.txt"))}
-exec ${quote(gatewayPath)} "$@"
+${interactive ? `if [ "$#" -gt 0 ] && /usr/bin/grep -q '^\\[scripted_providers\\]' ${quote(gatewayConfigPath)}; then
+  exec /usr/bin/env -u ${RECORDING_KEY_ENV} -u ${PROVIDER_CREDENTIAL_ENV} ${quote(NODE24)} ${quote(path.join(directories.app, "e2e/gateway-observer.mjs"))} ${quote(scriptedGatewayPath)} ${quote(keyPath)} ${quote(path.join(directories.control, "runtime-events.ndjson"))} ${quote(path.join(directories.runtimeRoot, "gateway-pids.txt"))} "$@"
+fi\n` : ""}exec ${quote(gatewayPath)} "$@"
 `, { mode: 0o700 });
 
   // --- Feishu secret reference and the scripted client's static config ------
@@ -121,7 +131,7 @@ exec ${quote(gatewayPath)} "$@"
     // the fixed bound. Two hundred frames were tried and reverted: the child
     // paces one frame per 20 ms, and on a loaded machine only 101 of them fit
     // inside the fixed media-capture budget, which may not be widened.
-    captureFrameLimit: CAPTURE_FRAME_LIMIT,
+    captureFrameLimit: interactive ? 3000 : CAPTURE_FRAME_LIMIT,
     // One observed participant, so the closed-meeting attendance the artifact
     // contract requires comes from real bridge-observed UI events rather than
     // anything the harness writes into the artifact.
@@ -149,9 +159,37 @@ exec ${quote(gatewayPath)} "$@"
   };
   writeFileSync(standaloneConfigPath, JSON.stringify(standaloneConfig, null, 2), { mode: 0o600 });
 
+  let vaultRevision = null;
+  if (interactive) {
+    const vaultEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_COUNT: "0", GIT_TEMPLATE_DIR: "" };
+    for (const argv of [["init", directories.teamVaultDir], ["-C", directories.teamVaultDir, "config", "user.name", "Synthetic E2E"],
+      ["-C", directories.teamVaultDir, "config", "user.email", "e2e@example.invalid"]]) {
+      if (run("/usr/bin/git", argv, { env: vaultEnv }).exit !== 0) throw new Error("fixture vault initialization failed");
+    }
+    writeFileSync(path.join(directories.teamVaultDir, "orion.md"), "Orion launch code is violet.\n");
+    for (const argv of [["add", "."], ["commit", "-m", "synthetic vault fixture"]]) {
+      if (run("/usr/bin/git", ["-C", directories.teamVaultDir, ...argv], { env: vaultEnv }).exit !== 0) throw new Error("fixture vault commit failed");
+    }
+    vaultRevision = run("/usr/bin/git", ["-C", directories.teamVaultDir, "rev-parse", "HEAD"], { env: vaultEnv }).stdout.trim();
+    if (!/^[0-9a-f]{40}$/.test(vaultRevision)) throw new Error("fixture vault revision unavailable");
+    // Observe the actual read-only Git adapter, without replacing retrieval.
+    writeFileSync(path.join(directories.traceBin, "git"), `#!/bin/sh
+if [ "$1" = '-C' ] && [ "$2" = ${quote(directories.teamVaultDir)} ]; then
+  shift 2
+  case "$1" in
+    rev-parse) printf '%s\\n' '{"type":"vault_revision_read"}' >> ${quote(path.join(directories.control, "vault-reads.ndjson"))} || exit 70 ;;
+    ls-tree) printf '{"type":"vault_index_tree","revision":"%s"}\\n' "$5" >> ${quote(path.join(directories.control, "vault-reads.ndjson"))} || exit 70 ;;
+    show) printf '{"type":"vault_index_source","source":"%s"}\\n' "$2" >> ${quote(path.join(directories.control, "vault-reads.ndjson"))} || exit 70 ;;
+  esac
+  exec /usr/bin/git -C ${quote(directories.teamVaultDir)} "$@"
+fi
+exec /usr/bin/git "$@"
+`, { mode: 0o700 });
+  }
+
   return {
-    root, directories, copies,
-    gatewayPath, sdkTarball, launcherPath, gatewayConfigPath, launcherLog, keyPath,
+    root, directories, copies, vaultRevision,
+    gatewayPath, scriptedGatewayPath, sdkTarball, launcherPath, gatewayConfigPath, launcherLog, keyPath,
     appSecretFile, bridgeStaticConfigPath, standaloneConfigPath, standaloneConfig,
     entryPath: path.join(directories.app, "e2e/entry.mjs"),
     mainPath: path.join(directories.app, "dist/src/main.js"),

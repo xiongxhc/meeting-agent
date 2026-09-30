@@ -7,8 +7,8 @@
 //
 // RuntimeContextSink is a narrow, EXPLICITLY-DERIVED slice of
 // ConversationRuntimePort (src/ports/conversation-runtime.ts) --
-// `Pick<ConversationRuntimePort, "seedConversationContext" |
-// "authorizeVoiceResponse">`,
+// `Pick<ConversationRuntimePort, "authorizeVoiceResponse">`, with optional
+// completed-history seeding for legacy untimed callers,
 // not a separately-declared type that merely happens to line up. The two
 // files import each other's types (this file's SeededContext; that file's
 // ConversationRuntimePort) -- both are type-only imports, erased at compile
@@ -135,13 +135,16 @@ export type SeededContext = {
   readonly text: string;
 };
 
-/** The narrow sink the router calls: seed context, THEN authorize. See the
+/** The narrow sink the router calls: bound context, THEN authorize. See the
  * module header -- this is Pick<ConversationRuntimePort, ...>, not an
  * independently-declared shape. */
 export type RuntimeContextSink = Pick<
   ConversationRuntimePort,
-  "seedConversationContext" | "authorizeVoiceResponse"
-> & {
+  "authorizeVoiceResponse"
+> & Partial<Pick<ConversationRuntimePort, "seedConversationContext">> & {
+  // Legacy untimed callers may seed completed history before authorization.
+  // An active SDK voice session must receive context through its authorization
+  // command instead: global history mutation is explicitly forbidden there.
   /** The live SDK voice-session binding. Retrieval is created before join, so
    * the session supplies this through a getter that fails closed until its
    * injected test/local start handle is available. */

@@ -13,6 +13,8 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { RecordingAlignmentOwner } from "../src/sessions/recording-alignment.ts";
+// @ts-expect-error Test-only JavaScript setup helper has no public declaration.
+import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
 
 const DEADLINE_MS = 5_000;
 async function bounded<T>(work: Promise<T>): Promise<T> {
@@ -51,7 +53,8 @@ function encryptedChunks(filename: string): number {
   return count;
 }
 
-test("actual encrypted Runtime recording restarts with private authority and stages SDK pages into SQLite", { timeout: 30_000 }, async () => {
+// Only the overall case adds the 60s launcher assessment setup budget.
+test("actual encrypted Runtime recording restarts with private authority and stages SDK pages into SQLite", { timeout: 30_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, async () => {
   const binary = process.env.MEETING_TEST_RUNTIME_GATEWAY;
   assert.ok(binary && path.isAbsolute(binary), "Prebuild immutable Runtime4c97 gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
   const root = mkdtempSync(path.join(os.tmpdir(), "meeting-authenticated-alignment-"));
@@ -167,6 +170,9 @@ capture_format = "pcm_s16le/24000/1/20ms"
   let stage = "first-connect";
   let primaryFailure: unknown;
   try {
+    stage = "launcher-preflight";
+    preflightLauncher(wrapper, { env: {} });
+    stage = "first-connect";
     const first = await start();
     clients.push(first); const firstId = first.currentSessionId; assert.ok(firstId);
     stage = "timed-start";

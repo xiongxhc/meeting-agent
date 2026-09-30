@@ -20,7 +20,7 @@
 // Everything this produces is "scripted local application test readiness".
 
 import { clearInterval, setInterval } from "node:timers";
-import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { Agent as HttpAgent } from "node:http";
 import path from "node:path";
 import process from "node:process";
@@ -35,7 +35,8 @@ import { runStandalone } from "../dist/src/main.js";
 import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-config.js";
 
 import { startFixtureProvider } from "./fixture-provider.mjs";
-import { liveGatewayToml, postmeetingGatewayToml } from "./gateway-config.mjs";
+import { interactiveGatewayToml, liveGatewayToml, postmeetingGatewayToml } from "./gateway-config.mjs";
+import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { RESERVE_ID, SCOPE, inviteEnvelope, startFeishuPeer } from "./feishu-peer.mjs";
 
 const plan = JSON.parse(readFileSync(process.argv[process.argv.indexOf("--plan") + 1], "utf8"));
@@ -80,8 +81,11 @@ function selectPostmeetingGatewayConfig(fixtureEndpoint) {
 
 async function main() {
   writeFileSync(eventsPath, "");
-  writeFileSync(plan.gatewayConfigPath, liveGatewayToml({
+  const interactive = plan.interactive ? await startInteractiveProvider() : null;
+  const liveConfig = plan.interactive ? interactiveGatewayToml : liveGatewayToml;
+  writeFileSync(plan.gatewayConfigPath, liveConfig({
     recordingsDir: plan.runtimeRecordingsDir, keyEnv: plan.recordingKeyEnv, credentialEnv: plan.providerCredentialEnv,
+    ...(interactive ? { endpoint: interactive.endpoint, recognitionEndpoint: interactive.recognitionEndpoint } : {}),
   }), { mode: 0o600 });
 
   const provider = await startFixtureProvider();
@@ -113,6 +117,8 @@ async function main() {
       return state?.mediaConnected && state.framesSent >= plan.captureFrames ? state : null;
     }, { budgetMs: plan.budgets.captureMs, name: "media_capture" });
     event("media_capture", { framesSent: child.framesSent, endpoint: child.mediaEndpoint });
+
+    if (interactive) await driveInteractive(interactive);
 
     // 4. Swap the gateway deployment configuration for the post-meeting lane,
     //    then end the meeting positively.
@@ -189,12 +195,72 @@ async function main() {
   const exit = await run;
   event("run_standalone_exit", { exit });
   await provider.close();
+  await interactive?.close();
   await peer.close();
   writeFileSync(path.join(plan.controlDir, "summary.json"), JSON.stringify({
     exit, driveFailure, shuttingDown, trace,
     feishuRequests: peer.requests, feishuMessages: peer.messages, providerCalls: provider.calls,
+    interactiveCalls: interactive?.calls ?? [], runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
   }));
   process.exit(driveFailure === null ? exit : 70);
+}
+
+function runtimeEvents() {
+  try { return readFileSync(path.join(plan.controlDir, "runtime-events.ndjson"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); }
+  catch { return []; }
+}
+function vaultReads() {
+  try { return readFileSync(path.join(plan.controlDir, "vault-reads.ndjson"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); }
+  catch { return []; }
+}
+
+async function driveInteractive(provider) {
+  const state = () => readJson(path.join(plan.controlDir, "state.json"));
+  await waitFor(() => provider.ready, { budgetMs: 15_000, name: "recognition_ready" });
+  event("silent_capture", { frames: state().framesSent, disclosure: state().disclosure, languageCalls: provider.calls.length, playback: state().playback.length, authorizations: runtimeEvents().filter((entry) => entry.type === "response_authorized").length });
+  async function turn(text, authorized) {
+    const before = runtimeEvents().length;
+    provider.transcript(text);
+    const expected = authorized ? "response_authorized" : "response_skipped";
+    const transcript = await waitFor(() => runtimeEvents().slice(before).find((entry) => entry.type === "voice_transcript_final"), { budgetMs: 15_000, name: "transcript_final" });
+    const decision = await waitFor(() => runtimeEvents().slice(before).find((entry) => entry.type === expected && entry.segment_id === transcript.segment_id), { budgetMs: 15_000, name: expected });
+    if (authorized) await waitFor(() => runtimeEvents().slice(before).some((entry) => entry.event?.type === "turn_completed" && entry.event.turn_id === decision.turn_id), { budgetMs: 15_000, name: "turn_completed" });
+    return { segment: transcript.segment_id, turn: decision.turn_id ?? null };
+  }
+  await turn("Copper budget is seven. Copper budget is approved.", false);
+  await turn("Meetbot is useful.", false);
+  await turn("Meetbop, please summarize.", false);
+  event("name_gate_negative", { languageCalls: provider.calls.filter((entry) => entry.route === "language").length, playback: state().playback.length });
+  const revisionReads = () => vaultReads().filter((entry) => entry.type === "vault_revision_read").length;
+  let before = revisionReads();
+  const current = await turn("Meetbot, what is copper budget?", true);
+  event("current_question_answered", { ...current, vaultReadsBefore: before, vaultReadsAfter: revisionReads() });
+  before = revisionReads();
+  const vault = await turn("Meetbot, please explain Orion launch code history?", true);
+  event("vault_question_answered", { ...vault, vaultReadsBefore: before, vaultReadsAfter: revisionReads() });
+  renameSync(plan.teamVaultDir, `${plan.teamVaultDir}.unavailable`);
+  try {
+    const unavailable = await turn("Meetbot, please recall nebula archive password?", true);
+    event("unavailable_question_answered", unavailable);
+  } finally { renameSync(`${plan.teamVaultDir}.unavailable`, plan.teamVaultDir); }
+
+  const hold = path.join(plan.controlDir, "hold-playback"), barge = path.join(plan.controlDir, "barge");
+  writeFileSync(hold, "hold");
+  const beforePlayback = state().playback.length, beforeEvents = runtimeEvents().length;
+  provider.holdLanguage();
+  provider.transcript("Meetbot, please tell us a long story?");
+  await waitFor(() => state().playback.length > beforePlayback, { budgetMs: 15_000, name: "held_playback" });
+  const frame = state().playback.at(-1), captureBefore = state().framesSent;
+  provider.armBargeOnSpeech();
+  writeFileSync(barge, "voiced capture");
+  const flush = await waitFor(() => state().flushes.find((entry) => entry.generation === frame.generation), { budgetMs: 15_000, name: "barge_flush_ack" });
+  await waitFor(() => runtimeEvents().slice(beforeEvents).some((entry) => entry.event?.type === "turn_cancelled"), { budgetMs: 15_000, name: "turn_cancelled" });
+  provider.releaseLanguage();
+  rmSync(hold); rmSync(barge);
+  await waitFor(() => state().framesSent >= captureBefore + 10, { budgetMs: 5000, name: "capture_after_interrupt" });
+  const activityAt = provider.calls.find((entry) => entry.route === "barge_activity")?.at;
+  event("interruption_acknowledged", { generation: frame.generation, turn: frame.turn, activityAt, flushAt: flush.at,
+    scriptedLatencyMs: typeof activityAt === "number" ? flush.at - activityAt : null, captureBefore, captureAfter: state().framesSent });
 }
 
 main().catch((error) => {

@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 import { URL } from "node:url";
 
-// Reviewed Runtime commit b03b3d6 on feat/meeting-online-profile (tree bac9e388;
-// a commit will replace this id), not a copied codec or a source-path alias.
+// Reviewed Runtime commit 316a3f6 on feat/meeting-online-profile (tree dd73d353),
+// packaged as runtime14d. SDK bytes are unchanged from runtime14c.
 // Repin only together with a reviewed SDK package/consumer handoff.
 const expected = {
   "browser.d.ts": "8c184a30fc0876283f4af2158f2cb37d19549d4cbefe65eeef67e815303fd2c0",
@@ -34,6 +34,6 @@ try {
       typeof sdk.RuntimeClient?.prototype.startDrainableTimedVoiceSession !== "function") throw new Error();
   if (sdk.DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION !== 3 || sdk.TIMED_MEDIA_PROTOCOL_VERSION !== 2) throw new Error();
 } catch {
-  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime b03b3d6314f03855adc8f2d060283483737fc444 on feat/meeting-online-profile and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
+  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime 316a3f6017aa483bc13af845d1049924fac62d01 on feat/meeting-online-profile and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
   process.exitCode = 1;
 }

@@ -114,6 +114,11 @@ max_error_bytes = 65536
 ${recording(recordingsDir, keyEnv)}`;
 }
 
+/** Test-only entry; the production loader continues to refuse this table. */
+export function interactiveGatewayToml(options) {
+  return `${liveGatewayToml(options)}\n[scripted_providers]\nlanguage = "${options.endpoint}"\nrecognition = "${options.recognitionEndpoint}"\nspeech = "${options.endpoint}"\n`;
+}
+
 /** Offline profile with the accepted local fixture provider host. */
 export function postmeetingGatewayToml({ recordingsDir, keyEnv, modelsDir, fixtureEndpoint }) {
   return `schema_version = 3

@@ -22,7 +22,7 @@ import { connectMediaClient } from "../media-client.mjs";
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 if ((statSync(configPath).mode & 0o777) !== 0o600) process.exit(8);
-for (const leaked of ["RUNTIME_SECRET", "FEISHU_APP_SECRET", "E2E_RECORDING_KEY", "E2E_PROVIDER_CREDENTIAL", "NODE_OPTIONS"]) {
+for (const leaked of ["RUNTIME_SECRET", "FEISHU_APP_SECRET", "E2E_RUNTIME_RECORDING_KEY", "E2E_RECORDING_KEY", "E2E_PROVIDER_CREDENTIAL", "NODE_OPTIONS"]) {
   if (process.env[leaked] !== undefined) process.exit(7);
 }
 
@@ -33,7 +33,7 @@ const sessionId = binding.bridgeSessionId;
 const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, left: null, commands: [],
+  mediaClosedReason: null, left: null, commands: [], playback: [], flushes: [], disclosure: null,
 };
 const FRAME_MS = 20;
 const CLOCK_PAIR_EVERY = 50; // one second at 20 ms frames
@@ -64,7 +64,9 @@ async function streamSilence() {
   for (;;) {
     if (media === null || state.framesSent >= limit) return;
     try {
-      const number = await media.sendSilentFrame();
+      let voiced = false;
+      try { readFileSync(path.join(control, "barge")); voiced = true; } catch { /* silent baseline */ }
+      const number = await media.sendSilentFrame(480, 24_000, voiced);
       state.framesSent = number;
       if (number % CLOCK_PAIR_EVERY === 0) { pair += 1; await media.sendClockPair({ sequence: pair }); }
     } catch (error) {
@@ -123,6 +125,9 @@ lines.on("line", (line) => {
         media = await connectMediaClient({
           endpoint: lease.connectEndpoint, credential: lease.credential,
           sessionId: BigInt(lease.sessionId), bridgeSessionId: lease.bridgeSessionId,
+          holdPlayback: () => { try { readFileSync(path.join(control, "hold-playback")); return true; } catch { return false; } },
+          onPlayback: (detail) => { state.playback.push(detail); persist(); },
+          onFlush: (detail) => { state.flushes.push(detail); persist(); },
         });
         await media.sendEpoch();
         await media.sendClockPair();
@@ -137,6 +142,13 @@ lines.on("line", (line) => {
       emit({ type: "media_connected", endpoint: lease.connectEndpoint });
       result(command, "ok", null);
       capture = streamSilence();
+      return;
+    }
+    if (command.type === "post_disclosure") {
+      state.disclosure = "failed";
+      emit({ type: "chat_disclosure", outcome: "failed" });
+      result(command, "failed", "synthetic disclosure failure");
+      persist();
       return;
     }
     result(command, "rejected", "unsupported by the scripted client");

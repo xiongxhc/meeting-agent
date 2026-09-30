@@ -1,8 +1,6 @@
-// The ONE place the built end-to-end harness names the Runtime artefacts.
-// Swapping Runtime13 for Runtime14 is a two-line change here: point `root` at
-// `artifacts/runtime14/` and replace the two digests with the ones that
-// repin's `scripts/check-runtime-sdk.mjs` verifies. Nothing else in e2e/
-// mentions an artefact path.
+// The ONE place the built end-to-end harness names packaged Runtime artefacts.
+// Each reviewed profile pins the production gateway and SDK, with separate
+// feature-only scripted binaries where available.
 //
 // The digests are refused-on-mismatch, not advisory: `verifyPins` throws
 // before anything is staged, so a rebuilt or substituted gateway can never be
@@ -52,10 +50,52 @@ export const RUNTIME_PROFILES = {
       sha256: "0501d127fb90ef5a3ac41001a6b26e535f5d71e9400a53ecf31fd200442e0e06",
     },
   },
+  runtime14c: {
+    name: "runtime14c",
+    root: path.join(ARTIFACTS, "runtime14c"),
+    revision: "de8581a58a181ce7693177cae102ca617965c24d",
+    gateway: {
+      path: path.join(ARTIFACTS, "runtime14c/target/debug/conversation-runtime-gateway"),
+      sha256: "29a6f5dcb3ea464fefd5f0744185da5428606d60a17295f2c1543a12dbbde7f9",
+    },
+    scriptedGateway: {
+      path: path.join(ARTIFACTS, "runtime14c/target/debug/conversation-runtime-gateway-scripted"),
+      sha256: "ecc4c484414e63ec14888dd50ec5384fce548a3b0e462d1f54c9c38a32606858",
+    },
+    scriptedPeers: {
+      path: path.join(ARTIFACTS, "runtime14c/target/debug/conversation-runtime-scripted-peers"),
+      sha256: "869f2cdd283483a8ed70137c1d2dd75d9104bdc1c99f3d9cfded2825b961e2b2",
+    },
+    sdkTarball: {
+      path: path.join(ARTIFACTS, "runtime14c/stage/conversation-runtime-0.1.0.tgz"),
+      sha256: "0501d127fb90ef5a3ac41001a6b26e535f5d71e9400a53ecf31fd200442e0e06",
+    },
+  },
+  runtime14d: {
+    name: "runtime14d",
+    root: path.join(ARTIFACTS, "runtime14d"),
+    revision: "316a3f6017aa483bc13af845d1049924fac62d01",
+    gateway: {
+      path: path.join(ARTIFACTS, "runtime14d/target/debug/conversation-runtime-gateway"),
+      sha256: "cfc7517cdfb5fdf599b5fa70bbfa2befeefea0ee267a9f7ba2a7d12935bd4c08",
+    },
+    scriptedGateway: {
+      path: path.join(ARTIFACTS, "runtime14d/target/debug/conversation-runtime-gateway-scripted"),
+      sha256: "979598b3b45403eddfa8bea7b3adfc23e0136de37a08c39fc42f3cbcef81af6e",
+    },
+    scriptedPeers: {
+      path: path.join(ARTIFACTS, "runtime14d/target/debug/conversation-runtime-scripted-peers"),
+      sha256: "4fef2514e7023b339e5b61702a89cb1af79d7b8f4f8d6cb4b00100079c2da189",
+    },
+    sdkTarball: {
+      path: path.join(ARTIFACTS, "runtime14d/stage/conversation-runtime-0.1.0.tgz"),
+      sha256: "0501d127fb90ef5a3ac41001a6b26e535f5d71e9400a53ecf31fd200442e0e06",
+    },
+  },
 };
 
 /** The selected build. Swap this one line to move the whole harness. */
-export const RUNTIME_PIN = RUNTIME_PROFILES.runtime14b;
+export const RUNTIME_PIN = RUNTIME_PROFILES.runtime14d;
 
 /** The accepted TeamMem staged tree the wheel is built from (D003 scope). */
 export const TEAMMEM_SOURCE = {
@@ -73,8 +113,9 @@ export async function sha256File(filename) {
 /** Refuses to run on any mismatch with the recorded pin. */
 export async function verifyPins() {
   const measured = {};
-  for (const key of ["gateway", "sdkTarball"]) {
+  for (const key of ["gateway", "sdkTarball", "scriptedGateway", "scriptedPeers"]) {
     const pin = RUNTIME_PIN[key];
+    if (pin === undefined) continue;
     const sha256 = await sha256File(pin.path);
     if (sha256 !== pin.sha256) {
       throw new Error(`runtime pin mismatch for ${key}: expected ${pin.sha256}, measured ${sha256}`);

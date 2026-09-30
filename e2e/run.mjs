@@ -13,8 +13,7 @@
 // never evidence about a Feishu tenant, a provider, acoustic capture, Linux or
 // a remote split.
 
-import { Buffer } from "node:buffer";
-import { setTimeout } from "node:timers";
+import { clearTimeout, setTimeout } from "node:timers";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,18 +22,22 @@ import process from "node:process";
 import Database from "better-sqlite3";
 
 import { RUNTIME_PIN, TEAMMEM_SOURCE, verifyPins } from "./pins.mjs";
-import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, run, stage } from "./stage.mjs";
+import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, run, stage } from "./stage.mjs";
 import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
+
+import { keyPresent, negativeProofs } from "./negative-proofs.mjs";
+import { preflightLauncher } from "./launcher-preflight.mjs";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const LABEL = "scripted local application test readiness";
 
 function parseArguments(argv) {
-  const options = { out: null, keep: false, onlyRefusals: false };
+  const options = { out: null, keep: false, onlyRefusals: false, interactive: false };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--out") { options.out = path.resolve(argv[index + 1] ?? ""); index += 1; }
     else if (argv[index] === "--keep") options.keep = true;
     else if (argv[index] === "--only-refusals") options.onlyRefusals = true;
+    else if (argv[index] === "--interactive") options.interactive = true;
     else throw new Error(`unknown argument ${argv[index]}`);
   }
   if (options.out === null) throw new Error("usage: node e2e/run.mjs --out <dir> [--keep] [--only-refusals]");
@@ -74,6 +77,8 @@ function sourceTreeId() {
   const indexDir = mkdtempSync(path.join(tmpdir(), "meeting-e2e-index-"));
   const env = { ...process.env, GIT_INDEX_FILE: path.join(indexDir, "index") };
   try {
+    const baseline = step("git_read_tree", run("/usr/bin/git", ["-C", REPO, "read-tree", "HEAD"], { env }));
+    if (baseline.exit !== 0) throw new Error("source tree baseline failed");
     step("git_add_tree", run("/usr/bin/git", ["-C", REPO, "add", "-A", "."], { env }));
     const written = step("git_write_tree", run("/usr/bin/git", ["-C", REPO, "write-tree"], { env }));
     return written.stdout.trim();
@@ -139,7 +144,7 @@ function refusalRuns(staged) {
       process.stdin.resume();
       process.on("SIGTERM", () => { lock.close(); process.exit(0); });
     }, (error) => { process.stderr.write(String(error && error.message) + "\\n"); process.exit(3); });
-  `], { stdio: ["pipe", "pipe", "pipe"] });
+  `], { cwd: staged.root, stdio: ["pipe", "pipe", "pipe"] });
   let holderOutput = "";
   holder.stdout.on("data", (chunk) => { holderOutput += chunk; });
   let lockHeld = { exit: null, stderr: "", stdout: "", command: [], durationMs: 0, loadAverage: loadAverage() };
@@ -169,7 +174,7 @@ function refusalRuns(staged) {
 // The live run
 // ---------------------------------------------------------------------------
 
-async function liveRun({ staged, teammem, outDir }) {
+async function liveRun({ staged, teammem, outDir, interactive }) {
   const meeting = {
     eventId: "e2e-invite-1",
     providerMeetingId: "9007199254740993",
@@ -186,6 +191,9 @@ async function liveRun({ staged, teammem, outDir }) {
     gatewayConfigPath: staged.gatewayConfigPath,
     runtimeRecordingsDir: staged.directories.recordingsDir,
     runtimeModelsDir: staged.directories.runtimeModelsDir,
+    teamVaultDir: staged.directories.teamVaultDir,
+    vaultRevision: staged.vaultRevision,
+    interactive,
     recordingKeyEnv: RECORDING_KEY_ENV,
     providerCredentialEnv: PROVIDER_CREDENTIAL_ENV,
     meeting,
@@ -207,12 +215,13 @@ async function liveRun({ staged, teammem, outDir }) {
   const startedAt = Date.now();
   const child = spawn(NODE24, [staged.entryPath, "--plan", planPath], {
     cwd: staged.directories.app, stdio: ["ignore", "pipe", "pipe"],
-    env: { HOME: process.env.HOME, PATH: `/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8" },
+    env: { HOME: process.env.HOME, PATH: `${staged.directories.traceBin}:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8" },
   });
   let stdout = "", stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+  let childOutcome = null;
+  const exited = new Promise((resolve) => child.on("exit", (code, signal) => { childOutcome = { code, signal }; resolve(childOutcome); }));
 
   const eventsPath = path.join(staged.directories.control, "events.ndjson");
   let peakTree = [];
@@ -226,7 +235,8 @@ async function liveRun({ staged, teammem, outDir }) {
       const events = readEvents(eventsPath);
       const found = events.find((entry) => names.includes(entry.name));
       if (found) return found;
-      if (events.some((entry) => entry.name === "entry_failed")) {
+      if (childOutcome) throw new Error(`entry exited before ${names.join("/")}`);
+      if (events.some((entry) => entry.name === "entry_failed" || entry.name === "drive_failed")) {
         throw new Error(`entry failed before ${names.join("/")}: ${JSON.stringify(events.filter((entry) => entry.name.endsWith("failed")))}`);
       }
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${names.join("/")}`);
@@ -278,7 +288,9 @@ async function liveRun({ staged, teammem, outDir }) {
   } finally {
     if (alive(child.pid)) {
       writeFileSync(path.join(staged.directories.control, "teammem-done"), "done");
-      await Promise.race([exited, pause(180_000)]);
+      let timeout;
+      try { await Promise.race([exited, new Promise((resolve) => { timeout = setTimeout(resolve, 180_000); })]); }
+      finally { clearTimeout(timeout); }
       if (alive(child.pid)) child.kill("SIGKILL");
     }
   }
@@ -296,6 +308,42 @@ async function liveRun({ staged, teammem, outDir }) {
   writeFileSync(path.join(outDir, "events.ndjson"), readFileSync(eventsPath, "utf8"));
 
   return { meeting, plan, events, summary, childState, outcome, peakTree, teammemResult, receipt, artifact, stdout, stderr };
+}
+
+function interactiveOracles(live) {
+  const events = live.summary?.runtimeEvents ?? [], calls = live.summary?.interactiveCalls ?? [];
+  const language = calls.filter((entry) => entry.route === "language"), speech = calls.filter((entry) => entry.route === "speech");
+  const silence = live.events.find((entry) => entry.name === "silent_capture");
+  const negative = live.events.find((entry) => entry.name === "name_gate_negative");
+  check("silent_name_gate", silence?.frames >= 51 && silence?.disclosure === "failed" && silence?.languageCalls === 0 && silence?.playback === 0 && silence?.authorizations === 0 &&
+    negative?.languageCalls === 0 && negative?.playback === 0 &&
+    events.filter((entry) => entry.type === "response_skipped").length >= 3,
+    "background, incidental alias and near-name produced three actual skips, no language or playback before invocation");
+  const current = live.events.find((entry) => entry.name === "current_question_answered");
+  const vault = live.events.find((entry) => entry.name === "vault_question_answered");
+  const completed = (question) => {
+    if (!question?.turn || !question?.segment) return false;
+    const terminals = events.filter((entry) => ["turn_completed", "turn_cancelled", "turn_failed"].includes(entry.event?.type) && entry.event.turn_id === question.turn);
+    return events.filter((entry) => entry.type === "response_authorized" && entry.segment_id === question.segment && entry.turn_id === question.turn).length === 1 &&
+      terminals.length === 1 && terminals[0].event.type === "turn_completed" && live.childState?.playback.some((entry) => entry.turn === question.turn && !entry.held);
+  };
+  const indexed = (live.summary?.vaultReads ?? []).some((entry) => entry.type === "vault_index_source" && entry.source === `${live.plan.vaultRevision}:orion.md`);
+  check("current_meeting_grounding", completed(current) && current?.vaultReadsBefore === current?.vaultReadsAfter && language[0]?.grounded === "current" && language[0]?.currentFact && !language[0]?.vaultFact &&
+    speech[0]?.text === "Copper budget is seven.", "first actual provider request carries prior current-meeting fact and no vault fact; matching speech request");
+  check("vault_grounding", completed(vault) && indexed && vault?.vaultReadsAfter === vault?.vaultReadsBefore + 1 && language[1]?.grounded === "vault" && language[1]?.vaultFact &&
+    speech[1]?.text === "Orion launch code is violet.", "second actual request carries indexed fixture-vault fact; matching speech request");
+  check("vault_unavailable", completed(live.events.find((entry) => entry.name === "unavailable_question_answered")) && language[2]?.unavailable && speech[2]?.text === "Historical team memory is unavailable.",
+    "removing fixture checkout produces the shipped unavailable-history instruction and a matching spoken disclosure");
+  const interruption = live.events.find((entry) => entry.name === "interruption_acknowledged");
+  const terminals = events.filter((entry) => ["turn_completed", "turn_cancelled", "turn_failed"].includes(entry.event?.type) && entry.event.turn_id === interruption?.turn);
+  check("acknowledged_interruption", Boolean(interruption) && terminals.length === 1 && terminals[0].event.type === "turn_cancelled" &&
+    events.some((entry) => entry.type === "voice_barge_in" && entry.generation_id === interruption.generation && entry.turn_id === interruption.turn) &&
+    events.some((entry) => entry.type === "voice_timing" && entry.turn_id === interruption.turn && entry.milestone === "playback_flush_acknowledged") &&
+    live.childState?.flushes.some((entry) => entry.generation === interruption.generation) &&
+    !live.childState?.playback.some((entry) => entry.generation === interruption.generation && entry.afterFlush),
+    "held playable frame, matching actual barge and Runtime flush-acknowledged timing, same-generation peer ACK, one cancellation terminal, no post-flush output; scripted only");
+  check("capture_after_interrupt", interruption?.captureAfter >= interruption?.captureBefore + 10,
+    "ten actual captured frames continue after the acknowledged interruption");
 }
 
 function readArtifact(bundleDir) {
@@ -346,90 +394,6 @@ function reopenOracles(staged) {
 // Negative proofs
 // ---------------------------------------------------------------------------
 
-function walkFiles(root, skip = []) {
-  const files = [];
-  const visit = (directory) => {
-    let entries;
-    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const target = path.join(directory, entry.name);
-      if (skip.some((prefix) => target.startsWith(prefix))) continue;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) visit(target);
-      else if (entry.isFile()) files.push(target);
-    }
-  };
-  visit(root);
-  return files;
-}
-
-function negativeProofs({ staged, live, teammem }) {
-  const key = existsSync(staged.keyPath) ? readFileSync(staged.keyPath, "utf8").trim() : null;
-  const secret = readFileSync(staged.appSecretFile, "utf8").trim();
-  const scanned = [
-    ...walkFiles(staged.directories.recordingsDir),
-    ...walkFiles(staged.directories.outboxDir),
-    ...walkFiles(staged.directories.receiptsDir),
-    ...walkFiles(staged.directories.control),
-    ...walkFiles(staged.directories.teammem, [path.join(staged.directories.teammem, "src"), path.join(staged.directories.teammem, "wheel-venv"), path.join(staged.directories.teammem, "wheelhouse")]),
-    ...[staged.launcherLog, teammem?.paths.envFile].filter((file) => file && existsSync(file)),
-  ];
-  const leaks = { key: [], secret: [], credential: [] };
-  const needles = [
-    ["key", key], ["secret", secret], ["credential", PROVIDER_CREDENTIAL],
-  ].filter(([, value]) => typeof value === "string" && value.length >= 16);
-  for (const file of scanned) {
-    let bytes;
-    try { bytes = readFileSync(file); } catch { continue; }
-    for (const [name, needle] of needles) {
-      if (bytes.includes(Buffer.from(needle, "utf8"))) leaks[name].push(file);
-    }
-  }
-  // The harness's own evidence copies are scanned too, after they are written.
-  const envLeaks = [];
-  for (const source of [live.summary?.trace ? null : null]) void source;
-  const childEnvKeys = live.childState?.envKeys ?? [];
-  for (const name of [RECORDING_KEY_ENV, PROVIDER_CREDENTIAL_ENV, "FEISHU_APP_SECRET"]) {
-    if (childEnvKeys.includes(name)) envLeaks.push(`bridge child environment carried ${name}`);
-  }
-
-  // Plaintext audio: a silent pcm_s16le frame is 960 NUL bytes; neither the
-  // encrypted recording nor the published audio may contain such a run, and
-  // neither may carry a WAV/RIFF container header.
-  const audioFiles = [
-    ...walkFiles(staged.directories.recordingsDir),
-    ...(live.artifact?.audioPath ? [live.artifact.audioPath] : []),
-    ...walkFiles(teammem?.paths.audioStore ?? staged.directories.recordingsDir),
-  ];
-  const pcmMarkers = [];
-  const zeroRun = Buffer.alloc(960);
-  for (const file of new Set(audioFiles)) {
-    let bytes;
-    try { bytes = readFileSync(file); } catch { continue; }
-    if (bytes.subarray(0, 4).toString("latin1") === "RIFF" || bytes.includes(Buffer.from("WAVEfmt "))) pcmMarkers.push(`${file}: container header`);
-    if (bytes.includes(zeroRun)) pcmMarkers.push(`${file}: 960-byte silent PCM run`);
-  }
-
-  const pids = [];
-  if (existsSync(staged.gatewayPidsPath)) {
-    for (const line of readFileSync(staged.gatewayPidsPath, "utf8").split("\n").map((value) => value.trim()).filter(Boolean)) pids.push({ role: "gateway", pid: Number(line) });
-  }
-  if (live.childState?.pid) pids.push({ role: "bridge_child", pid: live.childState.pid });
-  const orphans = pids.filter((entry) => alive(entry.pid));
-
-  const trace = live.summary?.trace ?? [];
-  const storeClosedAt = trace.lastIndexOf("shutdown_store_closed");
-  const afterStoreClose = storeClosedAt === -1 ? [] : trace.slice(storeClosedAt + 1);
-
-  const identities = new Set();
-  for (const row of live.reopen?.rows.sessions ?? []) if (row.occurrence_id) identities.add(row.occurrence_id);
-  for (const row of live.reopen?.rows.delivery ?? []) if (row.occurrence_id) identities.add(row.occurrence_id);
-  if (live.artifact?.occurrenceId) identities.add(live.artifact.occurrenceId);
-  for (const entry of live.receipt?.checks ?? []) if (entry.occurrenceMatchesArtifact === false) identities.add("receipt-mismatch");
-
-  return { scannedFiles: scanned.length, leaks, envLeaks, pcmMarkers, pids, orphans, afterStoreClose, identities: [...identities] };
-}
-
 // ---------------------------------------------------------------------------
 
 async function main() {
@@ -445,7 +409,7 @@ async function main() {
   if (build.exit !== 0) throw new Error(`npm run build failed: ${build.stderr.slice(0, 2000)}`);
   const treeId = sourceTreeId();
 
-  const staged = stage({ repository: REPO });
+  const staged = stage({ repository: REPO, interactive: options.interactive });
   let teammem = null;
   let live = { events: [], summary: null, childState: null, outcome: { code: null }, peakTree: [], teammemResult: null, receipt: null, artifact: null, reopen: null };
 
@@ -457,9 +421,20 @@ async function main() {
       for (const entry of teammem.steps) steps.push({ name: entry.name, command: entry.command, exit: entry.exit, durationMs: entry.durationMs, loadAverage: entry.loadAverage });
       oracle("teammem_wheel", "pass", `${path.basename(teammem.wheel)} sha256 ${teammem.wheelSha256}`);
       refusalRuns(staged);
-      const result = await liveRun({ staged, teammem, outDir: options.out });
+      // Complete macOS executable/temporary-script assessment before the
+      // unchanged protocol/admission deadlines. No arguments makes Runtime
+      // refuse before configuration or provider startup; each child is reaped.
+      for (const executable of [staged.gatewayPath, ...(options.interactive ? [staged.scriptedGatewayPath] : []), staged.launcherPath]) {
+        const prepared = preflightLauncher(executable, { env: {
+          HOME: process.env.HOME, PATH: `${staged.directories.traceBin}:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`,
+          TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8",
+        } });
+        step("runtime_argument_refusal_preflight", { ...prepared, command: [executable], loadAverage: loadAverage() });
+      }
+      const result = await liveRun({ staged, teammem, outDir: options.out, interactive: options.interactive });
       live = { ...live, ...result };
       live.reopen = reopenOracles(staged);
+      if (options.interactive) interactiveOracles(live);
 
       // --- spine oracles ---------------------------------------------------
       const named = (name) => live.events.some((entry) => entry.name === name);
@@ -477,14 +452,14 @@ async function main() {
       check("media_connected", live.childState?.mediaConnected === true,
         `endpoint ${live.childState?.mediaEndpoint}`);
       check("capture_recorded", (live.childState?.framesSent ?? 0) >= CAPTURE_FRAME_LIMIT && readdirSync(staged.directories.recordingsDir).some((name) => name.endsWith(".crsr")),
-        `${live.childState?.framesSent} silent frames; recordings ${JSON.stringify(readdirSync(staged.directories.recordingsDir))}`);
+        `${live.childState?.framesSent} produced capture frames; recordings ${JSON.stringify(readdirSync(staged.directories.recordingsDir))}`);
       check("meeting_ended", live.childState?.left === "ended", `bridge-observed terminal ${live.childState?.left}`);
       check("finalized_seed", (live.reopen?.rows.seeds ?? []).length === 1, JSON.stringify(live.reopen?.rows.seeds ?? []));
       const alignmentPages = live.reopen?.rows.alignmentPages ?? [];
       check("alignment_stored", alignmentPages.length > 0,
         `stored pages ${JSON.stringify(alignmentPages)}`);
       oracle("alignment_page_budget", "pass",
-        `largest stored page ${Math.max(0, ...alignmentPages.map((page) => page.storedBytes))} bytes against the private re-encoding bound of 2x the SDK's MAX_ALIGNMENT_PAGE_BYTES (D032 §1); the scripted capture runs ${CAPTURE_FRAME_LIMIT} frames, the length that refused every page before the fix`);
+        `largest stored page ${Math.max(0, ...alignmentPages.map((page) => page.storedBytes))} bytes against the private re-encoding bound of 2x the SDK's MAX_ALIGNMENT_PAGE_BYTES (D032 §1); this run produced ${live.childState?.framesSent} capture frames; the historical ${CAPTURE_FRAME_LIMIT}-frame fixture refused every page before the fix`);
 
       const buildReason = (live.reopen?.rows.seedLifecycle ?? [])[0]?.initial_build_last_reason ?? null;
       if (live.artifact !== null) {
@@ -536,12 +511,14 @@ async function main() {
     }
 
     // --- negative proofs ---------------------------------------------------
-    const proofs = options.onlyRefusals ? null : negativeProofs({ staged, live, teammem });
+    // Write all emitted artifacts/logs first so the security scan covers them.
+    writeBundle(options.out, { options, pins, treeId, staged, teammem, live });
+    const proofs = options.onlyRefusals ? null : negativeProofs({ staged, live, teammem, outDir: options.out });
     if (proofs) {
       check("no_key_or_plaintext_audio",
         proofs.leaks.key.length === 0 && proofs.leaks.secret.length === 0 && proofs.leaks.credential.length === 0
-        && proofs.envLeaks.length === 0 && proofs.pcmMarkers.length === 0,
-        `scanned ${proofs.scannedFiles} files; key hits ${proofs.leaks.key.length}; secret hits ${proofs.leaks.secret.length}; credential hits ${proofs.leaks.credential.length}; env ${JSON.stringify(proofs.envLeaks)}; pcm ${JSON.stringify(proofs.pcmMarkers)}`);
+        && proofs.scanErrors.length === 0 && keyPresent(staged) && proofs.permissions.every((entry) => entry.valid) && proofs.envLeaks.length === 0 && proofs.pcmMarkers.length === 0,
+        `scanned ${proofs.scannedFiles} files; scan errors ${proofs.scanErrors.length}; key hits ${proofs.leaks.key.length}; secret hits ${proofs.leaks.secret.length}; credential hits ${proofs.leaks.credential.length}; env ${JSON.stringify(proofs.envLeaks)}; pcm ${JSON.stringify(proofs.pcmMarkers)}`);
       check("no_orphan_process", proofs.orphans.length === 0, `recorded pids ${JSON.stringify(proofs.pids)}; still alive ${JSON.stringify(proofs.orphans)}`);
       check("no_closed_store_callback", proofs.afterStoreClose.length === 0, `codes after shutdown_store_closed: ${JSON.stringify(proofs.afterStoreClose)}`);
       check("single_occurrence_identity", proofs.identities.length === 1, `occurrence identities observed: ${JSON.stringify(proofs.identities)}`);
@@ -568,8 +545,10 @@ function writeNegativeProofs(outDir, { proofs, staged, live }) {
     "",
     "## No key, secret or provider credential in Meeting, the bridge or TeamMem",
     "",
-    `Scanned ${proofs.scannedFiles} files under the recordings, outbox, receipts, bridge-control, TeamMem and launcher-log paths for the run's synthetic Runtime recording key, the Feishu app-secret bytes and the synthetic provider credential.`,
+    `Scanned ${proofs.scannedFiles} files under the recordings, outbox, receipts, bridge-control, emitted evidence, TeamMem and launcher-log paths for the run's synthetic Runtime recording key, the Feishu app-secret bytes and the synthetic provider credential.`,
     "",
+    `- scan errors: ${proofs.scanErrors.length}`,
+    `- key/root permissions and ownership: ${proofs.permissions.every((entry) => entry.valid) ? "verified" : "failed"}`,
     `- recording key occurrences: ${proofs.leaks.key.length}`,
     `- app secret occurrences: ${proofs.leaks.secret.length}`,
     `- provider credential occurrences: ${proofs.leaks.credential.length}`,
@@ -578,7 +557,7 @@ function writeNegativeProofs(outDir, { proofs, staged, live }) {
     "",
     "## No plaintext audio",
     "",
-    "A silent pcm_s16le/24000/1 20 ms frame is 960 NUL bytes. Neither the encrypted recording nor the published audio may contain such a run or a WAV container header.",
+    "A silent pcm_s16le/24000/1 20 ms frame is 960 NUL bytes. Neither the encrypted recording nor the published audio may contain such a run, the scripted speech/voiced-capture PCM markers, or a WAV container header.",
     "",
     proofs.pcmMarkers.length === 0 ? "- no marker found" : proofs.pcmMarkers.map((marker) => `- ${marker}`).join("\n"),
     "",
@@ -614,14 +593,14 @@ function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
   const bundle = {
     label: LABEL,
     generatedAt: new Date().toISOString(),
-    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : [])],
-    mode: options.onlyRefusals ? "refusals" : "full",
+    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : []), ...(options.interactive ? ["--interactive"] : [])],
+    mode: options.onlyRefusals ? "refusals" : options.interactive ? "interactive" : "full",
     repository: REPO,
     sourceTreeId: treeId,
     runtimePins: { ...pins, name: RUNTIME_PIN.name, revision: RUNTIME_PIN.revision },
     teammem: teammem === null ? null : { source: TEAMMEM_SOURCE, wheel: path.basename(teammem.wheel), wheelSha256: teammem.wheelSha256, envFile: path.basename(teammem.paths.envFile) },
     gatewayConfigurations: {
-      live: "online profile, unreachable .invalid providers (the only profile the shipped client admits)",
+      live: options.interactive ? "online profile; feature-only scripted gateway, loopback external transports, byte-preserving control observation" : "online profile, unreachable .invalid providers (the only profile the shipped client admits)",
       postmeeting: "offline profile, local fixture provider host, same recording directory and key",
     },
     privateRoot: staged.root,
@@ -632,7 +611,10 @@ function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
     feishuRequests: live.summary?.feishuRequests ?? [],
     feishuMessages: (live.summary?.feishuMessages ?? []).map((message) => ({ uuid: message.uuid, recipientKnown: typeof message.receiveId === "string", textBytes: message.textBytes })),
     providerCalls: live.summary?.providerCalls ?? [],
-    bridgeChild: live.childState === null ? null : { pid: live.childState.pid, joined: live.childState.joined, mediaConnected: live.childState.mediaConnected, framesSent: live.childState.framesSent, left: live.childState.left, commands: live.childState.commands },
+    interactiveCalls: live.summary?.interactiveCalls ?? [],
+    runtimeEvents: live.summary?.runtimeEvents ?? [],
+    vaultReads: live.summary?.vaultReads ?? [],
+    bridgeChild: live.childState === null ? null : { pid: live.childState.pid, joined: live.childState.joined, mediaConnected: live.childState.mediaConnected, framesSent: live.childState.framesSent, left: live.childState.left, commands: live.childState.commands, playback: live.childState.playback, flushes: live.childState.flushes },
     processTreeAtPeak: live.peakTree,
     stateDatabase: live.reopen,
     artifact: live.artifact === null ? null : { files: live.artifact.files, revision: live.artifact.revision, hash: live.artifact.hash, occurrenceId: live.artifact.occurrenceId, manifest: live.artifact.manifest },

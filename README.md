@@ -37,12 +37,19 @@ SHIPPED standalone admission and composition against scripted local peers:
 export PATH=/opt/homebrew/opt/node@24/bin:$PATH
 npm run e2e -- --out /absolute/evidence/dir            # add --keep to retain the temp root
 npm run e2e -- --out /absolute/evidence/dir --only-refusals
-npm run test:e2e                                    # full spine and refusal assertions
+npm run e2e -- --out /absolute/evidence/interactive --interactive
+npm run test:e2e                                    # sequential spines and focused peer checks
 ```
 
 The application spine is excluded from `npm test`. Run it separately on an idle
 machine, with only one spine running at a time; it builds and launches the whole
-application and its peers.
+application and its peers. Do not overlap it with the full Node suite.
+
+The timed Runtime integration tests and spine assess each private launcher through a no-argument
+refusal before timed startup. This lets macOS complete executable assessment
+during setup. The child exits before configuration or provider startup; existing
+connection, media and cleanup deadlines remain unchanged. Test case windows
+include a separate 60-second setup allowance.
 
 It needs the pinned Runtime gateway and SDK tarball recorded in `e2e/pins.mjs`,
 and refuses to run when either SHA256 differs. Network is used only to build and
@@ -68,6 +75,17 @@ runs the same gateway binary in the `offline` profile against a local fixture
 provider so the alignment traversal and the one synthesis call are answered
 rather than invented.
 
+`--interactive` selects the separately packaged feature-only scripted gateway
+for the live lane, with loopback Feishu and speech/language transports. It drives
+the shipped name gate and current-first/vault retrieval, then interrupts a held
+active response through recognizer speech activity and matching playback flush.
+The evidence checks real framed events, segment/turn bindings, fixture Git reads,
+playback ACKs, capture progress, secret isolation and child cleanup. This is a
+bounded interactive smoke checkpoint. Full L1–L3 acceptance still requires
+final-playback races, durable recording/gap checks, repeated close and the native
+credential-expiry/reconnect cuts recorded in the acceptance matrix. The default
+production gateway and its provider validation remain separate.
+
 ## Running the tests
 
 Node24 is the verified local environment. SDK-dependent test/typecheck/build/start
@@ -79,7 +97,7 @@ prerequisite optional. `npm ci` removes a prior local bootstrap.
 
 Use an existing Runtime checkout path, but package only the immutable reviewed
 tree; never copy a concurrent worktree's `dist` or install a source alias. The
-pin is Runtime commit `b03b3d6` (tree `bac9e388`) on `feat/meeting-online-profile`,
+pin is Runtime commit `316a3f6` (tree `dd73d353`) on `feat/meeting-online-profile`,
 a reviewed local commit not yet on a reviewed remote.
 
 ```sh
@@ -87,7 +105,7 @@ export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if need
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive b03b3d6314f03855adc8f2d060283483737fc444 | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive 316a3f6017aa483bc13af845d1049924fac62d01 | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
@@ -116,7 +134,7 @@ before opening the store; no helper changes permissions on existing user paths.
 Recording/provider keys and plaintext audio remain exclusively outside Meeting.
 
 The hardware-free encrypted restart test also needs a prebuilt gateway from that
-same immutable source, built from the same `b03b3d6` commit staged above. Build
+same immutable source, built from the same `316a3f6` commit staged above. Build
 it before starting the unchanged test deadlines:
 
 ```sh

@@ -49,6 +49,10 @@ test("actual SDK/v2 session retains synchronous join evidence and authorizes tex
       }
     } };
   transport.onSend = (command) => {
+    if (command.type === "seed_conversation_context") {
+      transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "conversation history cannot be seeded while a voice session is active" } });
+      return;
+    }
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId,
       ...(command.type === "authorize_voice_response" ? { turn_id: "99" } : {}) });
     if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
@@ -75,6 +79,10 @@ test("actual SDK/v2 session retains synchronous join evidence and authorizes tex
         mapping_quality: "nominal_frame_endpoint_interpolation", capture_uncertainty_ns: null, known_rounding_allowance_ns: "1" } } });
     await setImmediate(); await session.settled();
     assert.ok(transport.commands.some((command) => command.type === "authorize_voice_response" && command.segmentId === "9"));
+    assert.equal(transport.commands.some((command) => command.type === "seed_conversation_context"), false, "active voice receives context only through its segment-scoped authorization");
+    const authorization = transport.commands.find((command) => command.type === "authorize_voice_response" && command.segmentId === "9");
+    assert.ok(authorization?.type === "authorize_voice_response");
+    assert.match(authorization.contextExchanges[0]?.assistant ?? "", /Historical team memory/);
     assert.equal(results.length, 0);
     assert.equal(store.readTimedFinal(binding, "", 1000)?.event.text, "Meetbot, please summarize");
     emit({ type: "ui_snapshot", snapshotSequence: 3, state: "ui_exact", feishuUserId: "person", reason: null, barrierBefore: null, observationTiming: timing("2000000000", "2000000001") });

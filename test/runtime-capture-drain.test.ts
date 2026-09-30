@@ -13,8 +13,12 @@ import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { createCoordinator } from "../src/sessions/coordinator.ts";
 import type { CaptureDrain } from "../src/contracts/bridge-session-v1.ts";
+// @ts-expect-error Test-only JavaScript setup helper has no public declaration.
+import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
 
 const DEADLINE_MS = 15_000;
+// Only the overall case adds the 60s launcher assessment setup budget.
+const CASE_TIMEOUT_MS = 60_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS;
 async function bounded<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -178,6 +182,14 @@ max_outbound_queue_bytes = 262144
 max_outbound_queue_ms = 10000
 capture_format = "pcm_s16le/24000/1/20ms"
 `, { mode: 0o600 });
+  try {
+    preflightLauncher(wrapper, { env: {} });
+  } catch (error) {
+    health.closeAllConnections();
+    await new Promise<void>((resolve) => health.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
   const transport = await StdioGatewayTransport.start({ gatewayPath: wrapper, configPath: config, protocolVersion: 4 });
   const client = await bounded(RuntimeClient.connect(transport, 4));
   /** The gateway's own refusal, so a dead child is diagnosed rather than
@@ -314,7 +326,7 @@ async function capture(label: string, finish: "send" | "withhold") {
   }
 }
 
-test("a confirmed media-v3 drain is persisted with the exact acknowledged boundary", { timeout: 60_000 }, async () => {
+test("a confirmed media-v3 drain is persisted with the exact acknowledged boundary", { timeout: CASE_TIMEOUT_MS }, async () => {
   const result = await capture("confirmed", "send");
   assert.equal(result.recording?.captureIntegrity, "confirmed");
   assert.deepEqual(result.recording?.captureDrain, drainOf(result.boundary));
@@ -326,7 +338,7 @@ test("a confirmed media-v3 drain is persisted with the exact acknowledged bounda
   assert.ok(result.chunksAfterFinalize >= result.chunksBeforeFinish);
 });
 
-test("a withheld capture-finish leaves the recording intact and the drain unconfirmed", { timeout: 60_000 }, async () => {
+test("a withheld capture-finish leaves the recording intact and the drain unconfirmed", { timeout: CASE_TIMEOUT_MS }, async () => {
   const result = await capture("withheld", "withhold");
   assert.equal(result.recording?.captureIntegrity, "unconfirmed");
   assert.deepEqual(result.recording?.captureDrain, { drain: "unconfirmed", reason: "drain_not_attempted", boundary: null });
@@ -345,7 +357,7 @@ test("a withheld capture-finish leaves the recording intact and the drain unconf
  * accepted MED2 framing on a v3 lease, a stale producer would silently record
  * on a lease whose drain it can never confirm.
  */
-test("a MED2 producer cannot authenticate on the v3 lease the drainable start issues", { timeout: 60_000 }, async () => {
+test("a MED2 producer cannot authenticate on the v3 lease the drainable start issues", { timeout: CASE_TIMEOUT_MS }, async () => {
   const boot = await gateway("med2-refused");
   let media: Socket | undefined;
   try {

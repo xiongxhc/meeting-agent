@@ -404,7 +404,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       }
       return runtimeSessionId;
     },
-    seedConversationContext: runtime.seedConversationContext.bind(runtime),
+    // Runtime refuses global completed-history seeding during active voice.
+    // Timed SDK sessions attach the same bounded context atomically to the
+    // segment-scoped authorizeVoiceResponse command below.
+    ...(options.timedEvidence ? {} : { seedConversationContext: runtime.seedConversationContext.bind(runtime) }),
     authorizeVoiceResponse: runtime.authorizeVoiceResponse.bind(runtime),
   };
 

@@ -44,7 +44,7 @@ function record(kind, sessionId, body) {
   return Buffer.concat([Buffer.from("MED3"), Buffer.from([3, kind]), u32(payload.length), payload]);
 }
 
-export async function connectMediaClient({ endpoint, credential, sessionId, bridgeSessionId, clockDomainId = "e2e-clock", captureEpoch = 1 }) {
+export async function connectMediaClient({ endpoint, credential, sessionId, bridgeSessionId, clockDomainId = "e2e-clock", captureEpoch = 1, holdPlayback = () => false, onPlayback = () => {}, onFlush = () => {} }) {
   const url = new URL(endpoint);
   if (url.protocol !== "tcp:") throw new Error(`unsupported media endpoint ${url.protocol}`);
   const socket = net.connect({ host: url.hostname, port: Number(url.port) });
@@ -59,7 +59,47 @@ export async function connectMediaClient({ endpoint, credential, sessionId, brid
   socket.write(Buffer.concat([Buffer.from("MED3"), Buffer.from([3, 1]), u32(body.length), body]));
 
   const inbound = { bytes: 0, packets: 0 };
-  socket.on("data", (chunk) => { inbound.bytes += chunk.length; inbound.packets += 1; });
+  let pending = Buffer.alloc(0);
+  const flushed = new Set();
+  const ack = (kind, body) => socket.write(Buffer.concat([Buffer.from("MED1"), Buffer.from([1, kind]), body]));
+  socket.on("data", (chunk) => {
+    inbound.bytes += chunk.length; inbound.packets += 1;
+    pending = Buffer.concat([pending, chunk]);
+    while (pending.length >= 6) {
+      if (pending.subarray(0, 6).equals(Buffer.from("MED3\x03\x09"))) {
+        if (pending.length < 10) return;
+        const length = 10 + pending.readUInt32BE(6);
+        if (pending.length < length) return;
+        if (pending.readBigUInt64BE(10) !== sessionId || pending.subarray(19, length).toString() !== bridgeSessionId) {
+          socket.destroy(new Error("media authentication binding mismatch")); return;
+        }
+        pending = pending.subarray(length);
+        continue;
+      }
+      if (pending.subarray(0, 4).toString() !== "MED1" || pending[4] !== 1) { socket.destroy(new Error("unexpected media response")); return; }
+      const kind = pending[5];
+      const length = kind === 9 ? 14 : kind === 4 ? 22 : kind === 2 && pending.length >= 66 ? 66 + pending.readUInt32BE(62) : null;
+      if (kind !== 9 && kind !== 4 && kind !== 2) { socket.destroy(new Error("unexpected media kind")); return; }
+      if (length === null || pending.length < length) return;
+      const packet = pending.subarray(0, length); pending = pending.subarray(length);
+      if (packet.readBigUInt64BE(kind === 2 ? 7 : 6) !== sessionId) { socket.destroy(new Error("media session mismatch")); return; }
+      if (kind === 2) {
+        const sequence = packet.readBigUInt64BE(15), generation = packet.readBigUInt64BE(31);
+        const detail = { sequence: sequence.toString(), generation: generation.toString(), turn: packet.readBigUInt64BE(23).toString(),
+          bytes: packet.readUInt32BE(62), held: holdPlayback(), afterFlush: flushed.has(generation.toString()), at: Date.now() };
+        onPlayback(detail);
+        if (!detail.afterFlush) {
+          ack(3, Buffer.concat([u64(sessionId), u64(sequence), Buffer.from([1])]));
+          if (!detail.held) ack(3, Buffer.concat([u64(sessionId), u64(sequence), Buffer.from([2])]));
+        }
+      } else if (kind === 4) {
+        const generation = packet.readBigUInt64BE(14);
+        flushed.add(generation.toString());
+        ack(5, Buffer.concat([u64(sessionId), u64(generation)]));
+        onFlush({ generation: generation.toString(), at: Date.now() });
+      }
+    }
+  });
   let closedReason = null;
   socket.on("close", () => { closedReason ??= "closed"; });
   socket.on("error", (error) => { closedReason = error.message; });
@@ -84,9 +124,10 @@ export async function connectMediaClient({ endpoint, credential, sessionId, brid
       ])));
     },
     /** One 20 ms silent pcm_s16le/24000/1 frame. */
-    async sendSilentFrame(sampleCount = 480, sampleRateHz = 24_000) {
+    async sendSilentFrame(sampleCount = 480, sampleRateHz = 24_000, voiced = false) {
       sequence += 1;
       const payload = Buffer.alloc(sampleCount * 2);
+      if (voiced) for (let i = 0; i < sampleCount; i += 1) payload.writeInt16LE(Math.round(20_000 * Math.sin(i * 2 * Math.PI * 440 / sampleRateHz)), i * 2);
       const hostStartNs = started + BigInt(sequence) * 20_000_000n;
       const timing = encodeTiming({ captureEpoch, sequence, outputStartSample, sampleCount, sourceRateHz: sampleRateHz,
         hostStartNs, hostEndNs: hostStartNs + 20_000_000n, roundingEnvelopeNs: 1000 });
