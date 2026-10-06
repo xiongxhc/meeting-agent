@@ -1,5 +1,6 @@
 // Private two-owner ingress campaign. Imports have no application/SDK effects.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import Database from "better-sqlite3";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
@@ -54,6 +55,8 @@ export function selectIngressSends(original, conflict) {
 export function assertIngressSelection(plan) {
   ingressData(plan);
   requireIngress(plan.conflictingReplay === undefined || plan.conflictingReplay === false || plan.conflictingReplay === true, "conflict_selection");
+  requireIngress(plan.closedGenerationReopen === undefined || typeof plan.closedGenerationReopen === "boolean", "reopen_selection");
+  requireIngress(!plan.closedGenerationReopen || !plan.missingLauncher && !plan.conflictingReplay, "reopen_selection");
   if (plan.phase !== 1 || !plan.sends) return;
   requireIngress(plan.sends.length === (plan.conflictingReplay ? 6 : 4) && new Set(plan.sends.map(s => s.wireMessageId)).size === plan.sends.length, "fresh_wire_ids");
   requireIngress(plan.sends.every(s => typeof s.wireMessageId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(s.wireMessageId)), "wire_id");
@@ -109,8 +112,8 @@ function ingressCloseRows(rows, keys, nested = []) {
   for (const row of rows) ingressCloseRecord(row, keys, nested);
 }
 function ingressCloseState(state) {
-  ingressCloseRecord(state, ["fileIdentity", "immutable", "metadata", "events", "sessions", "counts", "custody", "generations"],
-    ["immutable", "metadata", "events", "sessions", "counts", "custody", "generations"]);
+  ingressCloseRecord(state, ["fileIdentity", "immutable", "metadata", "events", "sessions", "counts", "custody", "generations", "reopenEvidence"],
+    ["immutable", "metadata", "events", "sessions", "counts", "custody", "generations", "reopenEvidence"]);
   ingressCloseRecord(state.immutable, ingressImmutableFields);
   ingressCloseRecord(state.metadata, ["state", "reason", "lastBlockedAtMs", "lastObservedAtMs", "claimed", "claimExpiresAtMs", "organizerId", "organizerSource",
     "reference", "admittedAtMs", "totalAttempts", "generationAttempts", "generationStartedAtMs", "firstAttemptAtMs", "lastAttemptAtMs", "retryGeneration",
@@ -126,13 +129,14 @@ function ingressCloseState(state) {
 export function ingressCloseFact(value) {
   value = ingressData(value);
   const keys = ["standaloneExit", "compositionClosed", "peerClosed", "lockClosedLast", "cleanupFailures", "finalState", "keyCustody",
-    "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver", "observerFailure", "overflow"];
-  ingressCloseRecord(value, keys, ["cleanupFailures", "finalState", "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver"]);
+    "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver", "observerFailure", "overflow", "history"];
+  ingressCloseRecord(value, keys, ["cleanupFailures", "finalState", "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver", "history"]);
   for (const key of ["compositionClosed", "peerClosed", "lockClosedLast", "observerFailure", "overflow"]) {
     requireIngress(value[key] === undefined || typeof value[key] === "boolean", "close_fields");
   }
   requireIngress(value.keyCustody === undefined || ["not_created", "private_runtime_file"].includes(value.keyCustody), "close_fields");
-  if (value.finalState !== undefined && value.finalState !== null) ingressCloseState(value.finalState);
+  if (value.finalState !== undefined && value.finalState !== null) { ingressCloseState(value.finalState); if (value.finalState.reopenEvidence) ingressReopenState(value.finalState); }
+  if (value.history !== undefined) ingressHistoryFact(value.history);
   ingressCloseRows(value.outcomes, ["occurrenceId", "bridgeId", "organizer", "phase", "controlSessionId", "failure", "finalization", "custody", "runtimeClose", "runtimeCleanup"], ["organizer"]);
   for (const row of value.outcomes) {
     const choices = { phase: ["starting", "live", "settled"], failure: [null, "runtime_startup_aborted", "runtime_startup_timeout", "runtime_startup_failed",
@@ -150,6 +154,115 @@ export function ingressCloseFact(value) {
   }
   return ingressFact(value);
 }
+// Selected reopen DTOs expose identity and lifecycle facts, never source paths or tokens.
+const reopenRows = {
+  generation: ["generationId", "occurrenceId", "bridgeSessionId", "controlSessionId", "handle", "terminalAtMs", "terminalSource", "terminalReason", "expiresAtMs"],
+  timedOwner: ["generationId", "bridgeSessionId", "controlSessionId", "state", "tokenPresent"],
+  recording: ["occurrenceId", "handle", "sha256", "keyId", "durationMs", "finalizedAtMs", "format", "captureDrain", "captureDrainReason", "captureDrainEpoch", "captureDrainLastFrameSequence", "captureDrainOutputEndSample", "captureDrainFinalPairSequence", "bytes", "device", "inode"],
+  recovery: ["generationId", "occurrenceId", "bridgeSessionId", "controlSessionId", "handle", "sha256", "keyId", "kind", "failureAttempt"],
+  physical: ["occurrenceId", "physicalClientId", "physicalGenerationId", "bridgeSessionId", "claimedAtMs", "clearedAtMs", "clearReason", "operatorPresent", "exitDiagnostic", "outcomeOccurrenceId", "outcomePhysicalClientId", "outcomePhysicalGenerationId", "outcomeBridgeSessionId", "observedAt"],
+  unknownEnd: ["occurrenceId", "sourceKind", "failureAttempt", "handle", "sha256", "keyId", "bytes", "device", "inode", "detectedAtMs", "deadlineMs", "state", "claimed", "claimExpiresAtMs", "failure", "deletedAtMs", "lastObservedAtMs"],
+};
+export function ingressReopenState(value) {
+  value = ingressData(value); ingressCloseState(value);
+  const e = value.reopenEvidence;
+  ingressCloseRecord(e, [...Object.keys(reopenRows), "counts"], [...Object.keys(reopenRows), "counts"]);
+  for (const [name, keys] of Object.entries(reopenRows)) {
+    ingressCloseRows(e[name], keys); requireIngress(e[name].length <= 1, "reopen_cardinality");
+    for (const row of e[name]) {
+      requireIngress(keys.every(key => Object.hasOwn(row, key)), "reopen_fields");
+      const enums = { terminalSource: ["bridge_observed", "local_clock", "legacy_unknown"], terminalReason: ["ended", "removed", "bridge_failure"],
+        captureDrain: ["confirmed", "unconfirmed"], kind: ["final", "bridge_failure"], sourceKind: ["final", "bridge_failure"],
+        clearReason: ["departure_observed", "join_not_issued", "operator_inspected_idle"], exitDiagnostic: ["nonzero_exit"],
+        state: name === "timedOwner" ? ["active", "recovering", "closed"] : ["assigned", "cleanup_claimed", "cleanup_failed", "deleted"],
+        failure: ["identity_mismatch", "source_missing", "unsafe_source", "detach_failed", "reader_active", "quiescence_unproven"] };
+      for (const [key, field] of Object.entries(row)) {
+        if (field === null) continue;
+        if (enums[key]) requireIngress(enums[key].includes(field), "reopen_fields");
+        else if (["tokenPresent", "operatorPresent", "claimed"].includes(key)) requireIngress(typeof field === "boolean", "reopen_fields");
+        else if (["handle", "sha256", "keyId", "device", "inode", "controlSessionId", "captureDrainEpoch", "captureDrainLastFrameSequence", "captureDrainOutputEndSample", "captureDrainFinalPairSequence"].includes(key)) {
+          const pattern = key === "handle" ? /^[a-f0-9]{32}$/ : key === "sha256" ? /^[a-f0-9]{64}$/ : key === "keyId" ? /^[a-f0-9]{16}$/ : /^[0-9]{1,40}$/;
+          requireIngress(typeof field === "string" && pattern.test(field), "reopen_fields");
+        } else if (key === "observedAt") requireIngress(typeof field === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(field) && Number.isSafeInteger(Date.parse(field)), "reopen_fields");
+        else if (typeof field === "number") requireIngress(Number.isSafeInteger(field) && field >= 0, "reopen_fields");
+        else requireIngress(typeof field === "string" && (key === "format" ? /^[a-z0-9_/.-]{1,128}$/ : /^[A-Za-z0-9._@:-]{1,2048}$/).test(field), "reopen_fields");
+      }
+    }
+  }
+  ingressCloseRecord(e.counts, ["failedRecording", "alignmentAttempt"]);
+  requireIngress(Object.keys(e.counts).length === 2 && Object.values(e.counts).every(n => Number.isSafeInteger(n) && n >= 0), "reopen_counts");
+  return value;
+}
+export function assertIngressClosedGeneration(state, removal) {
+  state = ingressReopenState(state); removal = ingressRemovalFact(removal);
+  const e = state.reopenEvidence, [g] = e.generation, [t] = e.timedOwner, [r] = e.recording, [b] = e.recovery, [p] = e.physical, [u] = e.unknownEnd, [c] = state.custody ?? [];
+  requireIngress(state.metadata.state === "admitted" && state.sessions.length === 1 && state.sessions[0].state === "finalizing" && state.sessions[0].terminalReason === null, "reopen_session");
+  requireIngress(g && t && r && b && p && u && c && state.generations.length === 1 && state.counts.custody === 1 && state.counts.recording === 1 &&
+    state.counts.seed === 0 && state.counts.delivery === 0 && state.counts.notification === 0 && e.counts.failedRecording === 0 && e.counts.alignmentAttempt === 0, "reopen_cardinality");
+  const id = state.immutable.occurrenceId;
+  requireIngress(g.occurrenceId === id && g.bridgeSessionId === removal.bridgeSessionId && g.controlSessionId === removal.controlSessionId &&
+    g.terminalSource === "bridge_observed" && g.terminalReason === "removed" && g.terminalAtMs === Date.parse(removal.observedAt) &&
+    g.expiresAtMs === g.terminalAtMs + 1209600000 && state.generations[0].bridgeSessionId === g.bridgeSessionId && state.generations[0].controlSessionId === g.controlSessionId, "reopen_generation");
+  requireIngress(t.generationId === g.generationId && t.bridgeSessionId === g.bridgeSessionId && t.controlSessionId === g.controlSessionId && t.state === "closed" && typeof t.tokenPresent === "boolean", "reopen_timed_owner");
+  requireIngress(/^[a-f0-9]{32}$/.test(r.handle) && /^[a-f0-9]{64}$/.test(r.sha256) && /^[a-f0-9]{16}$/.test(r.keyId) && r.occurrenceId === id &&
+    r.handle === g.handle && b.generationId === g.generationId && b.occurrenceId === id && b.bridgeSessionId === g.bridgeSessionId && b.controlSessionId === g.controlSessionId &&
+    b.handle === r.handle && b.sha256 === r.sha256 && b.keyId === r.keyId && b.kind === "final" && b.failureAttempt === null &&
+    Number.isSafeInteger(r.durationMs) && r.durationMs >= 0 && Number.isSafeInteger(r.finalizedAtMs) && r.finalizedAtMs >= g.terminalAtMs &&
+    typeof r.format === "string" && /^[a-z0-9_/.-]{1,128}$/.test(r.format) && r.captureDrain === "confirmed" && r.captureDrainReason === null &&
+    r.captureDrainEpoch === removal.captureEpoch && r.captureDrainLastFrameSequence === removal.lastFrameSequence && r.captureDrainOutputEndSample === removal.outputEndSample &&
+    r.captureDrainFinalPairSequence === removal.finalClockPairSequence, "reopen_recording");
+  requireIngress(c.state === "cleared" && c.failure === null && c.outcome === "departure_confirmed" && c.reason === "departure_observed" &&
+    c.bridgeSessionId === g.bridgeSessionId && p.occurrenceId === id && p.physicalClientId === c.physicalClientId && p.physicalGenerationId === c.physicalGenerationId &&
+    p.bridgeSessionId === c.bridgeSessionId && p.outcomeOccurrenceId === id && p.outcomePhysicalClientId === c.physicalClientId &&
+    p.outcomePhysicalGenerationId === c.physicalGenerationId && p.outcomeBridgeSessionId === c.bridgeSessionId && p.clearReason === "departure_observed" &&
+    p.operatorPresent === false && p.exitDiagnostic === null && Number.isSafeInteger(p.claimedAtMs) && p.claimedAtMs <= g.terminalAtMs &&
+    Number.isSafeInteger(c.recordedAtMs) && c.recordedAtMs >= Date.parse(p.observedAt) && Date.parse(p.observedAt) >= g.terminalAtMs && p.clearedAtMs === c.recordedAtMs, "reopen_physical");
+  requireIngress(u.occurrenceId === id && u.sourceKind === "final" && u.failureAttempt === 0 && u.handle === r.handle && u.sha256 === r.sha256 && u.keyId === r.keyId &&
+    Number.isSafeInteger(u.bytes) && u.bytes > 0 && u.bytes <= 8589934592 && /^[0-9]{1,40}$/.test(u.device) && /^[0-9]{1,40}$/.test(u.inode) &&
+    u.bytes === r.bytes && u.device === r.device && u.inode === r.inode && Number.isSafeInteger(u.detectedAtMs) && u.detectedAtMs >= r.finalizedAtMs &&
+    u.deadlineMs === u.detectedAtMs + 1209600000 && u.lastObservedAtMs === u.detectedAtMs && u.state === "assigned" && u.claimed === false &&
+    u.claimExpiresAtMs === null && u.failure === null && u.deletedAtMs === null, "reopen_unknown_end");
+}
+export function ingressRemovalFact(value) {
+  value = ingressData(value);
+  const keys = ["reason", "observedAt", "observationTiming", "observationTimingReason", "bridgeSessionId", "controlSessionId", "captureEpoch", "lastFrameSequence", "outputEndSample", "finalClockPairSequence"];
+  ingressCloseRecord(value, keys, ["observationTiming"]); requireIngress(keys.every(k => Object.hasOwn(value, k)), "removal_fields");
+  ingressCloseRecord(value.observationTiming, ["clockDomainId", "hostBeforeNs", "hostAfterNs"]);
+  const t = value.observationTiming;
+  requireIngress(value.reason === "removed" && typeof value.observedAt === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value.observedAt) && Number.isSafeInteger(Date.parse(value.observedAt)) &&
+    t.clockDomainId === "e2e-clock" && /^[0-9]{1,40}$/.test(t.hostBeforeNs) && /^[0-9]{1,40}$/.test(t.hostAfterNs) && BigInt(t.hostBeforeNs) <= BigInt(t.hostAfterNs) &&
+    value.observationTimingReason === null && typeof value.bridgeSessionId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(value.bridgeSessionId) && /^[1-9][0-9]{0,19}$/.test(value.controlSessionId) &&
+    ["captureEpoch", "lastFrameSequence", "outputEndSample", "finalClockPairSequence"].every(k => typeof value[k] === "string" && /^[1-9][0-9]{0,19}$/.test(value[k])), "removal_observation");
+  return value;
+}
+export function ingressHistoryFact(value) {
+  value = ingressData(value); ingressCloseRecord(value, ["runtime", "bridge", "files"], ["runtime", "bridge", "files"]);
+  ingressCloseRecord(value.runtime, ["bytes", "sha256", "pids"], ["pids"]); ingressCloseRecord(value.bridge, ["bytes", "sha256", "pid"]);
+  for (const row of [value.runtime, value.bridge]) requireIngress(Number.isSafeInteger(row.bytes) && row.bytes > 0 && row.bytes <= 1048576 && /^[a-f0-9]{64}$/.test(row.sha256), "history_extent");
+  requireIngress(value.runtime.pids.length === 1 && value.runtime.pids.every(n => Number.isSafeInteger(n) && n > 0) && Number.isSafeInteger(value.bridge.pid) && value.bridge.pid > 0, "history_identity");
+  ingressCloseRecord(value.files, ["recording", "outbox", "receipt", "key"]);
+  requireIngress(value.files.recording === 1 && value.files.outbox === 0 && value.files.receipt === 0 && value.files.key === true, "history_files"); return value;
+}
+export function readIngressHistory(plan, files) {
+  const runtime = boundedBytes(plan.runtimePidsPath), bridge = boundedBytes(path.join(plan.controlDir, "state.json"));
+  const child = ingressData(JSON.parse(bridge.toString("utf8")));
+  return ingressHistoryFact({ runtime: { bytes: runtime.length, sha256: createHash("sha256").update(runtime).digest("hex"),
+    pids: runtime.toString("utf8").trim().split("\n").filter(Boolean).map(Number) },
+    bridge: { bytes: bridge.length, sha256: createHash("sha256").update(bridge).digest("hex"), pid: child.pid }, files });
+}
+export function assertIngressReopenActivity(activity, history) {
+  activity = ingressData(activity); history = ingressHistoryFact(history);
+  requireIngress(activity.outcomes.length === 0 && activity.runtimePids.length === 0 && activity.bridge === null &&
+    !activity.trace.some(code => code.startsWith("occurrence_")) && activity.messages.length === 0 &&
+    activity.requests.length <= 2 && activity.requests.every(row => ["ws_endpoint", "tenant_access_token"].includes(row.route) && row.status === 200), "reopen_activity");
+  requireIngress(JSON.stringify(ingressHistoryFact(activity.history)) === JSON.stringify(history) && JSON.stringify(activity.files) === JSON.stringify(history.files), "reopen_history");
+  assertIngressIsolation({ counts: { seed: 0, delivery: 0, notification: 0 } }, activity, false);
+}
+export function assertIngressReopenDiscovery(fact) {
+  fact = ingressData(fact); ingressCloseRecord(fact, ["resolved", "launched", "deferred"]);
+  requireIngress(fact.resolved === 0 && fact.launched === 0 && fact.deferred === 0, "reopen_discovery");
+}
+
 export function ingressPathExists(filename) {
   try { lstatSync(filename); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
@@ -184,14 +297,19 @@ export function parseIngressArguments(argv) {
       options.out = value;
     } else if (argv[at] === "--missing-launcher" && !options.missingLauncher) options.missingLauncher = true;
     else if (argv[at] === "--conflicting-replay" && options.conflictingReplay === undefined) options.conflictingReplay = true;
+    else if (argv[at] === "--closed-generation-reopen" && options.closedGenerationReopen === undefined) options.closedGenerationReopen = true;
     else throw new Error("ingress_argument");
   }
+  requireIngress(!options.closedGenerationReopen || !options.missingLauncher && !options.conflictingReplay, "reopen_selection");
   requireIngress(options.out !== null, "output_required"); return options;
 }
 
 /** Only SELECT/readonly PRAGMAs. Guard the regular no-follow file/header before
  * SQLite can create WAL sidecars. The private parent protects readable DB bits. */
-export function readIngressState({ databasePath, occurrenceId }) {
+export function readIngressState(input) {
+  input = ingressData(input);
+  const { databasePath, occurrenceId, closedGenerationReopen = false } = input;
+  requireIngress(typeof closedGenerationReopen === "boolean", "reader_selection");
   requireIngress(typeof databasePath === "string" && path.isAbsolute(databasePath) && path.normalize(databasePath) === databasePath &&
     typeof occurrenceId === "string" && occurrenceId.length > 0 && Buffer.byteLength(occurrenceId) <= 4096, "reader_arguments");
   noSymlinkAncestors(databasePath);
@@ -247,7 +365,59 @@ export function readIngressState({ databasePath, occurrenceId }) {
       const generations = db.prepare(`SELECT bridge_session_id AS bridgeSessionId,runtime_session_id AS controlSessionId
         FROM reconciliation_generations WHERE occurrence_id=? LIMIT 2`).all(occurrenceId);
       requireIngress(custody.length <= 1 && generations.length <= 1, "binding_count");
-      return { fileIdentity: `${parent.dev}:${parent.ino}:${parent.birthtimeMs}:${held.dev}:${held.ino}:${held.birthtimeMs}`, immutable, metadata, events, sessions, counts, custody, generations };
+      let reopenEvidence;
+      if (closedGenerationReopen) {
+        // All rows share the same guarded readonly transaction. Global counts
+        // refuse foreign or extra sources; LIMIT 2 only bounds returned facts.
+        const rows = (table, sql) => {
+          const found = db.prepare(sql).all(occurrenceId);
+          requireIngress(found.length <= 1 && db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n === found.length, "reopen_cardinality"); return found;
+        };
+        const generation = rows("reconciliation_generations", `SELECT generation_id AS generationId,occurrence_id AS occurrenceId,
+          bridge_session_id AS bridgeSessionId,runtime_session_id AS controlSessionId,recording_handle AS handle,
+          terminal_at_ms AS terminalAtMs,terminal_source AS terminalSource,terminal_reason AS terminalReason,expires_at_ms AS expiresAtMs
+          FROM reconciliation_generations WHERE occurrence_id=? LIMIT 2`);
+        const timedOwner = rows("timed_evidence_owners", `SELECT o.generation_id AS generationId,g.bridge_session_id AS bridgeSessionId,
+          g.runtime_session_id AS controlSessionId,o.state,o.owner_token IS NOT NULL AS tokenPresent
+          FROM timed_evidence_owners o JOIN reconciliation_generations g ON g.generation_id=o.generation_id WHERE g.occurrence_id=? LIMIT 2`);
+        for (const row of timedOwner) row.tokenPresent = row.tokenPresent === 1;
+        const recording = rows("recordings", `SELECT occurrence_id AS occurrenceId,handle,sha256,key_id AS keyId,duration_ms AS durationMs,
+          finalized_at_ms AS finalizedAtMs,format,capture_drain AS captureDrain,capture_drain_reason AS captureDrainReason,
+          capture_drain_epoch AS captureDrainEpoch,capture_drain_last_frame_sequence AS captureDrainLastFrameSequence,
+          capture_drain_output_end_sample AS captureDrainOutputEndSample,capture_drain_final_pair_sequence AS captureDrainFinalPairSequence
+          FROM recordings WHERE occurrence_id=? LIMIT 2`);
+        for (const row of recording) {
+          const internal = db.prepare("SELECT encrypted_path AS source FROM recordings WHERE occurrence_id=?").get(occurrenceId);
+          requireIngress(typeof internal.source === "string" && path.isAbsolute(internal.source) && path.normalize(internal.source) === internal.source, "recording_source");
+          noSymlinkAncestors(internal.source); const file = lstatSync(internal.source);
+          requireIngress(file.isFile() && !file.isSymbolicLink() && file.nlink === 1 && file.uid === process.getuid() && (file.mode & 0o077) === 0 && file.size > 0 && file.size <= 8589934592, "recording_source");
+          row.bytes = file.size; row.device = String(file.dev); row.inode = String(file.ino);
+        }
+        const recovery = rows("recording_recovery_bindings", `SELECT generation_id AS generationId,occurrence_id AS occurrenceId,
+          bridge_session_id AS bridgeSessionId,source_session_id AS controlSessionId,recording_handle AS handle,sha256,key_id AS keyId,
+          recording_kind AS kind,failure_attempt AS failureAttempt FROM recording_recovery_bindings WHERE occurrence_id=? LIMIT 2`);
+        const physical = rows("physical_client_custody", `SELECT occurrence_id AS occurrenceId,physical_client_id AS physicalClientId,
+          physical_generation_id AS physicalGenerationId,bridge_session_id AS bridgeSessionId,claimed_at_ms AS claimedAtMs,
+          cleared_at_ms AS clearedAtMs,clear_reason AS clearReason,clear_operator IS NOT NULL AS operatorPresent,exit_diagnostic AS exitDiagnostic,
+          json_extract(outcome_json,'$.occurrenceId') AS outcomeOccurrenceId,json_extract(outcome_json,'$.physicalClientId') AS outcomePhysicalClientId,
+          json_extract(outcome_json,'$.physicalGenerationId') AS outcomePhysicalGenerationId,json_extract(outcome_json,'$.bridgeSessionId') AS outcomeBridgeSessionId,
+          json_extract(outcome_json,'$.observedAt') AS observedAt FROM physical_client_custody WHERE occurrence_id=? LIMIT 2`);
+        for (const row of physical) row.operatorPresent = row.operatorPresent === 1;
+        const unknownEnd = rows("unknown_end_custody", `SELECT occurrence_id AS occurrenceId,source_kind AS sourceKind,failure_attempt AS failureAttempt,
+          recording_handle AS handle,recording_sha256 AS sha256,recording_key_id AS keyId,recording_bytes AS bytes,recording_device AS device,recording_inode AS inode,
+          unknown_end_detected_at_ms AS detectedAtMs,unknown_end_deadline_ms AS deadlineMs,state,cleanup_claim_token IS NOT NULL AS claimed,
+          cleanup_claim_expires_at_ms AS claimExpiresAtMs,cleanup_failure_reason AS failure,deleted_at_ms AS deletedAtMs,last_observed_at_ms AS lastObservedAtMs
+          FROM unknown_end_custody WHERE occurrence_id=? LIMIT 2`);
+        for (const row of unknownEnd) row.claimed = row.claimed === 1;
+        const extraCounts = {};
+        for (const [name, table] of Object.entries({ failedRecording: "bridge_failure_recordings", alignmentAttempt: "recording_alignment_attempts" })) {
+          extraCounts[name] = db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n;
+        }
+        reopenEvidence = { generation, timedOwner, recording, recovery, physical, unknownEnd, counts: extraCounts };
+      }
+      const result = { fileIdentity: `${parent.dev}:${parent.ino}:${parent.birthtimeMs}:${held.dev}:${held.ino}:${held.birthtimeMs}`, immutable, metadata, events, sessions, counts, custody, generations,
+        ...(closedGenerationReopen ? { reopenEvidence } : {}) };
+      return closedGenerationReopen ? ingressReopenState(result) : result;
     })(); guard(); return state;
   } finally { db?.close(); closeSync(fd); }
 }
@@ -384,6 +554,85 @@ export function ingressProcessProof(evidence, owner, probe) {
   return globalThis.structuredClone(processCleanupProof({ evidence: owned, probe }));
 }
 
+export function assertIngressReopenOrigins(proof, ownerPid) {
+  proof = ingressReopenProcessFact(proof);
+  requireIngress(Number.isSafeInteger(ownerPid) && ownerPid > 0 && proof.cleanupConfirmed === true && proof.processInventoryVerified === true &&
+    proof.knownOwnedChildrenReaped === true && proof.pids.length === 1 && proof.pids[0].pid === ownerPid &&
+    proof.pids[0].origins.includes("ingress-phase-3") && proof.probes.length === 1 && proof.probes[0].pid === ownerPid &&
+    proof.probes[0].origins.includes("ingress-phase-3") && proof.probes[0].status === "absent" && proof.children.length === 1 &&
+    proof.children[0].role === "ingress-phase-3" && proof.children[0].pid === ownerPid && proof.children[0].outcome.exitObserved === true &&
+    proof.children[0].outcome.code === 0 && proof.children[0].outcome.signal === null, "reopen_process_origins");
+}
+export function ingressReopenPhaseFact(value) {
+  value = ingressData(value);
+  ingressCloseRecord(value, ["success", "phase", "root", "databasePath", "state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "processBindingObserved"],
+    ["state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child"]);
+  requireIngress(typeof value.success === "boolean" && [1, 2, 3].includes(value.phase) && typeof value.root === "string" && typeof value.databasePath === "string", "reopen_report");
+  if (value.state !== undefined) value.state = ingressReopenState(value.state);
+  if (value.close !== undefined) {
+    value.close = ingressCloseFact(value.close);
+    for (const key of ["trace", "environmentKeys", "cleanupFailures"]) if (value.close[key]) requireIngress(value.close[key].every(v => /^[A-Za-z0-9_]{1,128}$/.test(v)), "reopen_report");
+  }
+  if (value.removal !== undefined) value.removal = ingressRemovalFact(value.removal);
+  if (value.activity !== undefined) {
+    const a = value.activity;
+    ingressCloseRecord(a, ["trace", "requests", "messages", "runtimePids", "bridge", "outcomes", "receiver", "files", "history", "envKeys"],
+      ["trace", "requests", "messages", "runtimePids", "bridge", "outcomes", "receiver", "files", "history", "envKeys"]);
+    ingressCloseRows(a.requests, ["method", "route", "status"]);
+    requireIngress(a.requests.every(r => ["ws_endpoint", "tenant_access_token", "reserve_active_meeting", "reserve_get", "contact_user_get", "unmatched"].includes(r.route) &&
+      [200, 404].includes(r.status) && (r.method === undefined || ["GET", "POST"].includes(r.method))), "reopen_report");
+    requireIngress(a.messages.length === 0 && a.runtimePids.length <= 1 && a.runtimePids.every(n => Number.isSafeInteger(n) && n > 0), "reopen_report");
+    ingressCloseRecord(a.files, ["recording", "outbox", "receipt", "key"]);
+    for (const name of ["trace", "envKeys"]) requireIngress(Array.isArray(a[name]) && a[name].every(n => typeof n === "string" && /^[A-Za-z0-9_]{1,128}$/.test(n)), "reopen_report");
+    if (a.bridge !== null) {
+      ingressCloseRecord(a.bridge, ["pid", "joined", "mediaConnected", "framesSent", "occurrenceId", "bridgeSessionId", "controlSessionId", "envKeys", "bound"], ["envKeys"]);
+      requireIngress(a.bridge.envKeys.every(n => typeof n === "string" && /^[A-Za-z0-9_]{1,128}$/.test(n)), "reopen_report");
+    }
+    // Reuse the closed outcome and receiver contract before retaining activity.
+    ingressCloseFact({ outcomes: a.outcomes, commitObservations: [], receiver: a.receiver });
+    if (a.history !== undefined) ingressHistoryFact(a.history);
+  }
+  ingressCloseRows(value.observations, ["ordinal", "name"]);
+  requireIngress(value.observations.every(o => Number.isSafeInteger(o.ordinal) && ["ready", "deliver", "blocked", "discover", "read", "retry", "launched", "activity", "remove", "settled"].includes(o.name)), "reopen_report");
+  requireIngress(Array.isArray(value.failures) && value.failures.every(v => typeof v === "string" && /^ingress_[A-Za-z_]{1,120}$/.test(v)), "reopen_report");
+  if (value.child !== undefined) ingressCloseRecord(value.child, ["exitObserved", "closeObserved", "code", "signal", "forced", "stdioSettled", "pid"]);
+  if (value.ownerProcessProof !== undefined) value.ownerProcessProof = ingressReopenProcessFact(value.ownerProcessProof);
+  return value;
+}
+function ingressReopenProcessFact(value) {
+  value = ingressData(value);
+  const keys = ["pids", "probes", "orphans", "invalidPids", "inventory", "children", "knownOwnedChildrenReaped", "processInventoryVerified", "inventoryCoverage", "cleanupConfirmed"];
+  ingressCloseRecord(value, keys, ["pids", "probes", "orphans", "invalidPids", "inventory", "children"]);
+  for (const k of ["pids", "probes", "orphans"]) if (value[k] !== undefined) {
+    ingressCloseRows(value[k], k === "pids" ? ["pid", "origins"] : ["pid", "origins", "status"], ["origins"]);
+    for (const row of value[k]) requireIngress(Number.isSafeInteger(row.pid) && row.pid > 0 && row.origins.every(v => typeof v === "string" && /^[a-z0-9-]{1,64}$/.test(v)) &&
+      (k === "pids" || ["absent", "present", "unverified"].includes(row.status)), "reopen_process");
+  }
+  if (value.invalidPids !== undefined) requireIngress(value.invalidPids.every(v => typeof v === "string" && /^[a-z0-9-]{1,64}$/.test(v)), "reopen_process");
+  if (value.children !== undefined) {
+    ingressCloseRows(value.children, ["role", "pid", "outcome"], ["outcome"]);
+    for (const row of value.children) {
+      ingressCloseRecord(row.outcome, ["exitObserved", "code", "signal"]);
+      requireIngress(typeof row.role === "string" && /^[a-z0-9-]{1,64}$/.test(row.role) && Number.isSafeInteger(row.pid) && row.pid > 0 &&
+        typeof row.outcome.exitObserved === "boolean" && (row.outcome.code === null || Number.isInteger(row.outcome.code)) &&
+        (row.outcome.signal === null || /^SIG[A-Z0-9]{1,12}$/.test(row.outcome.signal)), "reopen_process");
+    }
+  }
+  if (value.inventory !== undefined) {
+    ingressCloseRecord(value.inventory, ["samples", "failures", "outcomes", "overflowOutcome"], ["failures", "outcomes", "overflowOutcome"]);
+    requireIngress(value.inventory.failures.every(v => typeof v === "string" && /^[a-z_]{1,128}$/.test(v)), "reopen_process");
+    for (const row of [...value.inventory.outcomes ?? [], ...value.inventory.overflowOutcome ? [value.inventory.overflowOutcome] : []]) {
+      ingressCloseRecord(row, ["ordinal", "stage", "command", "exit", "signal", "diagnostic", "durationMs", "classified"], ["command"]);
+      requireIngress(Number.isSafeInteger(row.ordinal) && row.ordinal > 0 && typeof row.stage === "string" && /^[a-z0-9-]{1,64}$/.test(row.stage) &&
+        (row.exit === null || Number.isInteger(row.exit)) && (row.signal === null || /^SIG[A-Z0-9]{1,12}$/.test(row.signal)) &&
+        (row.durationMs === null || typeof row.durationMs === "number" && row.durationMs >= 0) && ["pending", "observed", "refused"].includes(row.classified) &&
+        JSON.stringify(row.command) === JSON.stringify(["/bin/ps", "-eo", "pid=,ppid=,comm="]) &&
+        ["none", "inventory_command_failed", "ps: Operation not permitted", "ps: Permission denied", "ps: Not supported", "ps: Operation not supported"].includes(row.diagnostic), "reopen_process");
+    }
+  }
+  return value;
+}
+
 /** Same parent transitions for the CLI and explicitly synthetic component facts. */
 export async function runIngressCampaign(plan, effects, { signal, label = "component-facts" } = {}) {
   requireIngress(typeof label === "string" && ["component-facts", "attempted-application"].includes(label), "label");
@@ -395,23 +644,42 @@ export async function runIngressCampaign(plan, effects, { signal, label = "compo
     // Preparation fills the real adapter's captured plan. Retain that alias
     // through prepare, then freeze the completed controls before any owner.
     plan = ingressData(plan); assertIngressSelection({ ...plan, phase: 1 });
-    requireIngress(plan.missingLauncher === controls.missingLauncher && plan.conflictingReplay === controls.conflictingReplay &&
+    requireIngress(plan.missingLauncher === controls.missingLauncher && plan.conflictingReplay === controls.conflictingReplay && plan.closedGenerationReopen === controls.closedGenerationReopen &&
       plan.phase === controls.phase, "prepared_controls");
-    for (const phase of [1, 2]) {
-      active(); const result = await effects.runOwner({ ...plan, phase, original: phases[0]?.state }, signal); phases.push(ingressData(result)); active();
+    for (const phase of controls.closedGenerationReopen ? [1, 2, 3] : [1, 2]) {
+      active(); const previous = phases.at(-1);
+      let result = await effects.runOwner({ ...plan, phase, original: phase === 3 ? previous.close.finalState : phases[0]?.state,
+        ...(phase === 3 ? { history: previous.close.history, removal: previous.removal } : {}) }, signal);
+      result = controls.closedGenerationReopen ? ingressReopenPhaseFact(result) : ingressData(result); phases.push(result); active();
       requireIngress(result.success && result.root === plan.root && result.databasePath === plan.databasePath, "phase_result");
       const c = result.child;
       requireIngress(c?.closeObserved && c.exitObserved && c.code === 0 && c.signal === null && c.stdioSettled && !c.forced, "child_close");
       requireIngress(result.ownerProcessProof?.cleanupConfirmed === true, "owner_process_cleanup");
-      if (phase === 1) { const state = await effects.between(); active(); assert.deepEqual(state, result.state); }
+      if (controls.closedGenerationReopen && phase === 3) assertIngressReopenOrigins(result.ownerProcessProof, c.pid);
+      if (phase === 1 || controls.closedGenerationReopen) {
+        let value;
+        if (controls.closedGenerationReopen) {
+          const deadline = process.hrtime.bigint() + 25000000000n; let timer;
+          try {
+            value = await Promise.race([effects.between(phase), new Promise((_, reject) => { timer = globalThis.setTimeout(() => reject(new Error("ingress_between_timeout")), 25000); })]);
+            requireIngress(process.hrtime.bigint() < deadline, "between_timeout");
+          } finally { globalThis.clearTimeout(timer); }
+        } else value = await effects.between(phase);
+        active();
+        const state = controls.closedGenerationReopen ? ingressReopenState(value) : value;
+        if (phase >= 2) { assertIngressClosedGeneration(result.close.finalState, result.removal); ingressHistoryFact(result.close.history); }
+        assert.deepEqual(state, phase === 1 ? result.state : result.close.finalState);
+      }
     }
   } catch (error) { failures.push(ingressFailure(error, "ingress_campaign_failed")); }
   let processProof;
-  try { processProof = ingressData(await effects.cleanup()); if (!processProof.cleanupConfirmed) failures.push("ingress_process_cleanup"); }
+  try { processProof = controls.closedGenerationReopen ? ingressReopenProcessFact(await effects.cleanup()) : ingressData(await effects.cleanup()); if (!processProof.cleanupConfirmed) failures.push("ingress_process_cleanup"); }
   catch { failures.push("ingress_cleanup_failed"); }
   return { schema: "meeting-ingress-evidence/v1", label, branch: controls.missingLauncher ? "missing-launcher" : "live",
     ...(controls.conflictingReplay ? { selectedCase: "conflicting-replay" } : {}),
-    success: failures.length === 0 && phases.length === 2, failures, phases, processProof, preserved: true };
+    ...(controls.closedGenerationReopen ? { selectedCase: "closed-generation-reopen", phaseCount: phases.length,
+      durableSessionState: phases.at(-1)?.close?.finalState?.sessions[0]?.state ?? phases.at(-1)?.state?.sessions[0]?.state ?? null, strictTerminalState: false } : {}),
+    success: failures.length === 0 && phases.length === (controls.closedGenerationReopen ? 3 : 2), failures, phases, processProof, preserved: true };
 }
 
 async function realMain(argv) {
@@ -423,7 +691,7 @@ async function realMain(argv) {
   const evidence = processRules.createProcessEvidence(), controller = new globalThis.AbortController();
   const stop = () => controller.abort();
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, stop);
-  let staged, activeChild, plan = { missingLauncher: options.missingLauncher, ...(options.conflictingReplay ? { conflictingReplay: true } : {}) };
+  let staged, activeChild, plan = { missingLauncher: options.missingLauncher, ...(options.conflictingReplay ? { conflictingReplay: true } : {}), ...(options.closedGenerationReopen ? { closedGenerationReopen: true } : {}) };
   const inventory = (rootPid, owner, stage, baseline = false) => {
     requireIngress(!evidence.inventory.overflowOutcome, "inventory_history_overflow");
     let result; try { result = run("/bin/ps", ["-eo", "pid=,ppid=,comm="], { timeout: 1000, maxBuffer: 1048576 }); } catch { result = null; }
@@ -509,11 +777,14 @@ async function realMain(argv) {
       result.processBindingObserved = ownedPids.length;
       try { inventory(process.pid, record.role, `phase-${phasePlan.phase}-close`, true); } catch { failure = true; }
       const ownerProcessProof = ingressProcessProof(evidence, record.role);
+      if (phasePlan.closedGenerationReopen && phasePlan.phase === 3) {
+        try { assertIngressReopenOrigins(ownerProcessProof, child.pid); } catch { failure = true; }
+      }
       return { ...result, ownerProcessProof, success: result.success && !failure && ownerProcessProof.cleanupConfirmed,
-        child: { exitObserved, closeObserved, code, signal: exitSignal, forced,
+        child: { exitObserved, closeObserved, code, signal: exitSignal, forced, ...(phasePlan.closedGenerationReopen ? { pid: child.pid } : {}),
         stdioSettled: closeObserved && child.stdout.destroyed && child.stderr.destroyed } };
     },
-    async between() { return readIngressState({ databasePath: plan.databasePath, occurrenceId: plan.occurrenceId }); },
+    async between() { return readIngressState({ databasePath: plan.databasePath, occurrenceId: plan.occurrenceId, ...(plan.closedGenerationReopen ? { closedGenerationReopen: true } : {}) }); },
     async cleanup() {
       if (activeChild) activeChild.kill("SIGTERM");
       try { inventory(process.pid, "final", "final", true); } catch { /* Refusal is sticky and preserved in the returned proof. */ }

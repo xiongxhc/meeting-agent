@@ -6,7 +6,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { assertIngressAck, assertIngressAudit, assertIngressClose, assertIngressFinalReceiver, assertIngressIsolation, assertIngressLaunch, assertIngressRetry, assertIngressReceiver,
-  assertIngressConflict, assertIngressSelection, ingressData, ingressFact, ingressCloseFact, ingressFailure, ingressReceiverFact, boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
+  assertIngressConflict, assertIngressSelection, assertIngressClosedGeneration, assertIngressReopenActivity, assertIngressReopenDiscovery, ingressReopenState, ingressRemovalFact, ingressHistoryFact, readIngressHistory, ingressReopenPhaseFact, ingressData, ingressFact, ingressCloseFact, ingressFailure, ingressReceiverFact, boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
 
 /** Only the selected rejected replay has an already-admitted durable baseline. */
 export function readIngressConflictBaseline(send, read) {
@@ -22,9 +22,12 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
   const abort = () => { controller.abort(); try { effects.cancel?.(); } catch { failure.push("ingress_cancel_failed"); } };
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) abort();
+  requireIngress(Number.isFinite(budgetMs) && budgetMs > 0 && budgetMs <= 120000 && Number.isFinite(cleanupMs) && cleanupMs > 0 && cleanupMs <= 30000, "phase_budget");
+  const deadline = process.hrtime.bigint() + BigInt(Math.ceil(budgetMs * 1000000));
+  const elapsed = () => requireIngress(process.hrtime.bigint() < deadline && !controller.signal.aborted, "phase_cancelled");
   const timer = globalThis.setTimeout(abort, budgetMs);
   const step = async (name, ...args) => {
-    requireIngress(!controller.signal.aborted, "phase_cancelled");
+    elapsed();
     let onAbort;
     const stepTimer = globalThis.setTimeout(abort, ["ready", "launched"].includes(name) ? 30000 : 25000);
     try {
@@ -32,12 +35,18 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
         onAbort = () => reject(new Error("ingress_phase_cancelled")); controller.signal.addEventListener("abort", onAbort, { once: true });
       });
       const value = await Promise.race([effects[name](...args, controller.signal), cancelled]);
-      requireIngress(!controller.signal.aborted, "phase_cancelled");
+      elapsed();
       requireIngress(observations.length < 256, "history_overflow"); observations.push({ ordinal: observations.length + 1, name });
-      return ingressFact(value);
+      const fact = ingressFact(value);
+      if (plan.closedGenerationReopen) {
+        if (name === "read") return ingressReopenState(fact);
+        if (fact?.state) fact.state = ingressReopenState(fact.state);
+        if (name === "settled") fact.removal = ingressRemovalFact(fact.removal);
+      }
+      elapsed(); return fact;
     } finally { controller.signal.removeEventListener("abort", onAbort); globalThis.clearTimeout(stepTimer); }
   };
-  let state, activity, close; const acceptedSends = [], acceptedCommits = [];
+  let state, activity, close, removal; const acceptedSends = [], acceptedCommits = [];
   try {
     const ready = await step("ready"); requireIngress(ready.admitted && ready.started && ready.connections === 1, "owner_admission");
     assertIngressReceiver(ready.receiver, []);
@@ -77,6 +86,22 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
       const before = state; await step("discover"); state = await step("read");
       requireIngress(JSON.stringify(state) === JSON.stringify(before), "blocked_discovery_mutation");
       activity = await step("activity"); assertIngressIsolation(state, activity); assertIngressReceiver(activity.receiver, wireIds);
+    } else if (plan.closedGenerationReopen && plan.phase === 3) {
+      requireIngress(plan.original && plan.history && plan.removal, "reopen_plan");
+      const baseline = ingressReopenState(plan.original); removal = ingressRemovalFact(plan.removal); ingressHistoryFact(plan.history);
+      assertIngressClosedGeneration(baseline, removal);
+      state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(baseline), "reopen_projection");
+      activity = await step("activity"); assertIngressReopenActivity(activity, plan.history); assertIngressReceiver(activity.receiver, []);
+      assertIngressReopenDiscovery(await step("discover"));
+      state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(baseline), "reopen_projection");
+      activity = await step("activity"); assertIngressReopenActivity(activity, plan.history); assertIngressReceiver(activity.receiver, []);
+      const send = { ...plan.sends[0], wireMessageId: "phase3-a-replay", expectedCode: 200 };
+      const delivered = await step("deliver", send); assertIngressAck(send, delivered, baseline.immutable);
+      acceptedSends.push(send); acceptedCommits.push(delivered.commit);
+      requireIngress(JSON.stringify(delivered.state) === JSON.stringify(baseline), "reopen_replay_mutation");
+      assertIngressReopenDiscovery(await step("discover"));
+      state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(baseline), "reopen_projection");
+      activity = await step("activity"); assertIngressReopenActivity(activity, plan.history); assertIngressReceiver(activity.receiver, [send]);
     } else {
       requireIngress(plan.phase === 2 && plan.original, "reopen_plan");
       state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(plan.original), "reopen_projection");
@@ -96,23 +121,48 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
         requireIngress(next.activity.outcomes[0].controlSessionId === activity.outcomes[0].controlSessionId &&
           next.activity.bridge.pid === activity.bridge.pid && next.activity.bridge.bridgeSessionId === activity.bridge.bridgeSessionId, "live_binding_changed");
         state = next.state; activity = next.activity;
+        if (plan.closedGenerationReopen) {
+          requireIngress(state.sessions[0].state === "listening", "reopen_listening");
+          const before = activity;
+          const control = await step("remove"); requireIngress(control.requested === "removed", "removal_control");
+          const settled = await step("settled"); removal = ingressRemovalFact(settled.removal);
+          requireIngress(JSON.stringify(settled.state.immutable) === JSON.stringify(state.immutable), "removal_immutable_mutation");
+          requireIngress(JSON.stringify(settled.state.events) === JSON.stringify(state.events), "removal_audit_mutation");
+          assertIngressClosedGeneration(settled.state, removal);
+          const a = settled.activity, row = a.outcomes[0];
+          requireIngress(a.outcomes.length === 1 && row.phase === "settled" && row.failure === null && row.finalization === "recorded" && row.custody === "assigned" &&
+            row.runtimeClose === "closed" && row.runtimeCleanup === "graceful" && row.controlSessionId === before.outcomes[0].controlSessionId &&
+            a.bridge.pid === before.bridge.pid && a.bridge.bridgeSessionId === before.bridge.bridgeSessionId, "reopen_settlement");
+          assertIngressIsolation(settled.state, a, false); assertIngressReceiver(a.receiver, []);
+          state = settled.state; activity = a;
+        }
       }
     }
   } catch (error) { failure.push(ingressFailure(error, "ingress_phase_failed")); }
   finally {
     abort(); globalThis.clearTimeout(timer); signal?.removeEventListener("abort", abort);
     let closeTimer;
+    const closeDeadline = process.hrtime.bigint() + BigInt(Math.ceil(cleanupMs * 1000000));
     try {
       close = ingressCloseFact(await Promise.race([effects.close(), new Promise((_, reject) => {
         closeTimer = globalThis.setTimeout(() => reject(new Error("ingress_close_timeout")), cleanupMs);
-      })])); assertIngressClose(close); assertIngressFinalReceiver(close, acceptedSends, acceptedCommits);
+      })])); requireIngress(process.hrtime.bigint() < closeDeadline, "close_timeout"); assertIngressClose(close); assertIngressFinalReceiver(close, acceptedSends, acceptedCommits);
+      if (plan.closedGenerationReopen && plan.phase >= 2 && failure.length === 0) {
+        requireIngress(close.finalState && JSON.stringify(close.finalState) === JSON.stringify(state), "reopen_final_projection");
+        assertIngressClosedGeneration(close.finalState, removal);
+        ingressHistoryFact(close.history);
+        if (plan.phase === 3) requireIngress(JSON.stringify(close.history) === JSON.stringify(plan.history) && close.outcomes.length === 0 &&
+          !close.trace.some(code => code.startsWith("occurrence_")), "reopen_final_history");
+      }
       if (plan.conflictingReplay && plan.phase === 1 && failure.length === 0) {
         requireIngress(close.finalState && JSON.stringify(close.finalState) === JSON.stringify(state), "final_projection");
       }
     } catch (error) { failure.push(ingressFailure(error, "ingress_phase_cleanup")); }
     finally { globalThis.clearTimeout(closeTimer); }
   }
-  return { success: failure.length === 0, phase: plan.phase, root: plan.root, databasePath: plan.databasePath, state, activity, close, observations, failures: failure };
+  const result = { success: failure.length === 0, phase: plan.phase, root: plan.root, databasePath: plan.databasePath, state, activity, close, ...(plan.closedGenerationReopen && removal ? { removal } : {}), observations, failures: failure };
+  if (!plan.closedGenerationReopen) return result;
+  try { return ingressReopenPhaseFact(result); } catch (error) { return { success: false, phase: plan.phase, root: plan.root, databasePath: plan.databasePath, observations, failures: [...failure, ingressFailure(error, "ingress_reopen_report")] }; }
 }
 
 async function runRealEntry(plan) {
@@ -129,7 +179,7 @@ async function runRealEntry(plan) {
   let peer, app, run, http, connection, standaloneExit, compositionResult, ownerClosed = false, admitted = false, observerFailure = false, overflow = false;
   const trace = [], commits = [], ackIds = new Set(), cleanupFailures = [];
   let pending = null, ordinal = 0, closePromise;
-  const read = () => readIngressState({ databasePath: plan.databasePath, occurrenceId: plan.occurrenceId });
+  const read = () => readIngressState({ databasePath: plan.databasePath, occurrenceId: plan.occurrenceId, ...(plan.closedGenerationReopen ? { closedGenerationReopen: true } : {}) });
   function log(code) {
     if (trace.length === 256) { overflow = true; shutdown.abort(); return; }
     trace.push(code);
@@ -151,28 +201,36 @@ async function runRealEntry(plan) {
     const end = process.hrtime.bigint() + BigInt(budgetMs) * 1000000n;
     for (;;) {
       check(); requireIngress(!phaseSignal?.aborted, "phase_cancelled");
-      const fact = checkFact(); if (fact) return fact;
+      const fact = checkFact(); requireIngress(process.hrtime.bigint() < end, "observation_timeout"); if (fact) return fact;
       requireIngress(process.hrtime.bigint() < end, "observation_timeout");
       await delay(25, undefined, { signal: shutdown.signal });
     }
   }
   const outcomes = () => (app?.occurrenceOutcomes() ?? []).map(row => ({ ...row, controlSessionId: row.controlSessionId?.toString() ?? null }));
   function fileCount(directory) { return readdirSync(directory).length; }
+  let liveBridge = null;
+  const files = () => ({ recording: fileCount(plan.directories.recordingsDir), outbox: fileCount(plan.directories.outboxDir), receipt: fileCount(plan.directories.receiptsDir), key: ingressPathExists(plan.keyPath) });
   function activity() {
+    if (plan.closedGenerationReopen && plan.phase === 3) {
+      const history = readIngressHistory(plan, files());
+      requireIngress(JSON.stringify(history) === JSON.stringify(plan.history), "reopen_history");
+      return { trace: [...trace], requests: [...peer.requests], messages: [...peer.messages], runtimePids: [], bridge: null, outcomes: outcomes(), receiver: receiver(), files: files(), history, envKeys: Object.keys(process.env).sort() };
+    }
     const runtimePids = ingressPathExists(plan.runtimePidsPath) ? readPrivateText(plan.runtimePidsPath).trim().split("\n").filter(Boolean).map(Number) : [];
     requireIngress(runtimePids.length <= 1 && runtimePids.every(n => Number.isSafeInteger(n) && n > 0), "runtime_pid_extent");
     const child = boundedJson(path.join(plan.controlDir, "state.json"), true), state = read();
     let bridge = null;
     if (child) {
-      const config = boundedJson(child.configPath), binding = config.custody, generation = state.generations[0], custody = state.custody[0];
+      const config = plan.closedGenerationReopen && liveBridge ? null : boundedJson(child.configPath), binding = config?.custody ?? liveBridge.binding, generation = state.generations[0], custody = state.custody[0];
       bridge = { pid: child.pid, joined: child.joined, mediaConnected: child.mediaConnected, framesSent: child.framesSent,
         occurrenceId: binding.occurrenceId, bridgeSessionId: binding.bridgeSessionId, controlSessionId: generation?.controlSessionId ?? null,
         envKeys: child.envKeys, bound: state.generations.length === 1 && state.custody.length === 1 && binding.occurrenceId === plan.occurrenceId &&
           custody.physicalClientId === binding.physicalClientId && custody.physicalGenerationId === binding.physicalGenerationId &&
           custody.bridgeSessionId === binding.bridgeSessionId && generation.bridgeSessionId === binding.bridgeSessionId };
     }
+    if (plan.closedGenerationReopen && bridge?.bound && !liveBridge) liveBridge = { ...bridge, binding: boundedJson(child.configPath).custody };
     return { trace: [...trace], requests: [...peer.requests], messages: [...peer.messages], runtimePids, bridge, outcomes: outcomes(), receiver: receiver(),
-      files: { recording: fileCount(plan.directories.recordingsDir), outbox: fileCount(plan.directories.outboxDir), receipt: fileCount(plan.directories.receiptsDir), key: ingressPathExists(plan.keyPath) },
+      files: files(),
       envKeys: Object.keys(process.env).sort() };
   }
   const effects = {
@@ -235,10 +293,28 @@ async function runRealEntry(plan) {
         const rows = outcomes(), row = rows[0];
         if (plan.missingLauncher ? row?.phase === "settled" : row?.phase === "live") {
           const fact = { state: read(), activity: activity() };
-          if (plan.missingLauncher || fact.activity.bridge?.mediaConnected && fact.activity.bridge.framesSent > 0) return fact;
+          if (plan.missingLauncher || fact.activity.bridge?.mediaConnected && fact.activity.bridge.framesSent > 0 &&
+            (!plan.closedGenerationReopen || fact.state.sessions[0]?.state === "listening")) return fact;
         }
         return null;
       }, 30000, phaseSignal);
+    },
+    async remove() {
+      check(); requireIngress(plan.closedGenerationReopen && plan.phase === 2 && !ingressPathExists(path.join(plan.controlDir, "end")), "removal_control");
+      const fact = { state: read(), activity: activity() }; assertIngressLaunch(plan.original, fact, false);
+      requireIngress(fact.state.sessions[0].state === "listening", "reopen_listening");
+      writeFileSync(path.join(plan.controlDir, "end"), "removed", { mode: 0o600, flag: "wx" }); return { requested: "removed" };
+    },
+    async settled(phaseSignal) {
+      return wait(() => {
+        const row = outcomes()[0], child = boundedJson(path.join(plan.controlDir, "state.json"));
+        if (row?.phase !== "settled" || child.left !== "removed" || child.endObservation?.reason !== "removed" || !child.captureFinish || child.captureDrain?.drain !== "confirmed") return null;
+        const finish = child.captureFinish, boundary = finish.acknowledgedBoundary;
+        requireIngress(finish.authenticated === true && boundary && JSON.stringify(finish.requestedBoundary) === JSON.stringify(boundary) &&
+          finish.sessionId === liveBridge?.controlSessionId && finish.bridgeSessionId === liveBridge?.bridgeSessionId, "removal_capture");
+        const removal = ingressRemovalFact({ ...child.endObservation, bridgeSessionId: finish.bridgeSessionId, controlSessionId: finish.sessionId, ...boundary });
+        const fact = { state: read(), activity: activity(), removal }; assertIngressClosedGeneration(fact.state, removal); return fact;
+      }, 25000, phaseSignal);
     },
     async activity() {
       check(); requireIngress(peer.frameObservation.observations.length === ackIds.size &&
@@ -255,7 +331,7 @@ async function runRealEntry(plan) {
         try { await closePeer(); } catch { cleanupFailures.push("ingress_peer_close"); }
         let finalState;
         let keyCustody = "not_created";
-        if (trace.includes("shutdown_store_closed") && commits.length + (plan.phase === 2 ? 1 : 0) > 0) {
+        if (trace.includes("shutdown_store_closed") && commits.length + (plan.phase >= 2 ? 1 : 0) > 0) {
           try {
             finalState = read();
             requireIngress(finalState.counts.seed === 0 && finalState.counts.delivery === 0 && finalState.counts.notification === 0 &&
@@ -275,7 +351,8 @@ async function runRealEntry(plan) {
           peerClosed, lockClosedLast: ownerClosed && peerClosed && trace.includes("shutdown_store_closed"), cleanupFailures: [...cleanupFailures],
           finalState, keyCustody, outcomes: outcomes(), trace: [...trace], environmentKeys: Object.keys(process.env).sort(), commitObservations: [...commits],
           ackObservations: peer ? receiver().observations : [],
-          receiver: peer ? receiver() : { invalid: false, overflow: false, observations: [] }, observerFailure, overflow };
+          receiver: peer ? receiver() : { invalid: false, overflow: false, observations: [] }, observerFailure, overflow,
+          ...(plan.closedGenerationReopen && plan.phase >= 2 ? { history: readIngressHistory(plan, files()) } : {}) };
       })(); return closePromise;
     },
   };

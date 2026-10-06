@@ -742,3 +742,420 @@ test("C closed report keeps the actual optional outcome/organizer DTO and sparse
     assert.deepEqual(h.ingressCloseFact(close), close); // The cleanup oracle, not DTO projection, refuses this known negative fact.
   } finally { f.dispose(); }
 });
+
+test("closed generation selection is finite and rejects conflicting branches before effects", async () => {
+  const h = await helpers(), out = "/private/tmp/meeting-closed-selector-unused";
+  assert.deepEqual(h.parseIngressArguments(["--closed-generation-reopen", "--out", out]), { out, missingLauncher: false, closedGenerationReopen: true });
+  for (const flags of [["--closed-generation-reopen", "--missing-launcher"], ["--conflicting-replay", "--closed-generation-reopen"],
+    ["--closed-generation-reopen", "--closed-generation-reopen"], ["--terminal-reopen"], ["--closed-generation-reopen=true"]]) {
+    assert.throws(() => h.parseIngressArguments([...flags, "--out", out]), /ingress_argument|ingress_reopen_selection/);
+  }
+  const f = syntheticEffects(); Object.assign(f.plan, { closedGenerationReopen: true, missingLauncher: true });
+  await assert.rejects(h.runIngressCampaign(f.plan, f.effects), /reopen_selection/); assert.deepEqual(f.calls, []);
+});
+
+// Synthetic lifecycle input only; these rows are never authored by the executable.
+function closedState() {
+  const s = blocked(); s.metadata = { ...s.metadata, state: "admitted", totalAttempts: 2, generationAttempts: 1,
+    organizerId: "ou_e2e_organizer", organizerSource: "reservation", reference: { kind: "reservation", reserveId: "reserve-e2e-1" }, admittedAtMs: 201,
+    retryGeneration: 1, operatorRetryCount: 1, lastOperator: "e2e-ingress-operator", lastOperatorRetryAtMs: 200 };
+  return { ...s, sessions: [{ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId,
+    occurrenceStartedAt: identity.occurrenceStartedAt, state: "finalizing", terminalReason: null }],
+    counts: { ...s.counts, custody: 1, recording: 1 },
+    custody: [{ physicalClientId: "synthetic-client", physicalGenerationId: "a".repeat(32), bridgeSessionId: "synthetic-bridge", state: "cleared",
+      failure: null, recordedAtMs: 500, outcome: "departure_confirmed", reason: "departure_observed" }],
+    generations: [{ bridgeSessionId: "synthetic-bridge", controlSessionId: "41" }],
+    reopenEvidence: {
+      generation: [{ generationId: "synthetic-generation", occurrenceId: identity.occurrenceId, bridgeSessionId: "synthetic-bridge", controlSessionId: "41",
+        handle: "b".repeat(32), terminalAtMs: 300, terminalSource: "bridge_observed", terminalReason: "removed", expiresAtMs: 300 + 1209600000 }],
+      timedOwner: [{ generationId: "synthetic-generation", bridgeSessionId: "synthetic-bridge", controlSessionId: "41", state: "closed", tokenPresent: true }],
+      recording: [{ occurrenceId: identity.occurrenceId, handle: "b".repeat(32), sha256: "c".repeat(64), keyId: "d".repeat(16), durationMs: 20, finalizedAtMs: 350,
+        format: "pcm_s16le/24000/1", captureDrain: "confirmed", captureDrainReason: null, captureDrainEpoch: "1", captureDrainLastFrameSequence: "1",
+        captureDrainOutputEndSample: "480", captureDrainFinalPairSequence: "1", bytes: 100, device: "1", inode: "2" }],
+      recovery: [{ generationId: "synthetic-generation", occurrenceId: identity.occurrenceId, bridgeSessionId: "synthetic-bridge", controlSessionId: "41",
+        handle: "b".repeat(32), sha256: "c".repeat(64), keyId: "d".repeat(16), kind: "final", failureAttempt: null }],
+      physical: [{ occurrenceId: identity.occurrenceId, physicalClientId: "synthetic-client", physicalGenerationId: "a".repeat(32), bridgeSessionId: "synthetic-bridge",
+        claimedAtMs: 250, clearedAtMs: 500, clearReason: "departure_observed", operatorPresent: false, exitDiagnostic: null,
+        outcomeOccurrenceId: identity.occurrenceId, outcomePhysicalClientId: "synthetic-client", outcomePhysicalGenerationId: "a".repeat(32),
+        outcomeBridgeSessionId: "synthetic-bridge", observedAt: new Date(450).toISOString() }],
+      unknownEnd: [{ occurrenceId: identity.occurrenceId, sourceKind: "final", failureAttempt: 0, handle: "b".repeat(32), sha256: "c".repeat(64), keyId: "d".repeat(16),
+        bytes: 100, device: "1", inode: "2", detectedAtMs: 400, deadlineMs: 400 + 1209600000, state: "assigned", claimed: false,
+        claimExpiresAtMs: null, failure: null, deletedAtMs: null, lastObservedAtMs: 400 }], counts: { failedRecording: 0, alignmentAttempt: 0 }
+    } };
+}
+const removalFact = () => ({ reason: "removed", observedAt: new Date(300).toISOString(), observationTiming: {
+  clockDomainId: "e2e-clock", hostBeforeNs: "10", hostAfterNs: "11" }, observationTimingReason: null, bridgeSessionId: "synthetic-bridge", controlSessionId: "41", captureEpoch: "1", lastFrameSequence: "1", outputEndSample: "480", finalClockPairSequence: "1" });
+const historyFact = () => ({ runtime: { bytes: 3, sha256: "e".repeat(64), pids: [43] }, bridge: { bytes: 100, sha256: "f".repeat(64), pid: 44 },
+  files: { recording: 1, outbox: 0, receipt: 0, key: true } });
+test("closed generation predicate binds removal, recording and both independent retention clocks", async () => {
+  const h = await helpers(); h.assertIngressClosedGeneration(closedState(), removalFact());
+  assert.equal(closedState().reopenEvidence.timedOwner[0]!.tokenPresent, true);
+});
+
+async function reopenFixture(mutate: Mutation = () => {}) {
+  const h = await helpers(); let phase = 0; const current = closedState();
+  const acceptedAudit = (state: Record<string, unknown>) => { if (Array.isArray(state.events)) for (const [i, e] of state.events.entries()) Object.assign(e, { acceptedAtMs: 100 + i }); };
+  acceptedAudit(current);
+  const emptyEvidence = () => ({ generation: [], timedOwner: [], recording: [], recovery: [], physical: [], unknownEnd: [], counts: { failedRecording: 0, alignmentAttempt: 0 } });
+  const f = syntheticEffects(false, (name, value) => {
+    // Existing owners receive selected reader shape even before generation creation.
+    if (["deliver", "blocked", "launched", "retry"].includes(name)) (value.state as Record<string, unknown>).reopenEvidence = emptyEvidence();
+    if (name === "read" || name === "between") value.reopenEvidence = emptyEvidence();
+    if (name === "close") (value.finalState as Record<string, unknown>).reopenEvidence = emptyEvidence();
+    if (phase === 2 && name === "launched") (value.state as State).sessions[0]!.state = "listening";
+    if (phase === 2 && name === "read" && (value as unknown as State).sessions.length) (value as unknown as State).sessions[0]!.state = "listening";
+    if (value.state) acceptedAudit(value.state as Record<string, unknown>);
+    if (value.finalState) acceptedAudit(value.finalState as Record<string, unknown>);
+    acceptedAudit(value);
+    mutate(name, value);
+  });
+  Object.assign(f.plan, { closedGenerationReopen: true });
+  const ordinaryRun = f.effects.runOwner, ordinaryClose = f.owner.close;
+  const fact = <T extends object>(name: string, value: T) => { f.calls.push(name); const result = copy(value); mutate(name, result as Record<string, unknown>); return result; };
+  let settled = false; const live = () => ({ ...emptyActivity(), files: historyFact().files, runtimePids: [43], bridge: { pid: 44, bridgeSessionId: "synthetic-bridge", envKeys: ["PATH"] },
+    outcomes: [{ occurrenceId: identity.occurrenceId, phase: "settled", controlSessionId: "41", failure: null, finalization: "recorded", custody: "assigned", runtimeClose: "closed", runtimeCleanup: "graceful" }] });
+  const receiver = emptyActivity().receiver; const commits: Record<string, unknown>[] = [];
+  const reopenedActivity = () => ({ ...emptyActivity(), requests: [{ route: "ws_endpoint", status: 200 }], files: historyFact().files, history: historyFact(), receiver });
+  Object.assign(f.owner, {
+    async remove() { return fact("remove", { requested: "removed" }); },
+    async settled() { settled = true; return fact("settled", { state: current, activity: live(), removal: removalFact() }); },
+    async close() {
+      if (phase === 1 || !settled) return ordinaryClose();
+      return fact("close", { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true, cleanupFailures: [], finalState: current,
+        keyCustody: "private_runtime_file", outcomes: phase === 2 ? live().outcomes : [], trace: [], environmentKeys: ["PATH"],
+        receiver, observerFailure: false, overflow: false, commitObservations: commits, ackObservations: receiver.observations, history: historyFact() });
+    },
+  });
+  f.effects.runOwner = async (p, signal) => {
+    phase++; if (phase <= 2) return ordinaryRun(p, signal);
+    const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+    const owner3 = {
+      async ready() { return fact("ready3", { admitted: true, started: true, connections: 1, receiver }); },
+      async read() { return fact("read3", current); },
+      async activity() { return fact("activity3", reopenedActivity()); },
+      async discover() { return fact("discover3", { resolved: 0, launched: 0, deferred: 0 }); },
+      async deliver(send: typeof f.plan.sends[number]) {
+        const commit = { ordinal: 1, ackFloor: 0, wireMessageId: send.wireMessageId, eventId: send.eventId, expectedHash: send.hash, persistedHash: send.hash, immutable: identity };
+        commits.push(commit); receiver.observations.push({ ordinal: 1, kind: "ack", messageId: send.wireMessageId, payload: { code: 200 } });
+        return fact("deliver3", { commit, receiver, state: current });
+      }, close: f.owner.close,
+    };
+    const result = await runIngressPhase(p, owner3, { signal });
+    return fact("owner3", { ...result, ownerProcessProof: { cleanupConfirmed: true, processInventoryVerified: true, knownOwnedChildrenReaped: true,
+      pids: [{ pid: 45, origins: ["ingress-phase-3"] }], probes: [{ pid: 45, origins: ["ingress-phase-3"], status: "absent" }],
+      children: [{ pid: 45, role: "ingress-phase-3", outcome: { exitObserved: true, code: 0, signal: null } }] },
+      child: { pid: 45, closeObserved: true, exitObserved: true, code: 0, signal: null, stdioSettled: true, forced: false } });
+  };
+  f.effects.between = async () => {
+    if (phase !== 1) return fact(`between${phase}`, current);
+    const state = { ...blocked(), reopenEvidence: emptyEvidence() }; acceptedAudit(state); return fact("between1", state);
+  };
+  return { ...f, h };
+}
+test("selected ordinary campaign waits for removed settlement and cleanup before owner3 replay", async () => {
+  const f = await reopenFixture(), result = await f.h.runIngressCampaign(f.plan, f.effects);
+  assert.equal(result.success, true, JSON.stringify(result)); assert.equal(result.phases.length, 3);
+  assert.equal(result.selectedCase, "closed-generation-reopen"); assert.equal(result.strictTerminalState, false); assert.equal(result.durableSessionState, "finalizing");
+  assert.ok(f.calls.indexOf("remove") > f.calls.lastIndexOf("launched"));
+  assert.ok(f.calls.indexOf("settled") < f.calls.indexOf("owner2")); assert.ok(f.calls.indexOf("owner2") < f.calls.indexOf("between2"));
+  assert.ok(f.calls.indexOf("between2") < f.calls.indexOf("ready3")); assert.ok(f.calls.indexOf("owner3") < f.calls.indexOf("between3"));
+  assert.equal(f.calls.filter(c => c === "discover3").length, 2); assert.equal(f.calls.filter(c => c === "deliver3").length, 1);
+});
+
+const closedMutations: [string, string, (s: ReturnType<typeof closedState>) => void][] = [
+  ...["discovered", "failed", "notified"].map(v => [v, "reopen_session", (s: ReturnType<typeof closedState>) => { s.sessions[0]!.state = v; }] as [string, string, (s: ReturnType<typeof closedState>) => void]),
+  ["local clock", "reopen_generation", s => { s.reopenEvidence.generation[0]!.terminalSource = "local_clock"; }],
+  ["ended reason", "reopen_generation", s => { s.reopenEvidence.generation[0]!.terminalReason = "ended"; }],
+  ["generation expiry clock", "reopen_generation", s => { s.reopenEvidence.generation[0]!.expiresAtMs = s.reopenEvidence.unknownEnd[0]!.deadlineMs; }],
+  ["active timed owner", "reopen_timed_owner", s => { s.reopenEvidence.timedOwner[0]!.state = "active"; }],
+  ["quarantine", "reopen_physical", s => { s.custody[0]!.state = "quarantined"; }],
+  ["manual clearance", "reopen_physical", s => { s.reopenEvidence.physical[0]!.clearReason = "operator_inspected_idle"; }],
+  ["unrecorded physical", "reopen_physical", s => { Object.assign(s.custody[0]!, { recordedAtMs: null }); }],
+  ["unconfirmed departure", "reopen_physical", s => { s.custody[0]!.outcome = "departure_unconfirmed"; }],
+  ["foreign physical", "reopen_physical", s => { s.reopenEvidence.physical[0]!.outcomePhysicalGenerationId = "e".repeat(32); }],
+  ["unknown deadline", "reopen_unknown_end", s => { s.reopenEvidence.unknownEnd[0]!.deadlineMs++; }],
+  ["unknown first detection", "reopen_unknown_end", s => { s.reopenEvidence.unknownEnd[0]!.detectedAtMs++; s.reopenEvidence.unknownEnd[0]!.deadlineMs++; }],
+  ["unknown source", "reopen_unknown_end", s => { s.reopenEvidence.unknownEnd[0]!.sourceKind = "bridge_failure"; }],
+  ["unknown cleanup claim", "reopen_unknown_end", s => { s.reopenEvidence.unknownEnd[0]!.claimed = true; }],
+  ["recording source identity", "reopen_unknown_end", s => { s.reopenEvidence.recording[0]!.inode = "3"; }],
+  ["capture drain", "reopen_recording", s => { s.reopenEvidence.recording[0]!.captureDrain = "unconfirmed"; }],
+  ["recovery binding", "reopen_recording", s => { s.reopenEvidence.recovery[0]!.controlSessionId = "42"; }],
+  ...["seed", "delivery", "notification"].map(v => [v, "reopen_cardinality", (s: ReturnType<typeof closedState>) => { s.counts[v as "seed"] = 1; }] as [string, string, (s: ReturnType<typeof closedState>) => void]),
+];
+for (const [name, predicate, change] of closedMutations) test(`C closed generation ${name} independently stops owner3`, async () => {
+  const h = await helpers(), s = closedState(); change(s); assert.throws(() => h.assertIngressClosedGeneration(s, removalFact()), new RegExp(predicate));
+  const f = await reopenFixture((stage, v) => { if (stage === "settled") change(v.state as ReturnType<typeof closedState>); });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false);
+  assert.equal(f.calls.includes("ready3"), false); assert.ok(result.phases[1].failures.includes(`ingress_${predicate}`), JSON.stringify(result));
+});
+for (const stage of ["owner2", "between2", "close2"]) test(`C ${stage} boundary prevents third owner`, async () => {
+  let closes = 0;
+  const f = await reopenFixture((name, v) => {
+    if (name === "owner2" && stage === name) v.ownerProcessProof = { cleanupConfirmed: false };
+    if (name === "between2" && stage === name) v.fileIdentity = "other-file";
+    if (name === "close" && ++closes === 2 && stage === "close2") (v.finalState as ReturnType<typeof closedState>).events[0]!.title = "late mutation";
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false); assert.equal(f.calls.includes("ready3"), false);
+});
+for (const bad of ["resolved", "launched", "deferred", "code500", "wireID", "duplicate", "noCommit", "lateCommit", "audit", "extraOutcome", "history", "postclose", "lateACK"]) {
+  test(`C ordinary third-owner ${bad} refuses`, async () => {
+    let closes = 0;
+    const f = await reopenFixture((stage, v) => {
+      if (stage === "discover3" && ["resolved", "launched", "deferred"].includes(bad)) v[bad] = 1;
+      if (stage === "deliver3") {
+        const r = v.receiver as ReturnType<typeof emptyActivity>["receiver"];
+        if (bad === "code500") r.observations[0]!.payload.code = 500;
+        if (bad === "wireID") r.observations[0]!.messageId = "phase1-0";
+        if (bad === "duplicate") r.observations.push(copy(r.observations[0]!));
+        if (bad === "noCommit") delete v.commit;
+        if (bad === "lateCommit") (v.commit as { ackFloor: number }).ackFloor = 1;
+        if (bad === "audit") (v.state as ReturnType<typeof closedState>).events[0]!.hash = "e".repeat(64);
+      }
+      if (stage === "activity3" && bad === "extraOutcome") (v.outcomes as object[]).push({ occurrenceId: identity.occurrenceId, phase: "live" });
+      if (stage === "activity3" && bad === "history") (v.history as ReturnType<typeof historyFact>).bridge.sha256 = "0".repeat(64);
+      if (stage === "close" && ++closes === 3) {
+        if (bad === "postclose") (v.finalState as ReturnType<typeof closedState>).reopenEvidence.unknownEnd[0]!.detectedAtMs++;
+        if (bad === "lateACK") (v.receiver as ReturnType<typeof emptyActivity>["receiver"]).observations.push({ ordinal: 2, kind: "ack", messageId: "late", payload: { code: 200 } });
+      }
+    });
+    assert.equal((await f.h.runIngressCampaign(f.plan, f.effects)).success, false, bad);
+  });
+}
+test("C preserved historical bytes require no old config and detect append/new/changed source", async () => {
+  const h = await helpers(), root = mkdtempSync("/private/tmp/meeting-reopen-history-"); chmodSync(root, 0o700);
+  const plan = { runtimePidsPath: path.join(root, "pids"), controlDir: root }, stateFile = path.join(root, "state.json");
+  try {
+    writeFileSync(plan.runtimePidsPath, "43\n"); writeFileSync(stateFile, JSON.stringify({ pid: 44, configPath: path.join(root, "absent-config") }));
+    const history = h.readIngressHistory(plan, historyFact().files);
+    assert.equal(existsSync(path.join(root, "absent-config")), false);
+    const activity = { ...emptyActivity(), requests: [{ route: "ws_endpoint", status: 200 }], files: history.files, history };
+    h.assertIngressReopenActivity(activity, history);
+    writeFileSync(plan.runtimePidsPath, "43\n45\n"); assert.throws(() => h.readIngressHistory(plan, history.files), /history_identity/);
+    writeFileSync(plan.runtimePidsPath, "43\n "); assert.throws(() => h.assertIngressReopenActivity({ ...activity, history: h.readIngressHistory(plan, history.files) }, history), /reopen_history/);
+    writeFileSync(plan.runtimePidsPath, "43\n"); writeFileSync(stateFile, JSON.stringify({ pid: 44, joined: true }));
+    assert.throws(() => h.assertIngressReopenActivity({ ...activity, history: h.readIngressHistory(plan, history.files) }, history), /reopen_history/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+for (const field of ["privateDiagnostic", "recording_path", "authorization", "cleanup_claim_token"]) test(`C selected ${field} never survives success or failure report`, async () => {
+  for (const failed of [false, true]) {
+    const f = await reopenFixture((stage, v) => { if (stage === "settled") {
+      const state = v.state as ReturnType<typeof closedState>; Object.assign(state.reopenEvidence.unknownEnd[0]!, { [field]: "PRIVATE_UNRETAINED" });
+      if (failed) state.sessions[0]!.state = "failed";
+    } });
+    const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false); assert.equal(f.calls.includes("ready3"), false);
+    assert.equal(JSON.stringify(result).includes("PRIVATE_UNRETAINED"), false);
+  }
+});
+
+async function selectedReaderFixture() {
+  const h = await helpers(), peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
+  const root = mkdtempSync("/private/tmp/meeting-reopen-reader-"); chmodSync(root, 0o700);
+  const databasePath = path.join(root, "state.db"), source = path.join(root, "b".repeat(32) + ".crsr"), token = "private-owner-token".padEnd(36, "x"), authorization = "9".repeat(64);
+  const store = openSessionStore({ filename: databasePath }), envelope = peer.inviteEnvelope({ eventId: "original-a", providerMeetingId: "reader-component", meetingNo: "123456789",
+    title: "First accepted title", startSeconds: 1791280800, inviteSeconds: 1791280800, createTimeMs: 1791280800000 });
+  const invite = normalizeInvite(envelope, peer.SCOPE), occurrenceId = invite.occurrenceId;
+  store.acceptInvite(invite, 100); store.close();
+  const db = new Database(databasePath), e = closedState().reopenEvidence, g = e.generation[0]!, r = e.recording[0]!, p = e.physical[0]!;
+  const generationId = Buffer.from(occurrenceId).toString("hex") + ":" + Buffer.from(g.bridgeSessionId).toString("hex");
+  // Only component setup SQL. The executable has no row-writing factory.
+  db.prepare(`UPDATE feishu_invite_occurrences SET state='admitted', admitted_at_ms=201,organizer_source='reservation',organizer_id_type='open_id',
+    organizer_open_id='ou_e2e_organizer',organizer_display_name='Synthetic Organizer',reference_kind='reservation',reference_json=? WHERE occurrence_id=?`)
+    .run(JSON.stringify({ kind: "reservation", reserveId: "reserve-e2e-1" }), occurrenceId);
+  db.prepare("INSERT INTO sessions VALUES(?,?,?,?,'finalizing',NULL,100,300)").run(occurrenceId, "synthetic-segment", invite.providerMeetingId, invite.occurrenceStartedAt);
+  db.prepare(`INSERT INTO reconciliation_generations(generation_id,occurrence_id,bridge_session_id,runtime_session_id,recording_handle,created_at_ms,terminal_at_ms,terminal_source,terminal_reason,expires_at_ms)
+    VALUES(?,?,?,?,?,250,300,'bridge_observed','removed',?)`).run(generationId, occurrenceId, g.bridgeSessionId, "41", r.handle, g.expiresAtMs);
+  db.prepare("INSERT INTO timed_evidence_owners(generation_id,owner_token,state) VALUES(?,?,'closed')").run(generationId, token);
+  writeFileSync(source, Buffer.alloc(100), { mode: 0o600 });
+  db.prepare(`INSERT INTO recordings(occurrence_id,handle,sha256,duration_ms,finalized_at_ms,encrypted_path,format,key_id,capture_drain,capture_drain_reason,
+    capture_drain_epoch,capture_drain_last_frame_sequence,capture_drain_output_end_sample,capture_drain_final_pair_sequence)
+    VALUES(?,?,?,?,?,?,?,?, 'confirmed',NULL,'1','1','480','1')`).run(occurrenceId, r.handle, r.sha256, 20, 350, source, r.format, r.keyId);
+  db.prepare(`INSERT INTO recording_recovery_bindings(generation_id,occurrence_id,bridge_session_id,source_session_id,recording_handle,sha256,key_id,authorization,recording_kind,failure_attempt)
+    VALUES(?,?,?,?,?,?,?,?,'final',NULL)`).run(generationId, occurrenceId, g.bridgeSessionId, "41", r.handle, r.sha256, r.keyId, authorization);
+  const outcome = { schema: "bridge-process-outcome/v1", physicalClientId: p.physicalClientId, physicalGenerationId: p.physicalGenerationId,
+    occurrenceId, bridgeSessionId: p.bridgeSessionId, outcome: "departure_confirmed", reason: "departure_observed", observedAt: p.observedAt };
+  db.prepare(`INSERT INTO physical_client_custody(physical_client_id,physical_generation_id,occurrence_id,bridge_session_id,state,claimed_at_ms,
+    outcome_json,outcome_recorded_at_ms,cleared_at_ms,clear_reason) VALUES(?,?,?,?,'cleared',250,?,500,500,'departure_observed')`)
+    .run(p.physicalClientId, p.physicalGenerationId, occurrenceId, p.bridgeSessionId, JSON.stringify(outcome));
+  const assigner = openSessionStore({ filename: databasePath });
+  assigner.assignUnknownEndCustody({ kind: "final", occurrenceId }, 400, { recordingHandle: r.handle, encryptedPath: source, sha256: r.sha256, keyId: r.keyId });
+  assigner.close();
+  const read = () => h.readIngressState({ databasePath, occurrenceId, closedGenerationReopen: true });
+  return { h, read, db, databasePath, source, root, invite, envelope, token, authorization, occurrenceId, generationId, dispose() { db.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+test("C selected guarded schema29 projection and production exact replay/decoder preserve closed source", async () => {
+  const f = await selectedReaderFixture();
+  try {
+    const before = f.read(); f.h.assertIngressClosedGeneration(before, removalFact());
+    assert.equal(before.reopenEvidence.timedOwner[0].tokenPresent, true);
+    const json = JSON.stringify(before); for (const privateValue of [f.source, f.token, f.authorization]) assert.equal(json.includes(privateValue), false);
+    assert.equal(f.h.readIngressState({ databasePath: f.databasePath, occurrenceId: f.occurrenceId }).reopenEvidence, undefined);
+    const store = openSessionStore({ filename: f.databasePath });
+    try {
+      const codec = store.getRecording(f.occurrenceId)!; assert.equal(codec.captureDrain?.drain, "confirmed");
+      store.acceptInvite(normalizeInvite(f.envelope, { region: "feishu", tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef" }), 600);
+    } finally { store.close(); }
+    assert.deepEqual(f.read(), before);
+    const peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs")), decoder = peer.createFeishuFrameReceiver();
+    decoder.receive(peer.eventFrame({ code: 200 }, "phase3-a-replay"));
+    const commit = { ordinal: 1, wireMessageId: "phase3-a-replay", eventId: f.invite.eventId, expectedHash: f.invite.normalizedSha256,
+      persistedHash: before.events[0].hash, immutable: before.immutable, ackFloor: 0 };
+    f.h.assertIngressAck({ wireMessageId: "phase3-a-replay", eventId: f.invite.eventId, hash: f.invite.normalizedSha256, occurrenceId: f.occurrenceId },
+      { commit, receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: decoder.observations } }, before.immutable);
+  } finally { f.dispose(); }
+});
+for (const bad of ["missingOwner", "foreignGeneration", "duplicateGeneration", "foreignRecovery", "recordingBinding", "physicalBinding", "sourceReplacement", "sidecar", "selectionAccessor"]) {
+  test(`C guarded reopen reader ${bad} refuses its bound source`, async () => {
+    const f = await selectedReaderFixture();
+    try {
+      if (bad === "missingOwner") f.db.exec("DELETE FROM timed_evidence_owners");
+      if (["foreignGeneration", "foreignRecovery"].includes(bad)) f.db.pragma("foreign_keys=OFF"); // Explicit malformed component database input.
+      if (bad === "foreignGeneration") f.db.prepare("UPDATE reconciliation_generations SET occurrence_id='foreign'").run();
+      if (bad === "duplicateGeneration") f.db.prepare(`INSERT INTO reconciliation_generations(generation_id,occurrence_id,bridge_session_id,created_at_ms) VALUES('extra',?,'extra',250)`).run(f.occurrenceId);
+      if (bad === "foreignRecovery") f.db.exec("UPDATE recording_recovery_bindings SET occurrence_id='foreign'");
+      if (bad === "recordingBinding") f.db.exec("UPDATE recording_recovery_bindings SET source_session_id='42'");
+      if (bad === "physicalBinding") f.db.exec("UPDATE physical_client_custody SET bridge_session_id='other'");
+      if (bad === "sourceReplacement") { rmSync(f.source); writeFileSync(f.source, Buffer.alloc(101), { mode: 0o600 }); }
+      if (bad === "sidecar") writeFileSync(f.databasePath + "-wal", "synthetic");
+      if (bad === "selectionAccessor") {
+        let calls = 0; const input = { databasePath: f.databasePath, occurrenceId: f.occurrenceId, get closedGenerationReopen() { calls++; return true; } };
+        assert.throws(() => f.h.readIngressState(input), /descriptor/); assert.equal(calls, 0); return;
+      }
+      const predicate = bad === "duplicateGeneration" ? "binding_count" : bad === "recordingBinding" ? "reopen_recording" : bad === "physicalBinding" ? "reopen_physical" : bad === "sourceReplacement" ? "reopen_unknown_end" : bad === "sidecar" ? "WAL" : "reopen_cardinality";
+      assert.throws(() => f.h.assertIngressClosedGeneration(f.read(), removalFact()), new RegExp(predicate));
+    } finally { f.dispose(); }
+  });
+}
+
+for (const bad of ["extraChild", "wrongOrigin", "historicalPID"]) test(`C third-owner ${bad} process attribution refuses even with cleanupConfirmed`, async () => {
+  const f = await reopenFixture((stage, v) => {
+    if (stage !== "owner3") return;
+    const p = v.ownerProcessProof as { pids: { pid: number; origins: string[] }[] };
+    if (bad === "extraChild") p.pids.push({ pid: 46, origins: ["ingress-phase-3"] });
+    if (bad === "wrongOrigin") p.pids[0]!.origins = ["ingress-phase-2"];
+    if (bad === "historicalPID") p.pids[0]!.pid = 43;
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false); assert.deepEqual(result.failures, ["ingress_reopen_process_origins"]);
+});
+
+test("C real store replay and decoder bytes pass the shared ordinary third-owner consumer", async () => {
+  const f = await selectedReaderFixture(), peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")), decoder = peer.createFeishuFrameReceiver();
+  const commits: Record<string, unknown>[] = [], baseline = f.read(), history = historyFact();
+  const send = { eventId: f.invite.eventId, hash: f.invite.normalizedSha256, title: f.invite.title, createTime: f.invite.createTime,
+    inviteSeconds: f.invite.inviteSeconds, startSeconds: f.invite.startSeconds, occurrenceId: f.occurrenceId, envelope: f.envelope, wireMessageId: "phase1-a-1" };
+  const receiver = () => ({ invalid: decoder.invalid, overflow: decoder.overflow, observations: decoder.observations });
+  const activity = () => ({ ...emptyActivity(), requests: [{ route: "ws_endpoint", status: 200 }], files: history.files, history, receiver: receiver() });
+  const effects = {
+    async ready() { return { admitted: true, started: true, connections: 1, receiver: receiver() }; },
+    async read() { return f.read(); }, async activity() { return activity(); }, async discover() { return { resolved: 0, launched: 0, deferred: 0 }; },
+    async deliver(s: typeof send) {
+      const store = openSessionStore({ filename: f.databasePath });
+      try { store.acceptInvite(normalizeInvite(s.envelope, peer.SCOPE), 600); } finally { store.close(); }
+      const persisted = f.read(), commit = { ordinal: 1, ackFloor: 0, wireMessageId: s.wireMessageId, eventId: s.eventId,
+        expectedHash: s.hash, persistedHash: persisted.events[0].hash, immutable: persisted.immutable };
+      commits.push(commit); decoder.receive(peer.eventFrame({ code: 200 }, s.wireMessageId)); // Explicit synthetic wire input, not actual SDK.
+      return { commit, receiver: receiver(), state: persisted };
+    },
+    async close() { return { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true, cleanupFailures: [], finalState: f.read(),
+      history, outcomes: [], trace: [], environmentKeys: ["PATH"], receiver: receiver(), ackObservations: decoder.observations, commitObservations: commits, observerFailure: false, overflow: false }; },
+  };
+  try {
+    const result = await runIngressPhase({ closedGenerationReopen: true, phase: 3, root: f.root, databasePath: f.databasePath,
+      original: baseline, history, removal: removalFact(), sends: [send] }, effects);
+    assert.equal(result.success, true, JSON.stringify(result.failures)); assert.deepEqual(result.close.finalState, baseline);
+    assert.equal(result.close.receiver.observations[0].messageId, "phase3-a-replay"); assert.equal(result.close.commitObservations.length, 1);
+  } finally { f.dispose(); }
+});
+for (const bad of ["getter", "customArray", "toJSON", "nonprimitiveFailure", "rawKnownField"]) test(`C selected DTO ${bad} is discarded before failure serialization`, async () => {
+  let getterCalls = 0;
+  const f = await reopenFixture((stage, v) => {
+    if (stage !== "settled") return;
+    const s = v.state as ReturnType<typeof closedState>;
+    if (bad === "getter") Object.defineProperty(s.reopenEvidence.unknownEnd[0], "privateDiagnostic", { get() { getterCalls++; return "PRIVATE_UNRETAINED"; } });
+    if (bad === "customArray") Object.setPrototypeOf(s.reopenEvidence.unknownEnd, Object.create(Array.prototype));
+    if (bad === "toJSON") Object.assign(s.reopenEvidence.unknownEnd[0]!, { toJSON() { getterCalls++; return "PRIVATE_UNRETAINED"; } });
+    if (bad === "nonprimitiveFailure") Object.assign(s.reopenEvidence.unknownEnd[0]!, { failure: { privateDiagnostic: "PRIVATE_UNRETAINED" } });
+    if (bad === "rawKnownField") s.reopenEvidence.generation[0]!.generationId = "/private/PRIVATE_UNRETAINED";
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false); assert.equal(getterCalls, 0);
+  assert.equal(JSON.stringify(result).includes("PRIVATE_UNRETAINED"), false); assert.equal(f.calls.includes("ready3"), false);
+});
+test("C synchronous effect cannot overrun an absolute selected phase budget", async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")); let deliveries = 0;
+  const effects = { ready() { const end = performance.now() + 4; while (performance.now() < end) { /* synchronous component input */ }
+    return { admitted: true, started: true, connections: 1, receiver: emptyActivity().receiver }; },
+    deliver() { deliveries++; }, close() { return { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true, cleanupFailures: [], outcomes: [],
+      receiver: emptyActivity().receiver, ackObservations: [], commitObservations: [], observerFailure: false, overflow: false }; } };
+  const result = await runIngressPhase({ phase: 1, closedGenerationReopen: true, root: "/synthetic", databasePath: "/synthetic/db" }, effects, { budgetMs: 1 });
+  assert.equal(result.success, false); assert.ok(result.failures.includes("ingress_phase_cancelled")); assert.equal(deliveries, 0);
+});
+
+test("C selected prepare retains captured population alias and fences changed selection", async () => {
+  const f = await reopenFixture(), populated = copy(f.plan);
+  const minimal = { closedGenerationReopen: true, missingLauncher: false };
+  f.effects.prepare = async () => { f.calls.push("prepare"); Object.assign(minimal, populated); };
+  assert.equal((await f.h.runIngressCampaign(minimal, f.effects)).success, true);
+  const changed = await reopenFixture(); changed.effects.prepare = async () => { Object.assign(changed.plan, { closedGenerationReopen: false }); };
+  const result = await changed.h.runIngressCampaign(changed.plan, changed.effects); assert.equal(result.success, false);
+  assert.deepEqual(result.failures, ["ingress_prepared_controls"]); assert.equal(changed.calls.includes("owner1"), false);
+});
+for (const bad of ["notListening", "wrongRemoval", "settledFailure", "unconfirmedRuntime", "unsolicited3", "closeDiagnostic", "lateCustody", "parentLateCustody"]) test(`C reopen ${bad} boundary refuses`, async () => {
+  let closes = 0;
+  const f = await reopenFixture((stage, v) => {
+    if (bad === "notListening" && stage === "launched") (v.state as State).sessions[0]!.state = "discovered";
+    if (bad === "notListening" && stage === "read" && (v as unknown as State).sessions.length) (v as unknown as State).sessions[0]!.state = "discovered";
+    if (bad === "wrongRemoval" && stage === "settled") (v.removal as ReturnType<typeof removalFact>).observedAt = new Date(301).toISOString();
+    if (stage === "settled") {
+      const a = v.activity as { outcomes: { failure: string | null; runtimeCleanup: string }[] };
+      if (bad === "settledFailure") a.outcomes[0]!.failure = "join_failed";
+      if (bad === "unconfirmedRuntime") a.outcomes[0]!.runtimeCleanup = "unconfirmed";
+    }
+    if (bad === "unsolicited3" && stage === "ready3") (v.receiver as ReturnType<typeof emptyActivity>["receiver"]).observations.push({ ordinal: 1, kind: "ack", messageId: "unsolicited", payload: { code: 200 } });
+    if (stage === "close" && ++closes === 3) {
+      if (bad === "closeDiagnostic") Object.assign((v.finalState as ReturnType<typeof closedState>).reopenEvidence.physical[0]!, { privateDiagnostic: "PRIVATE_UNRETAINED" });
+      if (bad === "lateCustody") (v.finalState as ReturnType<typeof closedState>).reopenEvidence.unknownEnd[0]!.deadlineMs++;
+    }
+    if (bad === "parentLateCustody" && stage === "between3") (v as unknown as ReturnType<typeof closedState>).reopenEvidence.unknownEnd[0]!.deadlineMs++;
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false, bad); assert.equal(JSON.stringify(result).includes("PRIVATE_UNRETAINED"), false);
+  if (["notListening", "wrongRemoval", "settledFailure", "unconfirmedRuntime"].includes(bad)) assert.equal(f.calls.includes("ready3"), false);
+});
+
+test("C early selected refusal reports only observed owners and durable session state", async () => {
+  const f = await reopenFixture((stage, v) => { if (stage === "ready") v.admitted = false; });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false);
+  assert.equal(result.phaseCount, 1); assert.equal(result.durableSessionState, null); assert.equal(result.strictTerminalState, false);
+  assert.equal(f.calls.includes("owner2"), false); assert.equal(f.calls.includes("ready3"), false);
+});
+
+for (const changed of ["immutableTitle", "immutableAcceptance", "auditTitle", "auditAcceptance"]) test(`C correlated removal ${changed} cannot replace the admitted invitation baseline`, async () => {
+  let removed = false;
+  const mutateState = (s: Record<string, unknown>) => {
+    const immutable = s.immutable as typeof identity, audit = s.events as (typeof events[number] & { acceptedAtMs: number })[];
+    if (changed === "immutableTitle") immutable.title = "Changed during removal";
+    if (changed === "immutableAcceptance") immutable.acceptedAtMs = 101;
+    if (changed === "auditTitle") audit[0]!.title = "Changed during removal";
+    if (changed === "auditAcceptance") audit[0]!.acceptedAtMs = 101;
+  };
+  const f = await reopenFixture((stage, v) => {
+    if (stage === "settled") removed = true;
+    if (!removed) return;
+    // Every later lifecycle/read/close input agrees with the changed baseline.
+    // No later mismatch supplies an incidental reason to reject this input.
+    if (v.state) mutateState(v.state as Record<string, unknown>);
+    if (v.finalState) mutateState(v.finalState as Record<string, unknown>);
+    if (stage === "between2" || stage === "between3" || stage === "read3") mutateState(v);
+    if (stage === "deliver3") {
+      const commit = v.commit as { immutable: typeof identity };
+      if (changed === "immutableTitle") commit.immutable.title = "Changed during removal";
+      if (changed === "immutableAcceptance") commit.immutable.acceptedAtMs = 101;
+    }
+    if (stage === "close") for (const commit of v.commitObservations as { immutable: typeof identity }[]) {
+      if (changed === "immutableTitle") commit.immutable.title = "Changed during removal";
+      if (changed === "immutableAcceptance") commit.immutable.acceptedAtMs = 101;
+    }
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects);
+  assert.equal(result.success, false, changed); assert.equal(f.calls.includes("ready3"), false);
+  assert.ok(result.phases[1].failures.includes(changed.startsWith("immutable") ? "ingress_removal_immutable_mutation" : "ingress_removal_audit_mutation"), JSON.stringify(result.failures));
+});
