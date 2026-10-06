@@ -49,6 +49,8 @@ import { startR2Provider } from "./r2-provider.mjs";
 import { r2GatewayToml } from "./r2-gateway-config.mjs";
 import { assertR2Plan, runR2InitialBuild, withOwnedPeers } from "./r2-baseline.mjs";
 
+import { closeL4Composition, driveL4Capture, l4Configuration } from "./l4-campaign.mjs";
+
 import { mediaTimingConfiguration } from "./stage.mjs";
 import { mediaTimingMetadata, tailOmissionMetadata, readDurableEvidence } from "./durable-oracles.mjs";
 
@@ -76,10 +78,11 @@ function event(name, detail = {}) {
   const line = { at: new Date().toISOString(), monotonicNs: process.hrtime.bigint().toString(), name, ...detail };
   appendFileSync(eventsPath, `${JSON.stringify(line)}\n`);
 }
-function waitFor(check, { budgetMs, name }) {
+export function waitFor(check, { budgetMs, name, signal }) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + budgetMs;
     const timer = setInterval(() => {
+      if (signal?.aborted) { clearInterval(timer); reject(new Error("l4_drive_cancelled")); return; }
       let value;
       try { value = check(); } catch { value = undefined; }
       if (value) { clearInterval(timer); resolve(value); return; }
@@ -109,13 +112,14 @@ function selectPostmeetingGatewayConfig(fixtureEndpoint) {
 }
 
 async function main() {
+  l4Configuration(plan);
   mediaTimingConfiguration(plan);
   assertR2Plan(plan);
   writeFileSync(eventsPath, "");
   if (plan.initialR1) event("entry_environment", { keys: Object.keys(process.env).sort() });
   const result = await withOwnedPeers({
     interactive: async () => plan.interactive ? startInteractiveProvider() : null,
-    provider: async () => plan.r2Baseline ? startR2Provider({ segmentText: "Scripted fixture R2 baseline segment.", segmentStartMs: 100, segmentEndMs: 200 }) : startFixtureProvider(),
+    provider: async () => plan.r2Baseline ? startR2Provider({ segmentText: "Scripted fixture R2 baseline segment.", segmentStartMs: 100, segmentEndMs: 200 }) : startFixtureProvider({ l4Case: plan.l4Case }),
     unusedVoice: async () => plan.r2Baseline ? startInteractiveProvider() : null,
     peer: async () => startFeishuPeer({ meeting: plan.meeting }),
   }, driveApplication);
@@ -139,29 +143,40 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
   });
   const connection = createFeishuSocketOwner(HttpAgent);
 
+  const l4Controller = plan.l4Case === undefined ? null : new globalThis.AbortController();
+  let l4Drive = null;
   let shuttingDown = false;
   let compositionHandle = null;
   let r2Maintenance = null;
+  const driveWaitFor = (check, options) => waitFor(check, { ...options, ...(l4Controller ? { signal: l4Controller.signal } : {}) });
   const drive = (async () => {
     // 1. The long connection is ready once the shipped ingress reports started.
-    await waitFor(() => trace.includes("composition_started"), { budgetMs: plan.budgets.startMs, name: "composition_started" });
-    await waitFor(() => peer.connectionCount > 0, { budgetMs: plan.budgets.startMs, name: "long_connection" });
+    await driveWaitFor(() => trace.includes("composition_started"), { budgetMs: plan.budgets.startMs, name: "composition_started" });
+    await driveWaitFor(() => peer.connectionCount > 0, { budgetMs: plan.budgets.startMs, name: "long_connection" });
     event("long_connection_ready");
 
     // 2. One scheduled-meeting invite through the real dispatcher's accept().
     peer.deliverInvite(inviteEnvelope(plan.meeting), plan.meeting.eventId);
     event("invite_delivered");
-    await waitFor(() => peer.acknowledgements.some((value) => value?.code === 200), { budgetMs: plan.budgets.admitMs, name: "invite_ack" });
+    await driveWaitFor(() => peer.acknowledgements.some((value) => value?.code === 200), { budgetMs: plan.budgets.admitMs, name: "invite_ack" });
     event("invite_acknowledged");
 
     // 3. The scripted client reports its own media stream.
-    const child = await waitFor(() => {
+    const child = await driveWaitFor(() => {
       const state = readJson(path.join(plan.controlDir, "state.json"));
       return state?.mediaConnected && state.framesSent >= plan.captureFrames ? state : null;
     }, { budgetMs: plan.budgets.captureMs, name: "media_capture" });
     event("media_capture", { framesSent: child.framesSent, endpoint: child.mediaEndpoint });
 
-    if (interactive) await driveInteractive(interactive, () => compositionHandle);
+    if (plan.l4Case !== undefined) {
+      l4Drive = await driveL4Capture({ l4Case: plan.l4Case, provider: interactive,
+        child: () => readJson(path.join(plan.controlDir, "state.json")), runtimeEvents, waitFor: driveWaitFor, budgetMs: plan.budgets.captureMs });
+      const selectedChild = readJson(path.join(plan.controlDir, "state.json"));
+      l4Drive.bridgeSessionId = selectedChild.l4.bridgeSessionId;
+      l4Drive.disclosureCommandId = selectedChild.l4.disclosureCommandId;
+      event("l4_capture_recognized", { case: plan.l4Case, segmentId: l4Drive.segmentId, runtimeSessionId: l4Drive.runtimeSessionId,
+        planSha256: l4Drive.planSha256, rawRows: l4Drive.rawRows });
+    } else if (interactive) await driveInteractive(interactive, () => compositionHandle);
     // This fault cut closes the active shipped owner; it does not pretend a
     // positive meeting end or wait for publication the closure never promised.
     if (plan.d2Cut === "repeated-close") return;
@@ -203,13 +218,13 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
 
     if (plan.initialR1) {
       const databasePath = path.join(JSON.parse(readFileSync(plan.standaloneConfigPath, "utf8")).stateRoot, "orchestration.db");
-      const occurrence = await waitFor(() => compositionHandle?.occurrenceOutcomes().find(initialRuntimeSettled),
+      const occurrence = await driveWaitFor(() => compositionHandle?.occurrenceOutcomes().find(initialRuntimeSettled),
       { budgetMs: plan.budgets.buildMs, name: "r1_live_cleanup_confirmed" });
       event("r1_live_cleanup_confirmed", { occurrenceId: occurrence.occurrenceId });
       const outcome = await compositionHandle.maintenanceTick("backfill");
       if (outcome !== "backfill_rescheduled" || compositionHandle.maintenanceStatus().codes.length !== 0)
         throw new Error("r1_initial_worker_outcome_refused");
-      const seed = await waitFor(() => {
+      const seed = await driveWaitFor(() => {
         const occurrenceId = readSeedOccurrenceId(databasePath);
         const state = readKnownEndRecoveryState({ databasePath, occurrenceId });
         return state.r1Preconditions.initialFailureRestartReady ? state : null;
@@ -228,8 +243,13 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     //    A bundle the shipped delivery lane cannot build is a recorded block,
     //    not a harness failure: the run still closes through the real order.
     let bundle = null;
+    if (plan.l4Case !== undefined) {
+      bundle = await driveWaitFor(() => findReadyBundle(), { budgetMs: plan.budgets.buildMs, name: "l4_artifact_ready" });
+      event("artifact_ready", { bundle });
+      return; // Explicit L6/L7 non-publication selection; READY is still mandatory.
+    }
     try {
-      bundle = await waitFor(() => findReadyBundle(), { budgetMs: plan.budgets.buildMs, name: "artifact_bundle" });
+      bundle = await driveWaitFor(() => findReadyBundle(), { budgetMs: plan.budgets.buildMs, name: "artifact_bundle" });
       event("artifact_ready", { bundle });
     } catch (error) {
       event("artifact_blocked", { reason: String(error?.message ?? error) });
@@ -237,11 +257,11 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
 
     // 6. The harness runs the real TeamMem consumer; the shipped outbox worker
     //    journals its receipt and the notification lane delivers one DM.
-    await waitFor(() => controlFileExists("teammem-done"), { budgetMs: plan.budgets.teammemMs, name: "teammem_done" });
+    await driveWaitFor(() => controlFileExists("teammem-done"), { budgetMs: plan.budgets.teammemMs, name: "teammem_done" });
     event("teammem_done");
     if (bundle !== null) {
       try {
-        await waitFor(() => peer.messages.length > 0, { budgetMs: plan.budgets.notifyMs, name: "organizer_dm" });
+        await driveWaitFor(() => peer.messages.length > 0, { budgetMs: plan.budgets.notifyMs, name: "organizer_dm" });
         event("organizer_dm", { count: peer.messages.length });
       } catch (error) {
         event("organizer_dm_blocked", { reason: String(error?.message ?? error) });
@@ -274,19 +294,29 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     readConfig: readStandaloneConfig,
     inspectStateRoot,
     acquireOwnerLock: acquireApplicationOwnerLock,
-    composeAfterAdmission: (config, owner) => plan.d2Cut === "repeated-close" || plan.initialR1 || plan.r2Baseline
+    composeAfterAdmission: (config, owner) => plan.d2Cut === "repeated-close" || plan.initialR1 || plan.r2Baseline || plan.l4Case !== undefined
       ? runExposedComposition(composeApplication, config, owner, compositionOptions, (handle) => {
         compositionHandle = handle;
         event("test_entry_composition_exposed", { path: "built_composeApplication_after_shipped_admission" });
-      })
+      }, ...(l4Controller ? [l4Controller] : []))
       : runStandaloneComposition(config, owner, compositionOptions),
     report(channel, line) { event("report", { channel, line }); process[channel === "stdout" ? "stdout" : "stderr"].write(`${line}\n`); },
   };
 
   const run = runStandalone(["--standalone-config", plan.standaloneConfigPath], dependencies);
 
-  let driveFailure = null;
-  drive.then(() => undefined, (error) => { driveFailure = String(error?.message ?? error); event("drive_failed", { reason: driveFailure }); })
+  let driveFailure = null, l4Settlement = null;
+  if (l4Controller) {
+    l4Settlement = drive.then(() => undefined, error => {
+      driveFailure = /^l4_[a-z_]+$/.test(error?.message ?? "") ? error.message : "l4_drive_prerequisite_failed";
+      event("drive_failed", { reason: driveFailure });
+    }).then(async () => {
+      shuttingDown = true;
+      try { await closeL4Composition({ getApplication: () => compositionHandle, controller: l4Controller }); }
+      catch { driveFailure ??= "l4_public_close_failed"; event("drive_failed", { reason: driveFailure }); }
+      event("l4_public_close_settled");
+    });
+  } else drive.then(() => undefined, (error) => { driveFailure = String(error?.message ?? error); event("drive_failed", { reason: driveFailure }); })
     .then(() => {
       shuttingDown = true;
       event("shutdown_signalled");
@@ -297,7 +327,13 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
   try { exit = await run; }
   finally {
     // Close the admitted owner before external peers even on app failure.
-    if (compositionHandle) await compositionHandle.close();
+    if (l4Controller) {
+      if (!l4Controller.signal.aborted) {
+        try { await closeL4Composition({ getApplication: () => compositionHandle, controller: l4Controller }); }
+        catch { driveFailure ??= "l4_public_close_failed"; }
+      }
+      await l4Settlement;
+    } else if (compositionHandle) await compositionHandle.close();
   }
   event("run_standalone_exit", { exit });
   if (plan.d2Cut === "repeated-close") {
@@ -309,6 +345,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     exit, driveFailure, shuttingDown, trace,
     feishuRequests: peer.requests, feishuMessages: peer.messages, providerCalls: provider.calls,
     interactiveCalls: interactive?.calls ?? [], runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
+    ...(plan.l4Case === undefined ? {} : { l4Drive }),
     r2Maintenance: plan.r2Baseline ? compositionHandle?.maintenanceStatus() ?? r2Maintenance : null,
     unusedVoice: unusedVoice ? { calls: unusedVoice.calls, appended: unusedVoice.appended, ready: unusedVoice.ready } : null,
   } };

@@ -5,6 +5,8 @@ import { createServer } from "node:http";
 import process from "node:process";
 import { WebSocketServer } from "ws";
 
+import { createSubmittedFrameTracker, submittedTranscriptEvents } from "./l4-campaign.mjs";
+
 function wav() {
   // Ten 20 ms frames stay below Runtime's bounded pending-playback queue
   // while the peer holds Rendered for the actual interruption cut.
@@ -20,6 +22,8 @@ function wav() {
 }
 
 export async function startInteractiveProvider() {
+  const submitted = createSubmittedFrameTracker();
+  let connectionOrdinal = 0;
   const calls = [], sockets = new Set(), heldResponses = new Set();
   let holdLanguage = false, bargeOnSpeech = false;
   let recognition = null, previous = null, ordinal = 0, appended = 0;
@@ -53,16 +57,20 @@ export async function startInteractiveProvider() {
   });
   const websocket = new WebSocketServer({ server });
   websocket.on("connection", (socket) => {
+    const connection = `recognition-${++connectionOrdinal}`;
+    submitted.connect(connection);
     sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
+    socket.on("close", () => { sockets.delete(socket); submitted.close(connection); });
     socket.send(JSON.stringify({ type: "session.created", session: { type: "transcription" } }));
     socket.on("message", (bytes) => {
       const event = JSON.parse(bytes.toString());
       if (event.type === "session.update") {
         socket.send(JSON.stringify({ type: "session.updated", session: event.session }));
         recognition = socket;
+        submitted.update(connection, event.session);
       } else if (event.type === "input_audio_buffer.append") {
         appended += 1;
+        submitted.append(connection, event.audio);
         if (bargeOnSpeech && Buffer.from(event.audio, "base64").some((byte) => byte !== 0)) {
           bargeOnSpeech = false; ordinal += 1;
           const sent = { route: "barge_activity", at: Date.now(), monotonicNs: process.hrtime.bigint().toString() };
@@ -78,15 +86,18 @@ export async function startInteractiveProvider() {
   return {
     calls, endpoint: `http://${origin}/v1`, recognitionEndpoint: `ws://${origin}/v1/realtime?intent=transcription`,
     get ready() { return recognition !== null && appended > 0; },
+    get submitted() { return submitted.snapshot(); },
     get appended() { return appended; },
     holdLanguage() { holdLanguage = true; },
     armBargeOnSpeech() { bargeOnSpeech = true; },
     releaseLanguage() { holdLanguage = false; for (const response of heldResponses) response.end("data: [DONE]\n\n"); heldResponses.clear(); },
-    transcript(text) {
+    transcript(text, range) {
       if (recognition === null) throw new Error("scripted recognition is not ready");
-      ordinal += 1;
+      const next = ordinal + 1;
+      const selectedEvents = range === undefined ? null : submittedTranscriptEvents({ tracker: submitted.snapshot(), range, item: `interactive-${next}`, previous, text });
+      ordinal = next;
       const item = `interactive-${ordinal}`, start = (ordinal - 1) * 20;
-      for (const event of [
+      for (const event of selectedEvents ?? [
         { type: "input_audio_buffer.speech_started", item_id: item, audio_start_ms: start },
         { type: "input_audio_buffer.speech_stopped", item_id: item, audio_end_ms: start + 20 },
         { type: "input_audio_buffer.committed", item_id: item, previous_item_id: previous },

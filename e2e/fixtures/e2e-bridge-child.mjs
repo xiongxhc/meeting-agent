@@ -22,6 +22,8 @@ import { createCaptureLifecycle } from "./scripted-capture-lifecycle.mjs";
 import { createPhysicalOutcomeEmitter, parsePhysicalOutcomeScenario, readPhysicalOutcomeClose } from "./bridge-scenarios.mjs";
 import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge-observations.mjs";
 
+import { compileL4Plan, l4Configuration, l4PlanHash } from "../l4-campaign.mjs";
+
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 if ((statSync(configPath).mode & 0o777) !== 0o600) process.exit(8);
@@ -29,12 +31,17 @@ for (const leaked of ["RUNTIME_SECRET", "FEISHU_APP_SECRET", "E2E_RUNTIME_RECORD
   if (process.env[leaked] !== undefined) process.exit(7);
 }
 
+l4Configuration({ ...config, interactive: true });
+const l4Origin = config.l4Case === undefined ? null : { hostNs: process.hrtime.bigint().toString(), wallMs: Date.now() };
+if (l4Origin) config.observationPlan = compileL4Plan(config.l4Case, l4Origin);
+
 const mediaTiming = parseCaptureMediaTiming(config);
 const control = config.controlDir;
 const binding = config.custody;
 const physicalOutcomeScenario = parsePhysicalOutcomeScenario(config.physicalOutcomeScenario);
 const sessionId = binding.bridgeSessionId;
 const state = {
+  ...(l4Origin ? { l4: { case: config.l4Case, origin: l4Origin, bridgeSessionId: sessionId, planSha256: l4PlanHash(config.observationPlan) } } : {}),
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
@@ -234,6 +241,7 @@ lines.on("line", (line) => {
       return;
     }
     if (command.type === "post_disclosure") {
+      if (state.l4) state.l4.disclosureCommandId = command.commandId;
       if (observations === null) {
         state.disclosure = "failed";
         emit({ type: "chat_disclosure", outcome: "failed" });

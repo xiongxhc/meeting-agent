@@ -14,6 +14,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { EXPIRY_EVIDENCE_PROFILE, RUNTIME_PIN, TEAMMEM_SOURCE, resolveRuntimeProfile, sha256FileSync, validateExpiryEvidencePackage } from "./pins.mjs";
+import { l4Configuration } from "./l4-campaign.mjs";
 import { parseMediaTiming } from "./media-client.mjs";
 
 export const NODE24 = "/opt/homebrew/opt/node@24/bin/node";
@@ -76,12 +77,13 @@ export function mediaTimingConfiguration({ mediaTiming, interactive = false, r2B
 
 /** Final child fields, shared by the actual staged static configuration. */
 export function scriptedCaptureConfiguration(options) {
+  const l4 = l4Configuration(options);
   const timing = mediaTimingConfiguration(options);
-  return { ...timing, captureFrameLimit: options.interactive ? 3000 : timing.captureFrameLimit ?? CAPTURE_FRAME_LIMIT };
+  return { ...timing, ...l4, ...(options.l4Case === undefined ? {} : { participants: [] }), captureFrameLimit: options.interactive ? 3000 : timing.captureFrameLimit ?? CAPTURE_FRAME_LIMIT };
 }
 
-export function stage({ repository, interactive = false, r2Baseline = false, mediaTiming, runtimeProfile = RUNTIME_PIN }) {
-  const captureConfiguration = scriptedCaptureConfiguration({ mediaTiming, interactive, r2Baseline });
+export function stage({ repository, interactive = false, r2Baseline = false, mediaTiming, l4Case, runtimeProfile = RUNTIME_PIN }) {
+  const captureConfiguration = scriptedCaptureConfiguration({ mediaTiming, interactive, r2Baseline, l4Case });
   runtimeProfile = resolveRuntimeProfile(runtimeProfile);
   const expiryEvidence = runtimeProfile === EXPIRY_EVIDENCE_PROFILE;
   if (expiryEvidence && (interactive || r2Baseline)) throw new Error("expiry evidence profile incompatible with interactive or R2 staging");
@@ -174,7 +176,7 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
     // One observed participant, so the closed-meeting attendance the artifact
     // contract requires comes from real bridge-observed UI events rather than
     // anything the harness writes into the artifact.
-    participants: [{ feishuUserId: "ou_e2e_organizer", displayName: "Scripted Organizer" }],
+    participants: l4Case === undefined ? [{ feishuUserId: "ou_e2e_organizer", displayName: "Scripted Organizer" }] : [],
     audio: { captureDisplayId: 1, outputDeviceUid: "e2e-scripted-output" },
   }), { mode: 0o600 });
 

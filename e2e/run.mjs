@@ -34,6 +34,8 @@ import { d2OrderingOracles } from "./d2-oracles.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
 
+import { l4Configuration, l4Report, readL4Evidence, verifyL4Evidence } from "./l4-campaign.mjs";
+
 const REPO = path.resolve(import.meta.dirname, "..");
 const LABEL = "scripted local application test readiness";
 
@@ -45,6 +47,11 @@ export function parseArguments(argv) {
       const value = argv[++index];
       if (typeof value !== "string" || !path.isAbsolute(value) || value.includes("\0")) throw new Error("absolute dependency wheelhouse required");
       options.dependencyWheelhouse = value;
+    }
+    else if (argv[index] === "--l4-case") {
+      if (options.l4Case !== undefined) throw new Error("duplicate L4 flag");
+      options.l4Case = argv[++index];
+      if (options.l4Case === undefined) throw new Error("missing L4 case");
     }
     else if (argv[index] === "--media-timing") {
       if (options.mediaTiming !== undefined) throw new Error("duplicate media timing flag");
@@ -67,6 +74,7 @@ export function parseArguments(argv) {
     else throw new Error(`unknown argument ${argv[index]}`);
   }
   if (options.out === null) throw new Error("usage: node e2e/run.mjs --out <dir> [--keep] [--only-refusals]");
+  l4Configuration(options);
   mediaTimingConfiguration(options);
   if (options.r2Baseline && (options.interactive || options.d2Cut || options.onlyRefusals || options.packageRefusals))
     throw new Error("R2 baseline cannot combine modes");
@@ -77,8 +85,8 @@ export function parseArguments(argv) {
 }
 
 /** The real parent uses this decision before its publication block. */
-export function publicationRequired({ mediaTiming, d2Cut }) {
-  return mediaTiming === undefined && d2Cut !== "repeated-close";
+export function publicationRequired({ mediaTiming, d2Cut, l4Case }) {
+  return l4Case === undefined && mediaTiming === undefined && d2Cut !== "repeated-close";
 }
 export function mediaTimingArguments({ mediaTiming }) {
   return mediaTiming === undefined ? [] : ["--media-timing", mediaTiming];
@@ -247,7 +255,7 @@ async function refusalRuns(staged, processEvidence) {
 // The live run
 // ---------------------------------------------------------------------------
 
-async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut, mediaTiming, processEvidence }) {
+async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut, mediaTiming, l4Case, processEvidence }) {
   const meeting = {
     eventId: "e2e-invite-1",
     providerMeetingId: "9007199254740993",
@@ -268,6 +276,7 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     vaultRevision: staged.vaultRevision,
     interactive,
     r2Baseline,
+    ...(l4Case === undefined ? {} : { l4Case }),
     d2Cut,
     ...driveCaptureConfiguration({ mediaTiming, interactive, r2Baseline, d2Cut }),
     recordingKeyEnv: RECORDING_KEY_ENV,
@@ -341,9 +350,12 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     await waitForEvent("media_capture", plan.budgets.captureMs + 30_000);
     const sample = snapshotProcessTree(child.pid, processEvidence, "meeting_app");
     if (sample.length > peakTree.length) peakTree = sample;
-    if (mediaTiming !== undefined) {
+    if (l4Case !== undefined) {
+      const ready = await waitForEvent("artifact_ready", plan.budgets.buildMs + 60_000);
+      artifact = readArtifact(ready.bundle);
+    } else if (mediaTiming !== undefined) {
       await waitForAnyEvent(["media_timing_alignment_ready"], plan.budgets.buildMs + 60_000);
-    } else if (!publicationRequired({ mediaTiming, d2Cut })) {
+    } else if (!publicationRequired({ mediaTiming, d2Cut, l4Case })) {
       await waitForAnyEvent(["repeated_close"], 60_000);
     } else {
     const ready = await waitForAnyEvent(["artifact_ready", "artifact_blocked"], plan.budgets.buildMs + 60_000);
@@ -385,14 +397,14 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     if (receipt.status === "present") await waitForEvent("organizer_dm", plan.budgets.notifyMs + 30_000).catch(() => undefined);
     }
   } catch (error) {
-    oracle("live_run", "fail", error?.message ?? String(error));
+    oracle("live_run", "fail", l4Case === undefined ? error?.message ?? String(error) : "l4_drive_prerequisite_failed");
   } finally {
     if (owned.record.outcome === null) {
-      try { if (mediaTiming === undefined) writeFileSync(path.join(staged.directories.control, "teammem-done"), "done"); }
+      try { if (mediaTiming === undefined && l4Case === undefined) writeFileSync(path.join(staged.directories.control, "teammem-done"), "done"); }
       catch { oracle("cleanup_request", "fail", "owned entry completion request could not be written"); }
       if (await waitOwnedExit(owned, 180_000) === null) {
-        child.kill("SIGKILL");
-        await waitOwnedExit(owned, 5000);
+        if (l4Case === undefined) { child.kill("SIGKILL"); await waitOwnedExit(owned, 5000); }
+        else oracle("l4_owner_close_unconfirmed", "fail", "ordinary public close did not settle; retain private root");
       }
     }
     try { snapshotProcessTree(child.pid, processEvidence, "meeting_app"); }
@@ -533,7 +545,7 @@ async function main() {
   if (build.exit !== 0) throw new Error(`npm run build failed: ${build.stderr.slice(0, 2000)}`);
   const treeId = sourceTreeId();
 
-  const staged = stage({ repository: REPO, interactive: options.interactive, r2Baseline: options.r2Baseline, mediaTiming: options.mediaTiming });
+  const staged = stage({ repository: REPO, interactive: options.interactive, r2Baseline: options.r2Baseline, mediaTiming: options.mediaTiming, l4Case: options.l4Case });
   let teammem = null;
   let live = { events: [], summary: null, childState: null, outcome: { code: null }, peakTree: [], processEvidence: createProcessEvidence(), teammemResult: null, receipt: null, artifact: null, reopen: null };
   let runFailed = true;
@@ -572,7 +584,7 @@ async function main() {
         } });
         step("runtime_argument_refusal_preflight", { ...prepared, command: [executable], loadAverage: loadAverage() });
       }
-      const result = await liveRun({ staged, teammem, outDir: options.out, interactive: options.interactive, r2Baseline: options.r2Baseline, d2Cut: options.d2Cut, mediaTiming: options.mediaTiming, processEvidence: live.processEvidence });
+      const result = await liveRun({ staged, teammem, outDir: options.out, interactive: options.interactive, r2Baseline: options.r2Baseline, d2Cut: options.d2Cut, mediaTiming: options.mediaTiming, l4Case: options.l4Case, processEvidence: live.processEvidence });
       live = { ...live, ...result };
       const databasePath = path.join(staged.directories.stateRoot, "orchestration.db");
       try {
@@ -600,7 +612,7 @@ async function main() {
           check("r2_observed_order", indexes.every((index, i) => index >= 0 && (i === 0 || index > indexes[i - 1])), "actual capture/config/settlement/build/receipt/shutdown ordering");
         } catch { oracle("r2_baseline_read", "fail", "mandatory retained-source, publication or durable baseline facts absent or invalid"); }
       }
-      if (options.interactive) interactiveOracles(live);
+      if (options.interactive && options.l4Case === undefined) interactiveOracles(live);
       if (options.d2Cut) {
         try {
         const runtimeEvents = readRuntimeTrace(path.join(staged.directories.control, "runtime-events.ndjson"));
@@ -639,9 +651,20 @@ async function main() {
             const facts = await readRunEvidence({ databasePath: live.reopen.filename, r2Baseline: options.r2Baseline,
               read: () => readDurableEvidence(live.reopen.filename, occurrence) });
             for (const row of captureTailOracles(facts, live.childState)) oracle(row.name, row.status, row.detail);
-            live.durable = durableMetadata(facts);
+            if (options.l4Case === undefined) live.durable = durableMetadata(facts);
+            else {
+              live.l4 = await verifyL4Evidence({ l4Case: options.l4Case, snapshot: await readL4Evidence(live.reopen.filename, occurrence),
+                artifact: live.artifact, drive: live.summary?.l4Drive, runtimeEvents: live.summary?.runtimeEvents ?? [],
+                providerCalls: live.summary?.interactiveCalls ?? [], child: live.childState,
+                closed: live.outcome.code === 0 && live.summary?.driveFailure === null && live.summary.trace.includes("shutdown_store_closed") &&
+                  live.events.some(row => row.name === "owned_peers_closed") && live.events.some(row => row.name === "l4_public_close_settled") });
+              oracle("l4_selected_campaign", "pass", "actual closed READY artifact, observed attendance and capture-bound final identity matched");
+            }
           }
-        } catch (error) { oracle(mediaTimingFailureName(options.mediaTiming), "fail", String(error?.message ?? error)); }
+        } catch (error) {
+          if (options.l4Case !== undefined) oracle("l4_selected_campaign", "fail", /^l4_[a-z_]+$/.test(error?.message ?? "") ? error.message : "l4_evidence_prerequisite_failed");
+          else oracle(mediaTimingFailureName(options.mediaTiming), "fail", String(error?.message ?? error));
+        }
       }
 
       // --- spine oracles ---------------------------------------------------
@@ -718,7 +741,8 @@ async function main() {
       }
       } else {
         for (const name of ["artifact_bundle", "teammem_dry_run", "teammem_publish", "publication_receipt", "organizer_dm"])
-          oracle(name, "skipped", "not exercised by this command: recording media timing conformance only");
+          oracle(name, options.l4Case !== undefined && name === "artifact_bundle" ? (live.l4 ? "pass" : "fail") : "skipped",
+            options.l4Case !== undefined ? "selected L4 requires actual READY; L6/L7 publication not exercised" : "not exercised by this command: recording media timing conformance only");
       }
       check("shutdown_clean", live.outcome.code === 0 && logged("shutdown_store_closed"),
         `entry exit ${live.outcome.code}; shipped close order ${JSON.stringify((live.summary?.trace ?? []).filter((code) => code.startsWith("shutdown_")))}`);
@@ -771,6 +795,14 @@ async function main() {
 }
 
 function writeNegativeProofs(outDir, { proofs, staged, live }) {
+  if (live.summary?.l4Drive) {
+    writeFileSync(path.join(outDir, "NEGATIVE-PROOFS.md"), ["# Selected L4 negative proofs", "",
+      "Scripted local observation only; L6/L7 publication untested.",
+      `Cleanup confirmed: ${proofs.processCleanup.cleanupConfirmed === true}; inventory failures: ${proofs.processCleanup.inventory.failures.length}.`,
+      `Private scan: ${proofs.scannedFiles} files; scan errors: ${proofs.scanErrors.length}; key/secret/credential hits: ${proofs.leaks.key.length + proofs.leaks.secret.length + proofs.leaks.credential.length}.`,
+      `PCM markers: ${proofs.pcmMarkers.length}; callbacks after store close: ${proofs.afterStoreClose.length}.`, ""].join("\n"));
+    return;
+  }
   const lines = [
     "# Negative proofs",
     "",
@@ -818,7 +850,12 @@ function writeNegativeProofs(outDir, { proofs, staged, live }) {
 }
 
 function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
-  if (live.artifact) {
+  if (options.l4Case !== undefined) {
+    writeFileSync(path.join(outDir, "bundle.json"), JSON.stringify(l4Report({ l4Case: options.l4Case,
+      metadata: live.l4 ?? null, checks: oracles, processCleanup: live.proofs?.processCleanup ?? recordedProcessProof({ staged, live }) }), null, 2));
+    return;
+  }
+  if (live.artifact && options.l4Case === undefined) {
     const copied = path.join(outDir, "artifact");
     mkdirSync(copied, { recursive: true });
     for (const name of live.artifact.files) {
@@ -829,8 +866,9 @@ function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
   const bundle = {
     label: LABEL,
     generatedAt: new Date().toISOString(),
-    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...mediaTimingArguments(options), ...(options.packageRefusals ? ["--package-refusals"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : []), ...(options.interactive ? ["--interactive"] : []), ...(options.r2Baseline ? ["--r2-baseline"] : []), ...(options.d2Cut ? ["--d2-cut", options.d2Cut] : []), ...(options.dependencyWheelhouse ? ["--dependency-wheelhouse", options.dependencyWheelhouse] : [])],
-    mode: options.mediaTiming !== undefined ? "media-timing-recording-conformance" : options.onlyRefusals ? "refusals" : options.r2Baseline ? "r2-baseline" : options.interactive ? "interactive" : "full",
+    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...mediaTimingArguments(options), ...(options.l4Case === undefined ? [] : ["--l4-case", options.l4Case]), ...(options.packageRefusals ? ["--package-refusals"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : []), ...(options.interactive ? ["--interactive"] : []), ...(options.r2Baseline ? ["--r2-baseline"] : []), ...(options.d2Cut ? ["--d2-cut", options.d2Cut] : []), ...(options.dependencyWheelhouse ? ["--dependency-wheelhouse", options.dependencyWheelhouse] : [])],
+    l4: live.l4 ?? null,
+    mode: options.l4Case !== undefined ? "selected-l4" : options.mediaTiming !== undefined ? "media-timing-recording-conformance" : options.onlyRefusals ? "refusals" : options.r2Baseline ? "r2-baseline" : options.interactive ? "interactive" : "full",
     d2Cut: options.d2Cut,
     mediaTiming: live.mediaTiming ?? null,
     packageRefusalCuts: packageCuts,

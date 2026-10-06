@@ -10,6 +10,8 @@ import { URL } from "node:url";
 import { once } from "node:events";
 import { createServer } from "node:http";
 
+import { l4Configuration, l4PersonSummaries } from "./l4-campaign.mjs";
+
 const PLACEHOLDER = "Scripted fixture provider output; no model read this meeting.";
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -18,18 +20,19 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
  * summary and no invented project, decision, action item, discussion point or
  * person, so nothing in the artifact can be mistaken for a reading of the
  * recording. Any other prompt gets a one-key object. */
-function schemaShapedAnswer(prompt) {
+function schemaShapedAnswer(prompt, messages, l4Case) {
   if (prompt.includes("meeting synthesis")) {
     return JSON.stringify({
       summary: PLACEHOLDER, projects: [], decisions: [],
-      action_items: [], discussion_points: [], person_summaries: [],
+      action_items: [], discussion_points: [], person_summaries: l4Case === undefined ? [] : l4PersonSummaries(messages),
     });
   }
   return JSON.stringify({ summary: PLACEHOLDER });
 }
 
 /** Component-testable HTTP handler; fault arming is explicit and instance-local. */
-export function createFixtureProviderHandler() {
+export function createFixtureProviderHandler({ l4Case } = {}) {
+  l4Configuration({ l4Case, interactive: true });
   const calls = [];
   let nextChatFailure = false;
   const handler = (request, response) => {
@@ -84,7 +87,7 @@ export function createFixtureProviderHandler() {
           return;
         }
         recordChat("ok", promptBytes);
-        const content = schemaShapedAnswer(text);
+        const content = schemaShapedAnswer(text, body.messages ?? [], l4Case);
         response.setHeader("content-type", "application/x-ndjson");
         response.write(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content }, done: false })}\n`);
         response.end(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content: "" }, done: true, total_duration: 1000, load_duration: 1, prompt_eval_count: 1, prompt_eval_duration: 1, eval_count: 1, eval_duration: 1 })}\n`);
@@ -99,8 +102,8 @@ export function createFixtureProviderHandler() {
   return { handler, calls, armNextChatFailure() { nextChatFailure = true; } };
 }
 
-export async function startFixtureProvider() {
-  const { handler, calls, armNextChatFailure } = createFixtureProviderHandler();
+export async function startFixtureProvider(options = {}) {
+  const { handler, calls, armNextChatFailure } = createFixtureProviderHandler(options);
   const server = createServer(handler);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
