@@ -181,6 +181,29 @@ This command skips publication, receipt and organizer-DM assertions. Listener-fr
 checks are accepted source/component evidence; actual recording conformance,
 recognized speaker attribution and full L4/L5 remain unverified.
 
+The selected L4 command prepares three separate attribution cases. Use a fresh
+private output directory for each case:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case sent-named --keep --out /absolute/private/evidence/l4-sent-named
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case unavailable-missing --keep --out /absolute/private/evidence/l4-unavailable-missing
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case sent-drop --keep --out /absolute/private/evidence/l4-sent-drop
+```
+
+Each case requires actual Runtime final events, mapped capture evidence and an
+application-written READY artifact from the production reconciler. The named
+case requires observed speaker A; the missing-observation and declared-drop cases
+require anonymous attribution. Silent participant S must never receive a person
+summary, and A's explicit leave/rejoin must remain visible in attendance. The
+selected turn permits chat-only handling and rejects live voice output. Provider
+frame ordinals are not assumed to equal recorded source-frame positions.
+
+The declared `observation_drop` is not proof of a physical restart or unobserved
+attendance gap. These commands skip publication, receipt and organizer-DM
+assertions. Independently reviewed listener-free tests establish source/component
+preparation; actual case runs, ambiguous identity, full L4 acceptance and native
+capture remain unverified.
+
 The final-pair omission selection captures 49 frames below the 50-frame periodic
 clock-pair cadence, then omits the final pair and finish exchange:
 
