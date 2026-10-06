@@ -3,13 +3,15 @@
 import { Agent as HttpAgent } from "node:http";
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
-import { assertPendingStartupEnvironment, closeHeldStartup, createStartupLog, observeStartupDiagnostic, readStartupEmptyFiles, readStartupEmptyState, runPendingStartupPhase, validatePendingStartupPlan } from "./pending-startup-run.mjs";
+import { assertPendingStartupEnvironment, capturePendingStartupSnapshot, closeHeldStartup, createStartupLog, observeStartupDiagnostic, readStartupEmptyFiles, readStartupEmptyState, runPendingStartupPhase, validatePendingStartupMode, validatePendingStartupPlan } from "./pending-startup-run.mjs";
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); promise.catch(() => {}); return { promise, resolve, reject }; }
 function promiseStatus(promise) { return promise.then(() => true, () => false); }
 function unchanged(before, after) { return JSON.stringify({ ...before, elapsedMs: 0 }) === JSON.stringify({ ...after, elapsedMs: 0 }); }
 
-export async function runRealPendingStartup(plan) {
+export async function runRealPendingStartup(plan, mode = "ws-endpoint-normal-close") {
+  validatePendingStartupMode(mode);
+  const upgrade = mode === "ws-upgrade-normal-close";
   assertPendingStartupEnvironment(globalThis.process.env);
   validatePendingStartupPlan(plan);
   const [sdk, main, configApi, lockApi, composition, httpApi, socketApi, peers, lifecycle] = await Promise.all([
@@ -24,6 +26,7 @@ export async function runRealPendingStartup(plan) {
   let app, peer, http, httpConnection, connection, holdId = null, handleAt = null, run, lifecyclePromise, compositionResult = null, standaloneExit = null;
   let admittedOwnerCount = 0, handleCount = 0, lifecycleSettled = false, invalidObservation = false, cancelled = false, fixtureCleanupStarted = false;
   let peerClosePromise, closeRequest, closeRequestedOrdinal = 0, publicCloseSettledOrdinal = 0, peerSettledOrdinal = 0, admittedReturnOrdinal = 0, ownerCloseBeginOrdinal = 0, ownerCloseEndOrdinal = 0;
+  let readHttpHold, readUpgradeHold, readUpgradeObservation;
   const mark = observed.mark;
   const failCleanup = code => { if (!cleanupFailures.includes(code) && cleanupFailures.length < 8) cleanupFailures.push(code); };
   function normalClose() {
@@ -34,8 +37,9 @@ export async function runRealPendingStartup(plan) {
   function readPending() {
     const log = observed.snapshot();
     if (peer && peer.requests.length === 256) invalidObservation = true;
-    return {
-      holdId, hold: peer && holdId !== null ? peer.readPendingHold(holdId) : null,
+    const snapshot = {
+      holdId, hold: peer && holdId !== null ? readHttpHold(holdId) : null,
+      ...(upgrade ? { upgradeHold: peer && holdId !== null ? readUpgradeHold(holdId) : null, upgrade: peer ? readUpgradeObservation() : null } : {}),
       admittedOwnerCount, handleCount, elapsedMs: handleAt === null ? 0 : performance.now() - handleAt, lifecycleSettled,
       httpActive: http?.activeCount ?? null, httpSockets: httpConnection ? { active: httpConnection.activeCount, pending: httpConnection.pendingCount } : null,
       connectionSockets: connection ? { active: connection.activeCount, pending: connection.pendingCount } : null,
@@ -45,6 +49,7 @@ export async function runRealPendingStartup(plan) {
       invalidObservation: invalidObservation || log.invalid, historyOverflow: log.overflow,
       fixtureCleanupStarted, peerCloseOrdinal: peerSettledOrdinal, ownerCloseOrdinal: ownerCloseEndOrdinal,
     };
+    return upgrade ? capturePendingStartupSnapshot(snapshot, mode) : snapshot;
   }
   function closePeer() {
     if (!peer) return Promise.resolve();
@@ -69,7 +74,8 @@ export async function runRealPendingStartup(plan) {
       httpConnection = socketApi.createFeishuSocketOwner(HttpAgent);
       http = httpApi.createFeishuSdkHttp({ request: peer.rewriteRequest(sdk.defaultHttpInstance.request), connection: httpConnection });
       connection = socketApi.createFeishuSocketOwner(HttpAgent);
-      holdId = peer.armNext({ route: "ws_endpoint", outcome: "hold" });
+      readHttpHold = peer.readPendingHold; readUpgradeHold = peer.readPendingUpgrade; readUpgradeObservation = peer.readUpgradeObservation;
+      holdId = upgrade ? peer.armNextUpgrade() : peer.armNext({ route: "ws_endpoint", outcome: "hold" });
       lifecyclePromise = lifecycle.runExposedComposition(composition.composeApplication, config, owner, {
         feishu: { http, connection },
         maintenance: { intervalsMs: { backfill: 3600000, warning: 3600000, outbox: 3600000, notification: 3600000, discovery: 3600000, custody: 3600000 }, random: () => 0 },
@@ -99,7 +105,7 @@ export async function runRealPendingStartup(plan) {
       diagnostics.push(observeStartupDiagnostic(channel, line));
     } catch { invalidObservation = true; }
   }
-  const effects = {
+  const effects = Object.freeze({
     begin(signal) {
       signal.addEventListener("abort", effects.cancel, { once: true });
       if (signal.aborted) effects.cancel();
@@ -115,7 +121,7 @@ export async function runRealPendingStartup(plan) {
     },
     readPending,
     closeWhileHeld(expected) {
-      closeRequest = closeHeldStartup(expected, readPending, app, () => closeRequestedOrdinal = mark());
+      closeRequest = closeHeldStartup(expected, readPending, app, () => closeRequestedOrdinal = mark(), mode);
       return closeRequest;
     },
     async settleBeforeFixtureCleanup() {
@@ -125,7 +131,9 @@ export async function runRealPendingStartup(plan) {
       // Preserve the mandatory pre-cleanup snapshot, then use only the
       // remainder of the same 250-poll allowance as the held-arrival phase.
       let snapshot = readPending();
-      while (snapshot.hold !== null && snapshot.elapsedMs < 4500 && pollAllowance.remaining > 0) {
+      const unsettled = value => upgrade ? value.upgradeHold !== null || value.upgrade?.pending !== 0 || value.httpActive !== 0 ||
+        [value.httpSockets, value.connectionSockets].some(owner => owner?.active !== 0 || owner?.pending !== 0) : value.hold !== null;
+      while (unsettled(snapshot) && snapshot.elapsedMs < 4500 && pollAllowance.remaining > 0) {
         pollAllowance.remaining--; await delay(10); snapshot = readPending();
       }
       const third = app.close(); third.catch(() => {}); const thirdFulfilled = await promiseStatus(third);
@@ -150,6 +158,6 @@ export async function runRealPendingStartup(plan) {
       if (cancelled) return; cancelled = true;
       normalClose(); shutdown.abort(); permitFixtureCleanup.resolve();
     },
-  };
-  return runPendingStartupPhase(effects, { label: "attempted-application", pollAllowance });
+  });
+  return runPendingStartupPhase(effects, { label: "attempted-application", pollAllowance }, mode);
 }

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
-import { IncomingMessage, ServerResponse } from "node:http";
+import { Agent as HttpAgent, IncomingMessage, ServerResponse } from "node:http";
+import type { ClientRequestArgs } from "node:http";
 import type { Socket } from "node:net";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -9,6 +10,13 @@ import { Duplex } from "node:stream";
 import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { test, mock } from "node:test";
 import Database from "better-sqlite3";
+import type { createFeishuSocketOwner as SocketOwnerFactory } from "../src/adapters/feishu-sdk-connection.ts";
+// Runtime exercises compiled owner code; compilation derives its type from source.
+const socketOwnerModule: unknown = await import(new URL("../dist/src/adapters/feishu-sdk-connection.js", import.meta.url).href);
+assert.ok(socketOwnerModule && typeof socketOwnerModule === "object");
+const socketOwnerFactory: unknown = Reflect.get(socketOwnerModule, "createFeishuSocketOwner");
+assert.equal(typeof socketOwnerFactory, "function");
+const createFeishuSocketOwner = socketOwnerFactory as typeof SocketOwnerFactory;
 // @ts-expect-error Private controller has no declaration.
 const module = await import("./pending-startup-run.mjs").catch(() => ({}));
 // @ts-expect-error Accepted private controls have no declaration.
@@ -295,4 +303,334 @@ test("overall expiry during settlement still invokes ordinary final cleanup exac
     assert.equal(c.calls.cancel, 1); assert.equal(c.calls.finish, 1); assert.ok(c.snapshot().ownerCloseOrdinal > c.snapshot().peerCloseOrdinal);
     assert.equal(result.cleanupConfirmed, false);
   } finally { c.dispose(); }
+});
+
+// Synthetic component facts on actual owner/handler streams; no SDK/network/app.
+const upgradeModule: unknown = await import(new URL("./feishu-upgrade-controls.mjs", import.meta.url).href);
+type UpgradeObservation = { arrivals: number; accepted: number; pending: number; disposed: boolean; invalid: boolean; overflow: boolean;
+  events: { ordinal: number; id: string | null; kind: "held" | "accepted" | "remote_closed" | "fixture_closed" | "refused" }[] };
+type UpgradeControls = { handler: (request: IncomingMessage, socket: Duplex, head: Buffer) => void; armNextUpgrade: () => string;
+  readPendingUpgrade: (id: string) => { id: string; method: "GET"; route: "ws_upgrade"; arrival: number } | null;
+  readUpgradeObservation: () => UpgradeObservation; close: () => Promise<void> };
+function upgradeControls(): UpgradeControls {
+  assert.ok(upgradeModule && typeof upgradeModule === "object");
+  const factory: unknown = Reflect.get(upgradeModule, "createFeishuUpgradeControls"); assert.equal(typeof factory, "function");
+  return (factory as (server: { handleUpgrade: () => never }) => UpgradeControls)({ handleUpgrade() { assert.fail("held upgrade must not accept101"); } });
+}
+class UpgradeWire extends Duplex {
+  destroyRequested = false; completeDestroy: (() => void) | undefined; writes = 0; closing: Promise<void> | undefined;
+  constructor() { super({ autoDestroy: false, allowHalfOpen: true }); }
+  _read() {}
+  _write(_chunk: Buffer, _encoding: string, callback: () => void) { this.writes++; callback(); }
+  _destroy(_error: Error | null, callback: () => void) { this.destroyRequested = true; this.completeDestroy = callback; }
+  settleClose() { return this.closing ??= (async () => { if (this.closed) return; this.destroy(); this.completeDestroy!(); await setImmediate(); })(); }
+}
+const upgradeMode = "ws-upgrade-normal-close";
+function upgradeComponent(options: { noArrival?: boolean; stale?: boolean; neverRemote?: boolean; endOnly?: boolean; delayedCreation?: boolean;
+  rejectedClose?: boolean; nonmemoized?: boolean; lateBegin?: number } = {}) {
+  const p = upgradeControls(), id = p.armNextUpgrade(), wire = new UpgradeWire();
+  let completeCreation: (() => void) | undefined;
+  class InMemoryAgent extends HttpAgent {
+    override createConnection(_options: ClientRequestArgs, callback?: (error: Error | null, stream: Duplex) => void): Duplex | undefined {
+      if (options.delayedCreation) { completeCreation = () => callback?.(null, wire); return undefined; }
+      return wire;
+    }
+  }
+  const socketOwner = createFeishuSocketOwner(InMemoryAgent);
+  const message = new IncomingMessage(wire as unknown as Socket); message.method = "GET"; message.url = "/ws?private-upgrade-query";
+  message.headers = { upgrade: "websocket", connection: "Upgrade", "sec-websocket-version": "13", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" };
+  let ordinal = 0, owners = 0, handles = 0, lifecycleSettled = false, cleanup = false, peerOrdinal = 0, ownerOrdinal = 0;
+  let requestedOrdinal = 0, first: Promise<void>, second: Promise<void>, closePromise: Promise<void> | undefined, beginPromise: Promise<void> | undefined;
+  const log: { ordinal: number; code: string }[] = [], requests: { method: string; route: string; status: number }[] = [];
+  const calls = { selected: 0, normal: 0, cancel: 0, finish: 0 }, mark = (code: string) => { const n = ++ordinal; if (!code.startsWith("test_")) log.push({ ordinal: n, code }); return n; };
+  function snapshot() {
+    return { holdId: id, hold: null as { id: string; method: string; route: string } | null, upgradeHold: p.readPendingUpgrade(id), upgrade: p.readUpgradeObservation(),
+      admittedOwnerCount: owners, handleCount: handles, elapsedMs: 10, lifecycleSettled, httpActive: 0,
+      httpSockets: { active: 0, pending: 0 }, connectionSockets: { active: socketOwner.activeCount, pending: socketOwner.pendingCount },
+      peer: { connections: 0, ackCount: 0, legacyAckCount: 0, messageCount: 0, invalid: false, overflow: false },
+      requests: requests.map(row => ({ ...row })), lifecycle: log.map(row => ({ ...row })), invalidObservation: false, historyOverflow: false,
+      fixtureCleanupStarted: cleanup, peerCloseOrdinal: peerOrdinal, ownerCloseOrdinal: ownerOrdinal };
+  }
+  const app = { close() {
+    calls.normal++;
+    const make = async () => {
+      socketOwner.fence(); const closing = socketOwner.close(100);
+      if (!options.neverRemote && !options.endOnly) { await setImmediate(); await wire.settleClose(); }
+      if (options.endOnly) { wire.push(null); await setImmediate(); }
+      const clean = await closing; if (!clean) throw new Error("pending_startup_socket_close_failed");
+      lifecycleSettled = true; for (const code of shutdownCodes) mark(code);
+      if (options.rejectedClose) throw new Error("private-upgrade-close-secret");
+    };
+    if (options.nonmemoized) { const pending = make(); pending.catch(() => {}); return pending; }
+    return closePromise ??= make();
+  } };
+  const effects = {
+    begin(signal: AbortSignal) {
+      return beginPromise = (async () => {
+      if (options.lateBegin) await delay(options.lateBegin);
+      owners = handles = 1; for (const code of ["composition_lock_verified", "composition_store_opened", "maintenance_started"]) mark(code);
+      requests.push({ method: "POST", route: "ws_endpoint", status: 200 }); socketOwner.agent.createConnection({});
+      if (!options.noArrival) p.handler(message, wire, Buffer.alloc(0)); if (signal.aborted) app.close().catch(() => {});
+      })();
+    },
+    readPending: snapshot,
+    closeWhileHeld(expected: ReturnType<typeof snapshot>) {
+      if (options.stale) wire.emit("close");
+      const value = api("closeHeldStartup")(expected, effects.readPending, app, () => requestedOrdinal = mark("test_close_requested"), upgradeMode);
+      calls.selected++; first = value.first; second = value.second; return value;
+    },
+    async settleBeforeFixtureCleanup() {
+      const statuses = await Promise.allSettled([first, second]), settledOrdinal = mark("test_public_close_settled");
+      const before = snapshot(), third = app.close(); const thirdStatus = await Promise.allSettled([third]);
+      return { snapshot: before, composition: { status: "composition_closed", clean: false }, close: { requestedOrdinal, settledOrdinal,
+        firstFulfilled: statuses[0]!.status === "fulfilled", secondFulfilled: statuses[1]!.status === "fulfilled", promiseSame: first === second,
+        thirdFulfilled: thirdStatus[0]!.status === "fulfilled", thirdPromiseSame: first === third, repeatUnchanged: JSON.stringify(before) === JSON.stringify(snapshot()) } };
+    },
+    async finish() {
+      calls.finish++; await beginPromise; completeCreation?.(); await wire.settleClose(); await closePromise?.catch(() => {});
+      cleanup = true; await p.close(); peerOrdinal = mark("test_peer_settled");
+      const admittedReturnOrdinal = mark("test_admitted_return"), ownerCloseBeginOrdinal = mark("test_owner_close_begin"); ownerOrdinal = mark("test_owner_close_end");
+      return { snapshot: snapshot(), composition: { status: "composition_closed", clean: false }, standaloneExit: 70,
+        peerSettledOrdinal: peerOrdinal, admittedReturnOrdinal, ownerCloseBeginOrdinal, ownerCloseEndOrdinal: ownerOrdinal, cleanupFailures: [] as string[],
+        emptyState: { identity: { dev: 1, ino: 2, size: 4096, uid: 501, mode: 384 }, counts: Object.fromEntries(tables.map(table => [table, 0])) },
+        files: { recordings: 0, outbox: 0, receipts: 0, runtimePids: false, launcherLog: false, key: false, bridgeState: false }, liveCount: 0, outcomeCount: 0,
+        diagnostics: [{ channel: "stderr", code: "composition_closed" }] };
+    },
+    cancel() { calls.cancel++; if (handles) app.close().catch(() => {}); },
+  };
+  return { p, id, wire, socketOwner, app, effects, snapshot, calls, completeCreation() { completeCreation?.(); }, async dispose() { await wire.settleClose(); await p.close(); } };
+}
+// Catch endpoint-only selection, hidden owner counts, or fixture-first cancellation.
+test("upgrade shared controller uses actual Agent and U1 close events before fixture disposal", async () => {
+  const c = upgradeComponent();
+  try {
+    const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode);
+    assert.equal(r.success, true); assert.deepEqual(r.failures, []); assert.equal(r.label, "component-facts");
+    assert.equal(r.mode, upgradeMode); assert.equal(r.schema, "meeting-pending-upgrade-evidence/v1");
+    assert.deepEqual(r.heldSnapshot.connectionSockets, { active: 1, pending: 0 }); assert.equal(r.heldSnapshot.httpActive, 0);
+    assert.deepEqual(r.heldSnapshot.requests, [{ method: "POST", route: "ws_endpoint", status: 200 }]);
+    assert.equal(r.heldSnapshot.hold, null); assert.equal(r.heldSnapshot.upgradeHold.method, "GET"); assert.equal(c.wire.writes, 0);
+    assert.deepEqual(r.cancellationSnapshot.snapshot.upgrade.events, [{ ordinal: 1, id: c.id, kind: "held" }, { ordinal: 2, id: c.id, kind: "remote_closed" }]);
+    assert.equal(r.cancellationSnapshot.snapshot.upgrade.disposed, false); assert.equal(r.finalSnapshot.snapshot.upgrade.disposed, true);
+    assert.deepEqual(r.finalSnapshot.composition, { status: "composition_closed", clean: false }); assert.equal(r.finalSnapshot.standaloneExit, 70);
+    assert.equal(r.cleanupConfirmed, true); assert.equal(c.calls.selected, 1); assert.equal(c.calls.cancel, 0);
+    assert.equal(Object.isFrozen(r), true); assert.equal(Object.isFrozen(r.heldSnapshot.upgrade.events[0]), true);
+  } finally { await c.dispose(); }
+});
+test("real in-memory Agent destroy retains actual ownership until Duplex close", async () => {
+  const c = upgradeComponent({ neverRemote: true });
+  try {
+    await c.effects.begin(new AbortController().signal); const pending = c.app.close(); let settled = false; pending.then(() => settled = true);
+    assert.equal(c.wire.destroyRequested, true); assert.equal(c.socketOwner.activeCount, 1); assert.equal(c.socketOwner.pendingCount, 0);
+    assert.equal(c.p.readUpgradeObservation().pending, 1); assert.equal(c.p.readPendingUpgrade(c.id)?.arrival, 1);
+    c.wire.emit("end"); await setImmediate(); assert.equal(settled, false); assert.equal(c.socketOwner.activeCount, 1);
+    await c.wire.settleClose(); await pending; assert.equal(c.socketOwner.activeCount, 0); assert.equal(c.p.readUpgradeObservation().events[1]?.kind, "remote_closed");
+  } finally { await c.dispose(); }
+});
+for (const [name, options] of [["arm only", { noArrival: true }], ["cleared at synchronous recheck", { stale: true }], ["pending socket creation", { delayedCreation: true }], ["remote FIN alone", { endOnly: true }], ["absent remote close", { neverRemote: true }], ["rejected public close", { rejectedClose: true }], ["nonmemoized public close", { nonmemoized: true }]] as const)
+  test(`upgrade ${name} cannot pass and ordinary cleanup remains owned`, async () => {
+    const c = upgradeComponent(options); try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, cleanupMs: 15 }, upgradeMode);
+      assert.equal(r.success, false); assert.equal(c.calls.cancel, 1); assert.equal(c.calls.finish, 1); assert.equal(JSON.stringify(r).includes("private-upgrade"), false);
+    } finally { await c.dispose(); }
+  });
+type UpgradeSnapshot = ReturnType<ReturnType<typeof upgradeComponent>["snapshot"]>;
+const upgradePendingChanges: [string, (v: UpgradeSnapshot) => void][] = [
+  ["endpoint alone", v => { v.upgradeHold = null; v.upgrade = { arrivals: 0, accepted: 0, pending: 0, disposed: false, invalid: false, overflow: false, events: [] }; }],
+  ["HTTP hold", v => { v.hold = { id: v.holdId, method: "POST", route: "ws_endpoint" }; }],
+  ["wrong selected ID", v => { v.upgradeHold!.id = "foreign"; }], ["stale arrival", v => { v.upgradeHold!.arrival = 2; }],
+  ["WebSocket ownership zero", v => { v.connectionSockets.active = 0; }], ["pending socket", v => { v.connectionSockets.pending = 1; }],
+  ["HTTP work active", v => { v.httpActive = 1; }], ["HTTP socket active", v => { v.httpSockets.active = 1; }], ["HTTP socket pending", v => { v.httpSockets.pending = 1; }],
+  ["startup settled", v => { v.lifecycleSettled = true; }], ["false ready", v => { v.lifecycle.push({ ordinal: 99, code: "composition_started" }); }],
+  ["accepted101", v => { v.upgrade.accepted = 1; }], ["extra upgrade", v => { v.upgrade.arrivals = 2; }], ["peer disposal", v => { v.upgrade.disposed = true; }],
+  ["overflow", v => { v.upgrade.overflow = true; }], ["invalid", v => { v.upgrade.invalid = true; }],
+  ["endpoint499", v => { v.requests[0]!.status = 499; }], ["extra endpoint", v => { v.requests.push({ method: "POST", route: "ws_endpoint", status: 200 }); }],
+  ["token", v => { v.requests.push({ method: "POST", route: "tenant_access_token", status: 200 }); }],
+  ["ACK", v => { v.peer.ackCount = 1; }], ["ping/message", v => { v.peer.messageCount = 1; }], ["receiver overflow", v => { v.peer.overflow = true; }],
+  ["fixture started", v => { v.fixtureCleanupStarted = true; }], ["transport closed early", v => { v.upgrade.events.push({ ordinal: 2, id: v.holdId, kind: "remote_closed" }); }],
+  ["too late", v => { v.elapsedMs = 4500; }], ["unbounded counter", v => { v.upgrade.pending = Infinity; }],
+];
+for (const [name, mutate] of upgradePendingChanges) test(`upgrade pending ${name} refuses selected success close`, async () => {
+  const c = upgradeComponent(), read = c.effects.readPending; c.effects.readPending = () => { const v = structuredClone(read()); mutate(v); return v; };
+  try { const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode); assert.equal(r.success, false); assert.equal(c.calls.selected, 0); }
+  finally { await c.dispose(); }
+});
+type UpgradeSettlement = Awaited<ReturnType<ReturnType<typeof upgradeComponent>["effects"]["settleBeforeFixtureCleanup"]>>;
+const upgradeSettlementChanges: [string, (v: UpgradeSettlement) => void][] = [
+  ["fixture closed instead", v => { v.snapshot.upgrade.events[1]!.kind = "fixture_closed"; }], ["fixture disposed", v => { v.snapshot.upgrade.disposed = true; }],
+  ["remote close absent", v => { v.snapshot.upgrade.events.pop(); }], ["extra upgrade", v => { v.snapshot.upgrade.arrivals = 2; }],
+  ["pending upgrade", v => { v.snapshot.upgrade.pending = 1; }], ["pending client", v => { v.snapshot.connectionSockets.pending = 1; }],
+  ["HTTP499", v => { v.snapshot.requests[0]!.status = 499; }], ["wrong remote ID", v => { v.snapshot.upgrade.events[1]!.id = "foreign"; }],
+  ["late4500", v => { v.snapshot.elapsedMs = 4500; }], ["store log absent", v => { v.snapshot.lifecycle = v.snapshot.lifecycle.filter(row => row.code !== "shutdown_store_closed"); }],
+  ["clean rewritten", v => { v.composition.clean = true; }], ["fixture first", v => { v.snapshot.fixtureCleanupStarted = true; }],
+  ["third identity", v => { v.close.thirdPromiseSame = false; }], ["third mutation", v => { v.close.repeatUnchanged = false; }],
+];
+for (const [name, mutate] of upgradeSettlementChanges) test(`upgrade settlement ${name} remains failed after fallback cleanup`, async () => {
+  const c = upgradeComponent(), settle = c.effects.settleBeforeFixtureCleanup; c.effects.settleBeforeFixtureCleanup = async () => { const v = structuredClone(await settle()); mutate(v); return v; };
+  try { const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode); assert.equal(r.success, false); assert.equal(c.calls.finish, 1); assert.equal(r.cleanupConfirmed, false); }
+  finally { await c.dispose(); }
+});
+type UpgradeFinal = Awaited<ReturnType<ReturnType<typeof upgradeComponent>["effects"]["finish"]>>;
+const upgradeFinalChanges: [string, (v: UpgradeFinal) => void][] = [
+  ["standalone zero", v => { v.standaloneExit = 0; }], ["owner first", v => { v.ownerCloseBeginOrdinal = 1; }],
+  ["peer failure", v => { v.cleanupFailures.push("pending_startup_peer_close_failed"); }], ["not disposed", v => { v.snapshot.upgrade.disposed = false; }],
+  ["late invalid", v => { v.snapshot.upgrade.invalid = true; }], ["late pending", v => { v.snapshot.upgrade.pending = 1; }],
+  ["changed terminal history", v => { v.snapshot.upgrade.events[1]!.ordinal = 3; }], ["nonempty DB", v => { v.emptyState.counts.sessions = 1; }],
+  ["launch file", v => { v.files.launcherLog = true; }], ["new ACK", v => { v.snapshot.peer.ackCount = 1; }],
+];
+for (const [name, mutate] of upgradeFinalChanges) test(`upgrade final ${name} cannot certify cleanup`, async () => {
+  const c = upgradeComponent(), finish = c.effects.finish; c.effects.finish = async () => { const v = structuredClone(await finish()); mutate(v); return v; };
+  try { const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode); assert.equal(r.success, false); assert.equal(r.cleanupConfirmed, false); }
+  finally { await c.dispose(); }
+});
+for (const phase of ["begin", "closeWhileHeld", "settleBeforeFixtureCleanup"] as const) test(`upgrade synchronous ${phase} overrun cannot pass before timer dispatch`, async () => {
+  const c = upgradeComponent();
+  if (phase === "begin") { const begin = c.effects.begin; c.effects.begin = signal => { blockFor(20); return begin(signal); }; }
+  else if (phase === "closeWhileHeld") { const close = c.effects.closeWhileHeld; c.effects.closeWhileHeld = expected => { blockFor(20); return close(expected); }; }
+  else { const settle = c.effects.settleBeforeFixtureCleanup; c.effects.settleBeforeFixtureCleanup = async () => { const v = await settle(); blockFor(20); return v; }; }
+  try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, admissionMs: 5, cleanupMs: 5 }, upgradeMode);
+    assert.equal(r.success, false); assert.equal(c.calls.cancel, 1); assert.equal(c.calls.finish, 1); assert.equal(r.cleanupConfirmed, false);
+  } finally { await c.dispose(); }
+});
+test("upgrade selection and artifact validation are strict, finite and getter-free", async () => {
+  const root = mkdtempSync("/private/tmp/pending-upgrade-output-"); chmodSync(root, 0o700); const c = upgradeComponent();
+  try {
+    const out = path.join(root, "new"); assert.deepEqual(api("parsePendingStartupArguments")(["--mode", upgradeMode, "--out", out]), { out, mode: upgradeMode });
+    for (const argv of [["--mode", "unknown", "--out", out], ["--mode", "ws-endpoint-normal-close", "--out", out], ["--out", out, "--mode", upgradeMode], ["--mode", upgradeMode, "--out", out, "--mode", upgradeMode]]) assert.throws(() => api("parsePendingStartupArguments")(argv));
+    await assert.rejects(api("runPendingStartupPhase")(c.effects, budgets, "unknown"), /pending_startup_fact_invalid/); assert.equal(c.calls.normal, 0);
+    const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode); assert.equal(r.success, true);
+    let touched = 0;
+    for (const kind of ["mode", "schema", "missing pre-fixture", "unknown key", "getters", "overlarge events", "counter overflow", "private failure"]) {
+      const v = structuredClone(r);
+      if (kind === "mode") v.mode = "unknown"; else if (kind === "schema") v.schema = "meeting-pending-startup-evidence/v1";
+      else if (kind === "missing pre-fixture") v.cancellationSnapshot = null; else if (kind === "unknown key") v.heldSnapshot.upgrade.secret = "private-secret";
+      else if (kind === "getters") Object.defineProperty(v.heldSnapshot.upgrade, "pending", { enumerable: true, get() { touched++; return 0; } });
+      else if (kind === "overlarge events") v.heldSnapshot.upgrade.events = Array.from({ length: 17 }, () => ({ ordinal: 1, id: c.id, kind: "held" }));
+      else if (kind === "counter overflow") v.heldSnapshot.upgrade.arrivals = Number.MAX_SAFE_INTEGER + 1;
+      else v.failures = ["private-secret-token"];
+      assert.throws(() => api("writePendingStartupEvidence")(root, v), /pending_startup_/);
+    }
+    assert.equal(touched, 0); api("writePendingStartupEvidence")(root, r); assert.deepEqual(JSON.parse(readFileSync(path.join(root, "evidence.json"), "utf8")), r);
+    assert.equal(JSON.stringify(r).includes("private-upgrade-query"), false); assert.equal(JSON.stringify(r).includes("dGhlIHNh"), false);
+  } finally { await c.dispose(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("upgrade endpoint discovery can settle across polls without resetting the shared allowance", async () => {
+  const c = upgradeComponent(), read = c.effects.readPending, allowance = { remaining: 250 }; let reads = 0;
+  c.effects.readPending = () => {
+    const v = structuredClone(read());
+    if (++reads <= 2) { v.upgradeHold = null; v.upgrade = { arrivals: 0, accepted: 0, pending: 0, disposed: false, invalid: false, overflow: false, events: [] }; v.connectionSockets.active = 0;
+      if (reads === 1) { v.httpActive = 1; v.httpSockets.active = 1; v.requests = []; } }
+    return v;
+  };
+  try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, pollAllowance: allowance }, upgradeMode); assert.equal(r.success, true); assert.equal(allowance.remaining, 247); }
+  finally { await c.dispose(); }
+});
+test("upgrade blocking pending read cannot refresh a phase deadline", async () => {
+  const c = upgradeComponent(), read = c.effects.readPending;
+  c.effects.readPending = () => { blockFor(20); return read(); };
+  try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, pendingMs: 5 }, upgradeMode); assert.equal(r.success, false); assert.equal(c.calls.selected, 0); assert.equal(r.failures[0], "pending_startup_pending_timeout"); }
+  finally { await c.dispose(); }
+});
+test("upgrade late pre-start handle is normally closed while admission failure remains sticky", async () => {
+  const c = upgradeComponent({ lateBegin: 15 });
+  try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, admissionMs: 2 }, upgradeMode);
+    assert.equal(r.success, false); assert.equal(r.failures[0], "pending_startup_admission_timeout"); assert.equal(c.calls.selected, 0); assert.ok(c.calls.normal > 0);
+    assert.ok(c.snapshot().ownerCloseOrdinal > c.snapshot().peerCloseOrdinal); assert.equal(r.cleanupConfirmed, false);
+  } finally { await c.dispose(); }
+});
+test("delayed real Agent creation remains fenced and owned until late Duplex close", async () => {
+  const c = upgradeComponent({ delayedCreation: true, neverRemote: true });
+  try {
+    await c.effects.begin(new AbortController().signal); assert.equal(c.socketOwner.pendingCount, 1); assert.equal(c.socketOwner.activeCount, 0);
+    const pending = c.app.close(); let settled = false; pending.then(() => settled = true);
+    c.completeCreation(); assert.equal(c.socketOwner.pendingCount, 0); assert.equal(c.socketOwner.activeCount, 1); assert.equal(c.wire.destroyRequested, true);
+    await setImmediate(); assert.equal(settled, false); assert.equal(c.p.readUpgradeObservation().pending, 1);
+    await c.wire.settleClose(); await pending; assert.equal(c.socketOwner.activeCount, 0); assert.equal(c.p.readUpgradeObservation().events[1]?.kind, "remote_closed");
+  } finally { await c.dispose(); }
+});
+test("upgrade deferred final cleanup retains owner lifetime after observation expires", async () => {
+  const c = upgradeComponent(), finish = c.effects.finish; let late: ReturnType<typeof finish> | undefined;
+  c.effects.finish = () => late = delay(25).then(finish);
+  try { const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, cleanupMs: 5 }, upgradeMode);
+    assert.equal(r.success, false); assert.equal(r.cleanupConfirmed, false); assert.equal(r.finalSnapshot, null); assert.equal(c.snapshot().ownerCloseOrdinal, 0);
+    const failures = [...r.failures], actual = await late!; assert.ok(actual.ownerCloseEndOrdinal > actual.peerSettledOrdinal); assert.equal(actual.standaloneExit, 70); assert.equal(actual.composition.clean, false);
+    assert.deepEqual(r.failures, failures); assert.equal(r.cleanupConfirmed, false);
+  } finally { await c.dispose(); }
+});
+test("upgrade shared snapshot capture is exact and recursively immutable without reading getters", async () => {
+  const c = upgradeComponent();
+  try {
+    await c.effects.begin(new AbortController().signal); const value = c.snapshot(), captured = api("capturePendingStartupSnapshot")(value, upgradeMode);
+    assert.equal(Object.isFrozen(captured), true); assert.equal(Object.isFrozen(captured.requests), true); assert.equal(Object.isFrozen(captured.upgradeHold), true);
+    assert.throws(() => captured.requests.push({ method: "POST", route: "tenant_access_token", status: 200 }));
+    let touched = 0; Object.defineProperty(value, "upgrade", { enumerable: true, get() { touched++; throw new Error("private-query"); } });
+    assert.throws(() => api("capturePendingStartupSnapshot")(value, upgradeMode), /pending_startup_fact_invalid/); assert.equal(touched, 0);
+  } finally { await c.dispose(); }
+});
+
+test("actual U1 overflow keeps cleanup unconfirmed after all test wires later close", async () => {
+  const c = upgradeComponent(), extra = Array.from({ length: 4 }, () => new UpgradeWire()), begin = c.effects.begin;
+  c.effects.begin = async signal => { await begin(signal); for (const wire of extra) {
+    const request = new IncomingMessage(wire as unknown as Socket); request.method = "POST"; request.url = "/invalid";
+    c.p.handler(request, wire, Buffer.alloc(0));
+  } };
+  try {
+    const r = await api("runPendingStartupPhase")(c.effects, { ...budgets, cleanupMs: 5 }, upgradeMode);
+    assert.equal(r.success, false); assert.equal(r.cleanupConfirmed, false); assert.equal(r.finalSnapshot, null); assert.equal(c.calls.selected, 0);
+    assert.equal(r.failureSnapshot.upgrade.invalid, true); assert.equal(r.failureSnapshot.upgrade.overflow, true);
+    for (const wire of extra) await wire.settleClose(); await c.wire.settleClose();
+    assert.equal(c.p.readUpgradeObservation().pending, 1); assert.equal(c.snapshot().ownerCloseOrdinal, 0); assert.equal(r.cleanupConfirmed, false);
+  } finally { for (const wire of extra) await wire.settleClose(); await c.wire.settleClose(); /* Deliberately unconfirmed U1 promise stays retained. */ }
+});
+test("actual U1 late disposed callback cannot reuse historical cleanup fulfillment", async () => {
+  const c = upgradeComponent(), late = new UpgradeWire(), finish = c.effects.finish;
+  c.effects.finish = async () => {
+    const value = await finish(), request = new IncomingMessage(late as unknown as Socket); request.method = "POST"; request.url = "/invalid";
+    c.p.handler(request, late, Buffer.alloc(0)); value.snapshot = c.snapshot(); return value;
+  };
+  try { const r = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode);
+    assert.equal(r.success, false); assert.equal(r.cleanupConfirmed, false); assert.equal(r.finalSnapshot.snapshot.upgrade.invalid, true);
+    assert.equal(r.finalSnapshot.snapshot.upgrade.pending, 1); assert.equal(late.destroyRequested, true);
+  } finally { await late.settleClose(); await c.dispose(); }
+});
+
+// Catch writer validation invoking inherited serialization or failure methods.
+for (const mode of ["ws-endpoint-normal-close", upgradeMode]) test(`writer ${mode} rejects a nonprimitive failure without invoking methods`, () => {
+  const out = mkdtempSync("/private/tmp/pending-writer-primitive-"); chmodSync(out, 0o700); let calls = 0;
+  const value = { schema: mode === upgradeMode ? "meeting-pending-upgrade-evidence/v1" : "meeting-pending-startup-evidence/v1", label: "component-facts", mode, success: false,
+    failures: [{ slice() { calls++; return "phase_failed"; }, startsWith() { calls++; return true; }, toJSON() { calls++; return "private-output-sentinel"; } }],
+    heldSnapshot: null, cancellationSnapshot: null, finalSnapshot: null, failureSnapshot: null, cleanupConfirmed: false };
+  try {
+    let rejected = false; try { api("writePendingStartupEvidence")(out, value); } catch { rejected = true; }
+    assert.equal(calls, 0); assert.equal(rejected, true); assert.deepEqual(readdirSync(out), []);
+  } finally { rmSync(out, { recursive: true, force: true }); }
+});
+for (const location of ["failures", "events", "lifecycle", "requests"]) test(`upgrade writer rejects inherited ${location} serialization without reading it`, async () => {
+  const c = upgradeComponent(), out = mkdtempSync("/private/tmp/pending-writer-array-"); chmodSync(out, 0o700); let calls = 0;
+  try {
+    const result = structuredClone(await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode)); assert.equal(result.success, true);
+    result.success = false; result.failures = ["pending_startup_phase_failed"];
+    const array = location === "failures" ? result.failures : location === "events" ? result.heldSnapshot.upgrade.events : result.heldSnapshot[location];
+    const prototype = Object.create(Array.prototype); Object.defineProperty(prototype, "toJSON", { get() { calls++; return () => ["private-output-sentinel"]; } });
+    Object.setPrototypeOf(array, prototype);
+    let rejected = false; try { api("writePendingStartupEvidence")(out, result); } catch { rejected = true; }
+    assert.equal(calls, 0); assert.equal(rejected, true); assert.deepEqual(readdirSync(out), []);
+  } finally { await c.dispose(); rmSync(out, { recursive: true, force: true }); }
+});
+
+// Keep cancellation/final histories coherent so these guard failures cannot be
+// attributed to a later cross-history mismatch instead of the selected predicate.
+for (const violation of ["fixture_closed", "endpoint499"] as const) test(`coherent upgrade ${violation} histories still reject the selected cancellation`, async () => {
+  const c = upgradeComponent(), settle = c.effects.settleBeforeFixtureCleanup, finish = c.effects.finish;
+  const change = (snapshot: UpgradeSnapshot) => {
+    if (violation === "fixture_closed") snapshot.upgrade.events[1]!.kind = "fixture_closed";
+    else snapshot.requests[0]!.status = 499;
+  };
+  c.effects.settleBeforeFixtureCleanup = async () => { const value = structuredClone(await settle()); change(value.snapshot); return value; };
+  c.effects.finish = async () => { const value = structuredClone(await finish()); change(value.snapshot); return value; };
+  try { const result = await api("runPendingStartupPhase")(c.effects, budgets, upgradeMode);
+    assert.equal(result.success, false); assert.equal(result.failures[0], "pending_startup_settlement_invalid"); assert.equal(result.cleanupConfirmed, false);
+    assert.deepEqual(result.cancellationSnapshot.snapshot.requests, result.finalSnapshot.snapshot.requests);
+    assert.deepEqual(result.cancellationSnapshot.snapshot.upgrade.events, result.finalSnapshot.snapshot.upgrade.events);
+  } finally { await c.dispose(); }
 });
