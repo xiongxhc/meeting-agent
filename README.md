@@ -152,6 +152,23 @@ history, direct-child and descendant cleanup must all pass; both roots are
 preserved. The listener-free source checks do not establish R5/R7 application
 acceptance, crash-before-callback recovery or terminal-session reopen.
 
+The separate conflicting-replay selection sends a changed normalized invitation
+under the original event identity, then replays the original content:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/ingress-run.mjs --conflicting-replay --out /absolute/private/evidence/ingress-conflict
+```
+
+It requires an actual decoded SDK 500 for the conflict, no commit observation and
+an unchanged durable invitation. The subsequent original replay must receive 200
+and preserve the first title, hash and acceptance time. The existing two-owner
+reopen, public metadata retry and one-launch checks still apply. This option can
+also combine with `--missing-launcher` in a separate fresh output directory.
+Reviewed listener-free tests cover the normalizer, store transaction, decoder and
+campaign controls; actual SDK/application execution remains unverified. This
+nonfatal rejection does not establish commit-before-callback crash recovery or
+terminal-session reopen.
+
 The prepared capacity command accepts `--count 1`, `2`, `4` or `8`. Run each
 count sequentially with a fresh private output directory:
 
