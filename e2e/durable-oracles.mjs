@@ -247,6 +247,92 @@ function validatedMediaTiming(snapshot, child, mode) {
   return { ...selected, boundary, frames, overlap, warnings };
 }
 
+/** One-pair short recording: retained PCM cannot manufacture drain or wall confirmation. */
+function validatedTailOmission(snapshot, child) {
+  const selected = selectedAlignment(snapshot), { recording, binding, attempt, entries } = selected;
+  requireFact(snapshot.bindings.length === 1 && snapshot.selected.length === 1 && attempt.coverage_status === "partial",
+    "tail omission requires one selected partial final source");
+  const peer = child?.captureFinish, drain = child?.captureDrain;
+  const position = value => value?.captureEpoch === "1" && value.sequence === "49" && value.outputEndSample === "23520";
+  requireFact(child?.mediaTiming === "omit-final-pair" && child.mediaTimingTargetSequence === null && child.framesSent === 49 &&
+    position(child.capturePosition) && position(peer?.capturePosition), "tail omission producer selection or position mismatch");
+  requireFact(peer?.authenticated === true && peer.sessionId === binding.source_session_id && peer.bridgeSessionId === binding.bridge_session_id &&
+    peer.requestedBoundary === null && peer.acknowledgedBoundary === null &&
+    drain?.drain === "unconfirmed" && drain.reason === "final_clock_pair_omitted" && drain.boundary === null &&
+    child.mediaClosedReason === "final_clock_pair_omitted", "tail omission authenticated unconfirmed finish mismatch");
+  requireFact(recording.capture_drain === "unconfirmed" && recording.capture_drain_reason === "final_clock_pair_omitted" &&
+    ["capture_drain_epoch", "capture_drain_last_frame_sequence", "capture_drain_output_end_sample", "capture_drain_final_pair_sequence"]
+      .every(key => recording[key] === null), "tail omission persisted unconfirmed boundary mismatch");
+  const sameEpoch = epoch => epoch?.bridgeSessionId === binding.bridge_session_id && epoch.clockDomainId === "e2e-clock" && epoch.captureEpoch === 1n;
+  requireFact(entries[0]?.kind === "epoch" && sameEpoch(entries[0].epoch) && entries.filter(row => row.kind === "epoch").length === 1,
+    "tail omission initial epoch mismatch");
+  const pair = entries[1]?.pair;
+  requireFact(entries[1]?.kind === "clock_pair" && entries.filter(row => row.kind === "clock_pair").length === 1 &&
+    pair.clockDomainId === "e2e-clock" && pair.wallEpoch === 1n && pair.sequence === 1n &&
+    pair.hostBeforeNs <= pair.hostAfterNs && pair.wallResolutionNs === 1000n && pair.externalUtcAccuracyNs === null,
+    "tail omission requires exactly one initial clock pair");
+  const frames = entries.filter(row => row.kind === "frame");
+  requireFact(frames.length === 49 && recording.duration_ms === 980 && frames.at(-1)?.mediaEndSample === 23520n,
+    "tail omission exact final frame/sample count or duration mismatch");
+  requireFact(entries.slice(2, 51).every(row => row.kind === "frame") && frames.every(frame => sameEpoch(frame.epoch) && frame.provenance?.captureEpoch === 1n),
+    "tail omission frame order or epoch identity mismatch");
+  const base = frames[0]?.provenance?.span?.hostStartNs;
+  requireFact(typeof base === "bigint", "tail omission missing nominal span");
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i], p = frame.provenance, span = p?.span, start = BigInt(i) * 480n;
+    requireFact(p.sequence === BigInt(i + 1) && p.outputStartSample === start && p.sampleCount === 480 &&
+      p.sourceStartNumerator === start * 24000n && p.sourceEndNumerator === (start + 480n) * 24000n &&
+      p.sourceDenominator === 24000 && p.sourceRateHz === 24000 && p.quality === "nominal_frame_endpoint_interpolation" &&
+      frame.sampleRateHz === 24000 && frame.mediaStartSample === start && frame.mediaEndSample === start + 480n && frame.gapOffsetMs === 0n &&
+      span?.hostStartNs === base + BigInt(i) * 20000000n && span.hostEndNs === base + BigInt(i + 1) * 20000000n &&
+      span.roundingEnvelopeNs === 1000n && span.captureUncertaintyNs === null,
+    "tail omission sequence/sample/nominal span mismatch");
+    requireFact(frame.captureStatus === "available" && frame.wall === null &&
+      JSON.stringify([...frame.reasons].sort()) === '["missing_clock_pair","wall_alignment_missing"]',
+    "tail omission frame wall/status/reasons mismatch");
+  }
+  // Runtime cleanup may append reconnect, then an open gap at the PCM watermark.
+  const suffix = entries.slice(51);
+  let index = 0;
+  if (suffix[index]?.kind === "discontinuity") {
+    requireFact(suffix[index].captureEpoch === 1n && suffix[index].reason === "reconnect", "tail omission terminal reconnect mismatch");
+    index++;
+  }
+  let trailingGap = null;
+  if (suffix[index]?.kind === "audio_gap") {
+    trailingGap = suffix[index++];
+    requireFact(trailingGap.startedAtMs === 980n && trailingGap.endedAtMs === null && trailingGap.reason === "capture_discontinuity",
+      "tail omission terminal gap mismatch");
+  }
+  requireFact(index === suffix.length, "tail omission unexpected terminal suffix");
+  requireFact(snapshot.runtimeGaps.length === (trailingGap ? 1 : 0) && snapshot.runtimeGaps.every(row =>
+    String(row.started_at_ms) === "980" && row.ended_at_ms === null && row.reason === "capture_discontinuity") &&
+    !snapshot.gaps.some(row => row.direction === "capture"), "tail omission recorded gap disagreement or capture loss");
+  return { ...selected, peer, drain, frames, pair, suffix, warnings: JSON.parse(attempt.warnings_json) };
+}
+
+export function tailOmissionOracles(snapshot, child) {
+  try {
+    validatedTailOmission(snapshot, child);
+    return [{ name: "media_timing_omit_final_pair", status: "pass", detail: "selected COMPLETE partial recording retains all 49 frames/23520 samples/980ms; one initial pair, all frame walls missing; authenticated unconfirmed drain without requested or acknowledged finish" }];
+  } catch (error) { return [{ name: "media_timing_omit_final_pair", status: "fail", detail: String(error?.message ?? error) }]; }
+}
+export function tailOmissionMetadata(snapshot, child) {
+  const { recording, binding, attempt, entries, peer, drain, frames, pair, suffix, warnings } = validatedTailOmission(snapshot, child);
+  const last = frames.at(-1);
+  return { mode: child.mediaTiming, occurrence: snapshot.occurrence, generationId: binding.generation_id,
+    bridgeSessionId: binding.bridge_session_id, sourceSessionId: binding.source_session_id,
+    recordingHandle: recording.handle, sha256: recording.sha256, keyId: recording.key_id,
+    attemptId: attempt.attempt_id, pageCount: attempt.page_count, entryCount: attempt.entry_count, storedBytes: attempt.stored_bytes,
+    coverageStatus: attempt.coverage_status, captureDrain: { drain: drain.drain, reason: drain.reason, boundary: drain.boundary },
+    frames: frames.length, samples: String(last.mediaEndSample), durationMs: recording.duration_ms, initialPairSequence: String(pair.sequence),
+    finalPairRecorded: entries.some(row => row.kind === "clock_pair" && row.pair.sequence > pair.sequence), finishRequested: peer.requestedBoundary !== null, finishAcknowledged: peer.acknowledgedBoundary !== null,
+    lastFrame: { sequence: String(last.provenance.sequence), sourceStartSample: String(last.mediaStartSample), sourceEndSample: String(last.mediaEndSample),
+      captureStatus: last.captureStatus, wall: last.wall, reasons: [...last.reasons].sort() },
+    terminalSuffix: suffix.map(row => row.kind === "discontinuity" ? { kind: row.kind, captureEpoch: String(row.captureEpoch), reason: row.reason }
+      : { kind: row.kind, startedAtMs: String(row.startedAtMs), endedAtMs: row.endedAtMs, reason: row.reason }), warnings: [...warnings].sort() };
+}
+
 export function mediaTimingOracles(snapshot, child, mode) {
   try {
     validatedMediaTiming(snapshot, child, mode);
@@ -289,7 +375,7 @@ export function captureFinishMetadata(child) {
   const position = value => pick(value, ["captureEpoch", "sequence", "outputEndSample"]);
   const finish = child.captureFinish, observation = child.endObservation;
   return { ...(child.mediaTiming === "invalid2ns" ? { mediaTiming: { mode: "invalid2ns",
-    targetSequence: child.mediaTimingTargetSequence === "26" ? "26" : null } } : {}),
+    targetSequence: child.mediaTimingTargetSequence === "26" ? "26" : null } } : child.mediaTiming === "omit-final-pair" ? { mediaTiming: { mode: "omit-final-pair" } } : {}),
     captureDrain: child.captureDrain === null || child.captureDrain === undefined ? null : {
     drain: child.captureDrain.drain, reason: child.captureDrain.reason, boundary: boundary(child.captureDrain.boundary) },
     captureFinish: finish === null || finish === undefined ? null : { ...pick(finish, ["sessionId", "bridgeSessionId", "authenticated"]),

@@ -68,13 +68,20 @@ function stageBuiltApplication(repository, appDir) {
 
 export function mediaTimingConfiguration({ mediaTiming, interactive = false, r2Baseline = false, d2Cut, onlyRefusals = false, packageRefusals = false }) {
   if (mediaTiming === undefined) return {};
-  if (parseMediaTiming(mediaTiming) !== "invalid2ns" || interactive || r2Baseline || d2Cut || onlyRefusals || packageRefusals)
+  const mode = parseMediaTiming(mediaTiming);
+  if (mode === "normal" || interactive || r2Baseline || d2Cut || onlyRefusals || packageRefusals)
     throw new Error("invalid media timing command mode");
-  return { mediaTiming: "invalid2ns", captureFrameLimit: CAPTURE_FRAME_LIMIT };
+  return { mediaTiming: mode, captureFrameLimit: mode === "omit-final-pair" ? 49 : CAPTURE_FRAME_LIMIT };
+}
+
+/** Final child fields, shared by the actual staged static configuration. */
+export function scriptedCaptureConfiguration(options) {
+  const timing = mediaTimingConfiguration(options);
+  return { ...timing, captureFrameLimit: options.interactive ? 3000 : timing.captureFrameLimit ?? CAPTURE_FRAME_LIMIT };
 }
 
 export function stage({ repository, interactive = false, r2Baseline = false, mediaTiming, runtimeProfile = RUNTIME_PIN }) {
-  const timingConfiguration = mediaTimingConfiguration({ mediaTiming, interactive, r2Baseline });
+  const captureConfiguration = scriptedCaptureConfiguration({ mediaTiming, interactive, r2Baseline });
   runtimeProfile = resolveRuntimeProfile(runtimeProfile);
   const expiryEvidence = runtimeProfile === EXPIRY_EVIDENCE_PROFILE;
   if (expiryEvidence && (interactive || r2Baseline)) throw new Error("expiry evidence profile incompatible with interactive or R2 staging");
@@ -156,7 +163,6 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
   writeFileSync(bridgeStaticConfigPath, JSON.stringify({
     schema: "feishu-bridge-config/v1", bundleVersion: "e2e-scripted",
     controlDir: directories.control,
-    ...timingConfiguration,
     // Fifty-one 20 ms frames: more than twice the roughly twenty frames that
     // was the old ceiling, and the exact length D032 §1 was measured at. Its
     // two alignment pages re-encode to 46575 and 37801 private bytes, both
@@ -164,7 +170,7 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
     // the fixed bound. Two hundred frames were tried and reverted: the child
     // paces one frame per 20 ms, and on a loaded machine only 101 of them fit
     // inside the fixed media-capture budget, which may not be widened.
-    captureFrameLimit: interactive ? 3000 : CAPTURE_FRAME_LIMIT,
+    ...captureConfiguration,
     // One observed participant, so the closed-meeting attendance the artifact
     // contract requires comes from real bridge-observed UI events rather than
     // anything the harness writes into the artifact.

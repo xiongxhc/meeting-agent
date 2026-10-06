@@ -49,3 +49,35 @@ test("after-close check requires a fresh reopened strict oracle rather than read
   f.child.captureDrain.drain = "unconfirmed";
   assert.throws(() => run.verifyMediaTimingAfterClose(input), /finish/); assert.equal(reads, 2);
 });
+
+// Real assemblies are called by stage and liveRun; losing either selected count fails here.
+test("omission route assembles fixed49 child capture, parent wait and reporting while other modes retain counts", () => {
+  for (const [mode, count] of [[undefined, 51], ["invalid2ns", 51], ["omit-final-pair", 49]] as const) {
+    const options = mode === undefined ? {} : run.parseArguments(["--out", "/private/tmp/unused", "--media-timing", mode]);
+    assert.equal(stage.scriptedCaptureConfiguration(options).captureFrameLimit, count);
+    assert.equal(run.driveCaptureConfiguration(options).captureFrames, count);
+    assert.equal(run.captureRecorded({ framesSent: count }, options), true);
+    assert.equal(run.captureRecorded({ framesSent: count - 1 }, options), false);
+    assert.equal(run.mediaTimingFailureName(mode), mode === undefined ? "confirmed_capture_tail" : mode === "invalid2ns" ? "media_timing_invalid2ns" : "media_timing_omit_final_pair");
+  }
+  assert.equal(stage.scriptedCaptureConfiguration({ interactive: true }).captureFrameLimit, 3000);
+  assert.equal(run.driveCaptureConfiguration({ interactive: true }).captureFrames, 51);
+  assert.equal(run.publicationRequired({ mediaTiming: "omit-final-pair" }), false);
+  assert.deepEqual(run.mediaTimingArguments({ mediaTiming: "omit-final-pair" }), ["--media-timing", "omit-final-pair"]);
+  for (const extra of [["--interactive"], ["--r2-baseline"], ["--only-refusals"], ["--d2-cut", "durable"], ["--package-refusals"], ["--media-timing", "omit-final-pair"]])
+    assert.throws(() => run.parseArguments(["--out", "/private/tmp/unused", "--media-timing", "omit-final-pair", ...extra]));
+});
+test("omission readiness and after-close dispatch strict selected oracle then fresh reopened evidence", async () => {
+  // @ts-expect-error Private harness has no declaration.
+  const entry = await import("./entry.mjs");
+  const { omissionFixture } = await import("./durable-oracles.test.ts");
+  const f = omissionFixture(), summary = await entry.waitForMediaTimingAlignment({ read: () => f.snapshot,
+    child: () => f.child, mode: "omit-final-pair", budgetMs: 1000 });
+  assert.equal(summary.lastFrame.sequence, "49"); let reads = 0;
+  const input = { closed: true, read: () => { reads++; return f.snapshot; }, child: f.child, mode: "omit-final-pair" };
+  assert.throws(() => run.verifyMediaTimingAfterClose({ ...input, closed: false }), /closure/); assert.equal(reads, 0);
+  assert.equal(run.verifyMediaTimingAfterClose(input).metadata.frames, 49); assert.equal(reads, 1);
+  f.child.captureFinish.requestedBoundary = { finalClockPairSequence: "1" };
+  await assert.rejects(entry.waitForMediaTimingAlignment({ read: () => f.snapshot, child: () => f.child, mode: "omit-final-pair", budgetMs: 1000 }), /finish/);
+  assert.throws(() => run.verifyMediaTimingAfterClose(input), /finish/); assert.equal(reads, 2);
+});

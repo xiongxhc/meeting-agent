@@ -50,7 +50,7 @@ import { r2GatewayToml } from "./r2-gateway-config.mjs";
 import { assertR2Plan, runR2InitialBuild, withOwnedPeers } from "./r2-baseline.mjs";
 
 import { mediaTimingConfiguration } from "./stage.mjs";
-import { mediaTimingMetadata, readDurableEvidence } from "./durable-oracles.mjs";
+import { mediaTimingMetadata, tailOmissionMetadata, readDurableEvidence } from "./durable-oracles.mjs";
 
 /** Read-only polling of the shipped backfill owner's durable selection. */
 export async function waitForMediaTimingAlignment({ read, child, mode, budgetMs }) {
@@ -62,7 +62,7 @@ export async function waitForMediaTimingAlignment({ read, child, mode, budgetMs 
     const snapshot = read(); // Missing schema/read errors fail immediately.
     if (Date.now() >= deadline) throw new Error("e2e_timeout:media_timing_alignment");
     if (snapshot.recordings.length && snapshot.bindings.some(row => row.recording_kind === "final") && snapshot.selected.length)
-      return mediaTimingMetadata(snapshot, child(), mode);
+      return mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child()) : mediaTimingMetadata(snapshot, child(), mode);
     await pause(Math.min(25, Math.max(1, deadline - Date.now())));
   }
 }

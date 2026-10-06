@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { Duplex } from "node:stream";
+import process from "node:process";
 import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
 // @ts-expect-error Test-only connected peer has no public declaration.
@@ -323,4 +324,103 @@ test("actual MED3 bytes preserve 51 silent frames with only frame26 invalid by e
       assert.deepEqual(client.capturePosition, { captureEpoch: "2", sequence: "51", outputEndSample: "24480" });
     } finally { socket.destroy(); }
   }
+});
+
+// A restored final-pair branch must fail this byte-level contract.
+test("selected omission retains 49 authentic PCM frames and never requests or acknowledges finish", async () => {
+  const options: Record<string, unknown> = { mediaTiming: "omit-final-pair", captureEpoch: 1n };
+  const { socket, client } = await admitted(options); options.mediaTiming = "normal";
+  await client.sendEpoch(); await client.sendClockPair();
+  for (let i = 0; i < 49; i++) await client.sendSilentFrame();
+  const stop = client.finishCapture({ timeoutMs: 200 }); assert.equal(client.close(), stop);
+  await assert.rejects(client.sendSilentFrame(), /admission closed/);
+  assert.deepEqual(await stop, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+  const frames = socket.writes.filter(p => p[5] === 2), base = frames[0]!.readBigUInt64BE(81);
+  assert.equal(frames.length, 49); assert.equal(kinds(socket).filter(k => k === 7).length, 1);
+  assert.equal(kinds(socket).includes(10), false); assert.equal(socket.destroyed, true);
+  for (let i = 0; i < frames.length; i++) {
+    const p = frames[i]!, start = BigInt(i * 480);
+    assert.equal(p.subarray(0, 4).toString(), "MED3"); assert.equal(p[4], 3);
+    assert.deepEqual([...p.subarray(25, 29)], [1, 1, 1, 0]);
+    assert.equal(p.readBigUInt64BE(29), 1n); assert.equal(p.readBigUInt64BE(37), BigInt(i + 1));
+    assert.equal(p.readBigUInt64BE(45), start); assert.equal(p.readUInt32BE(53), 480);
+    assert.equal(p.readBigUInt64BE(57), start * 24000n); assert.equal(p.readBigUInt64BE(65), (start + 480n) * 24000n);
+    assert.equal(p.readUInt32BE(73), 24000); assert.equal(p.readUInt32BE(77), 24000);
+    assert.equal(p.readBigUInt64BE(81), base + BigInt(i) * 20_000_000n);
+    assert.equal(p.readBigUInt64BE(89), base + BigInt(i + 1) * 20_000_000n);
+    assert.equal(p.readBigUInt64BE(97), 1000n); assert.equal(p.readUInt32BE(113), 960);
+    assert.deepEqual(p.subarray(117), Buffer.alloc(960));
+  }
+  assert.deepEqual(client.finishEvidence, { sessionId: "41", bridgeSessionId: "synthetic-bridge", authenticated: true,
+    requestedBoundary: null, acknowledgedBoundary: null, capturePosition: { captureEpoch: "1", sequence: "49", outputEndSample: "23520" } });
+  socket.emit("data", ack(POSITIVE)); socket.emit("end");
+  assert.deepEqual(await client.close(), { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+});
+test("normal 49-frame byte control still emits final pair and requires exact synthetic ACK", async () => {
+  const { socket, client } = await admitted({ captureEpoch: 1n }); await client.sendEpoch(); await client.sendClockPair();
+  for (let i = 0; i < 49; i++) await client.sendSilentFrame();
+  const stop = client.finishCapture({ timeoutMs: 200 }); await setImmediate();
+  assert.equal(kinds(socket).filter(k => k === 7).length, 2);
+  assert.equal(socket.writes.at(-1)![5], 10); socket.receive(ack(socket.writes.at(-1)!));
+  assert.deepEqual(await stop, { drain: "confirmed", reason: null, boundary: { captureEpoch: "1", lastFrameSequence: "49",
+    outputEndSample: "23520", finalClockPairSequence: "2" } });
+});
+test("omission fences pending writes and capture work with original deadline and primary failure", async () => {
+  for (const fault of ["write", "deadline", "capture", "transport", "epoch"] as const) {
+    const { socket, client } = await admitted({ mediaTiming: "omit-final-pair" });
+    if (fault !== "epoch") { await client.sendEpoch(); await client.sendClockPair(); }
+    if (["write", "deadline"].includes(fault)) socket.holdKind = 2;
+    const frame = ["write", "deadline"].includes(fault) ? client.sendSilentFrame() : Promise.resolve(); void frame.catch(() => {});
+    const work = fault === "capture" ? Promise.reject(new Error("synthetic capture failure")) : Promise.resolve();
+    if (fault === "transport") socket.emit("error", new Error("synthetic transport failure"));
+    const stop = client.finishCapture({ timeoutMs: 20, captureWork: work }); await setImmediate();
+    if (fault === "write") socket.held.shift()!(new Error("synthetic write failure"));
+    const result = await stop;
+    assert.equal(result.reason, ({ write: "media_write_failed", deadline: "capture_finish_timeout", capture: "capture_finish_failed",
+      transport: "media_transport_error", epoch: "capture_epoch_missing" } as const)[fault]);
+    assert.equal(result.drain, "unconfirmed"); assert.equal(result.boundary, null);
+    assert.equal(kinds(socket).includes(10), false);
+    for (const callback of socket.held) callback(); await frame.catch(() => {});
+    assert.equal(client.finishCapture(), stop); assert.deepEqual(await stop, result);
+  }
+  const { socket, client } = await admitted({ mediaTiming: "omit-final-pair" }); await client.sendEpoch(); await client.sendClockPair();
+  const stop = client.finishCapture({ timeoutMs: 10, captureWork: new Promise(() => {}) });
+  assert.equal((await stop).reason, "capture_finish_timeout"); assert.equal(kinds(socket).filter(k => k === 7).length, 1);
+});
+test("child media selection rejects incompatible fixed counts before connected effects", () => {
+  assert.equal(typeof media.parseCaptureMediaTiming, "function");
+  assert.equal(media.parseCaptureMediaTiming({ mediaTiming: "omit-final-pair", captureFrameLimit: 49 }), "omit-final-pair");
+  assert.equal(media.parseCaptureMediaTiming({ mediaTiming: "invalid2ns", captureFrameLimit: 51 }), "invalid2ns");
+  assert.equal(media.parseCaptureMediaTiming({ captureFrameLimit: 3000 }), "normal");
+  for (const mediaTiming of ["invalid2ns", "omit-final-pair"]) for (const captureFrameLimit of [undefined, 0, 48, 50, 52, "49", 3000])
+    assert.throws(() => media.parseCaptureMediaTiming({ mediaTiming, captureFrameLimit }), /frame limit/);
+});
+
+test("omission waits for queued frame49 and capture work before selecting one unconfirmed terminal", async () => {
+  const { socket, client } = await admitted({ mediaTiming: "omit-final-pair", captureEpoch: 1n });
+  await client.sendEpoch(); await client.sendClockPair();
+  for (let i = 0; i < 48; i++) await client.sendSilentFrame();
+  socket.holdKind = 2; const last = client.sendSilentFrame();
+  let settleCapture: () => void = () => {};
+  const captureWork = new Promise<void>(resolve => { settleCapture = resolve; });
+  const stop = client.finishCapture({ timeoutMs: 200, captureWork }); let done = false; void stop.then(() => { done = true; });
+  await setImmediate(); assert.equal(done, false); assert.equal(client.capturePosition.sequence, "48");
+  socket.held.shift()!(); await last; await setImmediate(); assert.equal(done, false);
+  assert.deepEqual(client.capturePosition, { captureEpoch: "1", sequence: "49", outputEndSample: "23520" });
+  settleCapture(); assert.deepEqual(await stop, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+  assert.equal(kinds(socket).filter(k => k === 7).length, 1); assert.equal(kinds(socket).includes(10), false);
+});
+
+// An elapsed absolute budget wins even while synchronous work starves its timer callback.
+for (const blocker of ["capture work", "FIFO write callback"]) test(`omission deadline wins after blocking ${blocker} before timer dispatch`, async () => {
+  const { socket, client } = await admitted({ mediaTiming: "omit-final-pair", captureEpoch: 1n });
+  await client.sendEpoch(); await client.sendClockPair();
+  const block = () => { const end = process.hrtime.bigint() + 30_000_000n; while (process.hrtime.bigint() < end) { /* synthetic starvation */ } };
+  let frame = Promise.resolve();
+  if (blocker === "FIFO write callback") { socket.respond = packet => { if (packet[5] === 2) block(); }; frame = client.sendSilentFrame().then(() => {}); }
+  const captureWork = blocker === "capture work" ? Promise.resolve().then(block) : Promise.resolve();
+  const stop = client.finishCapture({ timeoutMs: 10, captureWork });
+  assert.deepEqual(await stop, { drain: "unconfirmed", reason: "capture_finish_timeout", boundary: null });
+  await frame; assert.equal(client.closedReason, "capture_finish_timeout");
+  assert.equal(kinds(socket).filter(k => k === 7).length, 1); assert.equal(kinds(socket).includes(10), false);
 });

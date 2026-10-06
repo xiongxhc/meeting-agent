@@ -29,7 +29,7 @@ import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 import { createProcessEvidence, observeProcessSnapshot } from "./process-evidence.mjs";
 import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-proofs.mjs";
 import { preflightLauncher } from "./launcher-preflight.mjs";
-import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
+import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
 import { d2OrderingOracles } from "./d2-oracles.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
@@ -49,7 +49,7 @@ export function parseArguments(argv) {
     else if (argv[index] === "--media-timing") {
       if (options.mediaTiming !== undefined) throw new Error("duplicate media timing flag");
       const value = argv[++index];
-      if (value !== "invalid2ns") throw new Error("invalid media timing command mode");
+      if (value !== "invalid2ns" && value !== "omit-final-pair") throw new Error("invalid media timing command mode");
       options.mediaTiming = value;
     }
     else if (argv[index] === "--package-refusals") options.packageRefusals = true;
@@ -83,11 +83,23 @@ export function publicationRequired({ mediaTiming, d2Cut }) {
 export function mediaTimingArguments({ mediaTiming }) {
   return mediaTiming === undefined ? [] : ["--media-timing", mediaTiming];
 }
+/** Actual drive plan fields and parent capture prerequisite use one selection. */
+export function driveCaptureConfiguration(options) {
+  const timing = mediaTimingConfiguration(options);
+  return { ...timing, captureFrames: timing.captureFrameLimit ?? CAPTURE_FRAME_LIMIT };
+}
+export function captureRecorded(child, options) {
+  return (child?.framesSent ?? 0) >= driveCaptureConfiguration(options).captureFrames;
+}
+export function mediaTimingFailureName(mode) {
+  return mode === undefined ? "confirmed_capture_tail" : mode === "omit-final-pair" ? "media_timing_omit_final_pair" : "media_timing_invalid2ns";
+}
 export function verifyMediaTimingAfterClose({ closed, read, child, mode }) {
   if (!closed) throw new Error("media timing owner closure unavailable");
-  const snapshot = read(), checks = mediaTimingOracles(snapshot, child, mode);
+  mediaTimingConfiguration({ mediaTiming: mode });
+  const snapshot = read(), checks = mode === "omit-final-pair" ? tailOmissionOracles(snapshot, child) : mediaTimingOracles(snapshot, child, mode);
   if (checks.some(row => row.status !== "pass")) throw new Error(checks[0].detail);
-  return { checks, metadata: mediaTimingMetadata(snapshot, child, mode), durable: durableMetadata(snapshot) };
+  return { checks, metadata: mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child) : mediaTimingMetadata(snapshot, child, mode), durable: durableMetadata(snapshot) };
 }
 
 const steps = [];
@@ -257,11 +269,10 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     interactive,
     r2Baseline,
     d2Cut,
-    ...mediaTimingConfiguration({ mediaTiming, interactive, r2Baseline, d2Cut }),
+    ...driveCaptureConfiguration({ mediaTiming, interactive, r2Baseline, d2Cut }),
     recordingKeyEnv: RECORDING_KEY_ENV,
     providerCredentialEnv: PROVIDER_CREDENTIAL_ENV,
     meeting,
-    captureFrames: CAPTURE_FRAME_LIMIT,
     // Test cadences only (D028). The backfill lane is deliberately slower than
     // the rest: it mints a NEW artifact revision on every tick while a
     // publication is still pending, and a receipt only ever names the revision
@@ -617,8 +628,6 @@ async function main() {
       if (options.d2Cut !== "repeated-close" && !live.r2SnapshotRefused) {
         try {
           const occurrence = `${live.meeting.providerMeetingId}@${new Date(live.meeting.startSeconds * 1000).toISOString().replace(".000Z", "Z")}`;
-          const facts = await readRunEvidence({ databasePath: live.reopen.filename, r2Baseline: options.r2Baseline,
-            read: () => readDurableEvidence(live.reopen.filename, occurrence) });
           if (options.mediaTiming !== undefined) {
             const result = verifyMediaTimingAfterClose({ closed: live.outcome.code === 0 && live.summary?.driveFailure === null &&
               live.summary.trace.includes("shutdown_store_closed") && live.events.some(row => row.name === "owned_peers_closed"),
@@ -627,10 +636,12 @@ async function main() {
             live.mediaTiming = result.metadata; live.durable = result.durable;
             check("media_timing_alignment_ready", live.events.some(row => row.name === "media_timing_alignment_ready"), "actual strict selected alignment observed before ordinary owner closure");
           } else {
+            const facts = await readRunEvidence({ databasePath: live.reopen.filename, r2Baseline: options.r2Baseline,
+              read: () => readDurableEvidence(live.reopen.filename, occurrence) });
             for (const row of captureTailOracles(facts, live.childState)) oracle(row.name, row.status, row.detail);
             live.durable = durableMetadata(facts);
           }
-        } catch (error) { oracle(options.mediaTiming === undefined ? "confirmed_capture_tail" : "media_timing_invalid2ns", "fail", String(error?.message ?? error)); }
+        } catch (error) { oracle(mediaTimingFailureName(options.mediaTiming), "fail", String(error?.message ?? error)); }
       }
 
       // --- spine oracles ---------------------------------------------------
@@ -648,7 +659,7 @@ async function main() {
         `child pid ${live.childState?.pid}, joined ${live.childState?.joined}`);
       check("media_connected", live.childState?.mediaConnected === true,
         `endpoint ${live.childState?.mediaEndpoint}`);
-      check("capture_recorded", (live.childState?.framesSent ?? 0) >= CAPTURE_FRAME_LIMIT && readdirSync(staged.directories.recordingsDir).some((name) => name.endsWith(".crsr")),
+      check("capture_recorded", captureRecorded(live.childState, options) && readdirSync(staged.directories.recordingsDir).some((name) => name.endsWith(".crsr")),
         `${live.childState?.framesSent} produced capture frames; recordings ${JSON.stringify(readdirSync(staged.directories.recordingsDir))}`);
       if (options.d2Cut !== "repeated-close") {
       check("meeting_ended", live.childState?.left === "ended", `bridge-observed terminal ${live.childState?.left}`);

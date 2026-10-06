@@ -17,7 +17,7 @@ import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
 
-import { connectMediaClient, parseMediaTiming } from "../media-client.mjs";
+import { connectMediaClient, parseCaptureMediaTiming } from "../media-client.mjs";
 import { createCaptureLifecycle } from "./scripted-capture-lifecycle.mjs";
 import { createPhysicalOutcomeEmitter, parsePhysicalOutcomeScenario, readPhysicalOutcomeClose } from "./bridge-scenarios.mjs";
 import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge-observations.mjs";
@@ -29,8 +29,7 @@ for (const leaked of ["RUNTIME_SECRET", "FEISHU_APP_SECRET", "E2E_RUNTIME_RECORD
   if (process.env[leaked] !== undefined) process.exit(7);
 }
 
-const mediaTiming = parseMediaTiming(config.mediaTiming);
-if (mediaTiming === "invalid2ns" && config.captureFrameLimit !== 51) throw new Error("invalid media timing frame limit");
+const mediaTiming = parseCaptureMediaTiming(config);
 const control = config.controlDir;
 const binding = config.custody;
 const physicalOutcomeScenario = parsePhysicalOutcomeScenario(config.physicalOutcomeScenario);

@@ -15,8 +15,16 @@ const MAX_TOKEN_BYTES = 128;
 
 export function parseMediaTiming(value) {
   if (value === undefined) return "normal";
-  if (value === "normal" || value === "invalid2ns") return value;
+  if (value === "normal" || value === "invalid2ns" || value === "omit-final-pair") return value;
   throw new Error("invalid media timing selector");
+}
+
+/** Child admission validates fixed cuts before creating any controls or peers. */
+export function parseCaptureMediaTiming({ mediaTiming, captureFrameLimit }) {
+  const mode = parseMediaTiming(mediaTiming);
+  if (mode !== "normal" && captureFrameLimit !== (mode === "omit-final-pair" ? 49 : 51))
+    throw new Error("invalid media timing frame limit");
+  return mode;
 }
 
 export function writePacket(socket, bytes, onWritten = () => {}) {
@@ -269,6 +277,10 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
           if (failure) throw new Error(failure);
           await Promise.race([Promise.all([captureWork, tail]), aborted]);
           if (failure || !authenticated || !epochWritten) throw new Error(failure ?? "capture_epoch_missing");
+          if (mediaTiming === "omit-final-pair") {
+            fail(remaining() <= 0 ? "capture_finish_timeout" : "final_clock_pair_omitted");
+            throw new Error(failure);
+          }
           await clockPair();
           expected = Object.freeze(boundary());
           const acked = new Promise((resolve, reject) => { ackResolve = resolve; ackReject = reject; });

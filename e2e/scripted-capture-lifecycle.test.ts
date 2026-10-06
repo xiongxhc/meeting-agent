@@ -14,12 +14,13 @@ class Peer extends Duplex {
   _write(bytes: Buffer, _encoding: string, done: () => void) { if (bytes[5] === 10) this.finish = Buffer.from(bytes); done(); }
   acknowledge() { const ack = Buffer.from(this.finish!); ack[5] = 11; this.push(ack); }
 }
-async function fixture() {
+async function fixture(mediaTiming?: string) {
   const socket = new Peer(), bridge = Buffer.from("synthetic-bridge");
-  const media = createConnectedMediaClient({ socket, credential: "synthetic", bridgeSessionId: bridge.toString(), sessionId: 41n, authTimeoutMs: 100 });
+  const media = createConnectedMediaClient({ socket, credential: "synthetic", bridgeSessionId: bridge.toString(), sessionId: 41n, authTimeoutMs: 100, mediaTiming });
   const auth = Buffer.alloc(19 + bridge.length); auth.write("MED3"); auth[4] = 3; auth[5] = 9;
   auth.writeUInt32BE(9 + bridge.length, 6); auth.writeBigUInt64BE(41n, 10); auth[18] = bridge.length; bridge.copy(auth, 19);
-  socket.push(auth); await media.ready; await media.sendEpoch(); await media.sendSilentFrame();
+  socket.push(auth); await media.ready; await media.sendEpoch(); await media.sendClockPair();
+  for (let i = 0; i < (mediaTiming === "omit-final-pair" ? 49 : 1); i++) await media.sendSilentFrame();
   const events: Array<Record<string, unknown>> = [], outcomes: unknown[] = []; let fences = 0;
   assert.equal(typeof lifecycle.createCaptureLifecycle, "function", "same child stop owner must publish typed drain before saved end");
   const owner = lifecycle.createCaptureLifecycle({ getMedia: () => media, fenceCapture: () => { fences++; },
@@ -76,5 +77,19 @@ test("end/EOF abort and settle owned pending authentication before terminal publ
     assert.equal(socket.destroyed, true); assert.equal(lateConnected, false);
     assert.equal((events[0]!.captureDrain as { drain: string }).drain, "unconfirmed");
     assert.deepEqual(events.map(row => row.type), end ? ["media_disconnected", "left"] : ["media_disconnected"]);
+  }
+});
+
+// Composes the child's real lifecycle and connected byte core, without ACK injection.
+test("selected omission publishes unconfirmed once before preserved left and EOF alone never invents left", async () => {
+  for (const end of [true, false]) {
+    const f = await fixture("omit-final-pair"), stop = f.owner.stop();
+    if (end) assert.equal(f.owner.observeEnd(observation), stop);
+    assert.equal(f.owner.stop(), stop); await stop;
+    assert.equal(f.fences(), 1); assert.equal(f.outcomes.length, 1); assert.equal(f.socket.finish, null);
+    assert.deepEqual(f.events.map(row => row.type), end ? ["media_disconnected", "participant_left", "left"] : ["media_disconnected"]);
+    assert.deepEqual(f.events[0]!.captureDrain, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+    if (end) assert.deepEqual(f.events.at(-1), { type: "left", ...observation });
+    else assert.equal(f.owner.observation, null);
   }
 });

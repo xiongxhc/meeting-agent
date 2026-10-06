@@ -409,3 +409,177 @@ for (const identity of ["bridge", "capture epoch"]) test(`MT-R1 refuses contradi
   assert.equal(m.mediaTimingOracles(f.snapshot, f.child, "invalid2ns")[0].status, "fail");
   assert.throws(() => m.mediaTimingMetadata(f.snapshot, f.child, "invalid2ns"), /epoch/);
 });
+
+// Synthetic selected pages only: no application DB, recording or receipt writes.
+export function omissionFixture(suffix: "none" | "gap" | "reconnect" | "both" = "none") {
+  const f = timingFixture(), page = decodeAlignmentPage(f.snapshot.pages[0]!.payload), template = page.entries[0]!;
+  if (template.kind !== "frame") throw new Error("fixture");
+  const epoch = { bridgeSessionId: "bridge-fixture", clockDomainId: "e2e-clock", captureEpoch: 1n };
+  const pair = { clockDomainId: "e2e-clock", wallEpoch: 1n, sequence: 1n, hostBeforeNs: 900_000_000n,
+    localUnixNs: 1_790_000_000_000_000_000n, hostAfterNs: 910_000_000n, wallResolutionNs: 1000n, externalUtcAccuracyNs: null };
+  const frames = Array.from({ length: 49 }, (_, i) => {
+    const start = BigInt(i * 480), host = 1_000_000_000n + BigInt(i) * 20_000_000n;
+    return { ...template, epoch, mediaStartSample: start, mediaEndSample: start + 480n,
+      captureStatus: "available" as const, wall: null, reasons: ["missing_clock_pair" as const, "wall_alignment_missing" as const],
+      provenance: { ...template.provenance!, sequence: BigInt(i + 1), outputStartSample: start,
+        sourceStartNumerator: start * 24000n, sourceEndNumerator: (start + 480n) * 24000n,
+        span: { ...template.provenance!.span!, hostStartNs: host, hostEndNs: host + 20_000_000n } } };
+  });
+  const entries: Array<(typeof page.entries)[number]> = [{ kind: "epoch", epoch }, { kind: "clock_pair", pair }, ...frames];
+  if (["reconnect", "both"].includes(suffix)) entries.push({ kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" });
+  if (["gap", "both"].includes(suffix)) entries.push({ kind: "audio_gap", startedAtMs: 980n, endedAtMs: null, reason: "capture_discontinuity" });
+  Object.assign(f.recording, { duration_ms: 980, capture_drain: "unconfirmed", capture_drain_reason: "final_clock_pair_omitted",
+    capture_drain_epoch: null, capture_drain_last_frame_sequence: null, capture_drain_output_end_sample: null, capture_drain_final_pair_sequence: null });
+  const position = { captureEpoch: "1", sequence: "49", outputEndSample: "23520" };
+  const child = { ...f.child, mediaTiming: "omit-final-pair", mediaTimingTargetSequence: null, framesSent: 49,
+    mediaClosedReason: "final_clock_pair_omitted", capturePosition: { ...position },
+    captureDrain: { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null as null | Record<string, string> },
+    captureFinish: { ...f.child.captureFinish, requestedBoundary: null as null | Record<string, string>,
+      acknowledgedBoundary: null as null | Record<string, string>, capturePosition: { ...position } } };
+  const result = { ...f, child };
+  replaceOmissionEntries(result, entries);
+  if (["gap", "both"].includes(suffix)) result.snapshot.runtimeGaps.push({ started_at_ms: "980", ended_at_ms: null, reason: "capture_discontinuity" });
+  return result;
+}
+export function replaceOmissionEntries(f: ReturnType<typeof omissionFixture>, entries: ReturnType<typeof decodeAlignmentPage>["entries"]) {
+  const page = decodeAlignmentPage(f.snapshot.pages[0]!.payload);
+  const chunks = [entries.slice(0, 27), entries.slice(27)];
+  f.snapshot.pages = chunks.map((chunk, i) => ({ attempt_id: "attempt", page_index: i, entry_count: chunk.length,
+    payload: encodeAlignmentPage({ ...page, pageIndex: BigInt(i), entries: chunk }) }));
+  Object.assign(f.snapshot.attempts[0]!, { page_count: 2, entry_count: entries.length,
+    stored_bytes: f.snapshot.pages.reduce((n, row) => n + Buffer.byteLength(row.payload), 0),
+    warnings_json: JSON.stringify([...new Set(f.snapshot.pages.flatMap(row => pageWarnings(decodeAlignmentPage(row.payload))))].sort()) });
+}
+export function omissionEntries(f: ReturnType<typeof omissionFixture>) { return f.snapshot.pages.flatMap(row => decodeAlignmentPage(row.payload).entries); }
+for (const suffix of ["none", "gap", "reconnect", "both"] as const) test(`omission strict oracle retains all 49 unmapped frames with genuine ${suffix} terminal suffix`, async () => {
+  // @ts-expect-error Private test route has no declaration.
+  const m = await import("./durable-oracles.mjs");
+  assert.equal(typeof m.tailOmissionOracles, "function"); assert.equal(typeof m.tailOmissionMetadata, "function");
+  const f = omissionFixture(suffix);
+  assert.deepEqual(m.tailOmissionOracles(f.snapshot, f.child).map((row: { name: string; status: string }) => [row.name, row.status]), [["media_timing_omit_final_pair", "pass"]]);
+  Object.assign(f.snapshot.bindings[0]!, { recoveryAuthorization: "PRIVATE_CAPABILITY" });
+  const summary = m.tailOmissionMetadata(f.snapshot, f.child);
+  assert.equal(summary.frames, 49); assert.equal(summary.samples, "23520"); assert.equal(summary.durationMs, 980);
+  assert.equal(summary.coverageStatus, "partial"); assert.equal(summary.initialPairSequence, "1");
+  assert.deepEqual([summary.finalPairRecorded, summary.finishRequested, summary.finishAcknowledged], [false, false, false]);
+  assert.deepEqual(summary.captureDrain, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+  assert.deepEqual(summary.lastFrame, { sequence: "49", sourceStartSample: "23040", sourceEndSample: "23520", captureStatus: "available", wall: null,
+    reasons: ["missing_clock_pair", "wall_alignment_missing"] });
+  assert.equal(summary.terminalSuffix.length, suffix === "both" ? 2 : suffix === "none" ? 0 : 1);
+  assert.deepEqual(m.captureFinishMetadata(f.child).mediaTiming, { mode: "omit-final-pair" });
+  for (const secret of ["PRIVATE_CAPABILITY", '"payload"', '"provenance"', '"credential"', '"localUnixNs"'])
+    assert.equal(JSON.stringify(summary).includes(secret), false);
+  assert.equal(m.captureTailOracles(f.snapshot, f.child)[0].status, "fail");
+});
+// Semantic changes use the actual codec and refreshed bytes/counts/warning union.
+for (const fault of ["wall-prefix", "wall-tail", "missing-pair", "extra-pair", "duplicate-pair", "duplicate-epoch", "missing-tail", "duplicate-tail",
+  "samples", "end", "duration", "rational", "rate", "quality", "rounding", "uncertainty", "foreign-frame", "foreign-all", "foreign-epoch", "foreign-pair",
+  "pair-sequence", "pair-wall-epoch", "pair-resolution", "pair-accuracy", "overlap", "interior-reconnect", "interior-gap", "reverse-suffix", "duplicate-suffix",
+  "closed-gap", "late-gap", "gap-disagreement", "gap-duplicate", "limit", "capture-loss", "source-loss", "audio-loss", "local-wall", "missing-reason"])
+  test(`omission rejects coherent selected ${fault}`, async () => {
+    // @ts-expect-error Private test route has no declaration.
+    const m = await import("./durable-oracles.mjs");
+    const f = omissionFixture(fault.includes("suffix") || fault.includes("gap") ? "both" : "none"), entries = omissionEntries(f);
+    const index = fault === "wall-prefix" ? 2 : 50, frame = entries[index]!;
+    if (frame.kind !== "frame") throw new Error("fixture");
+    const p = frame.provenance!;
+    if (fault === "missing-pair") entries.splice(1, 1);
+    else if (["extra-pair", "duplicate-pair"].includes(fault)) {
+      const entry = entries[1]!; if (entry.kind !== "clock_pair") throw new Error("fixture");
+      entries.push({ ...entry, pair: { ...entry.pair, sequence: fault === "extra-pair" ? 2n : 1n } });
+    } else if (fault === "duplicate-epoch") entries.splice(1, 0, entries[0]!);
+    else if (fault === "missing-tail") { entries.splice(50, 1); f.recording.duration_ms = 960; }
+    else if (fault === "duplicate-tail") entries.splice(50, 0, frame);
+    else if (fault === "duration") f.recording.duration_ms = 981;
+    else if (fault.startsWith("pair-") || fault === "foreign-pair") {
+      const entry = entries[1]!; if (entry.kind !== "clock_pair") throw new Error("fixture");
+      entries[1] = { ...entry, pair: { ...entry.pair, clockDomainId: fault === "foreign-pair" ? "other" : entry.pair.clockDomainId,
+        sequence: fault === "pair-sequence" ? 2n : 1n, wallEpoch: fault === "pair-wall-epoch" ? 2n : 1n,
+        wallResolutionNs: fault === "pair-resolution" ? 1001n : 1000n, externalUtcAccuracyNs: fault === "pair-accuracy" ? 0n : null } };
+    } else if (fault === "foreign-epoch") { const entry = entries[0]!; if (entry.kind !== "epoch") throw new Error("fixture"); entries[0] = { ...entry, epoch: { ...entry.epoch, clockDomainId: "other" } }; }
+    else if (fault === "foreign-all") for (let i = 2; i <= 50; i++) { const e = entries[i]!; if (e.kind === "frame") entries[i] = { ...e, epoch: { ...e.epoch!, clockDomainId: "other" } }; }
+    else if (fault === "interior-reconnect") entries.splice(25, 0, { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" });
+    else if (fault === "interior-gap") entries.splice(25, 0, { kind: "audio_gap", startedAtMs: 979n, endedAtMs: null, reason: "capture_discontinuity" });
+    else if (fault === "reverse-suffix") entries.splice(51, 2, entries[52]!, entries[51]!);
+    else if (fault === "duplicate-suffix") entries.push(entries[51]!);
+    else if (fault === "closed-gap" || fault === "late-gap") { const e = entries[52]!; if (e.kind !== "audio_gap") throw new Error("fixture"); entries[52] = { ...e, startedAtMs: fault === "late-gap" ? 981n : 980n, endedAtMs: fault === "closed-gap" ? 981n : null }; }
+    else if (fault === "gap-disagreement") f.snapshot.runtimeGaps[0]!.started_at_ms = "979";
+    else if (fault === "gap-duplicate") f.snapshot.runtimeGaps.push({ ...f.snapshot.runtimeGaps[0]! });
+    else if (fault === "limit") entries.push({ kind: "alignment_limit" });
+    else entries[index] = { ...frame, wall: fault.startsWith("wall-") ? { quality: "local_wall_estimate", policyId: "local-wall-estimate/v1", localStartNs: 10n, localEndNs: 20n, wallEpoch: 1n, wallRun: 1n,
+      maximumBracketNs: 1n, maximumResolutionNs: 1000n, modelAllowanceNs: 10_000_000n, interpolationRoundingNs: 1n, captureRoundingNs: 1000n, captureUncertaintyNs: null, externalUtcAccuracyNs: null, overallPhysicalAccuracyNs: null } : frame.wall,
+      sampleRateHz: fault === "rational" ? 23999 : frame.sampleRateHz,
+      captureStatus: fault === "quality" ? "capture_alignment_missing" : frame.captureStatus,
+      epoch: fault === "foreign-frame" ? { ...frame.epoch!, clockDomainId: "other" } : frame.epoch,
+      mediaEndSample: ["samples", "end"].includes(fault) ? frame.mediaEndSample - 1n : frame.mediaEndSample,
+      reasons: fault === "missing-reason" ? ["wall_alignment_missing"] : [...frame.reasons,
+        ...(({ "capture-loss": ["capture_alignment_missing"], "source-loss": ["source_drop"], "audio-loss": ["audio_missing"], "local-wall": ["local_wall_timestamp_estimate"] } as const)[fault as "capture-loss"] ?? [])],
+      provenance: { ...p, sampleCount: ["samples", "end"].includes(fault) ? 479 : p.sampleCount,
+        sourceStartNumerator: fault === "rate" ? p.outputStartSample * 48000n : p.sourceStartNumerator,
+        sourceEndNumerator: fault === "rate" ? (p.outputStartSample + BigInt(p.sampleCount)) * 48000n : ["samples", "end"].includes(fault) ? (p.outputStartSample + 479n) * 24000n : p.sourceEndNumerator,
+        sourceDenominator: fault === "rational" ? 23999 : p.sourceDenominator,
+        sourceRateHz: fault === "rate" ? 48000 : p.sourceRateHz,
+        quality: fault === "quality" ? "unknown_clock" : p.quality,
+        span: fault === "quality" ? null : { ...p.span!, hostStartNs: fault === "overlap" ? p.span!.hostStartNs - 2n : p.span!.hostStartNs,
+          roundingEnvelopeNs: fault === "rounding" ? 1001n : 1000n, captureUncertaintyNs: fault === "uncertainty" ? 1n : null } } };
+    replaceOmissionEntries(f, entries);
+    assert.equal(m.tailOmissionOracles(f.snapshot, f.child)[0].status, "fail", fault);
+    assert.throws(() => m.tailOmissionMetadata(f.snapshot, f.child));
+  });
+for (const fault of ["requested", "acknowledged", "confirmed", "legacy", "reason", "closed-reason", "persisted-boundary", "child-boundary", "mode", "count",
+  "position", "finish-position", "auth", "session", "bridge", "source", "hash", "key", "generation", "tentative", "unselected", "page-index", "totals", "warnings"])
+  test(`omission rejects stale or unbound ${fault}`, async () => {
+    // @ts-expect-error Private test route has no declaration.
+    const m = await import("./durable-oracles.mjs"); const f = omissionFixture();
+    const stale = { captureEpoch: "1", lastFrameSequence: "49", outputEndSample: "23520", finalClockPairSequence: "1" };
+    if (fault === "requested") f.child.captureFinish.requestedBoundary = stale;
+    if (fault === "acknowledged") f.child.captureFinish.acknowledgedBoundary = stale;
+    if (fault === "confirmed") { f.child.captureDrain.drain = "confirmed"; f.recording.capture_drain = "confirmed"; }
+    if (fault === "legacy") f.recording.capture_drain = null;
+    if (fault === "reason") { f.recording.capture_drain_reason = "capture_finish_timeout"; f.child.captureDrain.reason = "capture_finish_timeout"; }
+    if (fault === "closed-reason") f.child.mediaClosedReason = "media_eof";
+    if (fault === "persisted-boundary") f.recording.capture_drain_final_pair_sequence = "1";
+    if (fault === "child-boundary") f.child.captureDrain.boundary = stale;
+    if (fault === "mode") f.child.mediaTiming = "normal";
+    if (fault === "count") f.child.framesSent = 48;
+    if (fault === "position") f.child.capturePosition.outputEndSample = "23519";
+    if (fault === "finish-position") f.child.captureFinish.capturePosition.sequence = "48";
+    if (fault === "auth") f.child.captureFinish.authenticated = false;
+    if (fault === "session") f.child.captureFinish.sessionId = "43";
+    if (fault === "bridge") f.child.captureFinish.bridgeSessionId = "other";
+    if (fault === "source") f.snapshot.bindings[0]!.source_session_id = "43";
+    if (fault === "hash") f.recording.sha256 = "d".repeat(64);
+    if (fault === "key") f.snapshot.attempts[0]!.key_id = "d".repeat(16);
+    if (fault === "generation") f.snapshot.attempts[0]!.generation_id = "other";
+    if (fault === "tentative") f.snapshot.attempts[0]!.state = "staging";
+    if (fault === "unselected") f.snapshot.selected = [];
+    if (fault === "page-index") f.snapshot.pages[1]!.page_index = 0;
+    if (fault === "totals") f.snapshot.attempts[0]!.entry_count--;
+    if (fault === "warnings") f.snapshot.attempts[0]!.warnings_json = "[]";
+    assert.equal(m.tailOmissionOracles(f.snapshot, f.child)[0].status, "fail", fault);
+  });
+
+test("restored confirmed finish and final pair refuse omission while ordinary positive tail stays strict", async () => {
+  // @ts-expect-error Private test route has no declaration.
+  const m = await import("./durable-oracles.mjs"), f = omissionFixture();
+  const boundary = { captureEpoch: "1", lastFrameSequence: "49", outputEndSample: "23520", finalClockPairSequence: "2" };
+  f.child.captureDrain = { drain: "confirmed", reason: "", boundary };
+  f.child.captureFinish.requestedBoundary = boundary; f.child.captureFinish.acknowledgedBoundary = boundary;
+  Object.assign(f.recording, { capture_drain: "confirmed", capture_drain_reason: null,
+    capture_drain_epoch: "1", capture_drain_last_frame_sequence: "49", capture_drain_output_end_sample: "23520", capture_drain_final_pair_sequence: "2" });
+  const entries = omissionEntries(f), first = entries[1]!;
+  if (first.kind !== "clock_pair") throw new Error("fixture");
+  entries.push({ ...first, pair: { ...first.pair, sequence: 2n } }); replaceOmissionEntries(f, entries);
+  assert.equal(m.tailOmissionOracles(f.snapshot, f.child)[0].status, "fail");
+  // The separate positive oracle remains unchanged and does require a null reason.
+  f.child.mediaTiming = "normal";
+  const positiveChild = { ...f.child, captureDrain: { drain: "confirmed", reason: null, boundary } };
+  assert.equal(m.captureTailOracles(f.snapshot, positiveChild)[0].status, "pass");
+  assert.equal(m.mediaTimingOracles(f.snapshot, f.child, "omit-final-pair")[0].status, "fail");
+});
+for (const column of ["capture_drain_epoch", "capture_drain_last_frame_sequence", "capture_drain_output_end_sample", "capture_drain_final_pair_sequence"] as const)
+  test(`omission refuses non-null persisted ${column}`, async () => {
+    // @ts-expect-error Private test route has no declaration.
+    const m = await import("./durable-oracles.mjs"), f = omissionFixture(); f.recording[column] = "1";
+    assert.equal(m.tailOmissionOracles(f.snapshot, f.child)[0].status, "fail");
+  });
