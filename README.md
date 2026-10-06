@@ -128,7 +128,9 @@ Recording must remain independent of provider failures.”
 
 Run the prepared commands below from the reviewed preparation checkout at
 `<source-workspace>`, after matching its
-source inventory to the V7 manifest. The raw development checkout includes an
+source inventory to the matching versioned source manifest. Later reviewed
+commits have successor manifests; V7 describes only its original source cut.
+The raw development checkout includes an
 excluded partial implementation and is not the packaged source for these commands.
 
 The prepared ingress recovery campaign uses two sequential application owners
@@ -177,8 +179,23 @@ confirmed finish boundary, continuous samples and matching clock-domain/source
 provenance. It permits independent wall uncertainty without inventing audio loss.
 This command skips publication, receipt and organizer-DM assertions. Listener-free
 checks are accepted source/component evidence; actual recording conformance,
-recognized speaker attribution and full L4/L5 remain unverified. Final-pair
-omission is a separate unfinished selection.
+recognized speaker attribution and full L4/L5 remain unverified.
+
+The final-pair omission selection captures 49 frames below the 50-frame periodic
+clock-pair cadence, then omits the final pair and finish exchange:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/omit-final-pair --keep --media-timing omit-final-pair
+```
+
+It requires an unconfirmed drain with reason `final_clock_pair_omitted`, no
+requested or acknowledged finish boundary, and all 49 recorded frames present.
+Selected COMPLETE alignment must retain continuous sample coverage while reporting
+missing wall alignment. The initial pair cannot confirm the final tail. This
+short selection skips publication, receipt and organizer-DM assertions; it does
+not cover a long recording with a mapped prefix and unmapped tail. Reviewed
+listener-free checks establish source/component evidence. Actual encrypted
+recording and application conformance remain unverified.
 
 The prepared startup cancellation command holds the actual WebSocket endpoint
 request and invokes the ordinary public application close while it is pending:
@@ -192,7 +209,24 @@ then peer closure before the admission owner is released. Campaign conformance
 is separate from the underlying `clean:false` composition result and standalone
 exit 70. The reviewed deadline fixes reject late synchronous results and retain
 ordinary cleanup. Listener-free checks are component evidence; actual SDK
-cancellation and token, upgrade, launch and signal boundaries remain unverified.
+cancellation remains unverified.
+
+The separate upgrade selection allows the HTTP endpoint lookup to finish with
+status 200, then holds the actual GET WebSocket upgrade before acceptance:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/pending-startup-run.mjs --mode ws-upgrade-normal-close --out /absolute/private/evidence/pending-upgrade
+```
+
+It rechecks the held upgrade immediately before ordinary public close. The
+selected oracle requires the same peer-observed remote close and zero owned
+HTTP/connection sockets before fixture cleanup; local fixture closure cannot
+substitute. Overflow or later invalid observations keep cleanup unconfirmed even
+if an earlier close promise fulfilled. It preserves the real `clean:false`
+composition result and standalone exit 70 separately from campaign conformance.
+This is reviewed source/component preparation, with no actual SDK upgrade run.
+Tenant-token acquisition, child-launch and signal selections remain separate
+unfinished boundaries.
 
 The prepared D2 harness adds four independent cuts. Each requires real localhost
 listeners and a fresh absolute output directory; run them sequentially:
