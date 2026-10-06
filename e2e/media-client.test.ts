@@ -424,3 +424,103 @@ for (const blocker of ["capture work", "FIFO write callback"]) test(`omission de
   await frame; assert.equal(client.closedReason, "capture_finish_timeout");
   assert.equal(kinds(socket).filter(k => k === 7).length, 1); assert.equal(kinds(socket).includes(10), false);
 });
+
+test("long omission is a closed99-frame selection before connected effects", () => {
+  assert.equal(media.parseMediaTiming("omit-final-pair-long"), "omit-final-pair-long");
+  assert.equal(media.parseCaptureMediaTiming({ mediaTiming: "omit-final-pair-long", captureFrameLimit: 99 }), "omit-final-pair-long");
+  for (const captureFrameLimit of [undefined, null, 49, 51, 98, 100, "99", 3000])
+    assert.throws(() => media.parseCaptureMediaTiming({ mediaTiming: "omit-final-pair-long", captureFrameLimit }), /frame limit/);
+});
+test("long byte core owns immutable postinitialpair admission origin and two actual pairs without finish", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  const options = { mediaTiming: "omit-final-pair-long", captureEpoch: 1n }, { socket, client } = await admitted(options);
+  await client.sendEpoch(); host = 11_000_000_000n; await client.sendClockPair();
+  host = 12_000_000_000n; options.mediaTiming = "normal";
+  for (let i = 0; i < 99; i++) {
+    if (i === 1) host = 12_300_000_000n; // delayed callback cannot rebase origin
+    await client.sendSilentFrame();
+    if (i === 49) { host = 13_000_000_001n; await client.sendClockPair(); }
+  }
+  const stop = client.finishCapture({ timeoutMs: 100 }); assert.equal(client.close(), stop);
+  assert.deepEqual(await stop, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+  const frames = socket.writes.filter(p => p[5] === 2), pairs = socket.writes.filter(p => p[5] === 7);
+  assert.equal(frames.length, 99); assert.equal(pairs.length, 2); assert.equal(kinds(socket).includes(10), false);
+  assert.equal(frames[0]!.readBigUInt64BE(81), 12_020_000_000n);
+  for (let i = 0; i < 99; i++) {
+    assert.equal(frames[i]!.readBigUInt64BE(81), 12_020_000_000n + BigInt(i) * 20_000_000n);
+    assert.equal(frames[i]!.readBigUInt64BE(89), 12_040_000_000n + BigInt(i) * 20_000_000n);
+    assert.equal(frames[i]!.readBigUInt64BE(37), BigInt(i + 1)); assert.equal(frames[i]!.readBigUInt64BE(45), BigInt(i * 480));
+    assert.equal(frames[i]!.readUInt32BE(113), 960); assert.deepEqual(frames[i]!.subarray(117), Buffer.alloc(960));
+  }
+  assert.equal(socket.writes.indexOf(pairs[1]!), socket.writes.indexOf(frames[49]!) + 1);
+  assert.equal(socket.writes.indexOf(frames[50]!), socket.writes.indexOf(pairs[1]!) + 1);
+  assert.equal(pairs[0]!.readBigUInt64BE(44), 11_000_000_000n); assert.equal(pairs[1]!.readBigUInt64BE(44), 13_000_000_001n);
+  assert.deepEqual(client.capturePosition, { captureEpoch: "1", sequence: "99", outputEndSample: "47520" });
+  assert.equal(client.finishEvidence.requestedBoundary, null); assert.equal(client.finishEvidence.acknowledgedBoundary, null);
+  socket.emit("data", ack(POSITIVE)); assert.deepEqual(await client.close(), await stop);
+});
+for (const shape of ["pair before first end", "pair at last start", "missing periodic pair", "missing frame"])
+  test(`long source shape refuses ${shape} without repaired frame or finish`, async t => {
+    let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+    const { socket, client } = await admitted({ mediaTiming: "omit-final-pair-long", captureEpoch: 1n });
+    await client.sendEpoch(); await client.sendClockPair();
+    host = 10_100_000_000n;
+    for (let i = 0; i < (shape === "missing frame" ? 98 : 99); i++) {
+      await client.sendSilentFrame();
+      if (i === 49 && shape !== "missing periodic pair") {
+        host = shape === "pair at last start" ? 12_080_000_000n : shape === "pair before first end" ? 10_120_000_000n : 11_100_000_001n;
+        await client.sendClockPair();
+      }
+    }
+    const stop = client.finishCapture({ timeoutMs: 100 });
+    assert.deepEqual(await stop, { drain: "unconfirmed", reason: "long_tail_shape_unavailable", boundary: null });
+    assert.equal(kinds(socket).includes(10), false); assert.equal(client.finishEvidence.requestedBoundary, null);
+  });
+test("long first admission refuses missing, advanced or extra initial pair before frame bytes", async () => {
+  for (const pairs of [[], [2n], [1n, 2n]]) {
+    const { socket, client } = await admitted({ mediaTiming: "omit-final-pair-long" }); await client.sendEpoch();
+    for (const sequence of pairs) await client.sendClockPair({ sequence });
+    await assert.rejects(client.sendSilentFrame(), /invalid capture frame/);
+    assert.equal(socket.writes.some(p => p[5] === 2), false); assert.equal((await client.close()).reason, "capture_write_failed");
+  }
+});
+test("long capture cannot admit its first frame until the initial pair write completes", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  const { socket, client } = await admitted({ mediaTiming: "omit-final-pair-long", captureEpoch: 1n }); await client.sendEpoch();
+  socket.holdKind = 7; const pair = client.sendClockPair(), frame = client.sendSilentFrame(); await setImmediate();
+  assert.equal(socket.writes.some(p => p[5] === 2), false); host = 12_000_000_000n; socket.holdKind = null; socket.held.shift()!(); await pair; await frame;
+  assert.equal(socket.writes.find(p => p[5] === 2)!.readBigUInt64BE(81), 12_020_000_000n);
+  const stop = client.finishCapture(); assert.equal((await stop).reason, "long_tail_shape_unavailable");
+});
+test("long delayed frame99 cannot be counted or omitted before successful FIFO completion", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  const { socket, client } = await admitted({ mediaTiming: "omit-final-pair-long", captureEpoch: 1n }); await client.sendEpoch(); await client.sendClockPair();
+  host += 100_000_000n;
+  for (let i = 0; i < 98; i++) { await client.sendSilentFrame(); if (i === 49) { host = 11_100_000_001n; await client.sendClockPair(); } }
+  socket.holdKind = 2; const frame = client.sendSilentFrame(); await setImmediate();
+  let settled = false; const stop = client.finishCapture({ captureWork: frame, timeoutMs: 100 }); void stop.then(() => { settled = true; });
+  await setImmediate(); assert.equal(settled, false); assert.equal(client.capturePosition.sequence, "98");
+  socket.holdKind = null; socket.held.shift()!(); await frame;
+  assert.equal((await stop).reason, "final_clock_pair_omitted"); assert.equal(client.capturePosition.sequence, "99"); assert.equal(kinds(socket).includes(10), false);
+});
+test("long omission preserves primary capture-work failure and absolute postwork deadline", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  for (const fault of ["capture", "deadline"]) {
+    const { socket, client } = await admitted({ mediaTiming: "omit-final-pair-long" }); await client.sendEpoch(); await client.sendClockPair();
+    let release!: () => void;
+    const captureWork = new Promise<void>((resolve, reject) => { release = () => fault === "capture" ? reject(new Error("PRIVATE_BODY")) : resolve(); });
+    const stop = client.finishCapture({ timeoutMs: 10, captureWork }); host += 20_000_000n; release();
+    assert.equal((await stop).reason, fault === "capture" ? "capture_finish_failed" : "capture_finish_timeout");
+    assert.equal(kinds(socket).includes(10), false); assert.equal(client.finishEvidence.requestedBoundary, null);
+  }
+});
+test("existing normal invalid2ns and short modes keep their constructor-origin timing after delayed admission", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  for (const mediaTiming of [undefined, "normal", "invalid2ns", "omit-final-pair"]) {
+    host = 10_000_000_000n; const { socket, client } = await admitted({ mediaTiming });
+    await client.sendEpoch(); host = 11_000_000_000n; await client.sendClockPair(); host = 12_000_000_000n;
+    await client.sendSilentFrame(); assert.equal(socket.writes.find(p => p[5] === 2)!.readBigUInt64BE(81), 10_020_000_000n);
+    socket.respond = p => { if (p[5] === 10) socket.receive(ack(p)); };
+    assert.equal((await client.close()).reason, mediaTiming === "omit-final-pair" ? "final_clock_pair_omitted" : null);
+  }
+});

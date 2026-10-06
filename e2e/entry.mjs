@@ -52,24 +52,40 @@ import { assertR2Plan, runR2InitialBuild, withOwnedPeers } from "./r2-baseline.m
 import { closeL4Composition, driveL4Capture, l4Configuration } from "./l4-campaign.mjs";
 
 import { mediaTimingConfiguration } from "./stage.mjs";
-import { mediaTimingMetadata, tailOmissionMetadata, readDurableEvidence } from "./durable-oracles.mjs";
+import { mediaTimingMetadata, tailOmissionMetadata, longTailOmissionMetadata, readDurableEvidence } from "./durable-oracles.mjs";
 
 /** Read-only polling of the shipped backfill owner's durable selection. */
-export async function waitForMediaTimingAlignment({ read, child, mode, budgetMs }) {
+export async function waitForMediaTimingAlignment({ read, child, mode, budgetMs, signal }) {
   mediaTimingConfiguration({ mediaTiming: mode });
   if (!Number.isFinite(budgetMs) || budgetMs <= 0) throw new Error("invalid media timing deadline");
   const deadline = Date.now() + budgetMs;
   for (;;) {
+    if (mode === "omit-final-pair-long" && signal?.aborted) throw new Error("long_tail_drive_cancelled");
     if (Date.now() >= deadline) throw new Error("e2e_timeout:media_timing_alignment");
     const snapshot = read(); // Missing schema/read errors fail immediately.
+    if (mode === "omit-final-pair-long" && signal?.aborted) throw new Error("long_tail_drive_cancelled");
     if (Date.now() >= deadline) throw new Error("e2e_timeout:media_timing_alignment");
     if (snapshot.recordings.length && snapshot.bindings.some(row => row.recording_kind === "final") && snapshot.selected.length)
-      return mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child()) : mediaTimingMetadata(snapshot, child(), mode);
+      return mode === "omit-final-pair-long" ? longTailOmissionMetadata(snapshot, child()) : mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child()) : mediaTimingMetadata(snapshot, child(), mode);
     await pause(Math.min(25, Math.max(1, deadline - Date.now())));
   }
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+export async function closeLongTailComposition({ getApplication, controller }) {
+  try {
+    const application = getApplication();
+    if (!application || typeof application.close !== "function") throw new Error("long_tail_public_close_unavailable");
+    try { await application.close(); } catch { throw new Error("long_tail_public_close_failed"); }
+  } finally { controller.abort(); }
+}
+export async function settleLongTailDrive({ drive, getApplication, controller }) {
+  let failure = null;
+  try { await drive; } catch { failure = "long_tail_drive_prerequisite_failed"; }
+  try { await closeLongTailComposition({ getApplication, controller }); }
+  catch { failure ??= "long_tail_public_close_failed"; }
+  return failure;
+}
 const plan = isMain ? JSON.parse(readFileSync(process.argv[process.argv.indexOf("--plan") + 1], "utf8")) : {};
 const eventsPath = isMain ? path.join(plan.controlDir, "events.ndjson") : null;
 const trace = [];
@@ -144,11 +160,12 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
   const connection = createFeishuSocketOwner(HttpAgent);
 
   const l4Controller = plan.l4Case === undefined ? null : new globalThis.AbortController();
+  const longController = plan.mediaTiming === "omit-final-pair-long" ? new globalThis.AbortController() : null;
   let l4Drive = null;
   let shuttingDown = false;
   let compositionHandle = null;
   let r2Maintenance = null;
-  const driveWaitFor = (check, options) => waitFor(check, { ...options, ...(l4Controller ? { signal: l4Controller.signal } : {}) });
+  const driveWaitFor = (check, options) => waitFor(check, { ...options, ...(l4Controller || longController ? { signal: (l4Controller ?? longController).signal } : {}) });
   const drive = (async () => {
     // 1. The long connection is ready once the shipped ingress reports started.
     await driveWaitFor(() => trace.includes("composition_started"), { budgetMs: plan.budgets.startMs, name: "composition_started" });
@@ -205,7 +222,8 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
       const databasePath = path.join(JSON.parse(readFileSync(plan.standaloneConfigPath, "utf8")).stateRoot, "orchestration.db");
       const occurrence = `${plan.meeting.providerMeetingId}@${new Date(plan.meeting.startSeconds * 1000).toISOString().replace(".000Z", "Z")}`;
       const summary = await waitForMediaTimingAlignment({ read: () => readDurableEvidence(databasePath, occurrence),
-        child: () => readJson(path.join(plan.controlDir, "state.json")), mode: plan.mediaTiming, budgetMs: plan.budgets.buildMs });
+        child: () => readJson(path.join(plan.controlDir, "state.json")), mode: plan.mediaTiming, budgetMs: plan.budgets.buildMs,
+        ...(longController ? { signal: longController.signal } : {}) });
       event("media_timing_alignment_ready", { summary });
       return;
     }
@@ -294,18 +312,18 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     readConfig: readStandaloneConfig,
     inspectStateRoot,
     acquireOwnerLock: acquireApplicationOwnerLock,
-    composeAfterAdmission: (config, owner) => plan.d2Cut === "repeated-close" || plan.initialR1 || plan.r2Baseline || plan.l4Case !== undefined
+    composeAfterAdmission: (config, owner) => plan.d2Cut === "repeated-close" || plan.initialR1 || plan.r2Baseline || plan.l4Case !== undefined || longController
       ? runExposedComposition(composeApplication, config, owner, compositionOptions, (handle) => {
         compositionHandle = handle;
         event("test_entry_composition_exposed", { path: "built_composeApplication_after_shipped_admission" });
-      }, ...(l4Controller ? [l4Controller] : []))
+      }, ...(l4Controller || longController ? [l4Controller ?? longController] : []))
       : runStandaloneComposition(config, owner, compositionOptions),
     report(channel, line) { event("report", { channel, line }); process[channel === "stdout" ? "stdout" : "stderr"].write(`${line}\n`); },
   };
 
   const run = runStandalone(["--standalone-config", plan.standaloneConfigPath], dependencies);
 
-  let driveFailure = null, l4Settlement = null;
+  let driveFailure = null, l4Settlement = null, longSettlement = null;
   if (l4Controller) {
     l4Settlement = drive.then(() => undefined, error => {
       driveFailure = /^l4_[a-z_]+$/.test(error?.message ?? "") ? error.message : "l4_drive_prerequisite_failed";
@@ -315,6 +333,13 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
       try { await closeL4Composition({ getApplication: () => compositionHandle, controller: l4Controller }); }
       catch { driveFailure ??= "l4_public_close_failed"; event("drive_failed", { reason: driveFailure }); }
       event("l4_public_close_settled");
+    });
+  } else if (longController) {
+    longSettlement = settleLongTailDrive({ drive, getApplication: () => compositionHandle, controller: longController }).then(failure => {
+      shuttingDown = true;
+      driveFailure ??= failure;
+      if (driveFailure) event("drive_failed", { reason: driveFailure });
+      event("long_tail_public_close_settled");
     });
   } else drive.then(() => undefined, (error) => { driveFailure = String(error?.message ?? error); event("drive_failed", { reason: driveFailure }); })
     .then(() => {
@@ -333,6 +358,12 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
         catch { driveFailure ??= "l4_public_close_failed"; }
       }
       await l4Settlement;
+    } else if (longController) {
+      if (!longController.signal.aborted) {
+        try { await closeLongTailComposition({ getApplication: () => compositionHandle, controller: longController }); }
+        catch { driveFailure ??= "long_tail_public_close_failed"; }
+      }
+      await longSettlement;
     } else if (compositionHandle) await compositionHandle.close();
   }
   event("run_standalone_exit", { exit });

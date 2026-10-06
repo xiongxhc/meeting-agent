@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { Duplex } from "node:stream";
 import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
+import process from "node:process";
 // @ts-expect-error Test-only lifecycle leaf has no public declaration.
 import * as lifecycle from "./fixtures/scripted-capture-lifecycle.mjs";
 // @ts-expect-error Test-only connected media core has no public declaration.
@@ -10,17 +11,22 @@ import { createConnectedMediaClient } from "./media-client.mjs";
 
 class Peer extends Duplex {
   finish: Buffer | null = null;
+  writes: Buffer[] = [];
   _read() {}
-  _write(bytes: Buffer, _encoding: string, done: () => void) { if (bytes[5] === 10) this.finish = Buffer.from(bytes); done(); }
+  _write(bytes: Buffer, _encoding: string, done: () => void) { this.writes.push(Buffer.from(bytes)); if (bytes[5] === 10) this.finish = Buffer.from(bytes); done(); }
   acknowledge() { const ack = Buffer.from(this.finish!); ack[5] = 11; this.push(ack); }
 }
-async function fixture(mediaTiming?: string) {
+async function fixture(mediaTiming?: string, advanceHost: (periodic: boolean) => void = () => {}) {
   const socket = new Peer(), bridge = Buffer.from("synthetic-bridge");
   const media = createConnectedMediaClient({ socket, credential: "synthetic", bridgeSessionId: bridge.toString(), sessionId: 41n, authTimeoutMs: 100, mediaTiming });
   const auth = Buffer.alloc(19 + bridge.length); auth.write("MED3"); auth[4] = 3; auth[5] = 9;
   auth.writeUInt32BE(9 + bridge.length, 6); auth.writeBigUInt64BE(41n, 10); auth[18] = bridge.length; bridge.copy(auth, 19);
   socket.push(auth); await media.ready; await media.sendEpoch(); await media.sendClockPair();
-  for (let i = 0; i < (mediaTiming === "omit-final-pair" ? 49 : 1); i++) await media.sendSilentFrame();
+  advanceHost(false);
+  for (let i = 0; i < (mediaTiming === "omit-final-pair" ? 49 : mediaTiming === "omit-final-pair-long" ? 99 : 1); i++) {
+    await media.sendSilentFrame();
+    if (mediaTiming === "omit-final-pair-long" && i === 49) { advanceHost(true); await media.sendClockPair(); }
+  }
   const events: Array<Record<string, unknown>> = [], outcomes: unknown[] = []; let fences = 0;
   assert.equal(typeof lifecycle.createCaptureLifecycle, "function", "same child stop owner must publish typed drain before saved end");
   const owner = lifecycle.createCaptureLifecycle({ getMedia: () => media, fenceCapture: () => { fences++; },
@@ -91,5 +97,19 @@ test("selected omission publishes unconfirmed once before preserved left and EOF
     assert.deepEqual(f.events[0]!.captureDrain, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
     if (end) assert.deepEqual(f.events.at(-1), { type: "left", ...observation });
     else assert.equal(f.owner.observation, null);
+  }
+});
+test("selected long real lifecycle fences99 writes and emits unconfirmed before original departures without invented EOF left", async t => {
+  let host = 10_000_000_000n; t.mock.method(process.hrtime, "bigint", () => host);
+  for (const end of [true, false]) {
+    host = 10_000_000_000n;
+    const f = await fixture("omit-final-pair-long", periodic => { host = periodic ? 11_100_000_001n : 10_100_000_000n; });
+    const stop = f.owner.stop(); if (end) assert.equal(f.owner.observeEnd(observation), stop);
+    await stop; assert.equal(f.owner.stop(), stop); assert.equal(f.fences(), 1); assert.equal(f.outcomes.length, 1);
+    assert.deepEqual(f.events[0]!.captureDrain, { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null });
+    assert.deepEqual(f.events.map(e => e.type), end ? ["media_disconnected", "participant_left", "left"] : ["media_disconnected"]);
+    if (end) assert.deepEqual(f.events.at(-1), { type: "left", ...observation });
+    assert.equal(f.socket.writes.filter(p => p[5] === 2).length, 99); assert.equal(f.socket.writes.filter(p => p[5] === 7).length, 2);
+    assert.equal(f.socket.finish, null); await assert.rejects(f.media.sendSilentFrame(), /admission closed/);
   }
 });

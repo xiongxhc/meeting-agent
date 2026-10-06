@@ -72,7 +72,7 @@ export function mediaTimingConfiguration({ mediaTiming, interactive = false, r2B
   const mode = parseMediaTiming(mediaTiming);
   if (mode === "normal" || interactive || r2Baseline || d2Cut || onlyRefusals || packageRefusals)
     throw new Error("invalid media timing command mode");
-  return { mediaTiming: mode, captureFrameLimit: mode === "omit-final-pair" ? 49 : CAPTURE_FRAME_LIMIT };
+  return { mediaTiming: mode, captureFrameLimit: mode === "omit-final-pair" ? 49 : mode === "omit-final-pair-long" ? 99 : CAPTURE_FRAME_LIMIT };
 }
 
 /** Final child fields, shared by the actual staged static configuration. */

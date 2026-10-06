@@ -117,7 +117,7 @@ async function streamSilence() {
       state.capturePosition = media.capturePosition;
       if (captureRunning && number % CLOCK_PAIR_EVERY === 0) await media.sendClockPair();
     } catch (error) {
-      state.mediaClosedReason = String(error?.message ?? error);
+      state.mediaClosedReason = mediaTiming === "omit-final-pair-long" ? media?.closedReason ?? "long_tail_capture_failed" : String(error?.message ?? error);
       persist();
       return;
     }

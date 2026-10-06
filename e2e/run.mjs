@@ -29,7 +29,7 @@ import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 import { createProcessEvidence, observeProcessSnapshot } from "./process-evidence.mjs";
 import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-proofs.mjs";
 import { preflightLauncher } from "./launcher-preflight.mjs";
-import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
+import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, longTailOmissionMetadata, longTailOmissionOracles, longTailReport, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
 import { d2OrderingOracles } from "./d2-oracles.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
@@ -56,7 +56,7 @@ export function parseArguments(argv) {
     else if (argv[index] === "--media-timing") {
       if (options.mediaTiming !== undefined) throw new Error("duplicate media timing flag");
       const value = argv[++index];
-      if (value !== "invalid2ns" && value !== "omit-final-pair") throw new Error("invalid media timing command mode");
+      if (value !== "invalid2ns" && value !== "omit-final-pair" && value !== "omit-final-pair-long") throw new Error("invalid media timing command mode");
       options.mediaTiming = value;
     }
     else if (argv[index] === "--package-refusals") options.packageRefusals = true;
@@ -100,14 +100,14 @@ export function captureRecorded(child, options) {
   return (child?.framesSent ?? 0) >= driveCaptureConfiguration(options).captureFrames;
 }
 export function mediaTimingFailureName(mode) {
-  return mode === undefined ? "confirmed_capture_tail" : mode === "omit-final-pair" ? "media_timing_omit_final_pair" : "media_timing_invalid2ns";
+  return mode === undefined ? "confirmed_capture_tail" : mode === "omit-final-pair" ? "media_timing_omit_final_pair" : mode === "omit-final-pair-long" ? "media_timing_omit_final_pair_long" : "media_timing_invalid2ns";
 }
 export function verifyMediaTimingAfterClose({ closed, read, child, mode }) {
   if (!closed) throw new Error("media timing owner closure unavailable");
   mediaTimingConfiguration({ mediaTiming: mode });
-  const snapshot = read(), checks = mode === "omit-final-pair" ? tailOmissionOracles(snapshot, child) : mediaTimingOracles(snapshot, child, mode);
+  const snapshot = read(), checks = mode === "omit-final-pair-long" ? longTailOmissionOracles(snapshot, child) : mode === "omit-final-pair" ? tailOmissionOracles(snapshot, child) : mediaTimingOracles(snapshot, child, mode);
   if (checks.some(row => row.status !== "pass")) throw new Error(checks[0].detail);
-  return { checks, metadata: mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child) : mediaTimingMetadata(snapshot, child, mode), durable: durableMetadata(snapshot) };
+  return { checks, metadata: mode === "omit-final-pair-long" ? longTailOmissionMetadata(snapshot, child) : mode === "omit-final-pair" ? tailOmissionMetadata(snapshot, child) : mediaTimingMetadata(snapshot, child, mode), durable: mode === "omit-final-pair-long" ? null : durableMetadata(snapshot) };
 }
 
 const steps = [];
@@ -403,8 +403,8 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
       try { if (mediaTiming === undefined && l4Case === undefined) writeFileSync(path.join(staged.directories.control, "teammem-done"), "done"); }
       catch { oracle("cleanup_request", "fail", "owned entry completion request could not be written"); }
       if (await waitOwnedExit(owned, 180_000) === null) {
-        if (l4Case === undefined) { child.kill("SIGKILL"); await waitOwnedExit(owned, 5000); }
-        else oracle("l4_owner_close_unconfirmed", "fail", "ordinary public close did not settle; retain private root");
+        if (l4Case === undefined && mediaTiming !== "omit-final-pair-long") { child.kill("SIGKILL"); await waitOwnedExit(owned, 5000); }
+        else oracle(l4Case === undefined ? "long_tail_owner_close_unconfirmed" : "l4_owner_close_unconfirmed", "fail", "ordinary public close did not settle; retain private root");
       }
     }
     try { snapshotProcessTree(child.pid, processEvidence, "meeting_app"); }
@@ -647,6 +647,8 @@ async function main() {
             for (const row of result.checks) oracle(row.name, row.status, row.detail);
             live.mediaTiming = result.metadata; live.durable = result.durable;
             check("media_timing_alignment_ready", live.events.some(row => row.name === "media_timing_alignment_ready"), "actual strict selected alignment observed before ordinary owner closure");
+            if (options.mediaTiming === "omit-final-pair-long") check("long_tail_public_close", live.summary?.driveFailure === null &&
+              live.summary?.shuttingDown === true && live.events.some(row => row.name === "long_tail_public_close_settled"), "selected public close and drive settled without failure");
           } else {
             const facts = await readRunEvidence({ databasePath: live.reopen.filename, r2Baseline: options.r2Baseline,
               read: () => readDurableEvidence(live.reopen.filename, occurrence) });
@@ -763,7 +765,7 @@ async function main() {
       check("no_orphan_process", proofs.processCleanup.cleanupConfirmed, JSON.stringify(proofs.processCleanup));
       check("no_closed_store_callback", proofs.afterStoreClose.length === 0, `codes after shutdown_store_closed: ${JSON.stringify(proofs.afterStoreClose)}`);
       check("single_occurrence_identity", proofs.identities.length === 1, `occurrence identities observed: ${JSON.stringify(proofs.identities)}`);
-      writeNegativeProofs(options.out, { proofs, staged, live });
+      writeNegativeProofs(options.out, { proofs, staged, live, options });
       live.proofs = proofs;
     }
 
@@ -776,7 +778,7 @@ async function main() {
     writeBundle(options.out, { options, pins, treeId, staged, teammem, live });
     if (!options.onlyRefusals) {
       live.proofs = negativeProofs({ staged, live, teammem, outDir: options.out });
-      writeNegativeProofs(options.out, { proofs: live.proofs, staged, live });
+      writeNegativeProofs(options.out, { proofs: live.proofs, staged, live, options });
       writeBundle(options.out, { options, pins, treeId, staged, teammem, live });
     }
   } finally {
@@ -794,7 +796,11 @@ async function main() {
   process.exitCode = failed.length === 0 ? 0 : 1;
 }
 
-function writeNegativeProofs(outDir, { proofs, staged, live }) {
+function writeNegativeProofs(outDir, { proofs, staged, live, options }) {
+  if (options.mediaTiming === "omit-final-pair-long") {
+    writeFileSync(path.join(outDir, "NEGATIVE-PROOFS.md"), "# Selected long-tail checks\n\nThe finite bundle records the actual privacy and ownership check statuses. Detailed scan evidence remains in the owned private root. Publication is untested.\n");
+    return;
+  }
   if (live.summary?.l4Drive) {
     writeFileSync(path.join(outDir, "NEGATIVE-PROOFS.md"), ["# Selected L4 negative proofs", "",
       "Scripted local observation only; L6/L7 publication untested.",
@@ -849,7 +855,13 @@ function writeNegativeProofs(outDir, { proofs, staged, live }) {
   writeFileSync(path.join(outDir, "NEGATIVE-PROOFS.md"), lines.join("\n"));
 }
 
-function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
+export function writeBundle(outDir, { options, pins, treeId, staged, teammem, live }) {
+  if (options.mediaTiming === "omit-final-pair-long") {
+    writeFileSync(path.join(outDir, "bundle.json"), JSON.stringify(longTailReport({ metadata: live.mediaTiming ?? null,
+      checks: oracles.map(row => ({ name: row.name, status: row.status })),
+      cleanupConfirmed: (live.proofs?.processCleanup ?? recordedProcessProof({ staged, live })).cleanupConfirmed === true }), null, 2));
+    return;
+  }
   if (options.l4Case !== undefined) {
     writeFileSync(path.join(outDir, "bundle.json"), JSON.stringify(l4Report({ l4Case: options.l4Case,
       metadata: live.l4 ?? null, checks: oracles, processCleanup: live.proofs?.processCleanup ?? recordedProcessProof({ staged, live }) }), null, 2));

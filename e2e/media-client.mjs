@@ -15,14 +15,14 @@ const MAX_TOKEN_BYTES = 128;
 
 export function parseMediaTiming(value) {
   if (value === undefined) return "normal";
-  if (value === "normal" || value === "invalid2ns" || value === "omit-final-pair") return value;
+  if (value === "normal" || value === "invalid2ns" || value === "omit-final-pair" || value === "omit-final-pair-long") return value;
   throw new Error("invalid media timing selector");
 }
 
 /** Child admission validates fixed cuts before creating any controls or peers. */
 export function parseCaptureMediaTiming({ mediaTiming, captureFrameLimit }) {
   const mode = parseMediaTiming(mediaTiming);
-  if (mode !== "normal" && captureFrameLimit !== (mode === "omit-final-pair" ? 49 : 51))
+  if (mode !== "normal" && captureFrameLimit !== (mode === "omit-final-pair" ? 49 : mode === "omit-final-pair-long" ? 99 : 51))
     throw new Error("invalid media timing frame limit");
   return mode;
 }
@@ -117,6 +117,8 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
   if (!Number.isFinite(authTimeoutMs) || authTimeoutMs <= 0) throw new Error("authentication deadline required");
   let phase = "authenticating", failure = null, authenticated = false, epochWritten = false;
   let sequence = 0n, outputEnd = 0n, pairSequence = 0n, pending = Buffer.alloc(0), tail = Promise.resolve();
+  let longOrigin = null, firstSpan = null, lastSpan = null, longPairCount = 0;
+  const longPairs = [];
   let stopPromise = null, expected = null, acknowledged = null, ackResolve, ackReject;
   let readyResolve, readyReject;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
@@ -164,7 +166,13 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
     if (next <= pairSequence || next <= 0n) throw new Error("clock pair sequence did not advance");
     const before = process.hrtime.bigint(), unixNs = BigInt(Date.now()) * 1_000_000n, after = process.hrtime.bigint();
     return write(record(7, sessionId, Buffer.concat([putId(clockDomainId), u64(1), u64(next), u64(before), i64(unixNs),
-      u64(after), u64(1000), Buffer.from([0]), u64(0)])), () => { pairSequence = next; });
+      u64(after), u64(1000), Buffer.from([0]), u64(0)])), () => {
+      pairSequence = next;
+      if (mediaTiming === "omit-final-pair-long") {
+        longPairCount++;
+        if (longPairs.length < 2) longPairs.push(Object.freeze({ sequence: next, before, after }));
+      }
+    });
   }
   socket.on("data", chunk => {
     if (failure || phase === "terminal") return;
@@ -253,14 +261,24 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
     }); },
     sendSilentFrame(sampleCount = 480, sampleRateHz = 24000, voiced = false) { return admit(async () => {
       if (!epochWritten || !Number.isSafeInteger(sampleCount) || sampleCount < 1 || sampleCount > 32768 || sampleRateHz !== 24000) throw new Error("invalid capture frame");
+      if (mediaTiming === "omit-final-pair-long") {
+        if (sampleCount !== 480 || longOrigin === null && (longPairCount !== 1 || longPairs[0]?.sequence !== 1n)) throw new Error("invalid capture frame");
+        if (longOrigin === null) longOrigin = process.hrtime.bigint();
+      }
       const next = sequence + 1n, payload = Buffer.alloc(sampleCount * 2);
       if (voiced) for (let i = 0; i < sampleCount; i++) payload.writeInt16LE(Math.round(20000 * Math.sin(i * 2 * Math.PI * 440 / sampleRateHz)), i * 2);
-      const nominalStart = started + next * 20000000n;
+      const nominalStart = (longOrigin ?? started) + next * 20000000n;
       const hostStartNs = nominalStart - (mediaTiming === "invalid2ns" && next === 26n ? 2n : 0n);
       const timing = encodeTiming({ captureEpoch, sequence: next, outputStartSample: outputEnd, sampleCount, sourceRateHz: sampleRateHz,
         hostStartNs, hostEndNs: nominalStart + 20000000n, roundingEnvelopeNs: 1000 });
       await write(record(2, sessionId, Buffer.concat([Buffer.from([1]), u32(sampleRateHz), Buffer.from([0, 1]), timing, u32(payload.length), payload])),
-        () => { sequence = next; outputEnd += BigInt(sampleCount); });
+        () => {
+          sequence = next; outputEnd += BigInt(sampleCount);
+          if (mediaTiming === "omit-final-pair-long") {
+            const span = Object.freeze({ start: hostStartNs, end: nominalStart + 20000000n });
+            firstSpan ??= span; lastSpan = span;
+          }
+        });
       return Number(sequence);
     }); },
     finishCapture({ timeoutMs = 20000, captureWork = Promise.resolve() } = {}) {
@@ -277,8 +295,15 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
           if (failure) throw new Error(failure);
           await Promise.race([Promise.all([captureWork, tail]), aborted]);
           if (failure || !authenticated || !epochWritten) throw new Error(failure ?? "capture_epoch_missing");
-          if (mediaTiming === "omit-final-pair") {
-            fail(remaining() <= 0 ? "capture_finish_timeout" : "final_clock_pair_omitted");
+          if (mediaTiming === "omit-final-pair" || mediaTiming === "omit-final-pair-long") {
+            let reason = "final_clock_pair_omitted";
+            if (mediaTiming === "omit-final-pair-long" && !(captureEpoch === 1n && clockDomainId === "e2e-clock" &&
+                sequence === 99n && outputEnd === 47520n && longPairCount === 2 &&
+                longPairs[0].sequence === 1n && longPairs[1].sequence === 2n && firstSpan && lastSpan &&
+                longPairs[0].before + longPairs[0].after <= 2n * firstSpan.start &&
+                longPairs[1].before + longPairs[1].after >= 2n * firstSpan.end &&
+                longPairs[1].before + longPairs[1].after < 2n * lastSpan.start)) reason = "long_tail_shape_unavailable";
+            fail(remaining() <= 0 ? "capture_finish_timeout" : reason);
             throw new Error(failure);
           }
           await clockPair();

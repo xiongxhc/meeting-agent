@@ -2,6 +2,185 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeAlignmentPage, encodeAlignmentPage, pageWarnings, ALIGNMENT_POLICY } from "../src/sessions/recording-alignment.ts";
 import { encodeLiveEvidence } from "../src/sessions/live-evidence-codec.ts";
+import { mergeTimedRecordingEvidence } from "../src/sessions/timed-evidence-merge.ts";
+import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { createCoordinator } from "../src/sessions/coordinator.ts";
+import { buildMeetingIdentity } from "../src/domain/meeting.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+// Explicit synthetic component input, encoded through the production page codec.
+export function longOmissionFixture(k = 47, suffix: "none" | "gap" | "reconnect" | "both" = "none", straddle = false) {
+  const f = omissionFixture(), old = omissionEntries(f), template = old.find(e => e.kind === "frame");
+  if (template?.kind !== "frame" || old[0]?.kind !== "epoch" || old[1]?.kind !== "clock_pair") throw new Error("fixture");
+  const base = 1_000_000_000n, wallBase = 1_790_000_000_000_000_000n;
+  const pair1 = { ...old[1].pair, hostBeforeNs: base - 1000n, hostAfterNs: base, localUnixNs: wallBase };
+  const midpoint2 = base + BigInt(k) * 20_000_000n + (straddle ? 10_000_000n : 0n);
+  const pair2 = { ...pair1, sequence: 2n, hostBeforeNs: midpoint2 - 500n, hostAfterNs: midpoint2 + 500n,
+    localUnixNs: wallBase + midpoint2 - (base - 500n) };
+  const frames = Array.from({ length: 99 }, (_, i) => {
+    const start = BigInt(i) * 480n, host = base + BigInt(i) * 20_000_000n;
+    return { ...template, mediaStartSample: start, mediaEndSample: start + 480n,
+      provenance: { ...template.provenance!, sequence: BigInt(i + 1), outputStartSample: start,
+        sourceStartNumerator: start * 24000n, sourceEndNumerator: (start + 480n) * 24000n,
+        span: { ...template.provenance!.span!, hostStartNs: host, hostEndNs: host + 20_000_000n } },
+      reasons: i < k ? [] : template.reasons,
+      wall: i >= k ? null : { quality: "local_wall_estimate" as const, policyId: "local-wall-estimate/v1" as const,
+        localStartNs: wallBase + host - (base - 500n), localEndNs: wallBase + host + 20_000_000n - (base - 500n),
+        wallEpoch: 1n, wallRun: 1n, maximumBracketNs: 1000n, maximumResolutionNs: 1000n,
+        modelAllowanceNs: 10_000_000n as const, interpolationRoundingNs: 2n, captureRoundingNs: 1000n,
+        captureUncertaintyNs: null, externalUtcAccuracyNs: null, overallPhysicalAccuracyNs: null } };
+  });
+  const entries: ReturnType<typeof decodeAlignmentPage>["entries"][number][] = [old[0], { kind: "clock_pair", pair: pair1 },
+    ...frames.slice(0, 50), { kind: "clock_pair", pair: pair2 }, ...frames.slice(50)];
+  if (["reconnect", "both"].includes(suffix)) entries.push({ kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" });
+  if (["gap", "both"].includes(suffix)) entries.push({ kind: "audio_gap", startedAtMs: 1980n, endedAtMs: null, reason: "capture_discontinuity" });
+  Object.assign(f.recording, { duration_ms: 1980 });
+  const position = { captureEpoch: "1", sequence: "99", outputEndSample: "47520" };
+  const generation = Buffer.from(f.snapshot.occurrence).toString("hex") + ":" + Buffer.from("bridge-fixture").toString("hex");
+  f.snapshot.bindings[0]!.generation_id = generation; f.snapshot.selected[0]!.generation_id = generation;
+  f.snapshot.attempts[0]!.generation_id = generation;
+  f.snapshot.attempts[0]!.attempt_id = f.snapshot.selected[0]!.attempt_id = "12345678-1234-1234-1234-123456789abc";
+  Object.assign(f.child, { mediaTiming: "omit-final-pair-long", framesSent: 99, capturePosition: { ...position } });
+  f.child.captureFinish.capturePosition = { ...position }; replaceLongEntries(f, entries);
+  if (["gap", "both"].includes(suffix)) f.snapshot.runtimeGaps.push({ started_at_ms: "1980", ended_at_ms: null, reason: "capture_discontinuity" });
+  return f;
+}
+export function replaceLongEntries(f: ReturnType<typeof omissionFixture>, entries: ReturnType<typeof decodeAlignmentPage>["entries"]) {
+  const page = decodeAlignmentPage(f.snapshot.pages[0]!.payload), chunks = [];
+  for (let i = 0; i < entries.length; i += 25) chunks.push(entries.slice(i, i + 25));
+  f.snapshot.pages = chunks.map((chunk, i) => ({ attempt_id: f.snapshot.selected[0]!.attempt_id, page_index: i, entry_count: chunk.length,
+    payload: encodeAlignmentPage({ ...page, pageIndex: BigInt(i), entries: chunk }) }));
+  Object.assign(f.snapshot.attempts[0]!, { page_count: chunks.length, entry_count: entries.length,
+    stored_bytes: f.snapshot.pages.reduce((n, p) => n + Buffer.byteLength(p.payload), 0),
+    warnings_json: JSON.stringify([...new Set(f.snapshot.pages.flatMap(p => pageWarnings(decodeAlignmentPage(p.payload))))].sort()) });
+}
+for (const k of [1, 47, 50, 63, 97]) for (const straddle of [false, true])
+  test(`long selected codec pages derive K=${k} with ${straddle ? "straddling" : "equal-endpoint"} first missing frame`, async () => {
+    // @ts-expect-error Private oracle has no declaration.
+    const m = await import("./durable-oracles.mjs"), f = longOmissionFixture(k, "none", straddle);
+    assert.equal(m.longTailOmissionOracles(f.snapshot, f.child)[0].status, "pass");
+    const result = m.longTailOmissionMetadata(f.snapshot, f.child);
+    assert.equal(result.mappedFrames, k); assert.deepEqual(result.mappedSamples, { start: "0", end: String(k * 480) });
+    assert.deepEqual(result.missingSamples, { start: String(k * 480), end: "47520" });
+    assert.equal(result.frames, 99); assert.equal(result.finalPairRecorded, false);
+    for (const forbidden of ["localStartNs", "hostBeforeNs", "payload", "credential"]) assert.equal(JSON.stringify(result).includes(forbidden), false);
+  });
+for (const suffix of ["none", "gap", "reconnect", "both"] as const) test(`long selected terminal ${suffix} suffix remains source-bound`, async () => {
+  // @ts-expect-error Private oracle has no declaration.
+  const m = await import("./durable-oracles.mjs"), f = longOmissionFixture(63, suffix);
+  assert.equal(m.longTailOmissionOracles(f.snapshot, f.child)[0].status, "pass");
+  assert.equal(m.longTailOmissionMetadata(f.snapshot, f.child).terminalSuffix.length, suffix === "both" ? 2 : suffix === "none" ? 0 : 1);
+});
+const longFaults = ["all-mapped", "all-missing", "hole", "remap", "premature-map", "pair1-after-first", "pair2-covers-last", "pair-gap", "pair-residual", "pair-negative-wall", "pair-sequence", "pair-bracket", "pair-resolution", "extra-pair", "reorder-pair", "drop-last", "duplicate-last", "domain", "epoch", "rounding", "source-rate", "source-denominator", "quality", "wall-run", "wall-rounding", "closed-gap", "reverse-suffix"];
+for (const fault of longFaults) test(`long coherent selected mutant refuses ${fault} at its intended predicate`, async () => {
+  // @ts-expect-error Private oracle has no declaration.
+  const m = await import("./durable-oracles.mjs"), f = longOmissionFixture(47), entries = [...omissionEntries(f)];
+  const at = entries.findIndex(e => e.kind === "frame" && e.provenance?.sequence === 48n), frame = entries[at], mapped = entries[2];
+  if (frame?.kind !== "frame" || mapped?.kind !== "frame" || entries[1]?.kind !== "clock_pair" || entries[52]?.kind !== "clock_pair") throw new Error("fixture");
+  if (fault === "all-mapped" || fault === "all-missing") {
+    for (let i = 0; i < entries.length; i++) { const e = entries[i]; if (e?.kind === "frame") entries[i] = {
+      ...e, wall: fault === "all-mapped" ? mapped.wall : null, reasons: fault === "all-mapped" ? [] : frame.reasons }; }
+  } else if (fault === "hole") entries[2] = { ...mapped, wall: null, reasons: frame.reasons };
+  else if (fault === "remap") { const e = entries[at + 1]; if (e?.kind !== "frame") throw new Error("fixture"); entries[at + 1] = { ...e, wall: mapped.wall, reasons: [] }; }
+  else if (fault === "premature-map") { const e = entries[52]; if (e?.kind !== "clock_pair") throw new Error("fixture"); entries[52] = {
+    ...e, pair: { ...e.pair, hostBeforeNs: e.pair.hostBeforeNs - 20_000_000n, hostAfterNs: e.pair.hostAfterNs - 20_000_000n, localUnixNs: e.pair.localUnixNs - 20_000_000n } }; }
+  else if (fault.startsWith("pair") || fault === "extra-pair" || fault === "reorder-pair") {
+    const index = fault === "pair1-after-first" ? 1 : 52, e = entries[index]; if (e?.kind !== "clock_pair") throw new Error("fixture");
+    const p = e.pair;
+    entries[index] = { kind: "clock_pair", pair: { ...p,
+      hostBeforeNs: fault === "pair1-after-first" ? 1_010_000_000n : fault === "pair2-covers-last" ? 3_000_000_000n : fault === "pair-gap" ? 3_100_000_000n : p.hostBeforeNs,
+      hostAfterNs: fault === "pair1-after-first" ? 1_010_000_100n : fault === "pair2-covers-last" ? 3_000_000_100n : fault === "pair-gap" ? 3_100_000_100n : fault === "pair-bracket" ? p.hostBeforeNs + 5_000_001n : p.hostAfterNs,
+      localUnixNs: fault === "pair-residual" ? p.localUnixNs + 10_000_001n : fault === "pair-negative-wall" ? -1n : p.localUnixNs,
+      sequence: fault === "pair-sequence" ? 3n : p.sequence, wallResolutionNs: fault === "pair-resolution" ? 1001n : p.wallResolutionNs } };
+    if (fault === "extra-pair") entries.push(entries[52]!);
+    if (fault === "reorder-pair") { const pair = entries.splice(52, 1)[0]!; entries.splice(51, 0, pair); }
+  } else if (fault === "drop-last") { entries.pop(); f.recording.duration_ms = 1960; }
+  else if (fault === "duplicate-last") entries.push(entries.at(-1)!);
+  else if (fault === "closed-gap") entries.push({ kind: "audio_gap", startedAtMs: 1980n, endedAtMs: 1981n, reason: "capture_discontinuity" });
+  else if (fault === "reverse-suffix") entries.push({ kind: "audio_gap", startedAtMs: 1980n, endedAtMs: null, reason: "capture_discontinuity" }, { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" });
+  else if (fault === "quality") { const e = entries[3]; if (e?.kind !== "frame") throw new Error("fixture"); entries[3] = {
+    ...e, captureStatus: "capture_alignment_missing", provenance: { ...e.provenance!, quality: "unknown_clock", span: null }, wall: null }; }
+  else entries[2] = { ...mapped, epoch: { ...mapped.epoch!, clockDomainId: fault === "domain" ? "foreign" : "e2e-clock", captureEpoch: fault === "epoch" ? 2n : 1n },
+    sampleRateHz: fault === "source-denominator" ? 23999 : 24000, captureStatus: fault === "quality" ? "capture_alignment_missing" : "available",
+    provenance: { ...mapped.provenance!, captureEpoch: fault === "epoch" ? 2n : 1n,
+      sourceRateHz: fault === "source-rate" ? 48000 : 24000, sourceStartNumerator: 0n,
+      sourceEndNumerator: fault === "source-rate" ? 480n * 48000n : 480n * 24000n,
+      sourceDenominator: fault === "source-denominator" ? 23999 : 24000, quality: fault === "quality" ? "unknown_clock" : "nominal_frame_endpoint_interpolation",
+      span: fault === "quality" ? null : { ...mapped.provenance!.span!, roundingEnvelopeNs: fault === "rounding" ? 1001n : 1000n } },
+    wall: fault === "quality" ? null : { ...mapped.wall!, wallRun: fault === "wall-run" ? 2n : 1n, interpolationRoundingNs: fault === "wall-rounding" ? 1n : 2n } };
+  replaceLongEntries(f, entries);
+  const result = m.longTailOmissionOracles(f.snapshot, f.child)[0]; assert.equal(result.status, "fail", fault);
+  const category = fault.startsWith("pair") ? "pair|shape" : fault.includes("pair") ? "order" : fault.includes("last") ? "count|order" :
+    fault.startsWith("wall") ? "wall" : fault.includes("gap") || fault.includes("suffix") ? "suffix" : ["domain", "epoch", "rounding", "source-rate", "source-denominator", "quality"].includes(fault) ? "frame" : "partition";
+  assert.match(result.detail, new RegExp("long tail (" + (fault === "source-denominator" ? "evidence unavailable" : category) + ")"), fault);
+  if (fault === "source-denominator") assert.throws(() => m.longTailOmissionMetadata(f.snapshot, f.child), /invalid fixed-rate recording duration/);
+  else assert.throws(() => m.longTailOmissionMetadata(f.snapshot, f.child));
+});
+test("actual production merge retains synthetic prefix, tail and crossing wording independently of nullable wall", async () => {
+  const f = longOmissionFixture(47), entries = omissionEntries(f), source = decodeAlignmentPage(f.snapshot.pages[0]!.payload).source;
+  const ranges = [[0n, 4800n], [22080n, 23040n], [23520n, 28320n]] as const;
+  const segments = ranges.map(([start, end], i) => ({ segmentId: String(i + 1), startedAtMs: start / 24n, endedAtMs: end / 24n,
+    text: ["synthetic prefix wording", "synthetic crossing wording", "synthetic tail wording"][i]!, speakerCluster: "synthetic-cluster",
+    mediaSampleRange: { startSampleInclusive: start, endSampleExclusive: end, sampleRateHz: 24000, gapOffsetMs: 0n,
+      quantizationPolicy: "provider_seconds_outward_samples/v1" as const } }));
+  const result = await mergeTimedRecordingEvidence({ source, bridgeSessionId: "bridge-fixture", entries, ui: [], live: [],
+    final: { source, segments, warnings: [] }, uiLossReason: null, wordingLossReason: null });
+  assert.deepEqual(result.segments.map(s => s.text), segments.map(s => s.text));
+  assert.deepEqual(result.segments.map(s => s.range), segments.map(s => s.mediaSampleRange));
+  assert.equal(result.segments[0]!.wall !== null, true); assert.equal(result.segments[1]!.wall, null); assert.equal(result.segments[2]!.wall, null);
+  assert.deepEqual(result.segments.map(s => s.speaker.kind), ["anonymous", "anonymous", "anonymous"]);
+});
+test("owned synthetic SQLite production store selects long partial codec pages and readonly oracle derives its partition", async () => {
+  // @ts-expect-error Private oracle has no declaration.
+  const m = await import("./durable-oracles.mjs"), input = longOmissionFixture(63), dir = mkdtempSync(path.join(os.tmpdir(), "meeting-long-tail-store-")), filename = path.join(dir, "owned.db");
+  const store = openSessionStore({ filename });
+  try {
+    const identity = buildMeetingIdentity({ providerMeetingId: "9007199254740993", meetingNo: "000000000", occurrenceStartedAt: "2026-10-01T10:00:00Z", title: "Synthetic", organizer: null });
+    const coordinator = createCoordinator({ store, clock: { now: () => 1000 }, bridgeLeaseTtlMs: 30000, maxConcurrentSessions: 1 });
+    coordinator.discover(identity); coordinator.advance(identity.occurrenceId, "joining"); coordinator.advance(identity.occurrenceId, "listening");
+    store.beginReconciliationGeneration(identity.occurrenceId, "bridge-fixture", 1000); store.setReconciliationRuntimeSession(identity.occurrenceId, "bridge-fixture", 42n);
+    const source = decodeAlignmentPage(input.snapshot.pages[0]!.payload).source;
+    coordinator.finalizeWithRecording(identity.occurrenceId, { kind: "advance", toState: "finalizing" }, { handle: source.recordingHandle,
+      encryptedPath: path.join(dir, "synthetic-ciphertext-locator"), sha256: source.sha256, keyId: "c".repeat(16), format: "pcm_s16le/24000/1", durationMs: 1980,
+      captureDrain: { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null }, gaps: [], runtimeGaps: [],
+      recovery: { bridgeSessionId: "bridge-fixture", capability: { ...source, keyId: "c".repeat(16), authorization: "d".repeat(64) } } }, "bridge-fixture");
+    const recovery = store.getRecordingRecovery(identity.occurrenceId, "bridge-fixture", source.recordingHandle)!;
+    const claim = store.beginRecordingAlignment(recovery.generationId, "synthetic-component");
+    if (claim.kind !== "claimed") throw new Error("component claim");
+    for (const row of input.snapshot.pages) store.appendRecordingAlignment(claim.attempt, decodeAlignmentPage(row.payload));
+    store.completeRecordingAlignment(claim.attempt, { type: "recording_alignment_complete", source, pageCount: BigInt(input.snapshot.pages.length),
+      coverageStatus: "partial", warnings: ["local_wall_timestamp_estimate", "missing_clock_pair", "wall_alignment_missing"], traversalSucceeded: true });
+    const projection = m.readDurableEvidence(filename, identity.occurrenceId);
+    assert.equal(m.longTailOmissionOracles(projection, input.child)[0].status, "pass");
+    assert.equal(m.longTailOmissionMetadata(projection, input.child).mappedFrames, 63);
+    assert.equal(projection.pages.length, 5); assert.equal(projection.recordings[0].capture_drain_final_pair_sequence, null);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+for (const fault of ["requested", "acknowledged", "confirmed", "legacy", "reason", "persisted-boundary", "position", "auth", "session", "bridge", "source", "hash", "key", "generation", "tentative", "unselected", "gap-disagreement"])
+  test(`long selected source refuses stale or unbound ${fault}`, async () => {
+    // @ts-expect-error Private oracle has no declaration.
+    const m = await import("./durable-oracles.mjs"), f = longOmissionFixture(47, fault === "gap-disagreement" ? "gap" : "none");
+    const stale = { captureEpoch: "1", lastFrameSequence: "99", outputEndSample: "47520", finalClockPairSequence: "2" };
+    if (fault === "requested") f.child.captureFinish.requestedBoundary = stale;
+    if (fault === "acknowledged") f.child.captureFinish.acknowledgedBoundary = stale;
+    if (fault === "confirmed") { f.child.captureDrain.drain = "confirmed"; f.recording.capture_drain = "confirmed"; }
+    if (fault === "legacy") f.recording.capture_drain = null;
+    if (fault === "reason") f.child.captureDrain.reason = "capture_finish_timeout";
+    if (fault === "persisted-boundary") f.recording.capture_drain_final_pair_sequence = "2";
+    if (fault === "position") f.child.capturePosition.outputEndSample = "47519";
+    if (fault === "auth") f.child.captureFinish.authenticated = false;
+    if (fault === "session") f.child.captureFinish.sessionId = "43";
+    if (fault === "bridge") f.child.captureFinish.bridgeSessionId = "foreign";
+    if (fault === "source") f.snapshot.bindings[0]!.source_session_id = "43";
+    if (fault === "hash") f.recording.sha256 = "d".repeat(64);
+    if (fault === "key") f.snapshot.attempts[0]!.key_id = "d".repeat(16);
+    if (fault === "generation") f.snapshot.attempts[0]!.generation_id = "foreign";
+    if (fault === "tentative") f.snapshot.attempts[0]!.state = "staging";
+    if (fault === "unselected") f.snapshot.selected = [];
+    if (fault === "gap-disagreement") f.snapshot.runtimeGaps[0]!.started_at_ms = "1979";
+    assert.equal(m.longTailOmissionOracles(f.snapshot, f.child)[0].status, "fail"); assert.throws(() => m.longTailOmissionMetadata(f.snapshot, f.child));
+  });
 // @ts-expect-error Test-only reopened evidence has no public declaration.
 import { durableOracles } from "./durable-oracles.mjs";
 

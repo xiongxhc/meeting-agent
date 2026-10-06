@@ -333,6 +333,178 @@ export function tailOmissionMetadata(snapshot, child) {
       : { kind: row.kind, startedAtMs: String(row.startedAtMs), endedAtMs: row.endedAtMs, reason: row.reason }), warnings: [...warnings].sort() };
 }
 
+/** Selected long cut only; the decoded walls determine K, never the cadence. */
+function validatedLongTailOmission(snapshot, child) {
+  const selected = selectedAlignment(snapshot), { recording, binding, attempt, entries } = selected;
+  requireFact(snapshot.recordings.length === 1 && snapshot.bindings.length === 1 && snapshot.selected.length === 1 &&
+    snapshot.attempts.length === 1 && attempt.coverage_status === "partial", "long tail source selection mismatch");
+  const peer = child?.captureFinish, drain = child?.captureDrain;
+  const position = value => value?.captureEpoch === "1" && value.sequence === "99" && value.outputEndSample === "47520";
+  requireFact(child?.mediaTiming === "omit-final-pair-long" && child.mediaTimingTargetSequence === null && child.framesSent === 99 &&
+    position(child.capturePosition) && position(peer?.capturePosition), "long tail producer position mismatch");
+  requireFact(peer?.authenticated === true && peer.sessionId === binding.source_session_id && peer.bridgeSessionId === binding.bridge_session_id &&
+    peer.requestedBoundary === null && peer.acknowledgedBoundary === null && drain?.drain === "unconfirmed" &&
+    drain.reason === "final_clock_pair_omitted" && drain.boundary === null && child.mediaClosedReason === "final_clock_pair_omitted",
+  "long tail authenticated finish mismatch");
+  requireFact(recording.capture_drain === "unconfirmed" && recording.capture_drain_reason === "final_clock_pair_omitted" &&
+    ["capture_drain_epoch", "capture_drain_last_frame_sequence", "capture_drain_output_end_sample", "capture_drain_final_pair_sequence"]
+      .every(key => recording[key] === null), "long tail persisted boundary mismatch");
+  const sameEpoch = epoch => epoch?.bridgeSessionId === binding.bridge_session_id && epoch.clockDomainId === "e2e-clock" && epoch.captureEpoch === 1n;
+  requireFact(entries[0]?.kind === "epoch" && sameEpoch(entries[0].epoch) && entries.filter(e => e.kind === "epoch").length === 1,
+    "long tail epoch mismatch");
+  requireFact(entries[1]?.kind === "clock_pair" && entries[52]?.kind === "clock_pair" &&
+    entries.filter(e => e.kind === "clock_pair").length === 2 && entries.slice(2, 52).every(e => e.kind === "frame") &&
+    entries.slice(53, 102).length === 49 && entries.slice(53, 102).every(e => e.kind === "frame"), "long tail order mismatch");
+  const pairs = [entries[1].pair, entries[52].pair];
+  requireFact(pairs.every((p, i) => p.clockDomainId === "e2e-clock" && p.wallEpoch === 1n && p.sequence === BigInt(i + 1) &&
+    p.hostBeforeNs <= p.hostAfterNs && p.hostAfterNs - p.hostBeforeNs <= 5_000_000n && p.localUnixNs >= 0n &&
+    p.wallResolutionNs === 1000n && p.externalUtcAccuracyNs === null), "long tail pair policy mismatch");
+  const firstMid = pairs[0].hostBeforeNs + pairs[0].hostAfterNs, lastMid = pairs[1].hostBeforeNs + pairs[1].hostAfterNs;
+  const gap = lastMid - firstMid, residual = 2n * (pairs[1].localUnixNs - pairs[0].localUnixNs) - gap;
+  requireFact(gap > 0n && gap <= 4_000_000_000n && residual >= -20_000_000n && residual <= 20_000_000n,
+    "long tail pair interval mismatch");
+  const frames = entries.filter(e => e.kind === "frame"), base = frames[0]?.provenance?.span?.hostStartNs;
+  requireFact(frames.length === 99 && recording.duration_ms === 1980 && frames.at(-1)?.mediaEndSample === 47520n,
+    "long tail count mismatch");
+  requireFact(typeof base === "bigint" && firstMid <= 2n * base && lastMid >= 2n * (base + 20_000_000n) &&
+    lastMid < 2n * frames.at(-1).provenance?.span?.hostStartNs, "long tail shape unavailable");
+  const mappedFrames = frames.findIndex(f => f.wall === null);
+  requireFact(mappedFrames >= 1 && mappedFrames <= 98, "long tail partition mismatch");
+  const wallRun = frames[0].wall?.wallRun, maximumBracket = pairs.reduce((n, p) => p.hostAfterNs - p.hostBeforeNs > n ? p.hostAfterNs - p.hostBeforeNs : n, 0n);
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i], p = frame.provenance, span = p?.span, start = BigInt(i) * 480n;
+    requireFact(sameEpoch(frame.epoch) && p?.captureEpoch === 1n && p.sequence === BigInt(i + 1) && p.outputStartSample === start &&
+      p.sampleCount === 480 && p.sourceStartNumerator === start * 24000n && p.sourceEndNumerator === (start + 480n) * 24000n &&
+      p.sourceDenominator === 24000 && p.sourceRateHz === 24000 && p.quality === "nominal_frame_endpoint_interpolation" &&
+      frame.captureStatus === "available" && frame.sampleRateHz === 24000 && frame.mediaStartSample === start && frame.mediaEndSample === start + 480n &&
+      frame.gapOffsetMs === 0n && span?.hostStartNs === base + BigInt(i) * 20_000_000n &&
+      span.hostEndNs === base + BigInt(i + 1) * 20_000_000n && span.roundingEnvelopeNs === 1000n && span.captureUncertaintyNs === null,
+    "long tail frame mismatch");
+    const mapped = i < mappedFrames, bracketed = firstMid <= 2n * span.hostStartNs && 2n * span.hostEndNs <= lastMid;
+    requireFact(mapped === bracketed && (mapped ? frame.wall !== null && frame.reasons.length === 0 : frame.wall === null &&
+      JSON.stringify([...frame.reasons].sort()) === '["missing_clock_pair","wall_alignment_missing"]'), "long tail partition mismatch");
+    if (mapped) {
+      const w = frame.wall;
+      requireFact(w.wallEpoch === 1n && w.wallRun === wallRun && w.maximumBracketNs === maximumBracket && w.maximumResolutionNs === 1000n &&
+        w.modelAllowanceNs === 10_000_000n && w.interpolationRoundingNs === 2n && w.captureRoundingNs === 1000n &&
+        w.captureUncertaintyNs === null && w.externalUtcAccuracyNs === null && w.overallPhysicalAccuracyNs === null,
+      "long tail wall policy mismatch");
+    }
+  }
+  const suffix = entries.slice(102); let index = 0, trailingGap = null;
+  if (suffix[index]?.kind === "discontinuity") {
+    requireFact(suffix[index].captureEpoch === 1n && suffix[index].reason === "reconnect", "long tail suffix reconnect mismatch"); index++;
+  }
+  if (suffix[index]?.kind === "audio_gap") {
+    trailingGap = suffix[index++];
+    requireFact(trailingGap.startedAtMs === 1980n && trailingGap.endedAtMs === null && trailingGap.reason === "capture_discontinuity",
+      "long tail suffix gap mismatch");
+  }
+  requireFact(index === suffix.length, "long tail suffix order mismatch");
+  requireFact(snapshot.runtimeGaps.length === (trailingGap ? 1 : 0) && snapshot.runtimeGaps.every(g => String(g.started_at_ms) === "1980" &&
+    g.ended_at_ms === null && g.reason === "capture_discontinuity") && !snapshot.gaps.some(g => g.direction === "capture"), "long tail suffix recorded gap mismatch");
+  const warnings = JSON.parse(attempt.warnings_json), expected = ["local_wall_timestamp_estimate", "missing_clock_pair", "wall_alignment_missing"];
+  if (suffix.some(e => e.kind === "discontinuity")) expected.push("reconnect");
+  if (trailingGap) expected.push("audio_missing");
+  requireFact(JSON.stringify([...warnings].sort()) === JSON.stringify(expected.sort()), "long tail warnings mismatch");
+  return { ...selected, mappedFrames, suffix, warnings };
+}
+export function longTailOmissionOracles(snapshot, child) {
+  try {
+    validatedLongTailOmission(snapshot, child);
+    return [{ name: "media_timing_omit_final_pair_long", status: "pass", detail: "selected COMPLETE partial long recording retains mapped prefix and missing-wall tail; drain unconfirmed without finish" }];
+  } catch (error) {
+    const reasons = ["source selection", "producer position", "authenticated finish", "persisted boundary", "epoch", "order", "pair policy", "pair interval",
+      "count", "shape unavailable", "partition", "frame", "wall policy", "suffix reconnect", "suffix gap", "suffix order", "suffix recorded gap", "warnings"];
+    const message = reasons.flatMap(r => [`long tail ${r} mismatch`, `long tail ${r}`]).find(r => r === error?.message) ?? "long tail evidence unavailable";
+    return [{ name: "media_timing_omit_final_pair_long", status: "fail", detail: message }];
+  }
+}
+export function longTailOmissionMetadata(snapshot, child) {
+  const { recording, binding, attempt, mappedFrames, suffix, warnings } = validatedLongTailOmission(snapshot, child);
+  const result = { mode: "omit-final-pair-long", disposition: "observed-mapped-prefix-tail", occurrence: snapshot.occurrence,
+    generationId: binding.generation_id, bridgeSessionId: binding.bridge_session_id, sourceSessionId: binding.source_session_id,
+    recordingHandle: recording.handle, sha256: recording.sha256, keyId: recording.key_id, attemptId: attempt.attempt_id,
+    pageCount: attempt.page_count, entryCount: attempt.entry_count, storedBytes: attempt.stored_bytes, coverageStatus: "partial",
+    frames: 99, samples: "47520", durationMs: 1980, mappedFrames, mappedSamples: { start: "0", end: String(mappedFrames * 480) },
+    missingSamples: { start: String(mappedFrames * 480), end: "47520" }, pairSequences: ["1", "2"],
+    captureDrain: { drain: "unconfirmed", reason: "final_clock_pair_omitted", boundary: null }, finalPairRecorded: false,
+    finishRequested: false, finishAcknowledged: false, wallEstimate: "qualified-local-estimate",
+    terminalSuffix: suffix.map(e => e.kind === "discontinuity" ? { kind: "discontinuity", captureEpoch: "1", reason: "reconnect" }
+      : { kind: "audio_gap", startedAtMs: "1980", endedAtMs: null, reason: "capture_discontinuity" }), warnings: [...warnings].sort() };
+  return validateLongTailMetadata(result);
+}
+
+// Inspect descriptors before reading values or invoking any serialization method.
+function longData(value, budget = { left: 800 }) {
+  requireFact(--budget.left >= 0, "long_tail_output_refused");
+  if (value === null || typeof value === "boolean" || typeof value === "string" && value.length <= 640 ||
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  requireFact(typeof value === "object" && value !== null, "long_tail_output_refused");
+  const array = Array.isArray(value), proto = Object.getPrototypeOf(value);
+  requireFact(array ? proto === Array.prototype && value.length <= 128 : proto === Object.prototype || proto === null, "long_tail_output_refused");
+  requireFact(!Object.getOwnPropertyDescriptor(Object.prototype, "toJSON") && !Object.getOwnPropertyDescriptor(Array.prototype, "toJSON"), "long_tail_output_refused");
+  const descriptors = Object.getOwnPropertyDescriptors(value), keys = Reflect.ownKeys(descriptors);
+  requireFact(keys.every(k => typeof k === "string" && (array && k === "length" || descriptors[k].enumerable && Object.hasOwn(descriptors[k], "value"))) &&
+    (!array || keys.length === value.length + 1 && keys.every(k => k === "length" || /^(0|[1-9][0-9]*)$/.test(k))), "long_tail_output_refused");
+  const copy = array ? [] : {};
+  for (const key of keys) if (key !== "length" || !array)
+    Object.defineProperty(copy, key, { value: longData(descriptors[key].value, budget), enumerable: true, configurable: true, writable: true });
+  return copy;
+}
+export function validateLongTailMetadata(value) {
+  const m = longData(value), shape = (v, keys) => v && !Array.isArray(v) && Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
+  const instant = typeof m?.occurrence === "string" ? m.occurrence.split("@")[1] : null, ms = typeof instant === "string" ? Date.parse(instant) : NaN;
+  const scalar = ["mode", "disposition", "occurrence", "generationId", "bridgeSessionId", "sourceSessionId", "recordingHandle", "sha256", "keyId", "attemptId",
+    "pageCount", "entryCount", "storedBytes", "coverageStatus", "frames", "samples", "durationMs", "mappedFrames", "finalPairRecorded", "finishRequested", "finishAcknowledged", "wallEstimate"];
+  requireFact(shape(m, [...scalar, "mappedSamples", "missingSamples", "pairSequences", "captureDrain", "terminalSuffix", "warnings"]) &&
+    m.mode === "omit-final-pair-long" && m.disposition === "observed-mapped-prefix-tail" && m.coverageStatus === "partial" &&
+    typeof m.occurrence === "string" && /^[1-9][0-9]{0,19}@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(m.occurrence) &&
+    Number.isSafeInteger(ms) && ms >= 0 && new Date(ms).toISOString().replace(".000Z", "Z") === instant &&
+    typeof m.bridgeSessionId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(m.bridgeSessionId) &&
+    m.generationId === Buffer.from(m.occurrence).toString("hex") + ":" + Buffer.from(m.bridgeSessionId).toString("hex") &&
+    typeof m.sourceSessionId === "string" && /^[1-9][0-9]{0,19}$/.test(m.sourceSessionId) && BigInt(m.sourceSessionId) <= 18446744073709551615n &&
+    typeof m.recordingHandle === "string" && /^[a-f0-9]{32}$/.test(m.recordingHandle) && typeof m.sha256 === "string" && /^[a-f0-9]{64}$/.test(m.sha256) &&
+    typeof m.keyId === "string" && /^[a-f0-9]{16}$/.test(m.keyId) && typeof m.attemptId === "string" && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(m.attemptId) &&
+    [m.pageCount, m.entryCount, m.storedBytes, m.mappedFrames].every(Number.isSafeInteger) &&
+    m.pageCount >= 2 && m.pageCount <= 104 && m.entryCount >= 102 && m.entryCount <= 104 && m.pageCount <= m.entryCount &&
+    m.storedBytes > 0 && m.storedBytes <= 104 * 131072 && m.frames === 99 && m.samples === "47520" && m.durationMs === 1980 &&
+    m.mappedFrames >= 1 && m.mappedFrames <= 98 && shape(m.mappedSamples, ["start", "end"]) && shape(m.missingSamples, ["start", "end"]) &&
+    m.mappedSamples.start === "0" && m.mappedSamples.end === String(m.mappedFrames * 480) &&
+    m.missingSamples.start === m.mappedSamples.end && m.missingSamples.end === "47520" &&
+    Array.isArray(m.pairSequences) && m.pairSequences.length === 2 && m.pairSequences[0] === "1" && m.pairSequences[1] === "2" &&
+    shape(m.captureDrain, ["drain", "reason", "boundary"]) && m.captureDrain.drain === "unconfirmed" &&
+    m.captureDrain.reason === "final_clock_pair_omitted" && m.captureDrain.boundary === null && m.finalPairRecorded === false &&
+    m.finishRequested === false && m.finishAcknowledged === false && m.wallEstimate === "qualified-local-estimate" &&
+    Array.isArray(m.terminalSuffix) && m.terminalSuffix.length <= 2 && Array.isArray(m.warnings), "long_tail_output_refused");
+  let index = 0;
+  if (m.terminalSuffix[index]?.kind === "discontinuity") {
+    const e = m.terminalSuffix[index++]; requireFact(shape(e, ["kind", "captureEpoch", "reason"]) && e.captureEpoch === "1" && e.reason === "reconnect", "long_tail_output_refused");
+  }
+  if (m.terminalSuffix[index]?.kind === "audio_gap") {
+    const e = m.terminalSuffix[index++]; requireFact(shape(e, ["kind", "startedAtMs", "endedAtMs", "reason"]) && e.startedAtMs === "1980" && e.endedAtMs === null && e.reason === "capture_discontinuity", "long_tail_output_refused");
+  }
+  const expected = ["local_wall_timestamp_estimate", "missing_clock_pair", "wall_alignment_missing"];
+  if (m.terminalSuffix.some(e => e.kind === "discontinuity")) expected.push("reconnect");
+  if (m.terminalSuffix.some(e => e.kind === "audio_gap")) expected.push("audio_missing");
+  requireFact(index === m.terminalSuffix.length && m.entryCount === 102 + index &&
+    JSON.stringify([...m.warnings].sort()) === JSON.stringify(expected.sort()), "long_tail_output_refused");
+  return m;
+}
+export function longTailReport(input) {
+  const value = longData(input);
+  requireFact(value && Object.keys(value).length === 3 && Object.hasOwn(value, "metadata") && Object.hasOwn(value, "checks") &&
+    Object.hasOwn(value, "cleanupConfirmed") && typeof value.cleanupConfirmed === "boolean" && Array.isArray(value.checks) &&
+    value.checks.every(c => c && Object.keys(c).length === 2 && typeof c.name === "string" && /^[a-z_0-9]{1,80}$/.test(c.name) &&
+      ["pass", "fail", "blocked", "skipped"].includes(c.status)) && new Set(value.checks.map(c => c.name)).size === value.checks.length, "long_tail_output_refused");
+  const facts = value.metadata === null ? null : validateLongTailMetadata(value.metadata);
+  const required = ["media_timing_omit_final_pair_long", "media_timing_alignment_ready", "long_tail_public_close", "shutdown_clean", "no_key_or_plaintext_audio", "no_orphan_process", "no_closed_store_callback", "single_occurrence_identity"];
+  return { schema: "meeting-long-tail-report/v1", mode: "omit-final-pair-long", disposition: facts && value.cleanupConfirmed &&
+    !value.checks.some(c => c.status === "fail") && required.every(name => value.checks.some(c => c.name === name && c.status === "pass"))
+      ? "observed-mapped-prefix-tail" : "prerequisite-failed-or-unknown", facts, cleanupConfirmed: value.cleanupConfirmed,
+    publication: "untested", checks: value.checks };
+}
+
 export function mediaTimingOracles(snapshot, child, mode) {
   try {
     validatedMediaTiming(snapshot, child, mode);
