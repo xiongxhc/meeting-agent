@@ -169,6 +169,38 @@ campaign controls; actual SDK/application execution remains unverified. This
 nonfatal rejection does not establish commit-before-callback crash recovery or
 terminal-session reopen.
 
+The separate closed-generation selection observes removal, closes the second
+owner, and opens a third ordinary owner before replaying the original invite:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/ingress-run.mjs --closed-generation-reopen --out /absolute/private/evidence/closed-generation
+```
+
+It requires a closed generation and timed owner, confirmed physical departure
+and reap, separately assigned unknown-end recording custody, and unchanged first
+invitation and audit facts. The third owner must accept the replay without
+resolution, launch, deferral or durable mutation. Each owner must settle before
+the next begins. This selection is exclusive with conflict and missing-launcher
+options. The session remains `finalizing`; strict `failed`/`notified` terminal
+reopen is still open. Reviewed component checks do not establish an actual
+three-owner run, physical removal or recording custody.
+
+The admission rollback selection installs one guarded fixture-only event
+abort trigger on the admitted disposable database. For this command, `--out`
+names a new evidence file under an existing canonical parent directory:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/invite-admission-abort-run.mjs --out /absolute/private/evidence/invite-admission-abort.json
+```
+
+The first valid invite must receive 500 without a commit or partial occurrence.
+After exact trigger removal, the original invite must receive 200 as its first
+durable acceptance. A fresh ordinary application/store owner must then replay
+it unchanged. Missing metadata references keep the case blocked without launch.
+Both owners must close cleanly and the trigger must be absent. This is ordinary
+same-process reopen after a nonfatal transaction abort. Real-store components
+do not establish actual SDK ACKs, admitted ownership or crash recovery.
+
 The prepared capacity command accepts `--count 1`, `2`, `4` or `8`. Run each
 count sequentially with a fresh private output directory:
 
@@ -237,6 +269,20 @@ not cover a long recording with a mapped prefix and unmapped tail. Reviewed
 listener-free checks establish source/component evidence. Actual encrypted
 recording and application conformance remain unverified.
 
+The separate long omission selection captures 99 frames across the periodic
+clock-pair cadence, retaining two actual pairs and omitting the final exchange:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/omit-final-pair-long --keep --media-timing omit-final-pair-long
+```
+
+Selected COMPLETE pages must preserve every sample, a nonempty mapped prefix and
+an unmapped tail with no invented audio loss or finish confirmation. The mapped
+prefix boundary is derived from the recorded clock evidence. A delayed capture
+that cannot establish the selected shape fails. This skips publication, receipt
+and organizer-DM checks; reviewed components do not prove actual encrypted
+recording, recognition or full L4/L5 acceptance.
+
 The prepared startup cancellation command holds the actual WebSocket endpoint
 request and invokes the ordinary public application close while it is pending:
 
@@ -265,8 +311,22 @@ substitute. Overflow or later invalid observations keep cleanup unconfirmed even
 if an earlier close promise fulfilled. It preserves the real `clean:false`
 composition result and standalone exit 70 separately from campaign conformance.
 This is reviewed source/component preparation, with no actual SDK upgrade run.
-Tenant-token acquisition, child-launch and signal selections remain separate
-unfinished boundaries.
+Tenant-token acquisition has its own prepared selection below. Child-launch and
+signal selections remain separate unfinished boundaries.
+
+The tenant-token selection delivers a valid invitation, observes an actual
+outbound tenant-token request, and starts ordinary close while it is held:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/tenant-token-run.mjs --out /absolute/private/evidence/tenant-token
+```
+
+Close must wait for the owned HTTP timeout, retain a retryable metadata timeout,
+and settle remote request and transport ownership before fixture cleanup. This
+is not prompt token cancellation. Repeated close must preserve the same promise
+and state; peer cleanup must precede admission-owner release. Reviewed in-memory
+HTTP/socket/peer and discovery/store components do not prove SDK cache behavior
+or an actual application run.
 
 The prepared D2 harness adds four independent cuts. Each requires real localhost
 listeners and a fresh absolute output directory; run them sequentially:
