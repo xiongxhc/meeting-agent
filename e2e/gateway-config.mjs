@@ -31,16 +31,17 @@ verbosity = 50
 follow_up_frequency = 50
 `;
 
-function media(bind) {
+function media(bind, { credentialLifetimeMs = 60000, reconnectWindowMs = 10000, maxOutboundQueueMs = 10000 } = {}) {
+  if (![credentialLifetimeMs, reconnectWindowMs, maxOutboundQueueMs].every(value => Number.isSafeInteger(value) && value > 0) || reconnectWindowMs > credentialLifetimeMs || maxOutboundQueueMs > reconnectWindowMs) throw new Error("invalid synthetic media timing");
   return `[media]
 bind = "${bind}"
 advertised_endpoint = "tcp://${bind}"
-credential_lifetime_ms = 60000
-reconnect_window_ms = 10000
+credential_lifetime_ms = ${credentialLifetimeMs}
+reconnect_window_ms = ${reconnectWindowMs}
 max_frames_per_second = 100
 max_payload_bytes = 16384
 max_outbound_queue_bytes = 262144
-max_outbound_queue_ms = 10000
+max_outbound_queue_ms = ${maxOutboundQueueMs}
 capture_format = "pcm_s16le/24000/1/20ms"
 `;
 }
@@ -120,7 +121,7 @@ export function interactiveGatewayToml(options) {
 }
 
 /** Offline profile with the accepted local fixture provider host. */
-export function postmeetingGatewayToml({ recordingsDir, keyEnv, modelsDir, fixtureEndpoint }) {
+export function postmeetingGatewayToml({ recordingsDir, keyEnv, modelsDir, fixtureEndpoint, mediaTiming }) {
   return `schema_version = 3
 profile = "offline"
 privacy_mode = "local-only"
@@ -143,7 +144,7 @@ ownership = "external"
 readiness_url = "${fixtureEndpoint}/health"
 startup_timeout_ms = 5000
 environment = "inherit"
-${media("127.0.0.1:0")}[voice.capture]
+${media("127.0.0.1:0", mediaTiming)}[voice.capture]
 device = "system-default"
 [voice.turn]
 speech_start_ms = 200

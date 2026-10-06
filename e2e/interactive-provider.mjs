@@ -2,6 +2,7 @@
 import { Buffer } from "node:buffer";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import process from "node:process";
 import { WebSocketServer } from "ws";
 
 function wav() {
@@ -64,8 +65,9 @@ export async function startInteractiveProvider() {
         appended += 1;
         if (bargeOnSpeech && Buffer.from(event.audio, "base64").some((byte) => byte !== 0)) {
           bargeOnSpeech = false; ordinal += 1;
+          const sent = { route: "barge_activity", at: Date.now(), monotonicNs: process.hrtime.bigint().toString() };
           socket.send(JSON.stringify({ type: "input_audio_buffer.speech_started", item_id: `interactive-${ordinal}`, audio_start_ms: (appended - 1) * 20 }));
-          calls.push({ route: "barge_activity", at: Date.now() });
+          calls.push(sent);
         }
       }
     });

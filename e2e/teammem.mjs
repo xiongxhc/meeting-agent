@@ -17,6 +17,7 @@ import path from "node:path";
 
 import { PYTHON, run, loadAverage } from "./stage.mjs";
 import { sha256File } from "./pins.mjs";
+import { snapshotDependencyWheelhouse, teamMemDependencyOptions, validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 
 /** The argv prefix every Git and TeamMem invocation shares: no ambient GIT_*,
  * credential helper, template, hook or HOME survives it. */
@@ -27,7 +28,16 @@ export function safeEnvironment({ templateDir, binPath }) {
   };
 }
 
-export async function stageTeamMem({ staged, source }) {
+export function archiveTeamMemSource({ repository, tree, sourceDir, archivePath }) {
+  if (typeof tree !== "string" || !/^[0-9a-f]{40}$/.test(tree)) throw new Error("TeamMem source tree must be a 40-character hex object ID");
+  const env = safeEnvironment({ templateDir: "", binPath: "/usr/bin:/bin:/usr/sbin:/sbin" });
+  const archive = { name: "teammem_archive", ...run("/usr/bin/git", ["-C", repository, "archive", "--format=tar", "--output", archivePath, tree], { env }) };
+  if (archive.exit !== 0) return [archive];
+  return [archive, { name: "teammem_archive_extract", ...run("/usr/bin/tar", ["-xf", archivePath, "-C", sourceDir], { env }) }];
+}
+
+export async function stageTeamMem({ staged, source, dependencyWheelhouse }) {
+  if (dependencyWheelhouse !== undefined) await validateDependencyWheelhouse(dependencyWheelhouse);
   const steps = [];
   const record = (name, result) => { steps.push({ name, ...result }); if (result.exit !== 0) throw new Error(`${name} failed (exit ${result.exit}): ${result.stderr.slice(0, 600)}`); return result; };
 
@@ -36,16 +46,18 @@ export async function stageTeamMem({ staged, source }) {
   const venv = path.join(teammemRoot, "wheel-venv");
   const wheelhouse = path.join(teammemRoot, "wheelhouse");
   for (const directory of [sourceDir, wheelhouse]) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const dependencies = dependencyWheelhouse === undefined ? undefined : await snapshotDependencyWheelhouse({ dependencyWheelhouse, privateRoot: teammemRoot });
 
-  record("teammem_archive", run("/bin/sh", ["-c",
-    `git -C ${JSON.stringify(source.repository)} archive ${source.tree} | tar -x -C ${JSON.stringify(sourceDir)}`]));
+  for (const { name, ...result } of archiveTeamMemSource({ repository: source.repository, tree: source.tree, sourceDir, archivePath: path.join(teammemRoot, "source.tar") })) record(name, result);
   record("teammem_venv", run(PYTHON, ["-m", "venv", venv]));
-  // Network is used here and only here, to build and install the wheel.
-  record("teammem_wheel_build", run(path.join(venv, "bin/pip"), ["wheel", "--no-deps", "--wheel-dir", wheelhouse, sourceDir]));
+  // Optional validated private dependencies avoid network; default behavior is unchanged.
+  const dependencyOptions = await teamMemDependencyOptions(dependencies?.path);
+  record("teammem_wheel_build", run(path.join(venv, "bin/pip"), ["wheel", ...dependencyOptions.argv, "--no-deps", "--wheel-dir", wheelhouse, sourceDir], dependencyOptions.options));
   const wheel = readdirSync(wheelhouse).filter((name) => name.endsWith(".whl")).map((name) => path.join(wheelhouse, name))[0];
   if (wheel === undefined) throw new Error("no TeamMem wheel was produced");
   const wheelSha256 = await sha256File(wheel);
-  record("teammem_wheel_install", run(path.join(venv, "bin/pip"), ["install", wheel]));
+  const installDependencyOptions = await teamMemDependencyOptions(dependencies?.path);
+  record("teammem_wheel_install", run(path.join(venv, "bin/pip"), ["install", ...installDependencyOptions.argv, wheel], installDependencyOptions.options));
 
   const binary = path.join(venv, "bin/teammem");
   if (!existsSync(binary)) throw new Error("the installed TeamMem wheel exposes no teammem entry point");

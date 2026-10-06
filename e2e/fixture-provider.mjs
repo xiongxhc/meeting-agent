@@ -11,6 +11,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 
 const PLACEHOLDER = "Scripted fixture provider output; no model read this meeting.";
+const MAX_REQUEST_BYTES = 1024 * 1024;
 
 /** The shipped artifact build asks for one synthesis object with six required
  * members. The fixture answers exactly that shape, with a visible placeholder
@@ -27,33 +28,85 @@ function schemaShapedAnswer(prompt) {
   return JSON.stringify({ summary: PLACEHOLDER });
 }
 
-export async function startFixtureProvider() {
+/** Component-testable HTTP handler; fault arming is explicit and instance-local. */
+export function createFixtureProviderHandler() {
   const calls = [];
-  const server = createServer((request, response) => {
+  let nextChatFailure = false;
+  const handler = (request, response) => {
     const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
+    let requestBytes = 0;
+    let finished = false;
+    const recordChat = (outcome, promptBytes = 0) => calls.push({ route: "chat", outcome, promptBytes, requestBytes, at: Date.now() });
+    const reject = (status, message, outcome, chatRoute) => {
+      if (finished) return;
+      finished = true;
+      chunks.length = 0;
+      if (chatRoute) recordChat(outcome);
+      response.statusCode = status;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ error: message }));
+    };
+    let route;
+    try { route = new URL(request.url ?? "/", "http://fixture.invalid").pathname; }
+    catch { reject(400, "Invalid fixture provider request.", "invalid_request", false); return; }
+    const chatRoute = route.endsWith("/api/chat");
+    request.on("data", (chunk) => {
+      if (finished) return;
+      requestBytes += chunk.length;
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        reject(413, "Fixture provider request exceeds its byte limit.", "request_too_large", chatRoute);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("error", () => reject(400, "Invalid fixture provider request.", "invalid_request", chatRoute));
     request.on("end", () => {
-      const path = new URL(request.url ?? "/", "http://fixture.invalid").pathname;
-      if (path.endsWith("/api/chat")) {
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      if (finished) return;
+      if (chatRoute) {
+        let body;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+          if (body === null || typeof body !== "object" || Array.isArray(body)
+              || (body.messages !== undefined && (!Array.isArray(body.messages)
+                || body.messages.some((message) => message === null || typeof message !== "object" || Array.isArray(message))))) {
+            throw new Error("invalid request shape");
+          }
+        } catch { reject(400, "Invalid fixture provider request.", "invalid_request", true); return; }
         const text = (body.messages ?? []).map((message) => String(message.content ?? "")).join("\n");
-        calls.push({ route: "chat", promptBytes: Buffer.byteLength(text), at: Date.now() });
+        const promptBytes = Buffer.byteLength(text);
+        finished = true;
+        if (nextChatFailure) {
+          nextChatFailure = false;
+          recordChat("armed_failure", promptBytes);
+          response.statusCode = 503;
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({ error: "Scripted fixture provider chat failure." }));
+          return;
+        }
+        recordChat("ok", promptBytes);
         const content = schemaShapedAnswer(text);
         response.setHeader("content-type", "application/x-ndjson");
         response.write(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content }, done: false })}\n`);
         response.end(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content: "" }, done: true, total_duration: 1000, load_duration: 1, prompt_eval_count: 1, prompt_eval_duration: 1, eval_count: 1, eval_duration: 1 })}\n`);
         return;
       }
-      calls.push({ route: path.endsWith("/health") ? "health" : "other", at: Date.now() });
+      finished = true;
+      calls.push({ route: route.endsWith("/health") ? "health" : "other", at: Date.now() });
       response.setHeader("content-type", "application/json");
       response.end("{}");
     });
-  });
+  };
+  return { handler, calls, armNextChatFailure() { nextChatFailure = true; } };
+}
+
+export async function startFixtureProvider() {
+  const { handler, calls, armNextChatFailure } = createFixtureProviderHandler();
+  const server = createServer(handler);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const endpoint = `http://127.0.0.1:${server.address().port}`;
   return {
-    endpoint, calls,
+    endpoint, calls, armNextChatFailure,
     async close() {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(() => resolve()));

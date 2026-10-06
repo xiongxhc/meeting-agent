@@ -2,12 +2,8 @@ import { Buffer } from "node:buffer";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { processCleanupProof } from "./process-evidence.mjs";
 import { PROVIDER_CREDENTIAL, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV } from "./stage.mjs";
-
-function alive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return error.code !== "ESRCH"; }
-}
 
 function walkFiles(root, errors, skip = []) {
   const files = [];
@@ -30,7 +26,20 @@ export function keyPresent(staged) {
   try { return /^[0-9a-f]{64}$/.test(readFileSync(staged.keyPath, "utf8").trim()); } catch { return false; }
 }
 
-export function negativeProofs({ staged, live, teammem, outDir }) {
+export function recordedProcessProof({ staged, live, probe }) {
+  const knownPids = [];
+  try {
+    for (const line of readFileSync(staged.gatewayPidsPath, "utf8").split("\n").map(value => value.trim()).filter(Boolean)) {
+      knownPids.push({ role: "gateway", pid: /^[1-9][0-9]*$/.test(line) ? Number(line) : null });
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") knownPids.push({ role: "gateway_pid_file_unavailable", pid: null });
+  }
+  if (live.childState?.pid !== undefined) knownPids.push({ role: "bridge_child", pid: live.childState.pid });
+  return processCleanupProof({ evidence: live.processEvidence, knownPids, probe });
+}
+
+export function negativeProofs({ staged, live, teammem, outDir, probe }) {
   const key = existsSync(staged.keyPath) ? readFileSync(staged.keyPath, "utf8").trim() : null;
   const secret = readFileSync(staged.appSecretFile, "utf8").trim();
   const scanErrors = [];
@@ -91,12 +100,8 @@ export function negativeProofs({ staged, live, teammem, outDir }) {
     if (bytes.includes(speechMarker) || bytes.includes(voicedMarker)) pcmMarkers.push(`${file}: scripted speech/capture PCM marker`);
   }
 
-  const pids = [];
-  if (existsSync(staged.gatewayPidsPath)) {
-    for (const line of readFileSync(staged.gatewayPidsPath, "utf8").split("\n").map((value) => value.trim()).filter(Boolean)) pids.push({ role: "gateway", pid: Number(line) });
-  }
-  if (live.childState?.pid) pids.push({ role: "bridge_child", pid: live.childState.pid });
-  const orphans = pids.filter((entry) => alive(entry.pid));
+  const processCleanup = recordedProcessProof({ staged, live, probe });
+  const { pids, orphans } = processCleanup;
 
   const trace = live.summary?.trace ?? [];
   const storeClosedAt = trace.lastIndexOf("shutdown_store_closed");
@@ -108,5 +113,5 @@ export function negativeProofs({ staged, live, teammem, outDir }) {
   if (live.artifact?.occurrenceId) identities.add(live.artifact.occurrenceId);
   for (const entry of live.receipt?.checks ?? []) if (entry.occurrenceMatchesArtifact === false) identities.add("receipt-mismatch");
 
-  return { scannedFiles: scanned.length, scanErrors, leaks, envLeaks, permissions, pcmMarkers, pids, orphans, afterStoreClose, identities: [...identities] };
+  return { scannedFiles: scanned.length, scanErrors, leaks, envLeaks, permissions, pcmMarkers, pids, orphans, processCleanup, afterStoreClose, identities: [...identities] };
 }

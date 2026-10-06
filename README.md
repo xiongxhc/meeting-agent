@@ -86,6 +86,272 @@ final-playback races, durable recording/gap checks, repeated close and the nativ
 credential-expiry/reconnect cuts recorded in the acceptance matrix. The default
 production gateway and its provider validation remain separate.
 
+The prepared `--r2-baseline` command creates only the incomplete revision 1
+prerequisite for later R2 recovery. Run it on a permitted host with an explicit
+validated wheelhouse and local bare publication opt-in:
+
+```sh
+E2E_ALLOW_LOCAL_BARE_PUSH=1 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/r2-baseline --r2-baseline --dependency-wheelhouse /absolute/validated/wheelhouse --keep
+```
+
+Live capture uses the production online gateway and the default 51-frame peer.
+After capture, an atomic config replacement selects the separately pinned
+scripted gateway for postmeeting processing: final diarization stays unavailable,
+synthesis stays healthy, and actual issued recognition/speech endpoints come
+from a separate idle voice peer. The exposed shipped composition waits for the
+exact live occurrence's confirmed cleanup, then calls one public backfill tick;
+its automatic backfill cadence is one hour. No seed, artifact or receipt is
+injected. A dry run or missing publication receipt fails this baseline.
+
+The read-only schema29 projection requires one incomplete delivery, accepted
+publication, due retry job and original +11d/+14d deadlines. Retained source
+identity/hash and the actual TeamMem audio-store inventory are measured; on
+POSIX the accepted consumer retains two directory entries sharing one copied
+ciphertext inode (final file and custody hardlink), with link count two. File
+names are discovered, not assumed. Capture-tail, custody, privacy and owned
+process checks remain required. Idle voice telemetry proves zero recorded model
+calls/PCM appends; it does not count TCP/WebSocket connections.
+
+R2 inspects the SQLite file header and existing sidecars before any evidence
+connection opens, then checks schema29 before ordinary reopened/capture reads.
+A refused snapshot stops further SQL evidence collection without checkpointing
+or repair. Any failed R2 evidence or exceptional refusal preserves its private
+root and ciphertext even without `--keep`, with a bounded reason in `bundle.json`;
+ordinary modes retain their existing cleanup policy.
+
+Listener-free synthetic SQLite and provider checks are component evidence (C).
+The command is prepared but has not established an app-generated baseline on
+the currently restricted host. Actual cross-process capture/publication is
+integration evidence (I); higher revisions, replay and early cleanup remain
+separate R2 work. “VAD check gates speech recognition, not encrypted recording.
+Recording must remain independent of provider failures.”
+
+Run the prepared commands below from the reviewed preparation checkout at
+`<source-workspace>`, after matching its
+source inventory to the V7 manifest. The raw development checkout includes an
+excluded partial implementation and is not the packaged source for these commands.
+
+The prepared ingress recovery campaign uses two sequential application owners
+against the same preserved private root. An unavailable reservation first leaves
+one durable metadata-blocked invite; duplicate and reordered events keep its
+first title and identity. A corrected resolver on reopen leaves it blocked until
+one public operator retry, then verifies one Runtime/bridge launch:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/ingress-run.mjs --out /absolute/private/evidence/ingress
+/opt/homebrew/opt/node@24/bin/node e2e/ingress-run.mjs --out /absolute/private/evidence/missing-launcher --missing-launcher
+```
+
+Use a fresh output directory for each sequential invocation on a permitted host.
+The missing-launcher branch requires admitted metadata and the actual lazy
+Runtime startup failure before any bridge launch. Inventory or root refusal
+leaves that branch unexecuted. Exact commit-before-ACK observations, final ACK
+history, direct-child and descendant cleanup must all pass; both roots are
+preserved. The listener-free source checks do not establish R5/R7 application
+acceptance, crash-before-callback recovery or terminal-session reopen.
+
+The prepared capacity command accepts `--count 1`, `2`, `4` or `8`. Run each
+count sequentially with a fresh private output directory:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/capacity-run.mjs --count 1 --out /absolute/private/evidence/capacity-n1
+```
+
+One application owner admits distinct scripted slots, retains the excess invite
+in its durable queue, quarantines one missing physical outcome and drains the
+healthy controls. Reopened state must preserve admission, exact departure
+results and every observed capture watermark. These are prepared coordinator
+checks; actual runs, artifact isolation, maintenance and resource headroom remain
+unverified. Scripted slots do not establish simultaneous physical Mac meetings.
+
+The prepared recording timing command changes only frame 26's nominal start by
+two nanoseconds while retaining all 51 frames and their PCM samples:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/invalid2ns --keep --media-timing invalid2ns
+```
+
+The shipped backfill owner supplies selected COMPLETE alignment pages. Before
+and after closure, the oracle requires partial timing coverage, the exact
+confirmed finish boundary, continuous samples and matching clock-domain/source
+provenance. It permits independent wall uncertainty without inventing audio loss.
+This command skips publication, receipt and organizer-DM assertions. Listener-free
+checks are accepted source/component evidence; actual recording conformance,
+recognized speaker attribution and full L4/L5 remain unverified. Final-pair
+omission is a separate unfinished selection.
+
+The prepared startup cancellation command holds the actual WebSocket endpoint
+request and invokes the ordinary public application close while it is pending:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/pending-startup-run.mjs --out /absolute/private/evidence/pending-startup
+```
+
+It requires cancellation and zero transport/request counts before fixture cleanup,
+then peer closure before the admission owner is released. Campaign conformance
+is separate from the underlying `clean:false` composition result and standalone
+exit 70. The reviewed deadline fixes reject late synchronous results and retain
+ordinary cleanup. Listener-free checks are component evidence; actual SDK
+cancellation and token, upgrade, launch and signal boundaries remain unverified.
+
+The prepared D2 harness adds four independent cuts. Each requires real localhost
+listeners and a fresh absolute output directory; run them sequentially:
+
+```sh
+export E2E_ALLOW_LOCAL_BARE_PUSH=0
+npm run e2e -- --interactive --d2-cut durable --out /absolute/evidence/durable
+npm run e2e -- --interactive --d2-cut cancel-wins --out /absolute/evidence/cancel-wins
+npm run e2e -- --interactive --d2-cut complete-wins --out /absolute/evidence/complete-wins
+npm run e2e -- --interactive --d2-cut repeated-close --out /absolute/evidence/repeated-close
+```
+
+Durable checks reopen actual persisted live evidence, selected COMPLETE alignment
+and the Runtime trace, including recording-duration consistency. The scripted
+media-v3 peer now fences capture, sends its final clock pair and exact kind-10
+boundary, and waits for the matching kind-11 ACK on the authenticated connection
+under one 20-second stop budget. Its typed drain event precedes `left`, retaining
+the original observed end time. The positive baseline also checks every final
+frame/sample against the reopened confirmed drain and selected authenticated
+alignment; partial wall coverage remains separate from audio loss. In-memory
+byte-peer and synthetic SQLite/alignment tests are component evidence only.
+Each ordering
+waits for the actual bound Runtime playback acceptance; completion also requires
+Runtime to observe the late speech onset. Cancellation measures the interval from scripted provider
+onset send to the peer's flush-ACK write callback on the same host. It does not
+measure physical interruption latency. The two race cuts suppress a late or
+duplicate callback in the Node peer; Swift renderer acceptance remains separate.
+Repeated close uses the real composition owner while playback is held, checks
+one terminal through teardown, and preserves an actual unconfirmed-departure
+refusal (exit 70 and durable quarantine). That disposition proves refusal and
+cleanup, rather than clean physical departure; it does not exercise publication.
+
+These cuts are prepared, not accepted: the October 1 managed profile rejects
+localhost listeners with EPERM, so offline helper tests and a successful build
+do not prove these integrations. Full Node gates and actual cut bundles are
+required before acceptance or overlay repinning. Mac11d and D3–D4 remain open.
+
+### Prepared Mac failure calibration and offline packages
+
+`e2e/mac11d-swift` is a test-only native callback producer over the shipped
+Swift capture/converter, timed-media and child-control owners. Build its
+`mac11d-calibration` executable, then run one fresh SDK/gateway occurrence per
+scenario, sequentially:
+
+```sh
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario normal
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario confirmed-cleanup-write
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario metadata-primary
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario native-primary
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario unconfirmed-cleanup-write
+node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario expiry-rollback
+```
+
+The private metadata file separates source emission, actual completed writes,
+primary failure, native cleanup, typed capture drain and departure custody.
+Native failure may leave only an authenticated recording prefix; emitted samples
+do not establish a persisted tail. Delayed cleanup retains the shipped five-second
+stop budget and settles its real native callback afterward. Expiry uses an actual
+issued three-second lease, a fixed monotonic cutoff and a test-only admission-wall
+rollback; capture clock pairs retain their original coherent source.
+The fresh expired-credential authentication probe runs before leave or voice stop,
+and is bounded within a conservative reconnect window. Its empty EOF proves
+refusal of that issued expired credential. For the default profile, empty EOF does not identify the gateway's active-fence
+release or unique refusal cause: expiry remains `status: "incomplete"` with
+CLI exit 1, even with optimistic proof labels.
+
+This additional explicit TEST command is prepared for a later admitted host run;
+it has not produced observed integration evidence:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/mac11d-calibration.mjs --swift-child /absolute/mac11d-calibration --scenario expiry-rollback --runtime-profile runtime-media-evidence-test-20261005
+```
+
+TEST acceptance requires the actual native failure oracle, the held journal's
+exact released admission, one fresh measured TCP probe, a unique credential-only
+TTL rejection bound to that probe's tuple, and complete independently verified
+journal/provenance/receipt and cleanup. The controller owns the staged observer
+through the declaration-private, version-pinned SDK `startWithChildForTest`
+constructor after the existing installed-SDK hash prerequisite and TEST package
+checks. The default startup still uses the ordinary public SDK `start` path.
+Observer close 0/no signal/all three pipes and SDK closure share one 1200ms deadline;
+SDK graceful cleanup alone cannot authorize final receipt collection. Release
+polling and the at-most1500ms probe retain the original conservative reconnect
+deadline, issued lease and 3000ms budgets. There is no automatic default promotion.
+The instrumented package remains build-only TEST evidence and requires the
+external package erratum that records the failed full Cargo gate. Focused
+component checks do not accept R2, D2–D4 or the whole Meeting application.
+Control-only `e2e/mac11d-control.proof.mjs` never starts
+media and cannot accept these media scenarios.
+
+An explicit private wheelhouse can supply offline TeamMem dependencies:
+
+```sh
+npm run e2e -- --out /absolute/evidence/offline --dependency-wheelhouse /absolute/private/dependencies
+npm run e2e -- --out /absolute/evidence/package-refusals --only-refusals --package-refusals
+```
+
+The wheelhouse requires a closed `teammem-dependency-wheelhouse/v1` manifest,
+validated wheel identities/hashes and an owned private directory. Pip consumes
+an independently validated private snapshot, with no index or ambient pip config.
+Omitting the option preserves the existing dependency path. Package refusal cuts
+record prerequisite checks separately from unmodified main-loader checks; a
+masked static-schema refusal or unexecuted lazy launcher remains incomplete.
+
+These sources are unaccepted WIP. Actual SDK/media integration, D3 recovery and
+D4 capacity/package acceptance still require their matrix evidence on a host that
+permits localhost listeners and shipped macOS filesystem admission.
+
+### Prepared R1 recovery cut
+
+```sh
+node e2e/recovery-run.mjs --out /absolute/evidence/r1 # fresh directory; optional --keep
+node e2e/recovery-run.mjs --out /absolute/evidence/r1-warning-crash --warning-cut accepted-before-store-crash
+node e2e/recovery-run.mjs --out /absolute/evidence/r1-warning-sql --warning-cut acceptance-transaction-abort
+```
+
+This test-only controller uses the built application's real admission, SQLite,
+Runtime and maintenance workers. It drives a positive meeting end, fails the
+initial builder through one external provider 503, waits for confirmed owned
+process cleanup, then kills the actual app owner before a canonical artifact
+exists. It reopens the same private state and encrypted source, advances only
+the maintenance deadline clock through the original endedAt+11d and +14d
+boundaries, and injects one failure before the real warning adapter's file fsync.
+The cut requires persisted warning retry and acceptance, one physical warning
+file, and governed encrypted-source deletion; Runtime operation time remains
+monotonic and real. Failed attempts preserve their private root and evidence.
+
+The explicit `accepted-before-store-crash` variant holds the real filesystem
+sink receipt before SQLite acceptance, verifies the admitted owner's source,
+claim and process inventory, then kills and reaps that app. A dedicated reopen
+polls idle at the persisted claim expiry minus one millisecond and replays at
+the exact expiry, requiring the same file name, bytes, hash, device and inode
+before continuing to the original source expiry. The default warning cut remains
+`before-file-fsync`.
+`e2e/warning-commit-cut.test.ts` separately executes a component subprocess
+crash/replay proof with synthetic recording/capability metadata and the real
+migrated store, warning worker and sink. That leaf proof is not application
+admission, Runtime authentication or R1 integration evidence.
+
+The explicit `acceptance-transaction-abort` variant installs a scoped test-only
+SQLite AFTER UPDATE trigger after the actual application's seed reaches its
+original warning boundary. The unmodified sink durably accepts the file, then
+the real store's acceptance statement aborts and the real worker persists a
+pending retry. The fault is explicitly cleared after verification; a dedicated
+application reopen polls idle at persisted retry minus one millisecond and
+accepts at that exact retry, retaining the same bytes/hash/device/inode before
+the original source expiry. This injects a SQLite statement/acceptance-transaction
+abort, not a low-level COMMIT or disk fsync failure. The worker catches its SQL
+exception; the prepared application evidence records the installed fault and
+persisted reschedule, while `e2e/warning-store-fault.test.ts` separately proves
+the exact exception and rollback with synthetic component seed metadata.
+
+This is unaccepted source preparation. A passing scoped cut does not establish
+the complete R1 matrix, common privacy/K4 evidence, other recovery/custody fault
+variants, publication, or real-device readiness. The host must permit localhost
+TCP listeners, shipped macOS filesystem admission and `/bin/ps` process
+inventory. Any of these restrictions can prevent reaching the first seed;
+reaping a known child alone does not prove complete descendant cleanup.
+
 ## Running the tests
 
 Node24 is the verified local environment. SDK-dependent test/typecheck/build/start

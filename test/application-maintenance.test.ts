@@ -337,14 +337,15 @@ test("R2: an incomplete revision publishes through the real builder/outbox, noti
 // 4. R3: warning file idempotency across at-least-once sink calls; exact expiry
 // ---------------------------------------------------------------------------
 
-test("R3: at-least-once warning sink calls across a crash leave one visible inbox file and the expiry instant never moves", async () => {
+test("R3: simulated lost warning commit and graceful reopen leave one visible inbox file and the expiry instant never moves", async () => {
   const r = roots();
   let wall = WARNING_AT_MS;
   let store = openSessionStore({ filename: r.filename, nowMs: ENDED_AT_MS });
   const seeded = seedKnownEnded(store, r, () => wall, false);
   const real = createFilesystemOperatorWarningSink({ outboxDir: r.outboxDir });
   let accepts = 0;
-  // The sink durably accepts, then the process dies before the DB receipt commits.
+  // Simulate a lost receipt commit by throwing after durable sink acceptance;
+  // the worker reschedules, then this test gracefully closes and reopens SQLite.
   const crashingAfterAccept: OperatorWarningSink = { async accept(input) { const receipt = await real.accept(input); accepts += 1; if (accepts === 1) throw new Error("crash after sink acceptance"); return receipt; } };
   let owner = maintenance(store, r, () => wall, { options: { warningSink: crashingAfterAccept } });
   try {

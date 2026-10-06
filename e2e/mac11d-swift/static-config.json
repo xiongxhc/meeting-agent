@@ -1,0 +1,46 @@
+{
+  "schema": "feishu-bridge-config/v3",
+  "pid": 123,
+  "bundlePath": "/Applications/Synthetic.app",
+  "bundleIdentifier": "test.synthetic",
+  "bundleVersion": "1",
+  "locale": "en-US",
+  "evidenceRoot": "/private/tmp/PRIVATE-RUN/bridge-evidence",
+  "observationIntervalMs": 250,
+  "joinDeadlineMs": 1000,
+  "actionDeadlineMs": 1000,
+  "axCallTimeoutMs": 100,
+  "custody": {
+    "physicalClientId": "mac11d-slot",
+    "physicalGenerationId": "00000000000000000000000000000001",
+    "occurrenceId": "123456789@2026-10-01T00:00:00Z",
+    "bridgeSessionId": "mac11d-session"
+  },
+  "audio": {
+    "captureDisplayId": 123,
+    "outputDeviceUid": "mac11d.synthetic.output"
+  },
+  "selectors": {
+    "build": "1",
+    "locale": "en-US",
+    "measured": true,
+    "titles": {},
+    "identifiers": {
+      "appWindow": "mac11d.synthetic.appWindow",
+      "joinMeetingNumberField": "mac11d.synthetic.joinMeetingNumberField",
+      "joinButton": "mac11d.synthetic.joinButton",
+      "meetingWindow": "mac11d.synthetic.meetingWindow",
+      "meetingEndedNotice": "mac11d.synthetic.meetingEndedNotice",
+      "meetingNumberLabel": "mac11d.synthetic.meetingNumberLabel",
+      "leaveButton": "mac11d.synthetic.leaveButton",
+      "leaveConfirmButton": "mac11d.synthetic.leaveConfirmButton",
+      "chatToggle": "mac11d.synthetic.chatToggle",
+      "chatInput": "mac11d.synthetic.chatInput",
+      "chatSendButton": "mac11d.synthetic.chatSendButton",
+      "participantsPanel": "mac11d.synthetic.participantsPanel",
+      "participantRowPrefix": "mac11d.synthetic.participantRowPrefix",
+      "speakerGrid": "mac11d.synthetic.speakerGrid",
+      "speakerTilePrefix": "mac11d.synthetic.speakerTilePrefix"
+    }
+  }
+}

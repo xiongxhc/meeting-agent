@@ -13,11 +13,12 @@ import { Buffer } from "node:buffer";
 import { URL } from "node:url";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { TextDecoder } from "node:util";
 import { WebSocketServer } from "ws";
+import { createFeishuPeerControls } from "./feishu-peer-controls.mjs";
+export { ORGANIZER, RESERVE_ID } from "./feishu-peer-controls.mjs";
 
 export const SCOPE = { region: "feishu", tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef" };
-export const ORGANIZER = { openId: "ou_e2e_organizer", displayName: "Scripted Organizer" };
-export const RESERVE_ID = "reserve-e2e-1";
 
 /** One scheduled-meeting invite; `startSeconds` is chosen by the harness. */
 export function inviteEnvelope({ eventId, providerMeetingId, meetingNo, title, startSeconds, inviteSeconds, createTimeMs }) {
@@ -57,66 +58,127 @@ export function framePayload(buffer) {
   return null;
 }
 
-function json(response, body, status = 200) {
-  response.statusCode = status;
-  response.setHeader("content-type", "application/json");
-  response.end(JSON.stringify(body));
+// Narrow receive observation, not a general protobuf codec. Parse every extent
+// before exposing the legacy JSON projection; malformed bytes never reach the
+// old, deliberately unchanged framePayload decoder in a socket callback.
+function inspectReceivedFrame(buffer) {
+  const invalid = (reason = "e2e_frame_invalid") => ({ observation: { kind: "invalid", reason } });
+  try {
+    if (!(buffer instanceof Uint8Array) || buffer.byteLength > 65536) return invalid();
+    let at = 0;
+    const refuse = () => { throw new Error("e2e_frame_invalid"); };
+    const read = (end, maximum = Number.MAX_SAFE_INTEGER) => {
+      let value = 0;
+      for (let count = 0; count < 8; count++) {
+        if (at >= end) refuse();
+        const byte = buffer[at++];
+        value += (byte & 127) * 2 ** (7 * count);
+        if (!Number.isSafeInteger(value) || value > maximum) refuse();
+        if (!(byte & 128)) {
+          if (count && byte === 0) refuse();
+          return value;
+        }
+      }
+      refuse();
+    };
+    const tag = (end) => {
+      const value = read(end, 0xffffffff);
+      const index = Math.floor(value / 8), wire = value % 8;
+      if (!index || (wire !== 0 && wire !== 2)) refuse();
+      return { index, wire };
+    };
+    const extent = (end, maximum) => {
+      const length = read(end, maximum);
+      if (length > end - at) refuse();
+      const value = buffer.subarray(at, at + length);
+      at += length;
+      return value;
+    };
+    const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    const headers = new Map(), seen = new Set();
+    let method, payloadBytes, headerCount = 0;
+    while (at < buffer.length) {
+      const { index, wire } = tag(buffer.length);
+      if (index !== 5 && seen.has(index)) refuse();
+      seen.add(index);
+      if ((index <= 4 && wire !== 0) || (index >= 5 && index <= 9 && wire !== 2)) refuse();
+      if (wire === 0) {
+        const value = read(buffer.length, index === 4 ? 0xffffffff : Number.MAX_SAFE_INTEGER);
+        if (index === 4) method = value;
+      } else if (index === 5) {
+        if (++headerCount > 32) refuse();
+        const length = read(buffer.length, 65536);
+        if (length > buffer.length - at) refuse();
+        const end = at + length, parts = new Map();
+        while (at < end) {
+          const part = tag(end);
+          if (part.wire !== 2 || (part.index !== 1 && part.index !== 2) || parts.has(part.index)) refuse();
+          parts.set(part.index, utf8.decode(extent(end, part.index === 1 ? 64 : 256)));
+        }
+        const key = parts.get(1), value = parts.get(2);
+        if (!key || value === undefined || headers.has(key)) refuse();
+        headers.set(key, value);
+      } else {
+        const value = extent(buffer.length, index === 8 ? 8192 : 65536);
+        if (index === 8) payloadBytes = value;
+        else if (index === 6 || index === 7 || index === 9) utf8.decode(value);
+      }
+    }
+    const payload = payloadBytes?.length ? JSON.parse(utf8.decode(payloadBytes)) : null;
+    // The pinned SDK's periodic method0/type=ping has no event payload/ID.
+    if (method === 0 && headers.get("type") === "ping" && !payloadBytes?.length) {
+      return { observation: { kind: "ping" }, legacyPayload: payload };
+    }
+    const messageId = headers.get("message_id");
+    if (method !== 1 || headers.get("type") !== "event" || !messageId) {
+      return { ...invalid("e2e_frame_identity"), legacyPayload: payload };
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)
+      || !Number.isInteger(payload.code) || (payload.code !== 200 && payload.code !== 500)) {
+      return { ...invalid("e2e_frame_reply"), legacyPayload: payload };
+    }
+    return { observation: { kind: "ack", messageId, payload }, legacyPayload: payload };
+  } catch {
+    // Never expose decoding/JSON/UTF-8 error text or malformed input.
+    return invalid();
+  }
+}
+
+/** Exact received reply facts only; pending-envelope correlation is the driver's job. */
+export function observeFeishuFrame(buffer) {
+  return inspectReceivedFrame(buffer).observation;
+}
+
+/** The actual socket receive callback, also usable without listeners in tests. */
+export function createFeishuFrameReceiver() {
+  const acknowledgements = [], observations = [];
+  let ordinal = 0, invalid = false, overflow = false;
+  return {
+    acknowledgements, observations,
+    get invalid() { return invalid; },
+    get overflow() { return overflow; },
+    receive(buffer) {
+      const received = inspectReceivedFrame(buffer);
+      const observation = received.observation;
+      ordinal++;
+      if (received.legacyPayload) acknowledgements.push(received.legacyPayload);
+      if (observation.kind === "ping") return;
+      if (observation.kind === "invalid") invalid = true;
+      if (observations.length === 64) { overflow = true; return; }
+      observations.push({ ordinal, ...observation });
+    },
+  };
 }
 
 /**
  * @param meeting the occurrence the reservation must agree with, so the
  *   shipped resolver's own occurrence/meeting-number checks are exercised.
  */
-export async function startFeishuPeer({ meeting }) {
-  /** Redacted request trace: method, matched route and status only. */
-  const requests = [];
-  const messages = [];
+export async function startFeishuPeer(options) {
   let wsPath = null;
-
-  const server = createServer((request, response) => {
-    const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
-    request.on("end", () => {
-      const url = new URL(request.url ?? "/", "http://peer.invalid");
-      const route = (name, status = 200) => { requests.push({ method: request.method, route: name, status }); };
-      const path = url.pathname;
-      if (path.endsWith("/auth/v3/tenant_access_token/internal") || path.endsWith("/auth/v3/app_access_token/internal")) {
-        route("tenant_access_token");
-        json(response, { code: 0, msg: "ok", tenant_access_token: "e2e-scripted-token", app_access_token: "e2e-scripted-token", expire: 7200 });
-        return;
-      }
-      if (path.endsWith("/callback/ws/endpoint")) {
-        route("ws_endpoint");
-        json(response, { code: 0, data: { URL: `${wsPath}?device_id=e2e&service_id=1`, ClientConfig: { PingInterval: 120, ReconnectCount: 1, ReconnectInterval: 0, ReconnectNonce: 0 } } });
-        return;
-      }
-      if (path.endsWith(`/vc/v1/reserves/${RESERVE_ID}/get_active_meeting`)) {
-        route("reserve_active_meeting");
-        json(response, { code: 0, msg: "ok", data: { meeting: { id: meeting.providerMeetingId, meeting_no: meeting.meetingNo, start_time: String(meeting.startSeconds), topic: meeting.title } } });
-        return;
-      }
-      if (path.endsWith(`/vc/v1/reserves/${RESERVE_ID}`)) {
-        route("reserve_get");
-        json(response, { code: 0, msg: "ok", data: { reserve: { id: RESERVE_ID, meeting_no: meeting.meetingNo, reserve_user_id: ORGANIZER.openId } } });
-        return;
-      }
-      if (path.includes("/contact/v3/users/")) {
-        route("contact_user_get");
-        json(response, { code: 0, msg: "ok", data: { user: { open_id: ORGANIZER.openId, name: ORGANIZER.displayName } } });
-        return;
-      }
-      if (path.endsWith("/im/v1/messages")) {
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-        messages.push({ receiveId: body.receive_id, uuid: body.uuid, text: JSON.parse(body.content ?? "{}").text,
-          textBytes: typeof body.content === "string" ? body.content.length : 0, at: Date.now() });
-        route("im_message");
-        json(response, { code: 0, msg: "ok", data: { message_id: `om_e2e_${messages.length}` } });
-        return;
-      }
-      route("unmatched", 404);
-      json(response, { code: 99, msg: "not scripted" }, 404);
-    });
-  });
+  const controls = createFeishuPeerControls({ ...options, wsPath: () => wsPath });
+  const { requests, messages } = controls;
+  const server = createServer(controls.handler);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
@@ -125,18 +187,18 @@ export async function startFeishuPeer({ meeting }) {
 
   const sockets = new Set();
   const websocket = new WebSocketServer({ server, perMessageDeflate: false, maxPayload: 65536 });
-  const acknowledgements = [];
+  const frameObservation = createFeishuFrameReceiver();
+  const { acknowledgements } = frameObservation;
   websocket.on("connection", (socket) => {
     sockets.add(socket);
-    socket.on("message", (bytes) => {
-      const payload = framePayload(Buffer.from(bytes));
-      if (payload) acknowledgements.push(payload);
-    });
+    socket.on("message", frameObservation.receive);
     socket.on("close", () => sockets.delete(socket));
   });
 
   return {
-    origin, requests, messages, acknowledgements,
+    origin, requests, messages, acknowledgements, frameObservation,
+    armNext: controls.armNext, release: controls.release,
+    readPendingHold: controls.readPendingHold,
     get connectionCount() { return sockets.size; },
     /** The SDK HttpInstance request hook: same shape, local origin. */
     rewriteRequest(defaultRequest) {
@@ -150,6 +212,7 @@ export async function startFeishuPeer({ meeting }) {
       for (const socket of sockets) socket.send(eventFrame(raw, messageId));
     },
     async close() {
+      controls.close();
       for (const socket of sockets) socket.terminate();
       await new Promise((resolve) => websocket.close(() => resolve()));
       server.closeAllConnections();

@@ -11,13 +11,16 @@
 //   `<control>/state.json` -- written here: what the child actually observed.
 // It never fabricates a transcript, a speaker or a UI identity.
 
-import { clearInterval, setInterval, setTimeout } from "node:timers";
-import { mkdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
+import { closeSync, mkdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
 
-import { connectMediaClient } from "../media-client.mjs";
+import { connectMediaClient, parseMediaTiming } from "../media-client.mjs";
+import { createCaptureLifecycle } from "./scripted-capture-lifecycle.mjs";
+import { createPhysicalOutcomeEmitter, parsePhysicalOutcomeScenario, readPhysicalOutcomeClose } from "./bridge-scenarios.mjs";
+import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge-observations.mjs";
 
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -26,75 +29,150 @@ for (const leaked of ["RUNTIME_SECRET", "FEISHU_APP_SECRET", "E2E_RUNTIME_RECORD
   if (process.env[leaked] !== undefined) process.exit(7);
 }
 
+const mediaTiming = parseMediaTiming(config.mediaTiming);
+if (mediaTiming === "invalid2ns" && config.captureFrameLimit !== 51) throw new Error("invalid media timing frame limit");
 const control = config.controlDir;
-mkdirSync(control, { recursive: true, mode: 0o700 });
 const binding = config.custody;
+const physicalOutcomeScenario = parsePhysicalOutcomeScenario(config.physicalOutcomeScenario);
 const sessionId = binding.bridgeSessionId;
 const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
+  mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, left: null, commands: [], playback: [], flushes: [], disclosure: null,
+  mediaClosedReason: null, left: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], disclosure: null,
+  capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [],
 };
 const FRAME_MS = 20;
 const CLOCK_PAIR_EVERY = 50; // one second at 20 ms frames
 
-let sequence = 0;
-function emit(payload) {
-  sequence += 1;
-  writeSync(1, `${JSON.stringify({ schema: "bridge-session/v2", sessionId, sequence, observedAt: new Date().toISOString(), ...payload })}\n`);
+const emit = createBridgeEventEmitter({ sessionId, write: bytes => writeSync(1, bytes) });
+// Built staging includes dist/e2e, never src. An enabled plan must use the
+// shipped codec and pass complete admission before control/state/timer effects.
+let observations = null;
+if (config.observationPlan !== undefined) {
+  try {
+    const { parseEventV2 } = await import("../../dist/src/contracts/bridge-session-v2.js");
+    observations = createBridgeObservationOwner({ plan: config.observationPlan, binding,
+      participants: config.participants, parseEvent: parseEventV2, emit,
+      onState: summary => { state.observationPlan = summary; persist(); } });
+  } catch { throw new Error("invalid_bridge_observation_plan"); }
 }
+mkdirSync(control, { recursive: true, mode: 0o700 });
 function result(command, outcome, detail) {
   emit({ type: "command_result", commandId: command.commandId, outcome, detail });
 }
 function persist() {
   writeFileSync(path.join(control, "state.json"), JSON.stringify(state));
 }
+let physicalOutcomeTimer = null;
+const physicalOutcome = createPhysicalOutcomeEmitter({ binding, scenario: physicalOutcomeScenario,
+  write: bytes => writeSync(3, bytes), close: () => closeSync(3),
+  onState: observation => {
+    if (observation.phase !== "held" && physicalOutcomeTimer !== null) {
+      clearInterval(physicalOutcomeTimer); physicalOutcomeTimer = null;
+    }
+    state.physicalOutcomeScenario = observation;
+    persist();
+    if (observation.phase !== "held") return;
+    physicalOutcomeTimer = setInterval(() => {
+      try {
+        const command = readPhysicalOutcomeClose(path.join(control, "physical-outcome-close.json"));
+        if (command !== null) physicalOutcome.closeWith(command);
+      } catch {
+        observations?.dispose();
+        physicalOutcome.dispose();
+        state.physicalOutcomeScenario = { mode: physicalOutcomeScenario.mode, phase: "failed", cause: "control_failure" };
+        persist();
+        process.exitCode = 11;
+      }
+    }, 25);
+  },
+});
 const timing = () => {
   const before = process.hrtime.bigint();
-  return { clockDomainId: "e2e-clock", hostBeforeNs: before.toString(), hostAfterNs: (before + 1000n).toString() };
+  return { clockDomainId: "e2e-clock", hostBeforeNs: before.toString(), hostAfterNs: process.hrtime.bigint().toString() };
 };
 
 let media = null;
-let capture = null;
-let snapshotSequence = 0;
+let capture = null, connectionWork = Promise.resolve();
+const connectionAbort = new globalThis.AbortController();
+let captureRunning = true, captureTimer = null, wakeCapture = null;
+let snapshotSequence = 0, endTimer = null;
 
 async function streamSilence() {
-  let pair = 1;
   const limit = config.captureFrameLimit ?? Number.POSITIVE_INFINITY;
   for (;;) {
-    if (media === null || state.framesSent >= limit) return;
+    if (!captureRunning || media === null || state.framesSent >= limit) return;
     try {
       let voiced = false;
       try { readFileSync(path.join(control, "barge")); voiced = true; } catch { /* silent baseline */ }
       const number = await media.sendSilentFrame(480, 24_000, voiced);
       state.framesSent = number;
-      if (number % CLOCK_PAIR_EVERY === 0) { pair += 1; await media.sendClockPair({ sequence: pair }); }
+      state.capturePosition = media.capturePosition;
+      if (captureRunning && number % CLOCK_PAIR_EVERY === 0) await media.sendClockPair();
     } catch (error) {
       state.mediaClosedReason = String(error?.message ?? error);
       persist();
       return;
     }
     persist();
-    await new Promise((resolve) => setTimeout(resolve, FRAME_MS));
+    if (!captureRunning) return;
+    await new Promise((resolve) => {
+      wakeCapture = resolve;
+      captureTimer = setTimeout(() => { captureTimer = null; wakeCapture = null; resolve(); }, FRAME_MS);
+    });
   }
 }
+
+const renderRequestsSeen = new Set();
+const renderTimer = setInterval(() => {
+  let requests;
+  try { requests = JSON.parse(readFileSync(path.join(control, "render-callbacks.json"), "utf8")); } catch { return; }
+  for (const request of requests) {
+    if (media === null || renderRequestsSeen.has(request.id)) continue;
+    renderRequestsSeen.add(request.id);
+    void media.releaseRendered(request.sequence, request.generation).then((detail) => {
+      state.renderReleases.push({ requestId: request.id, ...detail }); persist();
+    }, (error) => { state.mediaClosedReason = String(error?.message ?? error); persist(); });
+  }
+}, 25);
+renderTimer.unref?.();
+
+const captureLifecycle = createCaptureLifecycle({
+  getMedia: () => media, getCaptureWork: () => capture ?? Promise.resolve(),
+  getConnectionWork: () => connectionWork,
+  abortConnection: () => { if (media === null) connectionAbort.abort(); },
+  participants: observations === null ? config.participants ?? [] : [], emit,
+  fenceCapture: () => {
+    observations?.dispose();
+    captureRunning = false;
+    clearInterval(renderTimer);
+    if (endTimer !== null) clearInterval(endTimer);
+    endTimer = null;
+    if (captureTimer !== null) clearTimeout(captureTimer);
+    captureTimer = null; wakeCapture?.(); wakeCapture = null;
+  },
+  onOutcome: ({ captureDrain, captureFinish }) => {
+    state.captureDrain = captureDrain; state.captureFinish = captureFinish;
+    state.mediaClosedReason = media?.closedReason ?? state.mediaClosedReason; persist();
+  },
+});
 
 /** The harness's scripted meeting end; never inferred from the media socket. */
 function watchForEnd() {
   const endPath = path.join(control, "end");
-  const timer = setInterval(() => {
+  endTimer = setInterval(() => {
     let reason;
     try { reason = readFileSync(endPath, "utf8").trim(); } catch { return; }
     if (!["ended", "removed", "bridge_failure"].includes(reason)) return;
-    clearInterval(timer);
-    state.left = reason;
-    for (const participant of config.participants ?? []) {
-      emit({ type: "participant_left", feishuUserId: participant.feishuUserId, observationTiming: timing(), observationTimingReason: null });
-    }
-    persist();
-    emit({ type: "left", reason, observationTiming: timing(), observationTimingReason: null });
+    clearInterval(endTimer); endTimer = null;
+    const before = process.hrtime.bigint(), observedAt = new Date().toISOString(), after = process.hrtime.bigint();
+    const observation = { reason, observedAt, observationTiming: { clockDomainId: "e2e-clock",
+      hostBeforeNs: before.toString(), hostAfterNs: after.toString() }, observationTimingReason: null };
+    state.left = reason; state.endObservation = observation; persist();
+    void captureLifecycle.observeEnd(observation).catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(11); });
   }, 25);
-  timer.unref?.();
+  endTimer.unref?.();
 }
 
 const lines = createInterface({ input: process.stdin });
@@ -102,33 +180,45 @@ lines.on("line", (line) => {
   void (async () => {
     const command = JSON.parse(line);
     state.commands.push(command.type);
-    if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) process.exit(9);
+    if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
     if (command.type === "join") {
+      const joinTiming = timing();
+      observations?.prepareJoin(joinTiming);
       state.joined = true;
-      emit({ type: "joined", meetingOccurrenceId: command.meetingOccurrenceId, observationTiming: timing(), observationTimingReason: null });
-      snapshotSequence += 1;
-      emit({ type: "ui_snapshot", snapshotSequence, observationTiming: timing(), state: "unknown",
-        feishuUserId: null, reason: "no_highlight", barrierBefore: "stream_start" });
-      for (const participant of config.participants ?? []) {
-        emit({ type: "participant_joined", feishuUserId: participant.feishuUserId, displayName: participant.displayName,
-          observationTiming: timing(), observationTimingReason: null });
+      emit({ type: "joined", meetingOccurrenceId: command.meetingOccurrenceId, observationTiming: joinTiming, observationTimingReason: null });
+      if (observations === null) {
+        snapshotSequence += 1;
+        emit({ type: "ui_snapshot", snapshotSequence, observationTiming: timing(), state: "unknown",
+          feishuUserId: null, reason: "no_highlight", barrierBefore: "stream_start" });
+        for (const participant of config.participants ?? []) {
+          emit({ type: "participant_joined", feishuUserId: participant.feishuUserId, displayName: participant.displayName,
+            observationTiming: timing(), observationTimingReason: null });
+        }
       }
       result(command, "ok", null);
       persist();
       watchForEnd();
+      if (observations !== null) void observations.start().catch(() => { observations.dispose(); physicalOutcome.dispose(); process.exit(10); });
       return;
     }
     if (command.type === "connect_media") {
       const lease = command.mediaLease;
       state.mediaEndpoint = lease.connectEndpoint;
       try {
-        media = await connectMediaClient({
-          endpoint: lease.connectEndpoint, credential: lease.credential,
+        if (captureLifecycle.stopping || lease.mediaProtocolVersion !== 3 || lease.timingContract !== "capture-clock/v1" ||
+          lease.captureFormat !== "pcm_s16le/24000/1/20ms" || lease.bridgeSessionId !== sessionId) throw new Error("drainable timed media lease required");
+        connectionWork = connectMediaClient({
+          mediaTiming, endpoint: lease.connectEndpoint, credential: lease.credential,
           sessionId: BigInt(lease.sessionId), bridgeSessionId: lease.bridgeSessionId,
+          authTimeoutMs: Math.min(20000, Number(BigInt(lease.expiresAtMs) - BigInt(Date.now()))), signal: connectionAbort.signal,
           holdPlayback: () => { try { readFileSync(path.join(control, "hold-playback")); return true; } catch { return false; } },
           onPlayback: (detail) => { state.playback.push(detail); persist(); },
           onFlush: (detail) => { state.flushes.push(detail); persist(); },
+          onRenderCallback: (detail) => { state.renderCallbacks.push(detail); persist(); },
         });
+        const connected = await connectionWork;
+        if (captureLifecycle.stopping) throw new Error("capture admission closed");
+        media = connected;
         await media.sendEpoch();
         await media.sendClockPair();
       } catch (error) {
@@ -145,28 +235,30 @@ lines.on("line", (line) => {
       return;
     }
     if (command.type === "post_disclosure") {
-      state.disclosure = "failed";
-      emit({ type: "chat_disclosure", outcome: "failed" });
-      result(command, "failed", "synthetic disclosure failure");
+      if (observations === null) {
+        state.disclosure = "failed";
+        emit({ type: "chat_disclosure", outcome: "failed" });
+        result(command, "failed", "synthetic disclosure failure");
+      } else state.disclosure = observations.postDisclosure(command.commandId);
       persist();
       return;
     }
     result(command, "rejected", "unsupported by the scripted client");
     persist();
-  })().catch(() => process.exit(10));
+  })().catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(10); });
 });
 
 lines.on("close", () => {
+  observations?.dispose();
   void (async () => {
-    const socket = media;
-    media = null;
-    await capture?.catch(() => undefined);
-    await socket?.close().catch(() => undefined);
-    persist();
-    const outcome = state.left !== null
-      ? { outcome: "departure_confirmed", reason: "departure_observed" }
-      : state.joined ? { outcome: "departure_unconfirmed", reason: "departure_not_observed" }
-        : { outcome: "no_join_action", reason: "join_not_issued" };
-    writeSync(3, `${JSON.stringify({ schema: "bridge-process-outcome/v1", ...binding, ...outcome, observedAt: new Date().toISOString() })}\n`);
-  })().catch(() => process.exit(11));
+    try {
+      await captureLifecycle.stop();
+      persist();
+      const completion = await physicalOutcome.finish({ joined: state.joined, left: state.left });
+      if (completion.exitCode !== 0) process.exitCode = completion.exitCode;
+    } finally {
+      if (physicalOutcomeTimer !== null) clearInterval(physicalOutcomeTimer);
+      physicalOutcomeTimer = null;
+    }
+  })().catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(11); });
 });

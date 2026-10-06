@@ -8,12 +8,13 @@
 
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { RUNTIME_PIN, TEAMMEM_SOURCE } from "./pins.mjs";
+import { EXPIRY_EVIDENCE_PROFILE, RUNTIME_PIN, TEAMMEM_SOURCE, resolveRuntimeProfile, sha256FileSync, validateExpiryEvidencePackage } from "./pins.mjs";
+import { parseMediaTiming } from "./media-client.mjs";
 
 export const NODE24 = "/opt/homebrew/opt/node@24/bin/node";
 export const PYTHON = "/opt/homebrew/bin/python3";
@@ -65,7 +66,20 @@ function stageBuiltApplication(repository, appDir) {
   return copies;
 }
 
-export function stage({ repository, interactive = false }) {
+export function mediaTimingConfiguration({ mediaTiming, interactive = false, r2Baseline = false, d2Cut, onlyRefusals = false, packageRefusals = false }) {
+  if (mediaTiming === undefined) return {};
+  if (parseMediaTiming(mediaTiming) !== "invalid2ns" || interactive || r2Baseline || d2Cut || onlyRefusals || packageRefusals)
+    throw new Error("invalid media timing command mode");
+  return { mediaTiming: "invalid2ns", captureFrameLimit: CAPTURE_FRAME_LIMIT };
+}
+
+export function stage({ repository, interactive = false, r2Baseline = false, mediaTiming, runtimeProfile = RUNTIME_PIN }) {
+  const timingConfiguration = mediaTimingConfiguration({ mediaTiming, interactive, r2Baseline });
+  runtimeProfile = resolveRuntimeProfile(runtimeProfile);
+  const expiryEvidence = runtimeProfile === EXPIRY_EVIDENCE_PROFILE;
+  if (expiryEvidence && (interactive || r2Baseline)) throw new Error("expiry evidence profile incompatible with interactive or R2 staging");
+  // Validate the actual reviewed package before mkdtemp or any private copy.
+  const expectedProvenance = expiryEvidence ? validateExpiryEvidencePackage() : undefined;
   const root = realpathSync(mkdtempSync(path.join(realpathSync(tmpdir()), "meeting-e2e-")));
   chmodSync(root, 0o700);
 
@@ -81,17 +95,43 @@ export function stage({ repository, interactive = false }) {
 
   // --- Runtime: pinned artefacts and the private launcher -------------------
   const gatewayPath = path.join(directories.runtimeRoot, "conversation-runtime-gateway");
-  const sdkTarball = path.join(directories.runtimeRoot, path.basename(RUNTIME_PIN.sdkTarball.path));
-  for (const [source, destination] of [[RUNTIME_PIN.gateway.path, gatewayPath], [RUNTIME_PIN.sdkTarball.path, sdkTarball]]) {
+  const sdkTarball = path.join(directories.runtimeRoot, path.basename(runtimeProfile.sdkTarball.path));
+  for (const [source, destination] of [[runtimeProfile.gateway.path, gatewayPath], [runtimeProfile.sdkTarball.path, sdkTarball]]) {
     const copied = run("/bin/cp", ["-c", source, destination]);
     if (copied.exit !== 0 && run("/bin/cp", [source, destination]).exit !== 0) throw new Error(`staging ${source} failed`);
   }
   chmodSync(gatewayPath, 0o700);
   const scriptedGatewayPath = path.join(directories.runtimeRoot, "conversation-runtime-gateway-scripted");
-  if (interactive) {
-    const copied = run("/bin/cp", [RUNTIME_PIN.scriptedGateway.path, scriptedGatewayPath]);
+  if (interactive || r2Baseline) {
+    const copied = run("/bin/cp", [runtimeProfile.scriptedGateway.path, scriptedGatewayPath]);
     if (copied.exit !== 0) throw new Error("staging scripted gateway failed");
     chmodSync(scriptedGatewayPath, 0o700);
+  }
+
+  let expiryEvidenceDescriptorPath, expiryEvidenceDescriptor;
+  if (expiryEvidence) {
+    if (sha256FileSync(gatewayPath) !== runtimeProfile.gateway.sha256 || sha256FileSync(sdkTarball) !== runtimeProfile.sdkTarball.sha256) throw new Error("staged expiry evidence artifact mismatch");
+    chmodSync(sdkTarball, 0o600);
+    const packagePaths = {};
+    for (const [key, source] of Object.entries(runtimeProfile.packagePaths)) {
+      const destination = path.join(directories.runtimeRoot, path.basename(source));
+      copyFileSync(source, destination); chmodSync(destination, 0o600);
+      if (sha256FileSync(destination) !== expectedProvenance[`${key}Sha256`]) throw new Error("staged expiry evidence package mismatch");
+      packagePaths[key] = destination;
+    }
+    expiryEvidenceDescriptor = {
+      schema: "meeting-expiry-collector/v1", privateRoot: directories.runtimeRoot,
+      journalPath: path.join(directories.runtimeRoot, "media-admission-evidence.ndjson"),
+      receiptPath: path.join(directories.runtimeRoot, "media-admission-ownership.json"),
+      gatewayPath, sdkPath: sdkTarball, packagePaths, expectedProvenance,
+    };
+    expiryEvidenceDescriptorPath = path.join(directories.runtimeRoot, "expiry-evidence-descriptor.json");
+    writeFileSync(expiryEvidenceDescriptorPath, JSON.stringify(expiryEvidenceDescriptor), { mode: 0o600, flag: "wx" });
+    writeFileSync(path.join(directories.runtimeRoot, "expiry-evidence-provenance.json"), JSON.stringify({
+      schema: "meeting-expiry-profile/v1", provenance: expectedProvenance,
+      scope: "build-only instrumented TEST candidate; no accepted default promotion",
+      fullRustWorkspace: "failed output; captured process exit and cleanup unknown; required erratum bound",
+    }), { mode: 0o600, flag: "wx" });
   }
 
   const keyPath = path.join(directories.runtimeKeyDir, "recording.key");
@@ -100,22 +140,14 @@ export function stage({ repository, interactive = false }) {
   const launcherLog = path.join(directories.runtimeRoot, "launcher.stderr.log");
   // The key is generated on first launch into a 0700 directory as a 0600 file
   // and exported to the gateway child only; the Meeting parent never sees it.
-  writeFileSync(launcherPath, `#!/bin/sh
-exec 2>>${quote(launcherLog)}
-if [ ! -f ${quote(keyPath)} ]; then
-  umask 077
-  /usr/bin/openssl rand -hex 32 > ${quote(keyPath)} || exit 2
-fi
-IFS= read -r ${RECORDING_KEY_ENV} < ${quote(keyPath)} || exit 2
-[ -n "$${RECORDING_KEY_ENV}" ] || exit 2
-export ${RECORDING_KEY_ENV}
-${PROVIDER_CREDENTIAL_ENV}=${quote(PROVIDER_CREDENTIAL)}
-export ${PROVIDER_CREDENTIAL_ENV}
-printf '%s\\n' "$$" >> ${quote(path.join(directories.runtimeRoot, "gateway-pids.txt"))}
-${interactive ? `if [ "$#" -gt 0 ] && /usr/bin/grep -q '^\\[scripted_providers\\]' ${quote(gatewayConfigPath)}; then
-  exec /usr/bin/env -u ${RECORDING_KEY_ENV} -u ${PROVIDER_CREDENTIAL_ENV} ${quote(NODE24)} ${quote(path.join(directories.app, "e2e/gateway-observer.mjs"))} ${quote(scriptedGatewayPath)} ${quote(keyPath)} ${quote(path.join(directories.control, "runtime-events.ndjson"))} ${quote(path.join(directories.runtimeRoot, "gateway-pids.txt"))} "$@"
-fi\n` : ""}exec ${quote(gatewayPath)} "$@"
-`, { mode: 0o700 });
+  writeFileSync(launcherPath, renderRuntimeLauncher({
+    launcherLog, keyPath, gatewayPath, gatewayConfigPath, scriptedGatewayPath,
+    observerPath: path.join(directories.app, "e2e/gateway-observer.mjs"),
+    eventsPath: path.join(directories.control, "runtime-events.ndjson"),
+    pidsPath: path.join(directories.runtimeRoot, "gateway-pids.txt"),
+    scripted: interactive || r2Baseline, expiryEvidenceDescriptorPath,
+    journalPath: expiryEvidenceDescriptor?.journalPath, receiptPath: expiryEvidenceDescriptor?.receiptPath,
+  }), { mode: 0o700 });
 
   // --- Feishu secret reference and the scripted client's static config ------
   const appSecretFile = path.join(directories.configDir, "app-secret");
@@ -124,6 +156,7 @@ fi\n` : ""}exec ${quote(gatewayPath)} "$@"
   writeFileSync(bridgeStaticConfigPath, JSON.stringify({
     schema: "feishu-bridge-config/v1", bundleVersion: "e2e-scripted",
     controlDir: directories.control,
+    ...timingConfiguration,
     // Fifty-one 20 ms frames: more than twice the roughly twenty frames that
     // was the old ceiling, and the exact length D032 §1 was measured at. Its
     // two alignment pages re-encode to 46575 and 37801 private bytes, both
@@ -189,6 +222,7 @@ exec /usr/bin/git "$@"
 
   return {
     root, directories, copies, vaultRevision,
+    runtimeProfile, expiryEvidenceDescriptorPath, expiryEvidenceDescriptor,
     gatewayPath, scriptedGatewayPath, sdkTarball, launcherPath, gatewayConfigPath, launcherLog, keyPath,
     appSecretFile, bridgeStaticConfigPath, standaloneConfigPath, standaloneConfig,
     entryPath: path.join(directories.app, "e2e/entry.mjs"),
@@ -196,4 +230,37 @@ exec /usr/bin/git "$@"
     gatewayPidsPath: path.join(directories.runtimeRoot, "gateway-pids.txt"),
     teammemSource: TEAMMEM_SOURCE,
   };
+}
+
+/** Actual private-launcher template. Component tests may substitute explicitly
+ * synthetic executables; no substitute becomes a registered Runtime profile. */
+export function renderRuntimeLauncher({ launcherLog, keyPath, gatewayPath, gatewayConfigPath, scriptedGatewayPath,
+  observerPath, eventsPath, pidsPath, scripted = false, expiryEvidenceDescriptorPath, journalPath, receiptPath }) {
+  return `#!/bin/sh
+exec 2>>${quote(launcherLog)}
+${expiryEvidenceDescriptorPath ? `unset RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH
+if [ "$#" -eq 0 ]; then
+  exec ${quote(gatewayPath)}
+fi
+umask 077
+/bin/mkdir ${quote(path.join(path.dirname(expiryEvidenceDescriptorPath), "expiry-evidence-launch.claim"))} || exit 70
+` : ""}
+if [ ! -f ${quote(keyPath)} ]; then
+  umask 077
+  /usr/bin/openssl rand -hex 32 > ${quote(keyPath)} || exit 2
+fi
+IFS= read -r ${RECORDING_KEY_ENV} < ${quote(keyPath)} || exit 2
+[ -n "$${RECORDING_KEY_ENV}" ] || exit 2
+export ${RECORDING_KEY_ENV}
+${PROVIDER_CREDENTIAL_ENV}=${quote(PROVIDER_CREDENTIAL)}
+export ${PROVIDER_CREDENTIAL_ENV}
+printf '%s\\n' "$$" >> ${quote(pidsPath)}
+${expiryEvidenceDescriptorPath ? `if [ -e ${quote(journalPath)} ] || [ -L ${quote(journalPath)} ] || [ -e ${quote(receiptPath)} ] || [ -L ${quote(receiptPath)} ]; then
+  exit 70
+fi
+exec /usr/bin/env -u ${RECORDING_KEY_ENV} -u ${PROVIDER_CREDENTIAL_ENV} -u RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH ${quote(NODE24)} ${quote(observerPath)} --expiry-evidence-descriptor ${quote(expiryEvidenceDescriptorPath)} -- ${quote(gatewayPath)} ${quote(keyPath)} ${quote(eventsPath)} ${quote(pidsPath)} "$@"
+` : ""}${scripted ? `if [ "$#" -gt 0 ] && /usr/bin/grep -q '^\\[scripted_providers\\]' ${quote(gatewayConfigPath)}; then
+  exec /usr/bin/env -u ${RECORDING_KEY_ENV} -u ${PROVIDER_CREDENTIAL_ENV} ${quote(NODE24)} ${quote(observerPath)} ${quote(scriptedGatewayPath)} ${quote(keyPath)} ${quote(eventsPath)} ${quote(pidsPath)} "$@"
+fi\n` : ""}exec ${quote(gatewayPath)} "$@"
+`;
 }

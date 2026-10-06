@@ -4,23 +4,42 @@ import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { appendFileSync, readFileSync } from "node:fs";
 import process from "node:process";
-import { clearTimeout, setTimeout } from "node:timers";
+import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
 import { FrameDecoder } from "@conversation/runtime";
+import { createExpiryEvidenceCollector } from "./expiry-evidence-collector.mjs";
 
-const [gateway, keyPath, eventsPath, pidsPath, ...args] = process.argv.slice(2);
-const child = spawn(gateway, args, { cwd: process.cwd(), stdio: ["pipe", "pipe", "inherit"], env: {
-  ...process.env, E2E_RUNTIME_RECORDING_KEY: readFileSync(keyPath, "utf8").trim(),
-  E2E_PROVIDER_CREDENTIAL: "e2e-synthetic-provider-credential-not-real",
-} });
+let argv = process.argv.slice(2), collector, child;
+try {
+  let descriptorPath;
+  if (argv[0] === "--expiry-evidence-descriptor") {
+    if (!argv[1] || argv[1].startsWith("--") || argv[2] !== "--") throw new Error();
+    descriptorPath = argv[1]; argv = argv.slice(3);
+  }
+  const [gateway, keyPath, , , ...args] = argv;
+  if (argv.length < 4 || argv.slice(0, 4).some(value => !value || value.startsWith("--"))) throw new Error();
+  if (descriptorPath) collector = createExpiryEvidenceCollector(descriptorPath, { gatewayPath: gateway });
+  const env = { ...process.env, E2E_RUNTIME_RECORDING_KEY: readFileSync(keyPath, "utf8").trim(), E2E_PROVIDER_CREDENTIAL: "e2e-synthetic-provider-credential-not-real" };
+  // Ambient journal activation cannot opt an ordinary observer into evidence.
+  delete env.RUNTIME_MEDIA_ADMISSION_EVIDENCE_PATH;
+  child = collector ? collector.spawn(args, { cwd: process.cwd(), env }) : spawn(gateway, args, { cwd: process.cwd(), stdio: ["pipe", "pipe", "inherit"], env });
+  if (collector) child.stderr.resume(); // Private failure path never echoes child diagnostics.
+} catch {
+  try { collector?.close(); } catch { /* static refusal below */ }
+  process.stderr.write("gateway_observer_failed\n"); process.exit(70);
+}
+const [, , eventsPath, pidsPath] = argv;
 const decoder = new FrameDecoder();
-let failed = false, reapTimer;
+let failed = false, reapTimer, evidenceTimer;
 function terminate(failure) {
-  if (failure && !failed) { failed = true; process.stderr.write("gateway_observer_failed\n"); }
+  if (failure && !failed) { failed = true; collector?.fail(); process.stderr.write("gateway_observer_failed\n"); }
   process.stdin.unpipe(child.stdin);
   child.stdin.end();
   child.kill("SIGTERM");
   reapTimer ??= setTimeout(() => child.kill("SIGKILL"), 2000);
 }
+// Sampling shares the owned child's lifespan, with no separate wait budget.
+// The controller's reader also holds its own no-follow FD for release scheduling.
+if (collector) evidenceTimer = setInterval(() => { try { collector.readTail(); } catch { terminate(true); } }, 10);
 // Forward the original bytes before observation. The tap never re-encodes them.
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
@@ -31,8 +50,8 @@ child.stdout.on("data", (chunk) => {
     const frame = JSON.parse(Buffer.from(bytes).toString("utf8"));
     const event = frame.type === "voice_event" ? frame.event : null;
     if (event !== null) {
-      const detail = { type: event.type, at: Date.now() };
-      for (const key of ["segment_id", "turn_id", "generation_id", "reason", "activity", "milestone", "state"]) {
+      const detail = { type: event.type, at: Date.now(), monotonicNs: process.hrtime.bigint().toString() };
+      for (const key of ["session_id", "segment_id", "turn_id", "generation_id", "reason", "activity", "milestone", "state"]) {
         if (event[key] !== undefined) detail[key] = event[key];
       }
       if (event.event) detail.event = { type: event.event.type, turn_id: event.event.turn_id };
@@ -47,8 +66,16 @@ process.stdout.on("error", () => terminate(true));
 for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => terminate(false));
 child.on("error", () => terminate(true));
 try { appendFileSync(pidsPath, `${child.pid}\n`); } catch { terminate(true); }
-child.on("close", (code) => {
+child.on("close", async (code) => {
   clearTimeout(reapTimer);
+  clearInterval(evidenceTimer);
   process.stdin.destroy();
+  if (collector) {
+    try {
+      await collector.whenClosed();
+      const result = collector.complete(); collector.close();
+      if (!result.ok && !failed) { failed = true; process.stderr.write(`gateway_observer_failed\n${result.code}\n`); }
+    } catch { if (!failed) { failed = true; process.stderr.write("gateway_observer_failed\n"); } }
+  }
   process.exitCode = failed ? 70 : code ?? 70;
 });
