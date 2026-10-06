@@ -10,6 +10,146 @@ import { setTimeout as delay } from "node:timers/promises";
 import { observeProcessSnapshot, processCleanupProof } from "./process-evidence.mjs";
 
 export function requireIngress(value, reason) { if (!value) throw new Error(`ingress_${reason}`); }
+export function ingressFailure(error, fallback) {
+  const descriptor = error && (typeof error === "object" || typeof error === "function") ? Object.getOwnPropertyDescriptor(error, "message") : null;
+  const message = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+  return typeof message === "string" && message.length <= 128 && /^ingress_[A-Za-z_]+$/.test(message) ? message : fallback;
+}
+/** Getter-free bounded data copy before controls, effects or serialization. */
+export function ingressData(value) {
+  let nodes = 0;
+  function visit(v, depth) {
+    requireIngress(++nodes <= 16384 && depth <= 16, "data_extent");
+    if (v === null || v === undefined || typeof v === "boolean") return v;
+    if (typeof v === "number") { requireIngress(Number.isFinite(v), "data_number"); return v; }
+    if (typeof v === "string") { requireIngress(Buffer.byteLength(v) <= 8192, "data_string"); return v; }
+    requireIngress(typeof v === "object", "data_type");
+    const array = Array.isArray(v), prototype = Object.getPrototypeOf(v);
+    requireIngress(array ? prototype === Array.prototype : prototype === Object.prototype || prototype === null, "data_prototype");
+    const descriptors = Object.getOwnPropertyDescriptors(v), keys = Reflect.ownKeys(descriptors);
+    requireIngress(keys.length <= 512 && keys.every(key => typeof key === "string" && key !== "toJSON" && key !== "__proto__" &&
+      Object.hasOwn(descriptors[key], "value")), "data_descriptor");
+    const out = array ? [] : {};
+    if (array) requireIngress(v.length <= 256 && keys.length === v.length + 1, "data_array");
+    for (const key of keys) {
+      if (array && key === "length") continue;
+      requireIngress(!array || /^(0|[1-9][0-9]*)$/.test(key), "data_array");
+      out[key] = visit(descriptors[key].value, depth + 1);
+    }
+    return out;
+  }
+  return visit(value, 0);
+}
+export function selectIngressSends(original, conflict) {
+  original = ingressData(original); requireIngress(original.length === 4 && new Set(original.map(s => s.wireMessageId)).size === 4, "fresh_wire_ids");
+  if (conflict === undefined) return original;
+  conflict = ingressData(conflict); const first = original[0];
+  requireIngress(conflict.eventId === first.eventId && conflict.occurrenceId === first.occurrenceId && conflict.title !== first.title &&
+    /^[a-f0-9]{64}$/.test(conflict.hash) && conflict.hash !== first.hash, "conflict_selection");
+  const selected = [original[0], { ...conflict, wireMessageId: "phase1-a-conflict" },
+    { ...original[0], wireMessageId: "phase1-a-replay" }, ...original.slice(1)];
+  requireIngress(new Set(selected.map(s => s.wireMessageId)).size === 6, "fresh_wire_ids");
+  return selected.map((send, index) => ({ ...send, expectedCode: index === 1 ? 500 : 200 }));
+}
+export function assertIngressSelection(plan) {
+  ingressData(plan);
+  requireIngress(plan.conflictingReplay === undefined || plan.conflictingReplay === false || plan.conflictingReplay === true, "conflict_selection");
+  if (plan.phase !== 1 || !plan.sends) return;
+  requireIngress(plan.sends.length === (plan.conflictingReplay ? 6 : 4) && new Set(plan.sends.map(s => s.wireMessageId)).size === plan.sends.length, "fresh_wire_ids");
+  requireIngress(plan.sends.every(s => typeof s.wireMessageId === "string" && /^[A-Za-z0-9-]{1,128}$/.test(s.wireMessageId)), "wire_id");
+  if (!plan.conflictingReplay) { requireIngress(plan.sends.every(s => s.expectedCode === undefined || s.expectedCode === 200), "conflict_selection"); return; }
+  const [first, conflict, replay] = plan.sends;
+  requireIngress(plan.sends.every((s, i) => s.expectedCode === (i === 1 ? 500 : 200)) && conflict.wireMessageId === "phase1-a-conflict" &&
+    replay.wireMessageId === "phase1-a-replay" && conflict.eventId === first.eventId && conflict.occurrenceId === first.occurrenceId &&
+    conflict.title !== first.title && /^[a-f0-9]{64}$/.test(conflict.hash) && conflict.hash !== first.hash &&
+    ["eventId", "hash", "title", "createTime", "inviteSeconds", "startSeconds", "occurrenceId"].every(k => replay[k] === first[k]), "conflict_selection");
+}
+function assertReply(send, delivery, code) {
+  const receiver = ingressData(delivery.receiver);
+  requireIngress(receiver && receiver.invalid === false && receiver.overflow === false && receiver.observations.length === 1, "ack_observation");
+  const reply = receiver.observations[0];
+  requireIngress(reply.kind === "ack" && reply.messageId === send.wireMessageId && reply.payload?.code === code &&
+    Number.isSafeInteger(reply.ordinal) && reply.ordinal > 0, "ack_identity_order");
+  return reply;
+}
+export function assertIngressConflict(send, delivery, before) {
+  ingressData(send); ingressData(delivery); ingressData(before);
+  requireIngress(send.expectedCode === 500 && before?.metadata.state === "metadata_blocked" &&
+    before.events.some(e => e.eventId === send.eventId && e.hash !== send.hash), "conflict_prerequisite");
+  assertReply(send, delivery, 500);
+  requireIngress(delivery.commit === undefined || delivery.commit === null, "rejection_commit");
+  requireIngress(JSON.stringify(delivery.state) === JSON.stringify(before), "conflict_mutation");
+}
+/** Retain decoded wire facts, never arbitrary SDK error bodies or headers. */
+export function ingressReceiverFact(receiver) {
+  receiver = ingressData(receiver);
+  requireIngress(receiver && typeof receiver.invalid === "boolean" && typeof receiver.overflow === "boolean" && Array.isArray(receiver.observations), "receiver_history");
+  return { invalid: receiver.invalid, overflow: receiver.overflow, observations: receiver.observations.map(row => {
+    requireIngress(Number.isSafeInteger(row.ordinal) && row.ordinal > 0 && row.kind === "ack" && typeof row.messageId === "string" &&
+      /^[A-Za-z0-9-]{1,128}$/.test(row.messageId) && (row.payload?.code === 200 || row.payload?.code === 500), "receiver_identity");
+    return { ordinal: row.ordinal, kind: "ack", messageId: row.messageId, payload: { code: row.payload.code } };
+  }) };
+}
+export function ingressFact(value) {
+  value = ingressData(value);
+  if (value?.receiver) value.receiver = ingressReceiverFact(value.receiver);
+  if (value?.activity?.receiver) value.activity.receiver = ingressReceiverFact(value.activity.receiver);
+  if (value?.ackObservations) value.ackObservations = ingressReceiverFact({ invalid: false, overflow: false, observations: value.ackObservations }).observations;
+  return value;
+}
+const ingressImmutableFields = ["occurrenceId", "region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt", "title", "acceptedAtMs"];
+function ingressCloseRecord(value, keys, nested = []) {
+  requireIngress(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key)), "close_fields");
+  for (const [key, field] of Object.entries(value)) if (!nested.includes(key)) {
+    requireIngress(field === null || field === undefined || ["string", "boolean", "number"].includes(typeof field), "close_fields");
+  }
+}
+function ingressCloseRows(rows, keys, nested = []) {
+  requireIngress(Array.isArray(rows), "close_fields");
+  for (const row of rows) ingressCloseRecord(row, keys, nested);
+}
+function ingressCloseState(state) {
+  ingressCloseRecord(state, ["fileIdentity", "immutable", "metadata", "events", "sessions", "counts", "custody", "generations"],
+    ["immutable", "metadata", "events", "sessions", "counts", "custody", "generations"]);
+  ingressCloseRecord(state.immutable, ingressImmutableFields);
+  ingressCloseRecord(state.metadata, ["state", "reason", "lastBlockedAtMs", "lastObservedAtMs", "claimed", "claimExpiresAtMs", "organizerId", "organizerSource",
+    "reference", "admittedAtMs", "totalAttempts", "generationAttempts", "generationStartedAtMs", "firstAttemptAtMs", "lastAttemptAtMs", "retryGeneration",
+    "operatorRetryCount", "lastOperator", "lastOperatorRetryAtMs", "nextAttemptAtMs"], ["reference"]);
+  if (state.metadata.reference !== null && state.metadata.reference !== undefined) ingressCloseRecord(state.metadata.reference,
+    ["kind", "reserveId", "calendarId", "eventId", "occurrenceId", "providerMeetingId", "occurrenceStartedAt", "vcOrganizerOpenId"]);
+  ingressCloseRows(state.events, ["eventId", "hash", "title", "createTime", "inviteSeconds", "startSeconds", "acceptedAtMs"]);
+  ingressCloseRows(state.sessions, ["occurrenceId", "providerMeetingId", "occurrenceStartedAt", "state", "terminalReason"]);
+  ingressCloseRecord(state.counts, ["custody", "recording", "seed", "delivery", "notification"]);
+  if (state.custody !== undefined) ingressCloseRows(state.custody, ["physicalClientId", "physicalGenerationId", "bridgeSessionId", "state", "failure", "recordedAtMs", "outcome", "reason"]);
+  if (state.generations !== undefined) ingressCloseRows(state.generations, ["bridgeSessionId", "controlSessionId"]);
+}
+export function ingressCloseFact(value) {
+  value = ingressData(value);
+  const keys = ["standaloneExit", "compositionClosed", "peerClosed", "lockClosedLast", "cleanupFailures", "finalState", "keyCustody",
+    "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver", "observerFailure", "overflow"];
+  ingressCloseRecord(value, keys, ["cleanupFailures", "finalState", "outcomes", "trace", "environmentKeys", "commitObservations", "ackObservations", "receiver"]);
+  for (const key of ["compositionClosed", "peerClosed", "lockClosedLast", "observerFailure", "overflow"]) {
+    requireIngress(value[key] === undefined || typeof value[key] === "boolean", "close_fields");
+  }
+  requireIngress(value.keyCustody === undefined || ["not_created", "private_runtime_file"].includes(value.keyCustody), "close_fields");
+  if (value.finalState !== undefined && value.finalState !== null) ingressCloseState(value.finalState);
+  ingressCloseRows(value.outcomes, ["occurrenceId", "bridgeId", "organizer", "phase", "controlSessionId", "failure", "finalization", "custody", "runtimeClose", "runtimeCleanup"], ["organizer"]);
+  for (const row of value.outcomes) {
+    const choices = { phase: ["starting", "live", "settled"], failure: [null, "runtime_startup_aborted", "runtime_startup_timeout", "runtime_startup_failed",
+      "application_closed", "physical_client_quarantined", "launch_failed", "join_failed", "media_format_rejected", "join_cancelled"],
+    finalization: ["none", "seeded", "recorded", "stop_failed", "finalize_failed", "transaction_failed"],
+    custody: ["not_applicable", "assigned", "existing", "refused", "unpersisted"], runtimeClose: ["pending", "closed", "failed"],
+    runtimeCleanup: [null, "graceful", "forced", "failed", "unconfirmed"] };
+    for (const [key, allowed] of Object.entries(choices)) requireIngress(row[key] === undefined || allowed.includes(row[key]), "close_fields");
+    if (row.organizer !== undefined && row.organizer !== null) ingressCloseRecord(row.organizer, ["feishuUserId", "displayName", "source"]);
+  }
+  ingressCloseRows(value.commitObservations, ["ordinal", "wireMessageId", "eventId", "expectedHash", "persistedHash", "immutable", "ackFloor"], ["immutable"]);
+  for (const row of value.commitObservations) if (row.immutable !== undefined) ingressCloseRecord(row.immutable, ingressImmutableFields);
+  for (const key of ["trace", "environmentKeys", "cleanupFailures"]) if (value[key] !== undefined) {
+    requireIngress(Array.isArray(value[key]) && value[key].every(row => typeof row === "string"), "close_fields");
+  }
+  return ingressFact(value);
+}
 export function ingressPathExists(filename) {
   try { lstatSync(filename); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
@@ -34,6 +174,7 @@ export function boundedJson(filename, optional = false) {
   const bytes = boundedBytes(filename, optional); return bytes === null ? null : JSON.parse(bytes.toString("utf8"));
 }
 export function parseIngressArguments(argv) {
+  argv = ingressData(argv); requireIngress(Array.isArray(argv) && argv.every(v => typeof v === "string"), "argument");
   const options = { out: null, missingLauncher: false };
   for (let at = 0; at < argv.length; at++) {
     if (argv[at] === "--out" && options.out === null) {
@@ -42,6 +183,7 @@ export function parseIngressArguments(argv) {
         [...value].every(c => c.charCodeAt(0) >= 32 && c.charCodeAt(0) !== 127) && !ingressPathExists(value), "output_path");
       options.out = value;
     } else if (argv[at] === "--missing-launcher" && !options.missingLauncher) options.missingLauncher = true;
+    else if (argv[at] === "--conflicting-replay" && options.conflictingReplay === undefined) options.conflictingReplay = true;
     else throw new Error("ingress_argument");
   }
   requireIngress(options.out !== null, "output_required"); return options;
@@ -118,7 +260,9 @@ export function assertIngressAudit(state, expected, immutable) {
   }
 }
 export function assertIngressAck(send, delivery, immutable) {
+  ingressData(send); ingressData(delivery); ingressData(immutable);
   const { commit, receiver } = delivery;
+  assertReply(send, delivery, 200);
   requireIngress(commit && receiver && !receiver.invalid && !receiver.overflow, "ack_observation");
   requireIngress(commit.wireMessageId === send.wireMessageId && commit.eventId === send.eventId && commit.expectedHash === send.hash &&
     commit.persistedHash === send.hash && commit.immutable.occurrenceId === send.occurrenceId && Number.isSafeInteger(commit.ordinal) && commit.ordinal > 0, "commit_identity");
@@ -127,12 +271,15 @@ export function assertIngressAck(send, delivery, immutable) {
   requireIngress(replies.length === 1 && replies[0].kind === "ack" && replies[0].messageId === send.wireMessageId &&
     replies[0].payload?.code === 200 && replies[0].ordinal > commit.ackFloor, "ack_identity_order");
 }
-export function assertIngressReceiver(receiver, expectedIds) {
-  requireIngress(receiver && !receiver.invalid && !receiver.overflow && receiver.observations.length === expectedIds.length, "receiver_history");
-  const seen = new Set();
-  for (const row of receiver.observations) {
-    requireIngress(row.kind === "ack" && row.payload?.code === 200 && expectedIds.includes(row.messageId) && !seen.has(row.messageId), "receiver_identity");
-    seen.add(row.messageId);
+export function assertIngressReceiver(receiver, expected) {
+  ingressData(receiver); ingressData(expected);
+  requireIngress(receiver && receiver.invalid === false && receiver.overflow === false && receiver.observations.length === expected.length, "receiver_history");
+  let ordinal = 0; const seen = new Set();
+  for (const [index, row] of receiver.observations.entries()) {
+    const send = expected[index], id = typeof send === "string" ? send : send.wireMessageId, code = typeof send === "string" ? 200 : send.expectedCode ?? 200;
+    requireIngress(row.kind === "ack" && row.payload?.code === code && row.messageId === id && !seen.has(id) &&
+      Number.isSafeInteger(row.ordinal) && row.ordinal > ordinal, "receiver_identity");
+    seen.add(id); ordinal = row.ordinal;
   }
 }
 const forbiddenKeys = ["E2E_RUNTIME_RECORDING_KEY", "E2E_RECORDING_KEY", "E2E_PROVIDER_CREDENTIAL", "FEISHU_APP_SECRET", "RUNTIME_SECRET", "NODE_OPTIONS"];
@@ -192,12 +339,16 @@ export function assertIngressClose(close) {
 }
 export function assertIngressFinalReceiver(close, sends, commits) {
   requireIngress(close.observerFailure === false && close.overflow === false, "final_observer_failure");
-  assertIngressReceiver(close.receiver, sends.map(send => send.wireMessageId));
+  assertIngressReceiver(close.receiver, sends);
   assert.deepEqual(close.ackObservations, close.receiver.observations);
   assert.deepEqual(close.commitObservations, commits);
-  requireIngress(close.commitObservations.length === sends.length, "final_commit_count");
-  for (const [index, send] of sends.entries()) assertIngressAck(send, { commit: close.commitObservations[index],
-    receiver: { ...close.receiver, observations: close.receiver.observations.filter(row => row.messageId === send.wireMessageId) } }, commits[index].immutable);
+  requireIngress(close.commitObservations.length === sends.filter(s => s.expectedCode !== 500).length, "final_commit_count");
+  let index = 0;
+  for (const send of sends) {
+    if (send.expectedCode === 500) { requireIngress(!close.commitObservations.some(c => c.wireMessageId === send.wireMessageId), "rejection_commit"); continue; }
+    assertIngressAck(send, { commit: close.commitObservations[index], receiver: { ...close.receiver,
+      observations: close.receiver.observations.filter(row => row.messageId === send.wireMessageId) } }, commits[index].immutable); index++;
+  }
 }
 
 /** Real adapter and component tests retain identical bounded command facts.
@@ -235,23 +386,31 @@ export function ingressProcessProof(evidence, owner, probe) {
 
 /** Same parent transitions for the CLI and explicitly synthetic component facts. */
 export async function runIngressCampaign(plan, effects, { signal, label = "component-facts" } = {}) {
+  requireIngress(typeof label === "string" && ["component-facts", "attempted-application"].includes(label), "label");
+  const controls = ingressData(plan); assertIngressSelection(controls);
   const phases = [], failures = [];
   const active = () => requireIngress(!signal?.aborted, "cancelled");
   try {
     active(); await effects.prepare(); active();
+    // Preparation fills the real adapter's captured plan. Retain that alias
+    // through prepare, then freeze the completed controls before any owner.
+    plan = ingressData(plan); assertIngressSelection({ ...plan, phase: 1 });
+    requireIngress(plan.missingLauncher === controls.missingLauncher && plan.conflictingReplay === controls.conflictingReplay &&
+      plan.phase === controls.phase, "prepared_controls");
     for (const phase of [1, 2]) {
-      active(); const result = await effects.runOwner({ ...plan, phase, original: phases[0]?.state }, signal); phases.push(result); active();
+      active(); const result = await effects.runOwner({ ...plan, phase, original: phases[0]?.state }, signal); phases.push(ingressData(result)); active();
       requireIngress(result.success && result.root === plan.root && result.databasePath === plan.databasePath, "phase_result");
       const c = result.child;
       requireIngress(c?.closeObserved && c.exitObserved && c.code === 0 && c.signal === null && c.stdioSettled && !c.forced, "child_close");
       requireIngress(result.ownerProcessProof?.cleanupConfirmed === true, "owner_process_cleanup");
       if (phase === 1) { const state = await effects.between(); active(); assert.deepEqual(state, result.state); }
     }
-  } catch (error) { failures.push(/^ingress_[A-Za-z_]+$/.test(error?.message ?? "") ? error.message : "ingress_campaign_failed"); }
+  } catch (error) { failures.push(ingressFailure(error, "ingress_campaign_failed")); }
   let processProof;
-  try { processProof = await effects.cleanup(); if (!processProof.cleanupConfirmed) failures.push("ingress_process_cleanup"); }
+  try { processProof = ingressData(await effects.cleanup()); if (!processProof.cleanupConfirmed) failures.push("ingress_process_cleanup"); }
   catch { failures.push("ingress_cleanup_failed"); }
-  return { schema: "meeting-ingress-evidence/v1", label, branch: plan.missingLauncher ? "missing-launcher" : "live",
+  return { schema: "meeting-ingress-evidence/v1", label, branch: controls.missingLauncher ? "missing-launcher" : "live",
+    ...(controls.conflictingReplay ? { selectedCase: "conflicting-replay" } : {}),
     success: failures.length === 0 && phases.length === 2, failures, phases, processProof, preserved: true };
 }
 
@@ -264,7 +423,7 @@ async function realMain(argv) {
   const evidence = processRules.createProcessEvidence(), controller = new globalThis.AbortController();
   const stop = () => controller.abort();
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, stop);
-  let staged, activeChild, plan = { missingLauncher: options.missingLauncher };
+  let staged, activeChild, plan = { missingLauncher: options.missingLauncher, ...(options.conflictingReplay ? { conflictingReplay: true } : {}) };
   const inventory = (rootPid, owner, stage, baseline = false) => {
     requireIngress(!evidence.inventory.overflowOutcome, "inventory_history_overflow");
     let result; try { result = run("/bin/ps", ["-eo", "pid=,ppid=,comm="], { timeout: 1000, maxBuffer: 1048576 }); } catch { result = null; }
@@ -296,6 +455,12 @@ async function realMain(argv) {
           wireMessageId: `phase1-${["a-1", "b-1", "c-1", "a-2"][at]}`, envelope: envelopes[index] })),
         standaloneConfigPath: staged.standaloneConfigPath, controlDir: staged.directories.control, runtimePidsPath: staged.gatewayPidsPath,
         keyPath: staged.keyPath, directories: staged.directories });
+      if (options.conflictingReplay) {
+        const envelope = inviteEnvelope({ ...meeting, title: "Conflicting replay title" }), n = normalizeInvite(envelope, SCOPE);
+        plan.sends = selectIngressSends(plan.sends, { eventId: n.eventId, hash: n.normalizedSha256, title: n.title,
+          createTime: n.createTime, inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds, occurrenceId: n.occurrenceId, envelope });
+      }
+      assertIngressSelection({ ...plan, phase: 1 });
       writeFileSync(path.join(options.out, "staged.json"), JSON.stringify({ root: staged.root, pins: await pins.verifyPins(),
         digests: await Promise.all([staged.gatewayPath, staged.launcherPath, staged.entryPath.replace("entry.mjs", "ingress-entry.mjs"),
           path.join(staged.directories.app, "e2e/ingress-run.mjs"), path.join(staged.directories.app, "e2e/feishu-peer.mjs"),

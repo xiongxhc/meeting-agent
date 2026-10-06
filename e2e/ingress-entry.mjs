@@ -6,11 +6,18 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { assertIngressAck, assertIngressAudit, assertIngressClose, assertIngressFinalReceiver, assertIngressIsolation, assertIngressLaunch, assertIngressRetry, assertIngressReceiver,
-  boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
+  assertIngressConflict, assertIngressSelection, ingressData, ingressFact, ingressCloseFact, ingressFailure, ingressReceiverFact, boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
+
+/** Only the selected rejected replay has an already-admitted durable baseline. */
+export function readIngressConflictBaseline(send, read) {
+  send = ingressData(send);
+  return send.expectedCode === 500 ? read() : undefined;
+}
 
 /** One shared phase, with component fact factories in tests and actual public
  * composition/peer observations in the executable adapter below. */
 export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000, cleanupMs = 30000 } = {}) {
+  plan = ingressData(plan); assertIngressSelection(plan);
   const controller = new globalThis.AbortController(), failure = [], observations = [];
   const abort = () => { controller.abort(); try { effects.cancel?.(); } catch { failure.push("ingress_cancel_failed"); } };
   signal?.addEventListener("abort", abort, { once: true });
@@ -27,7 +34,7 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
       const value = await Promise.race([effects[name](...args, controller.signal), cancelled]);
       requireIngress(!controller.signal.aborted, "phase_cancelled");
       requireIngress(observations.length < 256, "history_overflow"); observations.push({ ordinal: observations.length + 1, name });
-      return value;
+      return ingressFact(value);
     } finally { controller.signal.removeEventListener("abort", onAbort); globalThis.clearTimeout(stepTimer); }
   };
   let state, activity, close; const acceptedSends = [], acceptedCommits = [];
@@ -36,17 +43,25 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
     assertIngressReceiver(ready.receiver, []);
     if (plan.phase === 1) {
       let immutable, audits = []; const wireIds = [];
-      requireIngress(new Set(plan.sends.map(row => row.wireMessageId)).size === 4 && plan.sends.length === 4, "fresh_wire_ids");
+      assertIngressSelection(plan);
       for (const send of plan.sends) {
         const delivered = await step("deliver", send);
-        assertIngressAck(send, delivered, immutable);
-        acceptedSends.push(send); acceptedCommits.push(delivered.commit);
+        acceptedSends.push(send);
+        if (send.expectedCode === 500) {
+          assertIngressConflict(send, delivered, state); wireIds.push(send);
+          activity = await step("activity"); assertIngressReceiver(activity.receiver, wireIds); assertIngressIsolation(delivered.state, activity);
+          continue;
+        }
+        assertIngressAck(send, delivered, immutable); acceptedCommits.push(delivered.commit);
+        if (plan.conflictingReplay && acceptedSends.length === 3) {
+          requireIngress(JSON.stringify(delivered.state) === JSON.stringify(state), "original_replay_mutation");
+        }
         if (!immutable) {
           immutable = delivered.commit.immutable;
           requireIngress(Number.isSafeInteger(immutable.acceptedAtMs) && immutable.acceptedAtMs >= 0 &&
             Object.entries(plan.immutableExpected).every(([key, value]) => immutable[key] === value), "first_identity");
         }
-        wireIds.push(send.wireMessageId);
+        wireIds.push(send);
         if (!audits.some(row => row.eventId === send.eventId)) audits.push(plan.expected.find(row => row.eventId === send.eventId));
         assertIngressAudit(delivered.state, audits, immutable);
         // Exact replay must preserve the first persisted audit, including its acceptance time.
@@ -83,21 +98,25 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
         state = next.state; activity = next.activity;
       }
     }
-  } catch (error) { failure.push(/^ingress_[A-Za-z_]+$/.test(error?.message ?? "") ? error.message : "ingress_phase_failed"); }
+  } catch (error) { failure.push(ingressFailure(error, "ingress_phase_failed")); }
   finally {
     abort(); globalThis.clearTimeout(timer); signal?.removeEventListener("abort", abort);
     let closeTimer;
     try {
-      close = await Promise.race([effects.close(), new Promise((_, reject) => {
+      close = ingressCloseFact(await Promise.race([effects.close(), new Promise((_, reject) => {
         closeTimer = globalThis.setTimeout(() => reject(new Error("ingress_close_timeout")), cleanupMs);
-      })]); assertIngressClose(close); assertIngressFinalReceiver(close, acceptedSends, acceptedCommits);
-    } catch (error) { failure.push(/^ingress_[A-Za-z_]+$/.test(error?.message ?? "") ? error.message : "ingress_phase_cleanup"); }
+      })])); assertIngressClose(close); assertIngressFinalReceiver(close, acceptedSends, acceptedCommits);
+      if (plan.conflictingReplay && plan.phase === 1 && failure.length === 0) {
+        requireIngress(close.finalState && JSON.stringify(close.finalState) === JSON.stringify(state), "final_projection");
+      }
+    } catch (error) { failure.push(ingressFailure(error, "ingress_phase_cleanup")); }
     finally { globalThis.clearTimeout(closeTimer); }
   }
   return { success: failure.length === 0, phase: plan.phase, root: plan.root, databasePath: plan.databasePath, state, activity, close, observations, failures: failure };
 }
 
 async function runRealEntry(plan) {
+  plan = ingressData(plan); assertIngressSelection(plan);
   // All actual SDK and built composition imports are behind guarded execution.
   const [sdk, main, configApi, lockApi, composition, httpApi, socketApi, peers, lifecycle] = await Promise.all([
     import("@larksuiteoapi/node-sdk"), import("../dist/src/main.js"), import("../dist/src/standalone-config.js"),
@@ -195,13 +214,13 @@ async function runRealEntry(plan) {
       // Fail on unsolicited, duplicate or stale replies before another delivery.
       requireIngress(peer.frameObservation.observations.length === ackIds.size &&
         peer.frameObservation.observations.every(row => row.kind === "ack" && ackIds.has(row.messageId)), "unsolicited_ack");
-      const start = peer.frameObservation.observations.length; pending = send;
+      const start = peer.frameObservation.observations.length, before = readIngressConflictBaseline(send, read); pending = send;
       peer.deliverInvite(send.envelope, send.wireMessageId);
       await wait(() => peer.frameObservation.observations.length > start, 25000, phaseSignal);
-      const observations = peer.frameObservation.observations.slice(start);
+      const observations = receiver().observations.slice(start);
       const commit = commits.find(row => row.wireMessageId === send.wireMessageId);
       const result = { commit, receiver: { invalid: peer.frameObservation.invalid, overflow: peer.frameObservation.overflow, observations }, state: read() };
-      assertIngressAck(send, result); requireIngress(!ackIds.has(send.wireMessageId), "duplicate_ack");
+      if (send.expectedCode === 500) assertIngressConflict(send, result, before); else assertIngressAck(send, result); requireIngress(!ackIds.has(send.wireMessageId), "duplicate_ack");
       ackIds.add(send.wireMessageId); pending = null; return result;
     },
     async blocked(phaseSignal) {
@@ -255,13 +274,13 @@ async function runRealEntry(plan) {
         return { standaloneExit: standaloneExit ?? 70, compositionClosed: compositionResult?.status === "composition_closed" && compositionResult.clean,
           peerClosed, lockClosedLast: ownerClosed && peerClosed && trace.includes("shutdown_store_closed"), cleanupFailures: [...cleanupFailures],
           finalState, keyCustody, outcomes: outcomes(), trace: [...trace], environmentKeys: Object.keys(process.env).sort(), commitObservations: [...commits],
-          ackObservations: [...(peer?.frameObservation.observations ?? [])],
+          ackObservations: peer ? receiver().observations : [],
           receiver: peer ? receiver() : { invalid: false, overflow: false, observations: [] }, observerFailure, overflow };
       })(); return closePromise;
     },
   };
   let peerClosed = false, peerClosePromise;
-  function receiver() { return { invalid: peer.frameObservation.invalid, overflow: peer.frameObservation.overflow, observations: [...peer.frameObservation.observations] }; }
+  function receiver() { return ingressReceiverFact({ invalid: peer.frameObservation.invalid, overflow: peer.frameObservation.overflow, observations: [...peer.frameObservation.observations] }); }
   async function closePeer() {
     if (!peer) { peerClosed = true; return; }
     if (!peerClosePromise) peerClosePromise = peer.close().then(() => { peerClosed = true; });

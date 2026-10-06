@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, chmodSync,
 import path from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
+import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
+import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 
 // Listener-free component facts. No SDK, application, stage or process inventory.
 async function helpers() {
@@ -36,8 +38,8 @@ const emptyActivity = () => ({ trace: ["composition_lock_verified", "composition
   files: { recording: 0, outbox: 0, receipt: 0, key: false }, outcomes: [], envKeys: ["PATH"],
   receiver: { invalid: false, overflow: false, observations: [] as { ordinal: number; kind: string; messageId: string; payload: { code: number } }[] } });
 type Mutation = (name: string, fact: Record<string, unknown>) => void;
-function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}) {
-  const calls: string[] = [], plans = { occurrenceId: identity.occurrenceId, expected: events, sends: [0, 1, 2, 0].map((index, send) =>
+function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}, conflictingReplay = false) {
+  const calls: string[] = [], plans: { occurrenceId: string; expected: typeof events; sends: (typeof events[number] & { wireMessageId: string; occurrenceId: string; expectedCode?: number })[] } = { occurrenceId: identity.occurrenceId, expected: events, sends: [0, 1, 2, 0].map((index, send) =>
     ({ ...events[index]!, wireMessageId: `phase1-${send}`, occurrenceId: identity.occurrenceId })) };
   let current = blocked(), activity = emptyActivity(), phase = 0, sends = 0;
   const commits: { ordinal: number; ackFloor: number; wireMessageId: string; eventId: string; expectedHash: string; persistedHash: string; immutable: typeof identity }[] = [];
@@ -45,11 +47,17 @@ function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}) 
   const owner = {
     async ready() { return fact("ready", { admitted: true, started: true, connections: 1, receiver: activity.receiver }); },
     async deliver(send: typeof plans.sends[number]) {
-      sends++; current.events = copy(events.slice(0, Math.min(sends, 3)));
+      sends++;
+      if (send.expectedCode === 500) {
+        activity.receiver.observations.push({ ordinal: sends, kind: "ack", messageId: send.wireMessageId, payload: { code: 500 } });
+        return fact("deliver", { receiver: { invalid: false, overflow: false, observations: [activity.receiver.observations.at(-1)!] }, state: current });
+      }
+      const index = events.findIndex(e => e.eventId === send.eventId);
+      current.events = copy(events.slice(0, Math.max(current.events.length === 3 && sends === 1 ? 0 : current.events.length, index + 1)));
       activity.receiver.observations.push({ ordinal: sends, kind: "ack", messageId: send.wireMessageId, payload: { code: 200 } });
-      commits.push({ ordinal: sends, ackFloor: sends - 1, wireMessageId: send.wireMessageId, eventId: send.eventId,
+      commits.push({ ordinal: commits.length + 1, ackFloor: sends - 1, wireMessageId: send.wireMessageId, eventId: send.eventId,
         expectedHash: send.hash, persistedHash: send.hash, immutable: copy(identity) });
-      return fact("deliver", { commit: { ordinal: sends, ackFloor: sends - 1, wireMessageId: send.wireMessageId,
+      return fact("deliver", { commit: { ordinal: commits.length, ackFloor: sends - 1, wireMessageId: send.wireMessageId,
         eventId: send.eventId, expectedHash: send.hash, persistedHash: send.hash, immutable: identity },
         receiver: { invalid: false, overflow: false, observations: [{ ordinal: sends, kind: "ack", messageId: send.wireMessageId, payload: { code: 200 } }] }, state: current });
     },
@@ -80,10 +88,10 @@ function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}) 
     async activity() { return fact("activity", activity); },
     async close() { return fact("close", { standaloneExit: 0, compositionClosed: true, peerClosed: true,
       lockClosedLast: true, cleanupFailures: [], outcomes: activity.outcomes, receiver: activity.receiver,
-      observerFailure: false, overflow: false, commitObservations: commits, ackObservations: activity.receiver.observations }); },
+      finalState: current, observerFailure: false, overflow: false, commitObservations: commits, ackObservations: activity.receiver.observations }); },
   };
   const { acceptedAtMs: _acceptedAtMs, ...immutableExpected } = identity; void _acceptedAtMs;
-  return { calls, plan: { ...plans, immutableExpected, missingLauncher, root: "/synthetic", databasePath: "/synthetic/db" },
+  return { calls, owner, plan: { ...plans, immutableExpected, missingLauncher, ...(conflictingReplay ? { conflictingReplay: true } : {}), root: "/synthetic", databasePath: "/synthetic/db" },
     effects: {
       async prepare() { calls.push("prepare"); },
       async runOwner(p: Record<string, unknown>, signal: AbortSignal) {
@@ -400,3 +408,337 @@ for (const bad of ["falseAdmission", "rootRefusal", "connected", "bridge", "repe
     }); assert.equal((await runIngressCampaign(f.plan, f.effects)).success, false);
   });
 }
+
+// C only: losing mixed-status consumption or immutable transaction state fails.
+test("selected conflict replay preserves defaults and accepts only the finite fresh-ID sequence", async () => {
+  const h = await helpers(), f = syntheticEffects();
+  const changed = { ...f.plan.sends[0]!, title: "Conflicting content", hash: "f".repeat(64) };
+  assert.deepEqual(h.selectIngressSends(f.plan.sends), f.plan.sends);
+  const selected = h.selectIngressSends(f.plan.sends, changed);
+  assert.deepEqual(selected.map((s: { expectedCode: number }) => s.expectedCode), [200, 500, 200, 200, 200, 200]);
+  assert.equal(new Set(selected.map((s: { wireMessageId: string }) => s.wireMessageId)).size, 6);
+  assert.throws(() => h.selectIngressSends(f.plan.sends, { ...changed, hash: f.plan.sends[0]!.hash }));
+  assert.deepEqual(h.parseIngressArguments(["--out", "/private/tmp/conflict-new", "--conflicting-replay"]),
+    { out: "/private/tmp/conflict-new", missingLauncher: false, conflictingReplay: true });
+});
+test("conflict oracle consumes the real decoder500 without commit and requires identical durable bytes", async () => {
+  const h = await helpers(), { createFeishuFrameReceiver, eventFrame } = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
+  const f = syntheticEffects(), send = { ...f.plan.sends[0]!, hash: "f".repeat(64), wireMessageId: "phase1-a-conflict", expectedCode: 500 };
+  const decoder = createFeishuFrameReceiver(); decoder.receive(eventFrame({ code: 500, msg: "private-sdk-body" }, send.wireMessageId));
+  const before = blocked(), result = { receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: decoder.observations }, state: copy(before) };
+  h.assertIngressConflict(send, result, before);
+  for (const change of ["code", "commit", "event", "hash", "title", "acceptedAt", "metadata", "extra", "wire", "duplicate"]) {
+    const mutated = copy(result) as typeof result & { commit?: object };
+    if (change === "code") mutated.receiver.observations[0].payload.code = 200;
+    if (change === "commit") mutated.commit = { ordinal: 2 };
+    if (change === "event") mutated.state.events[0]!.eventId = "other";
+    if (change === "hash") mutated.state.events[0]!.hash = "e".repeat(64);
+    if (change === "title") mutated.state.immutable.title = "changed";
+    if (change === "acceptedAt") mutated.state.immutable.acceptedAtMs++;
+    if (change === "metadata") mutated.state.metadata.state = "pending_metadata";
+    if (change === "extra") mutated.state.events.push(copy(events[0]!));
+    if (change === "wire") mutated.receiver.observations[0].messageId = "wrong";
+    if (change === "duplicate") mutated.receiver.observations.push(copy(mutated.receiver.observations[0]));
+    assert.throws(() => h.assertIngressConflict(send, mutated, before), change);
+  }
+});
+test("control/report validation rejects accessors and custom arrays without calling them", async () => {
+  const h = await helpers(); let calls = 0;
+  assert.deepEqual(h.ingressData({ safe: [1, "ok"] }), { safe: [1, "ok"] });
+  assert.throws(() => h.ingressData({ get conflictingReplay() { calls++; return true; } }));
+  const list: string[] = []; Object.setPrototypeOf(list, { toJSON() { calls++; return []; } });
+  assert.throws(() => h.parseIngressArguments(list)); assert.equal(calls, 0);
+});
+test("C failure classification never invokes thrown message getters or string-like methods", async () => {
+  const h = await helpers(); let calls = 0;
+  assert.equal(h.ingressFailure(new Error("ingress_rejection_commit"), "ingress_phase_failed"), "ingress_rejection_commit");
+  assert.equal(h.ingressFailure({ get message() { calls++; return "ingress_hidden"; } }, "ingress_phase_failed"), "ingress_phase_failed");
+  assert.equal(h.ingressFailure({ message: { toString() { calls++; return "PRIVATE"; } } }, "ingress_phase_failed"), "ingress_phase_failed");
+  assert.equal(calls, 0);
+});
+
+for (const missingLauncher of [false, true]) test(`C selected conflict retains ordinary two-owner ${missingLauncher ? "missing-launcher" : "live"} retry`, async () => {
+  const h = await helpers(), f = syntheticEffects(missingLauncher, undefined, true);
+  f.plan.sends = h.selectIngressSends(f.plan.sends, { ...f.plan.sends[0], title: "Conflicting title", hash: "f".repeat(64) });
+  const result = await h.runIngressCampaign(f.plan, f.effects);
+  assert.equal(result.success, true); assert.equal(result.label, "component-facts");
+  assert.equal(f.calls.filter(n => n === "deliver").length, 6); assert.equal(f.calls.filter(n => n === "retry").length, 1);
+  assert.deepEqual(result.phases[0].close.receiver.observations.map((r: { payload: { code: number } }) => r.payload.code), [200, 500, 200, 200, 200, 200]);
+  assert.equal(result.phases[0].close.commitObservations.length, 5);
+});
+
+async function transactionConflictFixture(mutate: Mutation = () => {}) {
+  const h = await helpers(), peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
+  const root = mkdtempSync("/private/tmp/ingress-conflict-transaction-"); chmodSync(root, 0o700);
+  const databasePath = path.join(root, "actual.db"), store = openSessionStore({ filename: databasePath });
+  const meeting = { eventId: "ingress-a", providerMeetingId: "meeting-component", meetingNo: "987654321", title: "First accepted title",
+    startSeconds: 1791280800, inviteSeconds: 1791280800, createTimeMs: 1791280800000 };
+  const envelopes = [peer.inviteEnvelope(meeting), peer.inviteEnvelope({ ...meeting, eventId: "ingress-b", title: "Later observed title" }),
+    peer.inviteEnvelope({ ...meeting, eventId: "ingress-c", title: "Earlier event delivered late" })];
+  const normalized = envelopes.map(e => normalizeInvite(e, peer.SCOPE)), first = normalized[0]!;
+  const expected = normalized.map(n => ({ eventId: n.eventId, hash: n.normalizedSha256, title: n.title, createTime: n.createTime,
+    inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds }));
+  const base = [0, 1, 2, 0].map((i, at) => ({ ...expected[i], occurrenceId: first.occurrenceId, wireMessageId: `phase1-${at}`, envelope: envelopes[i] }));
+  const conflictEnvelope = peer.inviteEnvelope({ ...meeting, title: "Conflicting title" }), conflict = normalizeInvite(conflictEnvelope, peer.SCOPE);
+  const sends = h.selectIngressSends(base, { ...expected[0], title: conflict.title, hash: conflict.normalizedSha256, occurrenceId: first.occurrenceId, envelope: conflictEnvelope });
+  const decoder = peer.createFeishuFrameReceiver(), commits: Record<string, unknown>[] = [], calls: string[] = [];
+  const state = () => h.readIngressState({ databasePath, occurrenceId: first.occurrenceId });
+  const activity = () => ({ ...emptyActivity(), receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: copy(decoder.observations) } });
+  const fact = <T extends object>(name: string, value: T): T => { calls.push(name); mutate(name, value as Record<string, unknown>); return value; };
+  let deliveries = 0;
+  const effects = {
+    async ready() { return fact("ready", { admitted: true, started: true, connections: 1, receiver: activity().receiver }); },
+    async deliver(send: typeof base[number] & { expectedCode: number }) {
+      deliveries++; const n = normalizeInvite(send.envelope, peer.SCOPE), floor = decoder.observations.at(-1)?.ordinal ?? 0;
+      // Admission/rollback are real. Reply bytes below are explicit C inputs, never an SDK result.
+      if (deliveries === 2) assert.throws(() => store.acceptInvite(n, 100 + deliveries), /invite_conflict/);
+      else {
+        store.acceptInvite(n, 100 + deliveries); const projection = state();
+        commits.push({ ordinal: commits.length + 1, ackFloor: floor, wireMessageId: send.wireMessageId, eventId: n.eventId,
+          expectedHash: n.normalizedSha256, persistedHash: projection.events.find((e: { eventId: string }) => e.eventId === n.eventId).hash, immutable: projection.immutable });
+      }
+      decoder.receive(peer.eventFrame({ code: deliveries === 2 ? 500 : 200 }, send.wireMessageId));
+      return fact("deliver", { ...(deliveries === 2 ? {} : { commit: copy(commits.at(-1)) }),
+        receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: [copy(decoder.observations.at(-1))] }, state: state() });
+    },
+    async blocked() {
+      if (deliveries === 1) {
+        const claim = store.claimInviteMetadata(110)!;
+        store.failInviteClaim(claim, { status: "blocked", reason: "metadata_unavailable", retryable: false }, 111, 1000);
+      }
+      return fact("blocked", { state: state(), activity: activity() });
+    },
+    async activity() { return fact("activity", activity()); }, async discover() { return fact("discover", { launched: 0 }); },
+    async read() { return fact("read", state()); },
+    async close() { return fact("close", { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true,
+      cleanupFailures: [], outcomes: [], receiver: activity().receiver, ackObservations: copy(decoder.observations),
+      finalState: state(), commitObservations: copy(commits), observerFailure: false, overflow: false }); },
+  };
+  const plan = { phase: 1, root, databasePath, conflictingReplay: true, sends, expected, occurrenceId: first.occurrenceId,
+    immutableExpected: Object.fromEntries(["occurrenceId", "region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt", "title"].map(k => [k, first[k as keyof typeof first]])) };
+  return { plan, effects, calls, dispose() { store.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+test("C real normalization/SQLite transaction/decoder feed shared selected phase with unchanged conflict and original replay", async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")), f = await transactionConflictFixture();
+  try {
+    const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, true, JSON.stringify(result.failures));
+    assert.equal(result.state.events.length, 3); assert.equal(result.state.immutable.title, "First accepted title");
+    assert.equal(result.state.immutable.acceptedAtMs, 101); assert.equal(result.close.commitObservations.length, 5);
+    assert.deepEqual(result.close.receiver.observations.map((r: { payload: { code: number } }) => r.payload.code), [200, 500, 200, 200, 200, 200]);
+  } finally { f.dispose(); }
+});
+
+for (const bad of ["conflict200", "replay500", "rejectionCommit", "firstEvent", "firstHash", "firstTitle", "firstAcceptance", "metadata", "extraEvent",
+  "wrongWire", "reusedWire", "extraHistory", "duplicateHistory", "lateHistory", "lateCommit", "invalidHistory", "overflowHistory", "unconfirmedClose"]) {
+  test(`C coherent selected transaction rejects ${bad} at its target predicate`, async () => {
+    const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")); let delivered = 0;
+    const f = await transactionConflictFixture((name, value) => {
+      if (name === "deliver") {
+        delivered++; const v = value as { receiver: { observations: { messageId: string; payload: { code: number } }[] }; state: State; commit?: object };
+        if (bad === "replay500" && delivered === 3) v.receiver.observations[0]!.payload.code = 500;
+        if (delivered !== 2) return;
+        if (bad === "conflict200") v.receiver.observations[0]!.payload.code = 200;
+        if (bad === "rejectionCommit") v.commit = { ordinal: 2 };
+        if (bad === "firstEvent") v.state.events[0]!.eventId = "changed";
+        if (bad === "firstHash") v.state.events[0]!.hash = "e".repeat(64);
+        if (bad === "firstTitle") v.state.immutable.title = "changed";
+        if (bad === "firstAcceptance") v.state.immutable.acceptedAtMs++;
+        if (bad === "metadata") v.state.metadata.state = "pending_metadata";
+        if (bad === "extraEvent") v.state.events.push(copy(events[0]!));
+        if (bad === "wrongWire") v.receiver.observations[0]!.messageId = "wrong-wire";
+        if (bad === "reusedWire") v.receiver.observations[0]!.messageId = "phase1-0";
+      }
+      if (name === "close") {
+        const c = value as { receiver: { observations: { ordinal: number; kind: string; messageId: string; payload: { code: number } }[]; invalid: boolean; overflow: boolean };
+          ackObservations: unknown[]; commitObservations: object[]; outcomes: object[] };
+        if (["extraHistory", "lateHistory"].includes(bad)) c.receiver.observations.push({ ordinal: 7, kind: "ack", messageId: "late", payload: { code: 200 } });
+        if (bad === "duplicateHistory") c.receiver.observations.push(copy(c.receiver.observations[1]!));
+        if (bad === "invalidHistory") c.receiver.invalid = true;
+        if (bad === "overflowHistory") c.receiver.overflow = true;
+        if (bad === "lateCommit") c.commitObservations.push({ ordinal: 6, wireMessageId: "phase1-a-conflict" });
+        if (bad === "unconfirmedClose") c.outcomes = [{ runtimeCleanup: "unconfirmed" }];
+        c.ackObservations = copy(c.receiver.observations);
+      }
+    });
+    try {
+      const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, false);
+      const target = bad === "rejectionCommit" ? "ingress_rejection_commit" :
+        ["firstEvent", "firstHash", "firstTitle", "firstAcceptance", "metadata", "extraEvent"].includes(bad) ? "ingress_conflict_mutation" :
+        ["conflict200", "replay500", "wrongWire", "reusedWire"].includes(bad) ? "ingress_ack_identity_order" :
+        bad === "unconfirmedClose" ? "ingress_custody_cleanup" : bad === "lateCommit" ? "ingress_phase_cleanup" : "ingress_receiver_history";
+      assert.ok(result.failures.includes(target), JSON.stringify(result.failures));
+      assert.equal(delivered, bad === "replay500" ? 3 : ["conflict200", "rejectionCommit", "firstEvent", "firstHash", "firstTitle", "firstAcceptance", "metadata", "extraEvent", "wrongWire", "reusedWire"].includes(bad) ? 2 : 6);
+    } finally { f.dispose(); }
+  });
+}
+test("selected malformed/reused controls and custom descriptor arrays fail before lifecycle effects", async () => {
+  const h = await helpers(), { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const f = syntheticEffects(false, undefined, true);
+  f.plan.sends = h.selectIngressSends(f.plan.sends, { ...f.plan.sends[0], title: "Changed", hash: "f".repeat(64) });
+  for (const kind of ["duplicate", "selector", "accessor", "array", "replay"]) {
+    const p = copy({ ...f.plan, phase: 1 }); let calls = 0;
+    if (kind === "duplicate") p.sends[1]!.wireMessageId = p.sends[0]!.wireMessageId;
+    if (kind === "selector") Object.assign(p, { conflictingReplay: "unknown" });
+    if (kind === "accessor") Object.defineProperty(p, "phase", { get() { calls++; return 1; } });
+    if (kind === "array") Object.setPrototypeOf(p.sends, { toJSON() { calls++; return []; } });
+    if (kind === "replay") p.sends[2]!.hash = "f".repeat(64);
+    await assert.rejects(runIngressPhase(p, { ready() { calls++; }, close() { calls++; } })); assert.equal(calls, 0);
+  }
+});
+
+test("C selected accepted original replay refuses changed durable metadata", async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")); let delivered = 0;
+  const f = await transactionConflictFixture((name, value) => {
+    if (name === "deliver" && ++delivered === 3) (value.state as State).metadata.totalAttempts++;
+  });
+  try {
+    const result = await runIngressPhase(f.plan, f.effects);
+    assert.equal(result.success, false); assert.ok(result.failures.includes("ingress_original_replay_mutation"));
+    assert.equal(delivered, 3);
+  } finally { f.dispose(); }
+});
+test("C actual ACK payload body stays out of the shared phase report", async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const f = await transactionConflictFixture((name, value) => {
+    const v = value as { receiver?: { observations: { payload?: object }[] }; activity?: { receiver: { observations: { payload?: object }[] } }; ackObservations?: { payload?: object }[] };
+    for (const rows of [v.receiver?.observations, v.activity?.receiver.observations, v.ackObservations]) {
+      for (const row of rows ?? []) Object.assign(row.payload ?? {}, { msg: "PRIVATE_ACK_ERROR_BODY" });
+    }
+  });
+  try {
+    const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, true);
+    assert.equal(JSON.stringify(result).includes("PRIVATE_ACK_ERROR_BODY"), false);
+  } finally { f.dispose(); }
+});
+test("C selected closure refuses durable mutation after the last read", async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const f = await transactionConflictFixture((name, value) => {
+    if (name === "close") (value.finalState as State).events[0]!.hash = "f".repeat(64);
+  });
+  try {
+    const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, false);
+    assert.ok(result.failures.includes("ingress_final_projection"));
+  } finally { f.dispose(); }
+});
+
+for (const branch of ["default", "missing", "conflict", "conflict-missing"]) {
+  test(`C initially minimal real-shaped prepare plan reaches both owners for ${branch}`, async () => {
+    const h = await helpers(), selected = branch.includes("conflict"), missingLauncher = branch.includes("missing");
+    const f = syntheticEffects(missingLauncher, undefined, selected);
+    if (selected) f.plan.sends = h.selectIngressSends(f.plan.sends, { ...f.plan.sends[0], title: "Changed", hash: "f".repeat(64) });
+    const captured: Record<string, unknown> = { missingLauncher, ...(selected ? { conflictingReplay: true } : {}) };
+    const originalOwner = f.effects.runOwner;
+    const effects = { ...f.effects,
+      async prepare() { f.calls.push("prepare-minimal"); Object.assign(captured, f.plan); },
+      async runOwner(phasePlan: Record<string, unknown>, signal: AbortSignal) {
+        // Same closure/object mutation shape as realMain, no application effects.
+        Object.assign(phasePlan, captured); return originalOwner(phasePlan, signal);
+      },
+    };
+    const result = await h.runIngressCampaign(captured, effects);
+    assert.equal(result.success, true, JSON.stringify(result.failures)); assert.equal(result.phases.length, 2);
+    assert.equal(result.phases[0].root, "/synthetic"); assert.equal(result.phases[1].databasePath, "/synthetic/db");
+    assert.equal(f.calls.filter(n => n === "retry").length, 1);
+    assert.equal(f.calls.filter(n => n === "deliver").length, selected ? 6 : 4);
+    assert.equal(result.selectedCase, selected ? "conflicting-replay" : undefined);
+    assert.equal(result.branch, missingLauncher ? "missing-launcher" : "live");
+  });
+}
+for (const bad of ["accessor", "array", "selector", "phase"]) {
+  test(`C prepared control ${bad} refuses before owner without getter execution`, async () => {
+    const h = await helpers(), f = syntheticEffects(); const captured: Record<string, unknown> = { missingLauncher: false };
+    let getters = 0, owners = 0;
+    const result = await h.runIngressCampaign(captured, {
+      ...f.effects,
+      async prepare() {
+        Object.assign(captured, f.plan);
+        if (bad === "accessor") Object.defineProperty(captured, "root", { get() { getters++; return "/synthetic"; } });
+        if (bad === "array") Object.setPrototypeOf(captured.sends, { toJSON() { getters++; return []; } });
+        if (bad === "selector") captured.missingLauncher = true;
+        if (bad === "phase") captured.phase = 1;
+      },
+      async runOwner() { owners++; throw new Error("ingress_unexpected_owner"); },
+    });
+    assert.equal(result.success, false); assert.equal(getters, 0); assert.equal(owners, 0);
+  });
+}
+test("C real empty store adapter baseline waits until selected rejection, never before first delivery", async () => {
+  const h = await helpers(), { readIngressConflictBaseline } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const root = mkdtempSync("/private/tmp/ingress-conflict-empty-"); chmodSync(root, 0o700);
+  const databasePath = path.join(root, "actual.db"), store = openSessionStore({ filename: databasePath });
+  const scope = { region: "feishu" as const, tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef" };
+  const { inviteEnvelope } = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
+  const invite = normalizeInvite(inviteEnvelope({ eventId: "ingress-a", providerMeetingId: "component-empty", meetingNo: "987654321",
+    title: "First", startSeconds: 1791280800, inviteSeconds: 1791280800, createTimeMs: 1791280800000 }), scope);
+  const read = () => h.readIngressState({ databasePath, occurrenceId: invite.occurrenceId }); let reads = 0;
+  const adapterRead = () => { reads++; return read(); };
+  try {
+    assert.throws(read, /ingress_occurrence_count/);
+    assert.doesNotThrow(() => assert.equal(readIngressConflictBaseline({ expectedCode: 200 }, adapterRead), undefined));
+    assert.doesNotThrow(() => assert.equal(readIngressConflictBaseline({}, adapterRead), undefined)); assert.equal(reads, 0);
+    store.acceptInvite(invite, 100); const claim = store.claimInviteMetadata(101)!;
+    store.failInviteClaim(claim, { status: "blocked", reason: "metadata_unavailable", retryable: false }, 102, 1000);
+    const before = readIngressConflictBaseline({ expectedCode: 500 }, adapterRead);
+    assert.equal(reads, 1); assert.equal(before.metadata.state, "metadata_blocked");
+    assert.equal(readIngressConflictBaseline({ expectedCode: 200 }, adapterRead), undefined); assert.equal(reads, 1);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+test("C invalid label rejects before effects and serialization without calling toJSON", async () => {
+  const h = await helpers(), f = syntheticEffects(); let calls = 0;
+  for (const label of ["unknown", { toJSON() { calls++; return "PRIVATE_LABEL"; } }]) {
+    await assert.rejects(h.runIngressCampaign(f.plan, f.effects, { label }));
+  }
+  assert.equal(calls, 0); assert.deepEqual(f.calls, []);
+});
+for (const mode of ["success", "operation-failed", "accessor"]) {
+  test(`C unknown close diagnostic stays outside ${mode} phase reports`, async () => {
+    const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")); let getters = 0;
+    const f = await transactionConflictFixture((name, value) => {
+      if (mode === "operation-failed" && name === "deliver") {
+        const receiver = value.receiver as { observations: { payload: { code: number } }[] };
+        receiver.observations[0]!.payload.code = 500;
+      }
+      if (name === "close") {
+        if (mode === "accessor") Object.defineProperty(value, "privateDiagnostic", { get() { getters++; return "PRIVATE_DIAGNOSTIC"; } });
+        else value.privateDiagnostic = "PRIVATE_DIAGNOSTIC";
+      }
+    });
+    try {
+      const result = await runIngressPhase(f.plan, f.effects);
+      assert.equal(result.success, false); assert.equal(getters, 0);
+      assert.equal(JSON.stringify(result).includes("PRIVATE_DIAGNOSTIC"), false);
+      assert.equal(result.close, undefined);
+    } finally { f.dispose(); }
+  });
+}
+for (const place of ["outcome", "event", "compositionClosed", "keyCustody"]) {
+  test(`C nested close ${place} diagnostic rejects before retaining even a failed close`, async () => {
+    const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+    const f = await transactionConflictFixture((name, value) => {
+      if (name !== "close") return;
+      if (place === "outcome") value.outcomes = [{ privateDiagnostic: "PRIVATE_NESTED" }];
+      else if (place === "event") ((value.finalState as State).events[0] as unknown as Record<string, unknown>).privateDiagnostic = "PRIVATE_NESTED";
+      else value[place] = { privateDiagnostic: "PRIVATE_NESTED" };
+    });
+    try {
+      const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, false);
+      assert.equal(result.close, undefined); assert.equal(JSON.stringify(result).includes("PRIVATE_NESTED"), false);
+      assert.ok(result.failures.includes("ingress_close_fields"));
+    } finally { f.dispose(); }
+  });
+}
+test("C closed report keeps the actual optional outcome/organizer DTO and sparse cleanup fixtures", async () => {
+  const h = await helpers(), { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const f = await transactionConflictFixture();
+  try {
+    const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, true);
+    const close = copy(result.close);
+    close.outcomes = [{ occurrenceId: f.plan.occurrenceId, bridgeId: "component-bridge", organizer: {
+      feishuUserId: "ou_e2e_organizer", displayName: "Component organizer", source: "reservation" },
+    phase: "settled", controlSessionId: "41", failure: null, finalization: "recorded", custody: "assigned",
+    runtimeClose: "closed", runtimeCleanup: "graceful" }];
+    assert.deepEqual(h.ingressCloseFact(close), close);
+    close.outcomes = [{ runtimeCleanup: "unconfirmed" }];
+    assert.deepEqual(h.ingressCloseFact(close), close); // The cleanup oracle, not DTO projection, refuses this known negative fact.
+  } finally { f.dispose(); }
+});
