@@ -16,6 +16,7 @@ import { createServer } from "node:http";
 import { TextDecoder } from "node:util";
 import { WebSocketServer } from "ws";
 import { createFeishuPeerControls } from "./feishu-peer-controls.mjs";
+import { createFeishuUpgradeControls } from "./feishu-upgrade-controls.mjs";
 export { ORGANIZER, RESERVE_ID } from "./feishu-peer-controls.mjs";
 
 export const SCOPE = { region: "feishu", tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef" };
@@ -170,6 +171,19 @@ export function createFeishuFrameReceiver() {
   };
 }
 
+/** Listener-free construction is shared with the actual peer registration. */
+export function createFeishuUpgradeServer(server) {
+  const websocket = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 65536 });
+  const controls = createFeishuUpgradeControls(websocket);
+  server.on("upgrade", controls.handler);
+  return Object.freeze({ websocket, controls,
+    close() {
+      server.removeListener("upgrade", controls.handler);
+      return controls.close();
+    },
+  });
+}
+
 /**
  * @param meeting the occurrence the reservation must agree with, so the
  *   shipped resolver's own occurrence/meeting-number checks are exercised.
@@ -186,7 +200,8 @@ export async function startFeishuPeer(options) {
   wsPath = `${origin.replace("http:", "ws:")}/ws`;
 
   const sockets = new Set();
-  const websocket = new WebSocketServer({ server, perMessageDeflate: false, maxPayload: 65536 });
+  const upgrades = createFeishuUpgradeServer(server);
+  const { websocket } = upgrades;
   const frameObservation = createFeishuFrameReceiver();
   const { acknowledgements } = frameObservation;
   websocket.on("connection", (socket) => {
@@ -195,10 +210,14 @@ export async function startFeishuPeer(options) {
     socket.on("close", () => sockets.delete(socket));
   });
 
+  let closing = null;
   return {
     origin, requests, messages, acknowledgements, frameObservation,
     armNext: controls.armNext, release: controls.release,
     readPendingHold: controls.readPendingHold,
+    armNextUpgrade: upgrades.controls.armNextUpgrade,
+    readPendingUpgrade: upgrades.controls.readPendingUpgrade,
+    readUpgradeObservation: upgrades.controls.readUpgradeObservation,
     get connectionCount() { return sockets.size; },
     /** The SDK HttpInstance request hook: same shape, local origin. */
     rewriteRequest(defaultRequest) {
@@ -211,12 +230,17 @@ export async function startFeishuPeer(options) {
       if (sockets.size === 0) throw new Error("e2e_no_long_connection");
       for (const socket of sockets) socket.send(eventFrame(raw, messageId));
     },
-    async close() {
-      controls.close();
-      for (const socket of sockets) socket.terminate();
-      await new Promise((resolve) => websocket.close(() => resolve()));
-      server.closeAllConnections();
-      await new Promise((resolve) => server.close(() => resolve()));
+    close() {
+      if (closing) return closing;
+      const upgradeClose = upgrades.close();
+      closing = (async () => {
+        controls.close();
+        for (const socket of sockets) socket.terminate();
+        await Promise.all([upgradeClose, new Promise((resolve) => websocket.close(() => resolve()))]);
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(() => resolve()));
+      })();
+      return closing;
     },
   };
 }
