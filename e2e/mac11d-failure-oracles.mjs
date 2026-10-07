@@ -31,7 +31,7 @@ export function parseCalibrationFailureMetadata(text, scenario) {
   const contract = contractFor(scenario), expiry = scenario === "expiry-rollback";
   assert.equal(typeof text, "string"); assert.ok(Buffer.byteLength(text) <= 65536, "metadata bound exceeded");
   assert.ok(text === "" || text.endsWith("\n"), "incomplete metadata record");
-  const seen = new Set(); let terminal = false;
+  const seen = new Map(); let terminal = false;
   return text.split("\n").filter(Boolean).map(line => {
     assert.ok(Buffer.byteLength(line) <= 4096, "metadata line bound exceeded");
     assert.equal(terminal, false, "metadata after result");
@@ -39,7 +39,9 @@ export function parseCalibrationFailureMetadata(text, scenario) {
     if (row.type === "barrier") {
       exact(row, ["schema", "type", "name"]);
       assert.ok([...commonBarriers, ...contract.faults].includes(row.name), "foreign fault barrier");
-      assert.ok(!seen.has(row.name), "duplicate metadata barrier"); seen.add(row.name);
+      const count = (seen.get(row.name) ?? 0) + 1;
+      assert.ok(count <= (scenario === "unconfirmed-cleanup-write" && row.name === "capture_stopped" ? 2 : 1), "duplicate metadata barrier");
+      seen.set(row.name, count);
     } else {
       exact(row, [...normalKeys, ...contract.counters, ...(expiry ? ["rollbackApplied"] : [])]);
       assert.equal(row.type, "result");
@@ -56,9 +58,11 @@ export function parseCalibrationFailureMetadata(text, scenario) {
 export function runCalibrationFailureOracles({ scenario, records, result, events, drain, shutdown,
   finalized, pages, complete, sessionId, bridgeSessionId, expiredCredentialRefused }) {
   const contract = contractFor(scenario), expiry = scenario === "expiry-rollback", native = scenario === "native-primary";
+  const unconfirmed = scenario === "unconfirmed-cleanup-write";
   assert.ok(Array.isArray(records));
   const decoded = parseCalibrationFailureMetadata(records.map(row => JSON.stringify(row) + "\n").join(""), scenario);
-  assert.deepEqual(decoded.at(-1), result); assert.equal(decoded.length, commonBarriers.length + contract.faults.length + 1);
+  assert.deepEqual(decoded.at(-1), result);
+  assert.equal(decoded.length, commonBarriers.length + contract.faults.length + 1 + (unconfirmed ? 1 : 0), "failure metadata record count");
   const pos = Object.fromEntries([...commonBarriers, ...contract.faults].map(name => [name, decoded.findIndex(row => row.name === name)]));
   for (const [name, index] of Object.entries(pos)) assert.ok(index >= 0, `missing ${name}`);
   assert.equal(pos.child_ready, 0);
@@ -66,11 +70,18 @@ export function runCalibrationFailureOracles({ scenario, records, result, events
   const primary = native ? "native_primary_fault" : expiry ? "expiry_transport_fault" : "transport_write_fault";
   assert.ok(pos.capture_emission_complete < pos[primary], "fault precedes finite emission");
   if (expiry) assert.ok(pos.capture_emission_complete < pos.wall_rollback && pos.wall_rollback < pos[primary]);
-  for (const name of ["capture_stopped", "output_stopped"]) assert.ok(pos[primary] < pos[name] && pos[name] < pos.control_finished);
-  if (scenario === "unconfirmed-cleanup-write")
-    assert.ok(pos.capture_stopped < pos.native_stop_completion_late && pos.native_stop_completion_late < pos.control_finished);
-  for (const key of ["captureStarts", "captureStops", "outputStarts", "outputStops", "connectionsCreated"])
+  for (const name of ["capture_stopped", "output_stopped"])
+    assert.ok(pos[primary] < pos[name] && pos[name] < pos.control_finished, "fault cleanup order");
+  if (unconfirmed) {
+    const stops = decoded.flatMap((row, index) => row.name === "capture_stopped" ? [index] : []);
+    assert.equal(stops.length, 2, "unconfirmed capture stop count");
+    assert.ok(pos[primary] < stops[0] && stops[0] < pos.native_stop_completion_late &&
+      pos.native_stop_completion_late < pos.output_stopped && pos.output_stopped < stops[1] &&
+      stops[1] < pos.control_finished, "unconfirmed capture stop order");
+  }
+  for (const key of ["captureStarts", "outputStarts", "outputStops", "connectionsCreated"])
     assert.equal(result[key], 1, key);
+  assert.equal(result.captureStops, unconfirmed ? 2 : 1, "captureStops");
   assert.equal(result.emittedBuffers, contract.emittedBuffers); assert.equal(result.emittedSamples, contract.emittedSamples);
   assert.equal(result.cleanupConfirmed, contract.cleanup, "native cleanup disagrees with primary fault");
   if (!expiry) {
@@ -91,9 +102,11 @@ export function runCalibrationFailureOracles({ scenario, records, result, events
   assert.deepEqual(drain, { drain: "unconfirmed", reason: "drain_not_attempted", boundary: null });
   assert.deepEqual(result.captureDrain, drain, "metadata/control drain disagreement");
   assert.equal(shutdown.reaped, true); assert.equal(shutdown.failure, null);
-  assert.deepEqual(shutdown.outcome && { outcome: shutdown.outcome.outcome, reason: shutdown.outcome.reason },
-    { outcome: "departure_confirmed", reason: "departure_observed" });
-  assert.equal(result.departureOutcome, shutdown.outcome.outcome); assert.equal(result.departureReason, shutdown.outcome.reason);
+  const custody = expiry ? { outcome: "departure_confirmed", reason: "departure_observed" }
+    : { outcome: "departure_unconfirmed", reason: "cleanup_failed" };
+  assert.deepEqual(shutdown.outcome && { outcome: shutdown.outcome.outcome, reason: shutdown.outcome.reason }, custody, "scenario custody mismatch");
+  assert.equal(result.departureOutcome, shutdown.outcome.outcome, "departure metadata disagreement");
+  assert.equal(result.departureReason, shutdown.outcome.reason, "departure metadata disagreement");
   assert.ok(Array.isArray(events) && events.length > 0 && events.length <= 512);
   events.forEach((event, index) => {
     assert.equal(event.sessionId, bridgeSessionId);
@@ -148,7 +161,8 @@ export function runCalibrationFailureOracles({ scenario, records, result, events
   assert.equal(new Set(complete.warnings).size, complete.warnings.length); assert.deepEqual([...complete.warnings].sort(), warnings);
   assert.equal(complete.coverageStatus, warnings.some(warning => warning !== "local_wall_timestamp_estimate") ? "partial" : "available");
   const entries = pages.flatMap(page => page.entries);
-  assert.ok(entries.every(row => ["epoch", "clock_pair", "frame"].includes(row.kind)), "fabricated source loss or recovery");
+  const kinds = expiry ? ["epoch", "clock_pair", "frame"] : ["epoch", "clock_pair", "frame", "discontinuity", "audio_gap"];
+  assert.ok(entries.every(row => kinds.includes(row.kind)), "fabricated source loss or recovery");
   const epochs = entries.filter(row => row.kind === "epoch"), pairs = entries.filter(row => row.kind === "clock_pair");
   const frames = entries.filter(row => row.kind === "frame");
   assert.equal(epochs.length, 1); assert.equal(entries[0], epochs[0]);
@@ -181,8 +195,21 @@ export function runCalibrationFailureOracles({ scenario, records, result, events
     }
   });
   assert.ok(end <= BigInt(contract.emittedSamples)); assert.equal(finalized.durationMs, end * 1000n / 24000n);
+  if (!expiry) {
+    const markers = entries.filter(row => row.kind === "discontinuity"), gaps = entries.filter(row => row.kind === "audio_gap");
+    assert.equal(markers.length, 1, "terminal discontinuity count"); assert.equal(gaps.length, 1, "terminal gap count");
+    assert.equal(markers[0].reason, "reconnect", "terminal discontinuity reason");
+    assert.equal(markers[0].captureEpoch, 1n, "terminal discontinuity epoch");
+    assert.equal(gaps[0].reason, "capture_discontinuity", "terminal gap reason");
+    assert.equal(gaps[0].endedAtMs, null, "terminal gap must remain open");
+    assert.equal(gaps[0].startedAtMs, end * 1000n / 24000n, "terminal gap start disagrees with authenticated prefix");
+    const markerIndex = entries.indexOf(markers[0]);
+    assert.ok(markerIndex < entries.indexOf(gaps[0]), "terminal gap order");
+    assert.equal(entries.at(-1), gaps[0], "terminal gap must be final entry");
+    assert.ok([...frames, ...pairs].every(row => entries.indexOf(row) < markerIndex), "terminal discontinuity precedes authenticated prefix");
+  }
   return { recordedSamples: end.toString(), recordedFrames: frames.length, emittedSamples: result.emittedSamples,
     prefixComplete: end === BigInt(result.emittedSamples), pages: pages.length, drain: "unconfirmed",
-    nativeCleanup: contract.cleanup ? "confirmed" : "unconfirmed", custody: "departure_confirmed",
+    nativeCleanup: contract.cleanup ? "confirmed" : "unconfirmed", custody: custody.outcome,
     timingCoverage: complete.coverageStatus, timingWarnings: complete.warnings, scope: "component_only_failure_oracle" };
 }
