@@ -204,3 +204,15 @@ test("receive histories and sticky refusals belong to one peer only", () => {
   assert.deepEqual(first.acknowledgements, []);
   assert.deepEqual(second.observations, [{ ordinal: 1, kind: "ack", messageId: "other-peer", payload: { code: 200 } }]);
 });
+
+ test("selected backlog receiver keeps257 facts and sticky258 overflow without changing default64", () => {
+  const fn = peer.createFeishuFrameReceiver;
+  assert.throws(() => fn("unsupported"), /e2e_receiver_profile/);
+  const selected = fn("backlog-257");
+  for (let n = 0; n < 257; n++) selected.receive(reply({ id: `backlog-${n}` }));
+  assert.equal(selected.observations.length, 257); assert.equal(selected.overflow, false);
+  selected.receive(reply({ id: "258" })); selected.receive(ping());
+  assert.equal(selected.observations.length, 257); assert.equal(selected.overflow, true);
+  assert.equal(selected.observations[256].messageId, "backlog-256");
+  const fresh = fn("backlog-257"); assert.equal(fresh.overflow, false);
+ });

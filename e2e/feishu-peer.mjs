@@ -151,7 +151,9 @@ export function observeFeishuFrame(buffer) {
 }
 
 /** The actual socket receive callback, also usable without listeners in tests. */
-export function createFeishuFrameReceiver() {
+export function createFeishuFrameReceiver(profile) {
+  if (profile !== undefined && profile !== "backlog-257") throw new Error("e2e_receiver_profile");
+  const maximum = profile === "backlog-257" ? 257 : 64;
   const acknowledgements = [], observations = [];
   let ordinal = 0, invalid = false, overflow = false;
   return {
@@ -165,7 +167,7 @@ export function createFeishuFrameReceiver() {
       if (received.legacyPayload) acknowledgements.push(received.legacyPayload);
       if (observation.kind === "ping") return;
       if (observation.kind === "invalid") invalid = true;
-      if (observations.length === 64) { overflow = true; return; }
+      if (observations.length === maximum) { overflow = true; return; }
       observations.push({ ordinal, ...observation });
     },
   };
@@ -189,6 +191,8 @@ export function createFeishuUpgradeServer(server) {
  *   shipped resolver's own occurrence/meeting-number checks are exercised.
  */
 export async function startFeishuPeer(options) {
+  // Validate the selected literal before constructing any HTTP/socket owner.
+  const frameObservation = createFeishuFrameReceiver(options.receiverProfile);
   let wsPath = null;
   const controls = createFeishuPeerControls({ ...options, wsPath: () => wsPath });
   const { requests, messages } = controls;
@@ -202,7 +206,6 @@ export async function startFeishuPeer(options) {
   const sockets = new Set();
   const upgrades = createFeishuUpgradeServer(server);
   const { websocket } = upgrades;
-  const frameObservation = createFeishuFrameReceiver();
   const { acknowledgements } = frameObservation;
   websocket.on("connection", (socket) => {
     sockets.add(socket);
