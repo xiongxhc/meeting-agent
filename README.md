@@ -201,6 +201,25 @@ Both owners must close cleanly and the trigger must be absent. This is ordinary
 same-process reopen after a nonfatal transaction abort. Real-store components
 do not establish actual SDK ACKs, admitted ownership or crash recovery.
 
+The separate durable-backlog selection fills the production 256-invitation
+backlog without launching meetings. For this command, `--out` names a new
+JSON evidence file under an existing canonical private parent directory:
+
+```sh
+/opt/homebrew/opt/node@24/bin/node e2e/invite-backlog-run.mjs --out /absolute/private/evidence/invite-backlog.json
+```
+
+All 256 distinct invitations must commit before receiving 200, then settle
+with missing metadata references. Invitation 257 must receive 500 without a commit or partial row.
+After clean ordinary application/store reopen, each original invitation must
+receive 200 as an unchanged replay; the same overflow invitation must still
+receive 500. The full invitation, audit and metadata state must remain intact,
+with no downstream meeting work. Each application must close with zero owned transport work before fixture
+cleanup; the peer then closes before admitted return and owner release. The
+first owner must fully settle before the second begins. This is ordinary same-process reopen, not
+process restart. Real-store and decoded-frame components do not establish actual
+SDK ACKs, admitted application ownership or dispatcher saturation.
+
 The prepared capacity command accepts `--count 1`, `2`, `4` or `8`. Run each
 count sequentially with a fresh private output directory:
 
