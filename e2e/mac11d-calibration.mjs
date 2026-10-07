@@ -1,5 +1,6 @@
 // Synthetic Mac11d drain, reconnect and metadata-failure calibration only.
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -11,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { RuntimeClient, StdioGatewayTransport } from "@conversation/runtime";
 import { createChildBridgeSlot } from "../dist/src/adapters/child-bridge-process.js";
+import { parseEventV2 } from "../dist/src/contracts/bridge-session-v2.js";
 import { startFixtureProvider } from "./fixture-provider.mjs";
 import { postmeetingGatewayToml } from "./gateway-config.mjs";
 import { preflightLauncher } from "./launcher-preflight.mjs";
@@ -266,9 +268,21 @@ function telemetry(filename, complete = false, parser = parseCalibrationTelemetr
 }
 export function calibrationLease(lease, sessionId, bridgeSessionId) {
   assert.equal(lease.mediaProtocolVersion, 3); assert.equal(lease.sessionId, sessionId);
-  assert.equal(lease.bridgeSessionId, bridgeSessionId, "issued bridge identity mismatch");
-  return { ...lease, sessionId: lease.sessionId.toString(), expiresAtMs: lease.expiresAtMs.toString(),
+  assert.ok(typeof bridgeSessionId === "string" && bridgeSessionId.length > 0 && Buffer.byteLength(bridgeSessionId, "utf8") <= 64 &&
+    !/[\p{Cc}\p{Cf}]/u.test(bridgeSessionId), "invalid requested bridge identity");
+  // The SDK lease has Runtime identity; bridge identity comes from the exact start request.
+  if ("bridgeSessionId" in lease) assert.equal(lease.bridgeSessionId, bridgeSessionId, "issued bridge identity mismatch");
+  return { ...lease, bridgeSessionId, sessionId: lease.sessionId.toString(), expiresAtMs: lease.expiresAtMs.toString(),
     reconnectWindowMs: lease.reconnectWindowMs.toString() };
+}
+export function normalCalibrationLifecycle(events, bridgeSessionId) {
+  assert.ok(events.every(row => row.sessionId === bridgeSessionId), "unbound normal bridge event");
+  assert.ok(!events.some(row => ["reconnecting", "reconnected"].includes(row.type)), "normal capture reconnected");
+  const disconnected = events.filter(row => row.type === "media_disconnected");
+  assert.deepEqual(disconnected.map(row => row.reason), ["capture_drain_confirmed", "media_stopped"]);
+  for (const event of disconnected) parseEventV2(event);
+  assert.equal(Object.hasOwn(disconnected[0], "captureDrain"), false, "diagnostic carried typed drain");
+  assert.equal(disconnected[1].captureDrain?.drain, "confirmed", "normal terminal drain unconfirmed");
 }
 
 export async function runCalibration(executable, { scenario = "normal", runtimeProfile = RUNTIME_PIN } = {}) {
@@ -394,7 +408,7 @@ export async function runCalibration(executable, { scenario = "normal", runtimeP
     const records = readTelemetry(true), results = records.filter(row => row.type === "result");
     assert.equal(results.length, 1); assert.ok(records.some(row => row.name === "control_finished"));
     const disconnected = events.filter(row => row.type === "media_disconnected" && row.captureDrain !== undefined); assert.equal(disconnected.length, 1);
-    if (!reconnect && !metadataFailure && !remainingFailure) assert.equal(events.filter(row => row.type === "media_disconnected").length, 1);
+    if (!reconnect && !metadataFailure && !remainingFailure) normalCalibrationLifecycle(events, bridgeSessionId);
     phase = "finalize_and_authenticated_reopen";
     markFirstTeardown(); assert.equal(await bounded(voice.stopIfActive()), "stopped");
     markFirstTeardown(); const finalized = await bounded(client.finalizeRecording({ sessionId }));

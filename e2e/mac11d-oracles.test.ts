@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { parseGatewayMessage } from "@conversation/runtime";
+import { createBridgeSessionValidatorV2 } from "../src/contracts/bridge-session-v2.ts";
 // @ts-expect-error Test-only JavaScript oracle has no public declaration.
 import { calibrationOracle, parseCalibrationTelemetry } from "./mac11d-oracles.mjs";
 // @ts-expect-error Test-only JavaScript runner has no public declaration.
-import { calibrationLease } from "./mac11d-calibration.mjs";
+import { calibrationLease, normalCalibrationLifecycle } from "./mac11d-calibration.mjs";
 
 function fixture() {
   const boundary = { captureEpoch: "1", lastFrameSequence: "3", outputEndSample: "1097", finalClockPairSequence: "2" };
@@ -39,12 +41,75 @@ test("calibration requires actual recorded tail and matching typed drain separat
   const mismatched = fixture(); mismatched.drain.boundary.outputEndSample = "1096";
   assert.throws(() => calibrationOracle(mismatched));
 });
-test("SDK lease identity is checked before forwarding unchanged bridge binding", () => {
-  const lease = { mediaProtocolVersion: 3, bridgeSessionId: "mac11d", sessionId: 42n, expiresAtMs: 10000n, reconnectWindowMs: 1000n };
-  assert.equal(calibrationLease(lease, 42n, "mac11d").bridgeSessionId, "mac11d");
-  assert.throws(() => calibrationLease({ ...lease, bridgeSessionId: "foreign" }, 42n, "mac11d"));
-  assert.throws(() => calibrationLease({ ...lease, sessionId: 43n }, 42n, "mac11d"));
-  assert.throws(() => calibrationLease({ ...lease, mediaProtocolVersion: 2 }, 42n, "mac11d"));
+function sdkLease() {
+  const message = parseGatewayMessage({ protocol_version: 4, type: "timed_voice_session_started", request_id: "1",
+    media_lease: { media_protocol_version: 3, session_id: "9007199254740993", connect_endpoint: "tcp://127.0.0.1:9001",
+      credential: "synthetic_calibration_credential", expires_at_ms: String(Date.now() + 10000), reconnect_window_ms: "1000",
+      capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } }, 4);
+  assert.equal(message.type, "timed_voice_session_started");
+  if (message.type !== "timed_voice_session_started") throw new Error("unexpected SDK message");
+  return message.mediaLease;
+}
+test("actual SDK lease receives the requested bridge binding in a valid connect command without mutation", () => {
+  const lease = sdkLease(), original = { ...lease };
+  assert.equal(Object.hasOwn(lease, "bridgeSessionId"), false);
+  const mediaLease = calibrationLease(lease, 9007199254740993n, "mac11d");
+  assert.deepEqual(mediaLease, { mediaProtocolVersion: 3, sessionId: "9007199254740993", bridgeSessionId: "mac11d",
+    connectEndpoint: "tcp://127.0.0.1:9001", credential: "synthetic_calibration_credential",
+    expiresAtMs: original.expiresAtMs.toString(), reconnectWindowMs: "1000",
+    captureFormat: "pcm_s16le/24000/1/20ms", timingContract: "capture-clock/v1" });
+  const command = { schema: "bridge-session/v2", sessionId: "mac11d", commandId: "connect", type: "connect_media", mediaLease };
+  assert.deepEqual(createBridgeSessionValidatorV2("mac11d").acceptCommand(JSON.parse(JSON.stringify(command))),
+    { ok: true, value: command });
+  assert.deepEqual(lease, original);
+});
+test("calibration retains Runtime identity, media version and conflicting supplied bridge fences", () => {
+  const lease = sdkLease();
+  assert.throws(() => calibrationLease({ ...lease, bridgeSessionId: "foreign" }, lease.sessionId, "mac11d"));
+  assert.throws(() => calibrationLease({ ...lease, sessionId: 43n }, lease.sessionId, "mac11d"));
+  assert.throws(() => calibrationLease({ ...lease, mediaProtocolVersion: 2 }, lease.sessionId, "mac11d"));
+});
+test("calibration accepts only a finite valid requested bridge identity", () => {
+  const lease = sdkLease();
+  for (const bridgeSessionId of ["", null, undefined, 42, "a".repeat(65), "é".repeat(33), "mac\0", "mac\u200b"])
+    assert.throws(() => calibrationLease(lease, lease.sessionId, bridgeSessionId));
+  assert.equal(calibrationLease(lease, lease.sessionId, "a".repeat(64)).bridgeSessionId, "a".repeat(64));
+});
+function normalEvents() {
+  return [
+    { type: "media_connected", endpoint: "tcp://127.0.0.1:9001" },
+    { type: "media_disconnected", reason: "capture_drain_confirmed" },
+    { type: "media_disconnected", reason: "media_stopped", captureDrain: fixture().drain },
+  ].map((event, index) => ({ schema: "bridge-session/v2", sessionId: "mac11d", sequence: index + 1,
+    observedAt: "2026-10-01T00:00:00Z", ...event }));
+}
+test("normal lifecycle accepts the shipped ordered diagnostic and confirmed typed terminal pair", () => {
+  assert.doesNotThrow(() => normalCalibrationLifecycle(normalEvents(), "mac11d"));
+});
+test("normal lifecycle rejects missing, duplicate, reordered, extra, failed and unbound disconnects", () => {
+  const valid = normalEvents(), connected = valid[0]!, diagnostic = valid[1]!, terminal = valid[2]!;
+  for (const [label, events] of [
+    ["missing diagnostic", [connected, terminal]],
+    ["missing terminal", [connected, diagnostic]],
+    ["duplicate diagnostic", [connected, diagnostic, diagnostic, terminal]],
+    ["duplicate terminal", [connected, diagnostic, terminal, terminal]],
+    ["reordered", [connected, terminal, diagnostic]],
+    ["extra disconnect", [...valid, { ...diagnostic, reason: "capture_delivery_interrupted" }]],
+    ["unknown diagnostic", [connected, { ...diagnostic, reason: "unknown" }, terminal]],
+    ["failed diagnostic", [connected, { ...diagnostic, reason: "capture_drain_unconfirmed" }, terminal]],
+    ["failed terminal", [connected, diagnostic, { ...terminal, reason: "media_cleanup_unconfirmed" }]],
+    ["unknown terminal", [connected, diagnostic, { ...terminal, reason: "unknown" }]],
+    ["typed diagnostic", [connected, { ...diagnostic, captureDrain: fixture().drain }, terminal]],
+    ["undefined diagnostic property", [connected, { ...diagnostic, captureDrain: undefined }, terminal]],
+    ["missing typed terminal", [connected, diagnostic, { ...terminal, captureDrain: undefined }]],
+    ["unconfirmed terminal", [connected, diagnostic, { ...terminal, captureDrain: { drain: "unconfirmed", reason: "failure", boundary: null } }]],
+    ["malformed confirmed drain", [connected, diagnostic, { ...terminal, captureDrain: { drain: "confirmed", reason: null, boundary: null } }]],
+    ["foreign diagnostic", [connected, { ...diagnostic, sessionId: "foreign" }, terminal]],
+    ["foreign terminal", [connected, diagnostic, { ...terminal, sessionId: "foreign" }]],
+    ["foreign connected", [{ ...connected, sessionId: "foreign" }, diagnostic, terminal]],
+    ["reconnecting", [...valid, { ...connected, type: "reconnecting", attempt: 1 }]],
+    ["reconnected", [...valid, { ...connected, type: "reconnected", attempt: 1 }]],
+  ] as const) assert.throws(() => normalCalibrationLifecycle(events, "mac11d"), label);
 });
 test("recorded final pairs require the bound host domain and contiguous unique sequences", () => {
   for (const fault of ["domain", "sequence", "duplicate"]) {
