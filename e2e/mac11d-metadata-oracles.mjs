@@ -76,10 +76,21 @@ export function metadataFailureOracle({ records, result, events, drain, shutdown
   assert.equal(new Set(complete.warnings).size, complete.warnings.length);
   assert.deepEqual([...complete.warnings].sort(), warnings); assert.equal(complete.coverageStatus, "partial");
   const entries = pages.flatMap(page => page.entries);
-  assert.ok(entries.every(row => ["epoch", "clock_pair", "frame"].includes(row.kind)), "unexpected source loss or reconnect");
+  assert.ok(entries.every(row => ["epoch", "clock_pair", "frame", "discontinuity", "audio_gap"].includes(row.kind)), "unexpected metadata recording entry");
   const epochs = entries.filter(row => row.kind === "epoch"), pairs = entries.filter(row => row.kind === "clock_pair");
   const frames = entries.filter(row => row.kind === "frame");
   assert.equal(epochs.length, 1); assert.equal(pairs.length, 1); assert.equal(frames.length, 3);
+  // Runtime records terminal transport closure at EOF under the same admitted epoch.
+  const discontinuities = entries.filter(row => row.kind === "discontinuity"), gaps = entries.filter(row => row.kind === "audio_gap");
+  assert.equal(discontinuities.length, 1, "metadata terminal discontinuity count");
+  assert.equal(gaps.length, 1, "metadata terminal gap count");
+  assert.equal(discontinuities[0].reason, "reconnect", "metadata terminal discontinuity reason");
+  assert.equal(discontinuities[0].captureEpoch, 1n, "metadata terminal discontinuity epoch");
+  assert.equal(gaps[0].reason, "capture_discontinuity", "metadata terminal gap reason");
+  assert.equal(gaps[0].startedAtMs, 45n, "metadata terminal gap start");
+  assert.equal(gaps[0].endedAtMs, null, "metadata terminal gap must remain open");
+  assert.ok(entries.indexOf(discontinuities[0]) > entries.indexOf(frames.at(-1)) &&
+    entries.indexOf(gaps[0]) > entries.indexOf(discontinuities[0]), "metadata terminal closure order");
   const epoch = epochs[0].epoch;
   assert.equal(epoch.captureEpoch, 1n); assert.equal(epoch.bridgeSessionId, bridgeSessionId);
   assert.ok(typeof epoch.clockDomainId === "string" && epoch.clockDomainId.length > 0);

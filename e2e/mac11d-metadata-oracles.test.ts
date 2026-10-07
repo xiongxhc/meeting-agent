@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { RecordingAlignmentPage } from "@conversation/runtime";
+import { pageWarnings } from "../src/sessions/recording-alignment.ts";
 // @ts-expect-error Test-only JavaScript oracle has no public declaration.
 import { metadataFailureOracle, parseMetadataTelemetry } from "./mac11d-metadata-oracles.mjs";
 
@@ -29,9 +31,11 @@ function fixture() {
     shutdown: { reaped: true, failure: null, outcome: { outcome: "departure_confirmed", reason: "departure_observed" } },
     finalized: { recordingHandle: "opaque", sha256: source.sha256, durationMs: 45n, format: "pcm_s16le/24000/1" },
     pages: [{ type: "recording_alignment_page", source, pageIndex: 0n, entries: [
-      { kind: "epoch", epoch }, { kind: "clock_pair", pair: { sequence: 1n, clockDomainId: epoch.clockDomainId } }, ...frames] }],
+      { kind: "epoch", epoch }, { kind: "clock_pair", pair: { sequence: 1n, clockDomainId: epoch.clockDomainId } }, ...frames,
+      { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" },
+      { kind: "audio_gap", startedAtMs: 45n, endedAtMs: null as bigint | null, reason: "capture_discontinuity" }] }],
     complete: { type: "recording_alignment_complete", source, pageCount: 1n, traversalSucceeded: true,
-      coverageStatus: "partial", warnings: ["missing_clock_pair", "wall_alignment_missing"] } };
+      coverageStatus: "partial", warnings: ["missing_clock_pair", "wall_alignment_missing", "reconnect", "audio_missing"] } };
 }
 test("metadata oracle keeps native cleanup, failed drain and authenticated tail as separate facts", () => {
   const proof = metadataFailureOracle(fixture());
@@ -42,12 +46,53 @@ test("metadata oracle keeps native cleanup, failed drain and authenticated tail 
     if (fault === "drain") f.drain.reason = "drain_deadline";
     if (fault === "cleanup") f.result.cleanupConfirmed = false;
     if (fault === "restart") f.result.captureStarts = 2;
-    if (fault === "tail") f.pages[0]!.entries.pop();
+    if (fault === "tail") f.pages[0]!.entries.splice(f.pages[0]!.entries.findLastIndex(entry => entry.kind === "frame"), 1);
     if (fault === "rejects") f.result.rejectedWallSamples = 1;
     if (fault === "barrier") f.records.splice(4, 1);
     assert.throws(() => metadataFailureOracle(f), fault);
   }
 });
+test("metadata oracle preserves terminal EOF closure and open gap without a retry", () => {
+  const f = fixture();
+  assert.deepEqual(f.pages[0]!.entries.slice(-2), [
+    { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" },
+    { kind: "audio_gap", startedAtMs: 45n, endedAtMs: null, reason: "capture_discontinuity" },
+  ]);
+  assert.equal(metadataFailureOracle(f).recordedSamples, "1097");
+});
+for (const fault of ["missing_closure", "missing_gap", "duplicate_closure", "duplicate_gap", "closure_reason",
+  "closure_epoch", "gap_reason", "gap_start", "closed_gap", "reversed_tail", "closure_before_last_frame",
+  "gap_before_last_frame", "unsupported_kind"] as const) {
+  test(`metadata oracle rejects ${fault} at the selected terminal predicate`, () => {
+    const f = fixture(), entries = f.pages[0]!.entries;
+    const closure = entries.find(entry => entry.kind === "discontinuity")! as { kind: string; captureEpoch: bigint; reason: string };
+    const gap = entries.find(entry => entry.kind === "audio_gap")! as { kind: string; startedAtMs: bigint; endedAtMs: bigint | null; reason: string };
+    const lastFrame = entries.findLast(entry => entry.kind === "frame")!;
+    let failure = /metadata terminal discontinuity count/;
+    if (fault === "missing_closure") entries.splice(entries.indexOf(closure), 1);
+    if (fault === "missing_gap") { entries.splice(entries.indexOf(gap), 1); failure = /metadata terminal gap count/; }
+    if (fault === "duplicate_closure") entries.push(structuredClone(closure));
+    if (fault === "duplicate_gap") { entries.push(structuredClone(gap)); failure = /metadata terminal gap count/; }
+    if (fault === "closure_reason") { closure.reason = "pause"; failure = /metadata terminal discontinuity reason/; }
+    if (fault === "closure_epoch") { closure.captureEpoch = 2n; failure = /metadata terminal discontinuity epoch/; }
+    if (fault === "gap_reason") { gap.reason = "recording_failed"; failure = /metadata terminal gap reason/; }
+    if (fault === "gap_start") { gap.startedAtMs = 44n; failure = /metadata terminal gap start/; }
+    if (fault === "closed_gap") { gap.endedAtMs = 46n; failure = /metadata terminal gap must remain open/; }
+    if (fault === "reversed_tail") {
+      const a = entries.indexOf(closure), b = entries.indexOf(gap); [entries[a], entries[b]] = [gap, closure];
+      failure = /metadata terminal closure order/;
+    }
+    if (fault === "closure_before_last_frame" || fault === "gap_before_last_frame") {
+      const selected = fault === "closure_before_last_frame" ? closure : gap;
+      entries.splice(entries.indexOf(selected), 1); entries.splice(entries.indexOf(lastFrame), 0, selected);
+      failure = /metadata terminal closure order/;
+    }
+    if (fault === "unsupported_kind") { entries.push({ kind: "alignment_limit" } as never); failure = /unexpected metadata recording entry/; }
+    // These thin component fixtures expose only fields the oracle reads; warnings use its genuine production helper.
+    f.complete.warnings = [...new Set(f.pages.flatMap(page => pageWarnings(page as unknown as RecordingAlignmentPage)))].sort();
+    assert.throws(() => metadataFailureOracle(f), failure);
+  });
+}
 test("metadata oracle refuses recovery attempts, foreign events and premature typed finish", () => {
   for (const fault of ["retry", "foreign", "order", "finish"] as const) {
     const f = fixture();
@@ -58,7 +103,7 @@ test("metadata oracle refuses recovery attempts, foreign events and premature ty
     assert.throws(() => metadataFailureOracle(f), fault);
   }
 });
-test("metadata oracle does not fabricate wall timing, final pair or audio-loss gap", () => {
+test("metadata oracle rejects fabricated wall timing, final pair or extra audio-loss gap", () => {
   for (const fault of ["wall", "pair", "gap", "sequence", "warnings", "duration", "source", "terminal", "reap"] as const) {
     const f = fixture();
     const frame = f.pages[0]!.entries[3] as { provenance: { sequence: bigint }; wall: object | null };
