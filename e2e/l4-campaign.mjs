@@ -5,7 +5,8 @@ import process from "node:process";
 
 export const L4_TEXT = "The synthetic budget is seven.";
 export const L4_A = "ou_l4_speaker", L4_S = "ou_l4_silent";
-const CASES = ["sent-named", "unavailable-missing", "sent-drop"];
+export const L4_B = "ou_l4_candidate_b";
+const CASES = ["sent-named", "unavailable-missing", "sent-drop", "sent-conflict"];
 const requireFact = (value, code) => { if (!value) throw new Error(code); };
 function plainData(value, array = false) {
   return value !== null && typeof value === "object" && Object.getPrototypeOf(value) === (array ? Array.prototype : Object.prototype) &&
@@ -26,6 +27,22 @@ export function compileL4Plan(l4Case, origin) {
     Number.isSafeInteger(origin.wallMs) && origin.wallMs >= 0, "l4_origin_refused");
   const base = BigInt(origin.hostNs), events = [];
   requireFact(base + 4900000000n <= 18446744073709551615n, "l4_origin_refused");
+  if (l4Case === "sent-conflict") {
+    const addNs = (offset, payload) => {
+      const due = base + offset;
+      events.push({ emitAtHostNs: due.toString(), event: { ...payload, observedAt: new Date(origin.wallMs + Number(offset / 1000000n)).toISOString(),
+        observationTiming: { clockDomainId: "e2e-clock", hostBeforeNs: (due - 1n).toString(), hostAfterNs: due.toString() },
+        ...(payload.type === "ui_snapshot" ? {} : { observationTimingReason: null }) } });
+    };
+    addNs(1000000000n, { type: "participant_joined", feishuUserId: L4_A, displayName: "Speaker A" });
+    addNs(1010000000n, { type: "participant_joined", feishuUserId: L4_B, displayName: "Candidate B" });
+    for (let k = 0; k < 30; k++) for (let j = 0; j < 2; j++) addNs(1450000000n + BigInt(k) * 20000000n + BigInt(j), {
+      type: "ui_snapshot", snapshotSequence: 2 * k + j + 1, state: "ui_exact", feishuUserId: j === 0 ? L4_A : L4_B, reason: null,
+      barrierBefore: k === 0 && j === 0 ? "stream_start" : null });
+    addNs(4500000000n, { type: "participant_left", feishuUserId: L4_A });
+    addNs(4900000000n, { type: "participant_left", feishuUserId: L4_B });
+    return { schema: "e2e-bridge-observations/v1", disclosure: "sent", events };
+  }
   function add(ms, payload) {
     const due = base + BigInt(ms) * 1000000n;
     events.push({ emitAtHostNs: due.toString(), event: { ...payload, observedAt: new Date(origin.wallMs + ms).toISOString(),
@@ -90,24 +107,27 @@ export function l4HasLiveOutput(events) {
 }
 export async function driveL4Capture({ l4Case, provider, child, runtimeEvents, waitFor, budgetMs, nowHostNs = () => process.hrtime.bigint() }) {
   l4Configuration({ l4Case, interactive: true });
+  const conflict = l4Case === "sent-conflict", rows = conflict ? 64 : 38;
   requireFact(Number.isFinite(budgetMs) && budgetMs > 0, "l4_budget_refused");
   const wait = async (check, name) => {
     let failure = null;
-    const value = await waitFor(() => { try { return check(); } catch (error) { failure = error; return true; } }, { budgetMs, name });
+    const value = await waitFor(() => { try { return check(); } catch (error) { failure = error; return true; } },
+      { budgetMs, name, ...(conflict && name === "l4_observed_readiness" ? { pollMs: 5 } : {}) });
     if (failure) throw failure;
     return value;
   };
   await wait(() => {
     requireFact(!l4HasLiveOutput(runtimeEvents()), "l4_runtime_decision_refused");
     const state = child();
-    if (state?.l4?.origin) requireFact(nowHostNs() <= BigInt(state.l4.origin.hostNs) + 2100000000n, "l4_fixed_window_missed");
-    return state?.joined && state.mediaConnected && provider.submitted.ready && provider.submitted.valid && state.observationPlan?.emitted >= 6;
+    if (state?.l4?.origin) requireFact(nowHostNs() <= BigInt(state.l4.origin.hostNs) + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
+    return state?.joined && state.mediaConnected && provider.submitted.ready && provider.submitted.valid && state.observationPlan?.emitted >= 6 &&
+      (!conflict || nowHostNs() >= BigInt(state.l4.origin.hostNs) + 1480000000n);
   }, "l4_observed_readiness");
   const state = child(), plan = compileL4Plan(l4Case, state.l4?.origin);
   requireFact(state.l4?.case === l4Case && state.l4.planSha256 === l4PlanHash(plan) &&
-    state.observationPlan.planned === 38 && state.observationPlan.phase === "running", "l4_plan_binding_refused");
+    state.observationPlan.planned === rows && state.observationPlan.phase === "running", "l4_plan_binding_refused");
   const now = nowHostNs(), base = BigInt(state.l4.origin.hostNs);
-  requireFact(now >= base + 1400000000n && now <= base + 2100000000n, "l4_fixed_window_missed");
+  requireFact(now >= base + (conflict ? 1480000000n : 1400000000n) && now <= base + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
   const observed = provider.submitted;
   const range = { connection: observed.connection, startFrame: observed.appended + 1, endFrame: observed.appended + 50 };
   const before = runtimeEvents().length;
@@ -121,12 +141,12 @@ export async function driveL4Capture({ l4Case, provider, child, runtimeEvents, w
   provider.transcript(L4_TEXT, range);
   const final = await wait(() => runtimeEvents().slice(before).find(row => row.type === "voice_transcript_final"), "l4_runtime_final");
   await wait(() => runtimeEvents().slice(before).some(row => row.type === "response_skipped" && row.segment_id === final.segment_id && row.session_id === final.session_id), "l4_runtime_skip");
-  await wait(() => child()?.observationPlan?.phase === "completed" && child()?.observationPlan?.emitted === 38, "l4_observations_complete");
+  await wait(() => child()?.observationPlan?.phase === "completed" && child()?.observationPlan?.emitted === rows, "l4_observations_complete");
   const decisions = runtimeEvents().slice(before);
   requireFact(decisions.filter(row => row.type === "voice_transcript_final").length === 1 && decisions.filter(row => row.type === "response_skipped").length === 1 &&
     !l4HasLiveOutput(runtimeEvents()) &&
     !(provider.calls ?? []).some(row => row.route === "language" || row.route === "speech"), "l4_runtime_decision_refused");
-  return { case: l4Case, origin: state.l4.origin, planSha256: state.l4.planSha256, range, segmentId: final.segment_id, runtimeSessionId: final.session_id, rawRows: 38 };
+  return { case: l4Case, origin: state.l4.origin, planSha256: state.l4.planSha256, range, segmentId: final.segment_id, runtimeSessionId: final.session_id, rawRows: rows };
 }
 
 /** The caller always releases the existing composition controller, including failures. */
@@ -136,7 +156,7 @@ export async function closeL4Composition({ getApplication, controller }) {
 }
 
 /** The ONLY identity input is a named segment in the actual canonical transcript. */
-export function l4PersonSummaries(messages) {
+export function l4PersonSummaries(messages, l4Case) {
   requireFact(plainData(messages, true) && messages.length <= 32 && messages.every(message => plainData(message)), "l4_synthesis_input_refused");
   const canonical = messages.filter(message => typeof message.content === "string").flatMap(message => {
     try { const parsed = JSON.parse(message.content); return Array.isArray(parsed) ? [parsed] : []; } catch { return []; }
@@ -146,9 +166,10 @@ export function l4PersonSummaries(messages) {
     typeof row.segment_id !== "string" || typeof row.text !== "string" || typeof row.started_at !== "string" || typeof row.ended_at !== "string" ||
     !Number.isFinite(Date.parse(row.started_at)) || !Number.isFinite(Date.parse(row.ended_at)) || !plainData(row.speaker) || !plainData(row.provenance) ||
     !["live_stream", "final_batch"].includes(row.provenance.stage) || typeof row.provenance.model !== "string")) return [];
-  const named = canonical[0].find(row => typeof row?.segment_id === "string" && typeof row.text === "string" && row.text.trim() &&
-    row.speaker?.kind === "person" && row.speaker.reconciled === true && row.speaker.person_id === L4_A && typeof row.speaker.display_name === "string" && row.speaker.display_name.length > 0);
-  return named ? [{ person_id: named.speaker.person_id, display_name: named.speaker.display_name, text: "Synthetic summary of the named transcript contribution." }] : [];
+  const named = canonical[0].filter(row => typeof row?.segment_id === "string" && typeof row.text === "string" && row.text.trim() &&
+    row.speaker?.kind === "person" && row.speaker.reconciled === true && (row.speaker.person_id === L4_A || l4Case === "sent-conflict" && row.speaker.person_id === L4_B) && typeof row.speaker.display_name === "string" && row.speaker.display_name.length > 0);
+  const selected = l4Case === "sent-conflict" ? named.filter((row, index) => named.findIndex(other => other.speaker.person_id === row.speaker.person_id) === index) : named.slice(0, 1);
+  return selected.map(row => ({ person_id: row.speaker.person_id, display_name: row.speaker.display_name, text: "Synthetic summary of the named transcript contribution." }));
 }
 
 async function productionCodecs() {
@@ -180,14 +201,37 @@ export async function readL4Evidence(filename, occurrence) {
 
 /** Source/component callers may supply the same production source functions. */
 export function assertL4ReconciledIdentity(unit, l4Case) {
-  requireFact(l4Case === "sent-named" ? unit.speaker.kind === "named" && unit.speaker.feishuUserId === L4_A : unit.speaker.kind === "anonymous", "l4_reconciled_identity");
+  requireFact(l4Case === "sent-named" ? unit.speaker.kind === "named" && unit.speaker.feishuUserId === L4_A : unit.speaker.kind === (l4Case === "sent-conflict" ? "ambiguous" : "anonymous"), "l4_reconciled_identity");
+}
+/** Union of authenticated wording-clipped frame samples; point counts confer no duration. */
+export function l4ConflictingSamples({ entries, ui, bridgeSessionId, capture, range }, Cursor) {
+  const cursor = new Cursor(ui, bridgeSessionId), intervals = [];
+  try {
+    for (const frame of entries) {
+      if (frame.kind !== "frame") continue;
+      const observed = cursor.read(frame), p = frame.provenance;
+      if (frame.epoch?.captureEpoch !== capture.captureEpoch || frame.epoch.clockDomainId !== capture.clockDomainId ||
+        !p || p.sequence < capture.firstFrameSequence || p.sequence > capture.lastFrameSequence ||
+        !observed.observedIdentities.includes(L4_A) || !observed.observedIdentities.includes(L4_B)) continue;
+      const start = frame.mediaStartSample > range.startSampleInclusive ? frame.mediaStartSample : range.startSampleInclusive;
+      const end = frame.mediaEndSample < range.endSampleExclusive ? frame.mediaEndSample : range.endSampleExclusive;
+      if (end > start) intervals.push({ start, end });
+    }
+  } finally { cursor.close(); }
+  intervals.sort((a, b) => a.start < b.start ? -1 : a.start > b.start ? 1 : 0);
+  let end = range.startSampleInclusive, total = 0n;
+  for (const interval of intervals) if (interval.end > end) {
+    total += interval.end - (interval.start > end ? interval.start : end); end = interval.end;
+  }
+  return total;
 }
 export async function verifyL4Evidence(input, codecs) {
   const c = codecs ?? await productionCodecs(), { snapshot: s, drive, artifact, runtimeEvents, l4Case } = input;
   l4Configuration({ l4Case, interactive: true });
+  const conflict = l4Case === "sent-conflict", rows = conflict ? 64 : 38;
   requireFact(input.closed === true, "l4_owner_closure_unavailable");
   const plan = compileL4Plan(l4Case, drive?.origin);
-  requireFact(drive.case === l4Case && drive.planSha256 === l4PlanHash(plan) && drive.rawRows === 38, "l4_plan_binding_refused");
+  requireFact(drive.case === l4Case && drive.planSha256 === l4PlanHash(plan) && drive.rawRows === rows, "l4_plan_binding_refused");
   const owner = one(s.owners, "l4_owner_binding"), live = one(s.live, "l4_live_count"), binding = one(s.bindings, "l4_recording_binding");
   requireFact(owner.state === "closed" && owner.live_rows === 1 && live.owner_state === "closed" && live.result !== null &&
     live.capture_complete === 1 && live.incomplete_reason === null && owner.wording_loss_reason === null && live.wording_loss_reason === null, "l4_owner_retention");
@@ -202,7 +246,7 @@ export async function verifyL4Evidence(input, codecs) {
   });
   requireFact(raw.length === owner.ui_rows && raw.every((row, i) => i === 0 || row.sequence === raw[i - 1].sequence + 1), "l4_raw_sequence");
   const planned = raw.filter(row => ["participant_joined", "participant_left", "ui_snapshot"].includes(row.type));
-  requireFact(planned.length === 38 && planned.every((row, i) => {
+  requireFact(planned.length === rows && planned.every((row, i) => {
     const payload = { ...row }; delete payload.schema; delete payload.sessionId; delete payload.sequence;
     return same(Object.entries(payload).sort(), Object.entries(plan.events[i].event).sort());
   }), "l4_raw_plan_mismatch");
@@ -255,12 +299,15 @@ export async function verifyL4Evidence(input, codecs) {
     sourceEnd += 480n;
   }
   requireFact(sourceEnd === capture.sourceEndSample && !entries.some(row => row.kind === "audio_gap") && s.gaps.length === 0 && s.runtimeGaps.length === 0, "l4_audio_loss");
+  if (conflict) requireFact(frames[0].provenance.span.hostStartNs >= base + 1460000000n && frames[0].provenance.span.hostStartNs <= base + 1500000000n, "l4_conflict_frame_phase");
   const merged = await c.mergeTimedRecordingEvidence({ source: decoded[0].source, bridgeSessionId: drive.bridgeSessionId, entries, ui: raw,
     live: [evidence], final: { unavailable: true }, uiLossReason: expectedLoss, wordingLossReason: null });
   const unit = one(merged.segments, "l4_reconciled_count");
   requireFact(unit.range && unit.range.endSampleExclusive - unit.range.startSampleInclusive === 24000n && unit.wall &&
     unit.liveSegmentIds.length === 1 && unit.liveSegmentIds[0] === drive.segmentId && unit.wording === "live", "l4_reconciled_capture");
   assertL4ReconciledIdentity(unit, l4Case);
+  const conflictingSamples = conflict ? l4ConflictingSamples({ entries, ui: raw, bridgeSessionId: drive.bridgeSessionId, capture, range: unit.range }, c.FrameUiCursor) : null;
+  if (conflict) requireFact(conflictingSamples > 12000n && conflictingSamples <= 24000n, "l4_conflict_sample_threshold");
   requireFact(artifact?.files && ["READY", "audio.enc", "manifest.json", "meeting.json"].every(name => artifact.files.includes(name)), "l4_ready_bundle_missing");
   const meeting = c.parseSupportedTeamMemMeetingArtifact(artifact.meeting);
   requireFact(meeting.schema === "teammem-meeting/v2" && meeting.occurrence_id === s.occurrence && artifact.occurrenceId === s.occurrence &&
@@ -271,24 +318,26 @@ export async function verifyL4Evidence(input, codecs) {
   const segment = one(meeting.transcript, "l4_artifact_transcript_count");
   requireFact(segment.segment_id === unit.segmentId && segment.text === L4_TEXT && segment.provenance.stage === "live_stream" &&
     segment.started_at === unit.wall.startedAt && segment.ended_at === unit.wall.endedAt, "l4_artifact_live_binding");
-  requireFact(l4Case === "sent-named" ? segment.speaker.kind === "person" && segment.speaker.person_id === L4_A : segment.speaker.kind === "anonymous", "l4_artifact_identity");
+  requireFact(l4Case === "sent-named" ? segment.speaker.kind === "person" && segment.speaker.person_id === L4_A : segment.speaker.kind === (conflict ? "ambiguous" : "anonymous"), "l4_artifact_identity");
   const intervals = c.reduceAttendance(raw.flatMap(row => row.type === "participant_joined" ? [{ type: row.type, feishuUserId: row.feishuUserId, displayName: row.displayName,
     occurredAt: row.observedAt, sequence: row.sequence, bridgeSessionId: row.sessionId }] : row.type === "participant_left" ? [{ type: row.type, feishuUserId: row.feishuUserId,
     occurredAt: row.observedAt, sequence: row.sequence, bridgeSessionId: row.sessionId }] : []));
-  const grouped = [L4_A, L4_S].map(id => ({ person_id: id, display_name: intervals.find(row => row.feishuUserId === id)?.displayName,
+  const grouped = [L4_A, conflict ? L4_B : L4_S].map(id => ({ person_id: id, display_name: intervals.find(row => row.feishuUserId === id)?.displayName,
     attendance: intervals.filter(row => row.feishuUserId === id).map(row => ({ joined_at: row.joinedAt, left_at: row.leftAt })) }));
-  requireFact(intervals.length === 3 && grouped[0].attendance.length === 2 && grouped[1].attendance.length === 1 && same(meeting.participants, grouped), "l4_observed_attendance");
+  requireFact(intervals.length === (conflict ? 2 : 3) && grouped[0].attendance.length === (conflict ? 1 : 2) && grouped[1].attendance.length === 1 && same(meeting.participants, grouped), "l4_observed_attendance");
   requireFact(l4Case === "sent-named" ? meeting.person_summaries.length === 1 && meeting.person_summaries[0].person_id === L4_A : meeting.person_summaries.length === 0, "l4_summary_identity");
   requireFact(meeting.processing_warnings.filter(row => row.code === "timed_ui_evidence_loss").length === (expectedLoss ? 1 : 0) &&
     (!expectedLoss || meeting.processing_warnings.some(row => row.code === "timed_ui_evidence_loss" && row.detail === expectedLoss)) &&
     !meeting.processing_warnings.some(row => row.code === "timed_capture_loss"), "l4_artifact_ui_warning");
+  if (conflict) requireFact(meeting.transcript_complete === merged.transcriptComplete, "l4_transcript_complete_truth");
   return { case: l4Case, disposition: "source-bound_scripted_campaign", planSha256: drive.planSha256,
     occurrenceId: s.occurrence, generationId: binding.generation_id, bridgeSessionId: drive.bridgeSessionId, runtimeSessionId: drive.runtimeSessionId,
     alignmentAttemptId: attempt.attempt_id, recordingSha256: recording.sha256, artifactHash: artifact.hash, artifactRevision: artifact.revision,
-    rawRows: 38, disclosure: disclosure.outcome, capture: { firstFrame: capture.firstFrameSequence.toString(), lastFrame: capture.lastFrameSequence.toString(),
+    rawRows: rows, disclosure: disclosure.outcome, capture: { firstFrame: capture.firstFrameSequence.toString(), lastFrame: capture.lastFrameSequence.toString(),
       sourceStartSample: capture.sourceStartSample.toString(), sourceEndSample: capture.sourceEndSample.toString(), samples: "24000", frames: 50 },
     attendance: grouped, warnings: meeting.processing_warnings.map(row => row.code), transcriptComplete: meeting.transcript_complete,
-    summaries: { A: meeting.person_summaries.some(row => row.person_id === L4_A), S: false } };
+    summaries: conflict ? { A: meeting.person_summaries.some(row => row.person_id === L4_A), B: meeting.person_summaries.some(row => row.person_id === L4_B) } : { A: meeting.person_summaries.some(row => row.person_id === L4_A), S: false },
+    ...(conflict ? { conflictingSamples: conflictingSamples.toString(), speakerKind: unit.speaker.kind } : {}) };
 }
 
 /** Public bundle is a whitelist. Raw private traces remain in the owned root. */
@@ -306,12 +355,14 @@ export function l4Report(input) {
       ["pass", "fail", "skipped", "blocked"].includes(row.status)) && new Set(input.checks.map(row => row.name)).size === input.checks.length &&
     plainData(input.processCleanup) && typeof input.processCleanup.cleanupConfirmed === "boolean", "l4_report_input_refused");
   const metadata = input.metadata;
+  const conflict = input.l4Case === "sent-conflict";
   let facts = null;
   if (metadata !== null && metadata !== undefined) {
     const scalars = ["case", "disposition", "planSha256", "occurrenceId", "generationId", "bridgeSessionId", "runtimeSessionId", "alignmentAttemptId",
-      "recordingSha256", "artifactHash", "artifactRevision", "rawRows", "disclosure", "transcriptComplete"];
+      "recordingSha256", "artifactHash", "artifactRevision", "rawRows", "disclosure", "transcriptComplete", ...(conflict ? ["conflictingSamples", "speakerKind"] : [])];
     requireFact(shape(metadata, [...scalars, "capture", "summaries", "attendance", "warnings"]) && metadata.case === input.l4Case &&
-      metadata.disposition === "source-bound_scripted_campaign" && metadata.rawRows === 38 && typeof metadata.transcriptComplete === "boolean" &&
+      metadata.disposition === "source-bound_scripted_campaign" && metadata.rawRows === (conflict ? 64 : 38) && typeof metadata.transcriptComplete === "boolean" &&
+      (!conflict || uint(metadata.conflictingSamples, 24000n) && BigInt(metadata.conflictingSamples) > 12000n && metadata.speakerKind === "ambiguous") &&
       typeof metadata.planSha256 === "string" && /^[a-f0-9]{64}$/.test(metadata.planSha256) &&
       typeof metadata.recordingSha256 === "string" && /^[a-f0-9]{64}$/.test(metadata.recordingSha256) &&
       typeof metadata.artifactHash === "string" && /^sha256:[a-f0-9]{64}$/.test(metadata.artifactHash) &&
@@ -329,20 +380,20 @@ export function l4Report(input) {
       uint(metadata.capture.sourceStartSample, 1440000n) && uint(metadata.capture.sourceEndSample, 1440000n) &&
       BigInt(metadata.capture.sourceEndSample) - BigInt(metadata.capture.sourceStartSample) === 24000n &&
       metadata.capture.samples === "24000" && metadata.capture.frames === 50 &&
-      shape(metadata.summaries, ["A", "S"]) && metadata.summaries.A === (input.l4Case === "sent-named") && metadata.summaries.S === false &&
+      shape(metadata.summaries, ["A", conflict ? "B" : "S"]) && metadata.summaries.A === (input.l4Case === "sent-named") && metadata.summaries[conflict ? "B" : "S"] === false &&
       array(metadata.attendance, 2) && metadata.attendance.length === 2 && metadata.attendance.every((person, index) =>
-        shape(person, ["person_id", "display_name", "attendance"]) && person.person_id === [L4_A, L4_S][index] &&
-        person.display_name === ["Speaker A", "Silent S"][index] && array(person.attendance, 2) && person.attendance.length === (index === 0 ? 2 : 1) &&
+        shape(person, ["person_id", "display_name", "attendance"]) && person.person_id === [L4_A, conflict ? L4_B : L4_S][index] &&
+        person.display_name === ["Speaker A", conflict ? "Candidate B" : "Silent S"][index] && array(person.attendance, 2) && person.attendance.length === (!conflict && index === 0 ? 2 : 1) &&
         person.attendance.every(row => shape(row, ["joined_at", "left_at"]) && instant(row.joined_at) !== null && instant(row.left_at) !== null)) &&
       array(metadata.warnings, 8) && new Set(metadata.warnings).size === metadata.warnings.length && metadata.warnings.every(code =>
         ["local_wall_timestamp_estimate", "timed_ui_evidence_loss", "timed_final_processing_incomplete", "timed_cluster_conflict", "timed_live_outside_final", "runtime_text_warning"].includes(code)) &&
       metadata.warnings.includes("local_wall_timestamp_estimate") && metadata.warnings.includes("timed_ui_evidence_loss") === (input.l4Case === "sent-drop"), "l4_report_input_refused");
     const a = metadata.attendance[0].attendance, s = metadata.attendance[1].attendance, start = instant(a[0].joined_at);
-    requireFact(instant(a[0].left_at) - start === 3500 && instant(a[1].joined_at) - start === 3700 && instant(a[1].left_at) - start === 3800 &&
+    requireFact(instant(a[0].left_at) - start === 3500 && (conflict || instant(a[1].joined_at) - start === 3700 && instant(a[1].left_at) - start === 3800) &&
       instant(s[0].joined_at) - start === 10 && instant(s[0].left_at) - start === 3900, "l4_report_input_refused");
     const pick = (row, keys) => Object.fromEntries(keys.map(key => [key, row[key]]));
     facts = { ...pick(metadata, scalars), capture: pick(metadata.capture, ["firstFrame", "lastFrame", "sourceStartSample", "sourceEndSample", "samples", "frames"]),
-      summaries: pick(metadata.summaries, ["A", "S"]), attendance: metadata.attendance.map(person => ({ ...pick(person, ["person_id"]),
+      summaries: pick(metadata.summaries, ["A", conflict ? "B" : "S"]), attendance: metadata.attendance.map(person => ({ ...pick(person, ["person_id"]),
         attendance: person.attendance.map(row => pick(row, ["joined_at", "left_at"])) })),
       warnings: [...metadata.warnings] };
   }

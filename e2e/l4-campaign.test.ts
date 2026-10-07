@@ -123,14 +123,14 @@ test("ordinary selected public close always settles controller and preserves clo
 
 import { encodeLiveEvidence, encodeProvisionalResult, decodeLiveEvidence, decodeProvisionalResult } from "../src/sessions/live-evidence-codec.ts";
 import { encodeAlignmentPage, decodeAlignmentPage, pageWarnings } from "../src/sessions/recording-alignment.ts";
-import { mergeTimedRecordingEvidence } from "../src/sessions/timed-evidence-merge.ts";
+import { FrameUiCursor, mergeTimedRecordingEvidence } from "../src/sessions/timed-evidence-merge.ts";
 import { reduceAttendance, type MeetingLifecycleEvent } from "../src/domain/participants.ts";
 import { parseSupportedTeamMemMeetingArtifact } from "../src/contracts/teammem-meeting-v2.ts";
 import { canonicalArtifactHash } from "../src/contracts/teammem-meeting-v1.ts";
 import { buildTimedTeamMemMeetingArtifactV2 } from "../src/delivery/artifact-builder.ts";
 import type { RecordingAlignmentEntry, RecordingAlignmentPage, VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 
-const codecs = { parseEventV2, decodeLiveEvidence, decodeProvisionalResult, decodeAlignmentPage, pageWarnings, mergeTimedRecordingEvidence,
+const codecs = { parseEventV2, decodeLiveEvidence, decodeProvisionalResult, decodeAlignmentPage, pageWarnings, FrameUiCursor, mergeTimedRecordingEvidence,
   reduceAttendance, parseSupportedTeamMemMeetingArtifact, canonicalArtifactHash };
 async function component(l4Case = "sent-named") {
   const l4 = await load(), plan = l4.compileL4Plan(l4Case, origin), raw: Array<ReturnType<typeof parseEventV2>> = [];
@@ -175,9 +175,116 @@ async function component(l4Case = "sent-named") {
     bindings: [{ generation_id: generation, occurrence_id: artifact.occurrenceId, bridge_session_id: "bridge", source_session_id: "41", recording_handle: source.recordingHandle, sha256: source.sha256, key_id: "c".repeat(16), recording_kind: "final" }], selected: [{ generation_id: generation, attempt_id: "attempt-1" }],
     attempts: [{ attempt_id: "attempt-1", generation_id: generation, source_session_id: "41", recording_handle: source.recordingHandle, sha256: source.sha256, key_id: "c".repeat(16), state: "complete", timing_contract: "capture-clock/v1", page_count: 2, entry_count: 50, stored_bytes: payloads.reduce((n, payload) => n + Buffer.byteLength(payload), 0), coverage_status: "available", warnings_json: '["local_wall_timestamp_estimate"]' }],
     pages: payloads.map((payload, i) => ({ attempt_id: "attempt-1", page_index: i, entry_count: 25, payload })), deliveries: [{ occurrence_id: artifact.occurrenceId, revision: 1, artifact_hash: artifact.hash, bundle_path: artifact.bundleDir, transcript_complete: 0 }] };
-  return { l4Case, snapshot, artifact, drive: { case: l4Case, origin, planSha256: l4.l4PlanHash(plan), range: { connection: "one", startFrame: 1, endFrame: 50 }, segmentId: "1", runtimeSessionId: "41", rawRows: 38, bridgeSessionId: "bridge", disclosureCommandId: "chat" },
+  return { l4Case, snapshot, artifact, drive: { case: l4Case, origin, planSha256: l4.l4PlanHash(plan), range: { connection: "one", startFrame: 1, endFrame: 50 }, segmentId: "1", runtimeSessionId: "41", rawRows: l4Case === "sent-conflict" ? 64 : 38, bridgeSessionId: "bridge", disclosureCommandId: "chat" },
     runtimeEvents: [{ type: "voice_transcript_final", session_id: "41", segment_id: "1" }, { type: "response_skipped", session_id: "41", segment_id: "1" }], providerCalls: [], child: { playback: [], flushes: [] }, closed: true };
 }
+
+test("sent-conflict selector compiles exactly 64 admitted one-ID observations at 20ms/+1ns", async () => {
+  const l4 = await load(), options = parseArguments(["--interactive", "--l4-case", "sent-conflict", "--out", "/private/tmp/component-unused"]);
+  assert.equal(options.l4Case, "sent-conflict"); assert.equal(publicationRequired(options), false);
+  assert.deepEqual(scriptedCaptureConfiguration(options), { l4Case: "sent-conflict", captureFrameLimit: 3000, participants: [] });
+  const plan = l4.compileL4Plan("sent-conflict", origin); assert.equal(plan.events.length, 64);
+  for (let k = 0; k < 30; k++) for (let j = 0; j < 2; j++) {
+    const row = plan.events[2 + 2 * k + j], due = BigInt(origin.hostNs) + 1450000000n + BigInt(k) * 20000000n + BigInt(j);
+    assert.equal(row.emitAtHostNs, due.toString()); assert.equal(row.event.observationTiming.hostBeforeNs, (due - 1n).toString());
+    assert.equal(row.event.observationTiming.hostAfterNs, due.toString()); assert.equal(row.event.snapshotSequence, 2 * k + j + 1);
+    assert.equal(row.event.feishuUserId, j === 0 ? "ou_l4_speaker" : "ou_l4_candidate_b");
+  }
+  let host = BigInt(origin.hostNs), pending: (() => void) | null = null, count = 0;
+  const emit = createBridgeEventEmitter({ sessionId: "bridge", write: (bytes: string) => { parseEventV2(JSON.parse(bytes)); count++; } });
+  const owner = createBridgeObservationOwner({ plan, binding, participants: [], parseEvent: parseEventV2, emit, nowHostNs: () => host,
+    timers: { setTimeout(callback: () => void) { pending = callback; return 1; }, clearTimeout() { pending = null; } } });
+  owner.prepareJoin({ clockDomainId: "e2e-clock", hostBeforeNs: host.toString(), hostAfterNs: host.toString() }); const done = owner.start();
+  for (const row of plan.events) { host = BigInt(row.emitAtHostNs); (pending as unknown as () => void)(); }
+  await done; owner.dispose(); assert.equal(count, 64);
+});
+test("sent-conflict synthesis detects wrongly named A and B independently through the actual HTTP handler", async () => {
+  const l4 = await load();
+  for (const id of ["ou_l4_speaker", "ou_l4_candidate_b"]) {
+    const named = [{ segment_id: "live:1", text: "Synthetic contribution.", speaker: { kind: "person", person_id: id, display_name: id === "ou_l4_speaker" ? "Speaker A" : "Candidate B", reconciled: true },
+      started_at: "2026-10-06T12:00:01.500000Z", ended_at: "2026-10-06T12:00:02.500000Z", provenance: { stage: "live_stream", model: "synthetic" } }];
+    const messages = [{ content: "meeting synthesis" }, { content: JSON.stringify(named) }];
+    assert.equal(l4.l4PersonSummaries(messages, "sent-conflict").length, 1);
+    assert.equal(answer(messages, { l4Case: "sent-conflict" }).person_summaries[0].person_id, id);
+    if (id === "ou_l4_candidate_b") assert.equal(l4.l4PersonSummaries(messages, "sent-named").length, 0);
+    assert.equal(answer([{ content: "meeting synthesis" }, { content: JSON.stringify([{ ...named[0], speaker: { kind: "ambiguous", label: "speaker_01" } }]) }], { l4Case: "sent-conflict" }).person_summaries.length, 0);
+  }
+});
+test("sent-conflict oracle earns positive samples from actual production cursor merger builder and artifact contract", async () => {
+  const l4 = await load(), input = await component("sent-conflict");
+  assert.equal(input.artifact.meeting.transcript[0]?.speaker.kind, "ambiguous");
+  const result = await l4.verifyL4Evidence(input, codecs);
+  assert.equal(result.conflictingSamples, "12960"); assert.equal(result.speakerKind, "ambiguous");
+  assert.equal(result.rawRows, 64); assert.deepEqual(result.summaries, { A: false, B: false });
+  assert.equal(result.attendance[0].attendance.length, 1); assert.equal(result.attendance[1].person_id, "ou_l4_candidate_b");
+  assert.equal(result.transcriptComplete, false);
+});
+test("sent-conflict driver selects 50 future actual tracker frames only within its fixed 1480..1500ms window", async () => {
+  const l4 = await load(), plan = l4.compileL4Plan("sent-conflict", origin);
+  const child = { joined: true, mediaConnected: true, l4: { case: "sent-conflict", origin, planSha256: l4.l4PlanHash(plan) }, observationPlan: { phase: "running", planned: 64, emitted: 6 } };
+  const tracker = l4.createSubmittedFrameTracker(); tracker.connect("one"); tracker.update("one", { type: "transcription", audio: { input: { format: { type: "audio/pcm", rate: 24000 } } } });
+  for (let i = 0; i < 70; i++) tracker.append("one", Buffer.alloc(960).toString("base64"));
+  const events: Array<Record<string, string>> = []; let sent = 0, offset = 1470000000n;
+  const provider = { get submitted() { return tracker.snapshot(); }, transcript(_text: string, range: { startFrame: number; endFrame: number }) {
+    sent++; assert.equal(range.startFrame, 71); assert.equal(range.endFrame, 120);
+    events.push({ type: "voice_transcript_final", segment_id: "1", session_id: "41" }, { type: "response_skipped", segment_id: "1", session_id: "41" }); } };
+  const waitFor = async (check: () => unknown, { name }: { name: string }) => {
+    if (name === "l4_observed_readiness") { assert.equal(Boolean(check()), false); offset = 1480000000n; }
+    if (name === "l4_submitted_window") { for (let i = 0; i < 50; i++) tracker.append("one", Buffer.alloc(960).toString("base64")); offset = 2500000000n; }
+    if (name === "l4_following_confirmation") child.observationPlan.emitted = 62;
+    if (name === "l4_observations_complete") { child.observationPlan.phase = "completed"; child.observationPlan.emitted = 64; }
+    const result = check(); assert.ok(result, name); return result;
+  };
+  const result = await l4.driveL4Capture({ l4Case: "sent-conflict", provider, child: () => child, runtimeEvents: () => events, waitFor, nowHostNs: () => BigInt(origin.hostNs) + offset, budgetMs: 100 });
+  assert.equal(result.rawRows, 64); assert.equal(sent, 1);
+  await assert.rejects(l4.driveL4Capture({ l4Case: "sent-conflict", provider, child: () => child, runtimeEvents: () => [], waitFor: async (check: () => unknown) => check(), nowHostNs: () => BigInt(origin.hostNs) + 1500000001n, budgetMs: 100 }), /l4_fixed_window_missed/);
+  assert.equal(sent, 1);
+});
+test("sent-conflict configurations refuse incompatible modes before staging", () => {
+  for (const extra of [["--only-refusals"], ["--package-refusals"], ["--r2-baseline"], ["--media-timing", "invalid2ns"], ["--d2-cut", "durable"]])
+    assert.throws(() => parseArguments(["--interactive", "--l4-case", "sent-conflict", ...extra, "--out", "/private/tmp/component-unused"]));
+});
+test("sent-conflict actual cursor sample union and actual merger retain strict 11999/12000/12001 threshold", async () => {
+  const l4 = await load(), input = await component("sent-conflict"), evidence = decodeLiveEvidence(input.snapshot.live[0]!.evidence, l4.L4_TEXT);
+  const entries = input.snapshot.pages.flatMap(row => decodeAlignmentPage(row.payload).entries), ui = input.snapshot.ui.map(row => parseEventV2(JSON.parse(row.payload)));
+  const source = decodeAlignmentPage(input.snapshot.pages[0]!.payload).source;
+  for (const [count, kind] of [[11999n, "anonymous"], [12000n, "anonymous"], [12001n, "ambiguous"]] as const) {
+    const capture = { ...evidence.capture!, sourceEndSample: count, lastFrameSequence: (count - 1n) / 480n + 1n };
+    const lastFrame = entries[Number(capture.lastFrameSequence - 1n)];
+    assert.ok(lastFrame?.kind === "frame" && lastFrame.provenance?.span);
+    const liveCoverage = { ...evidence.liveCoverage!, hostEndNs: lastFrame.provenance.span.hostEndNs };
+    const checked = decodeLiveEvidence(encodeLiveEvidence({ ...evidence, capture, liveCoverage }), evidence.text);
+    const merged = await mergeTimedRecordingEvidence({ source, bridgeSessionId: "bridge", entries, ui, live: [checked], final: { unavailable: true }, uiLossReason: null, wordingLossReason: null });
+    assert.equal(merged.segments.length, 1); const unit = merged.segments[0]!;
+    assert.equal(unit.speaker.kind, kind); assert.equal(unit.text, l4.L4_TEXT);
+    assert.equal(l4.l4ConflictingSamples({ entries, ui, bridgeSessionId: "bridge", capture, range: unit.range }, FrameUiCursor), count);
+    if (kind === "anonymous") assert.throws(() => l4.assertL4ReconciledIdentity(unit, "sent-conflict"), /l4_reconciled_identity/);
+  }
+  const single = ui.map(row => row.type === "ui_snapshot" ? parseEventV2({ ...row, feishuUserId: "ou_l4_speaker" }) : row);
+  const merged = await mergeTimedRecordingEvidence({ source, bridgeSessionId: "bridge", entries, ui: single, live: [evidence], final: { unavailable: true }, uiLossReason: null, wordingLossReason: null });
+  assert.equal(l4.l4ConflictingSamples({ entries, ui: single, bridgeSessionId: "bridge", capture: evidence.capture, range: merged.segments[0]!.range }, FrameUiCursor), 0n);
+  assert.throws(() => l4.assertL4ReconciledIdentity(merged.segments[0], "sent-conflict"), /l4_reconciled_identity/);
+});
+for (const id of ["ou_l4_speaker", "ou_l4_candidate_b"]) test(`sent-conflict coherent artifact falsely naming ${id} is detected`, async () => {
+  const l4 = await load(), input = await component("sent-conflict");
+  input.artifact.meeting.transcript[0]!.speaker = { kind: "person", person_id: id, display_name: id === "ou_l4_speaker" ? "Speaker A" : "Candidate B", reconciled: true };
+  input.artifact.meeting.person_summaries = [{ person_id: id, display_name: id === "ou_l4_speaker" ? "Speaker A" : "Candidate B", text: "False synthetic summary" }]; rehash(input);
+  parseSupportedTeamMemMeetingArtifact(input.artifact.meeting);
+  await assert.rejects(l4.verifyL4Evidence(input, codecs), /^Error: l4_artifact_identity$/);
+});
+const conflictMutants: Array<[string, string, (input: Awaited<ReturnType<typeof component>>) => void]> = [
+  ["missing candidate row", "l4_raw_sequence", input => { input.snapshot.ui.splice(3, 1); input.snapshot.owners[0]!.ui_rows--; }],
+  ["wrong candidate clock", "l4_raw_plan_mismatch", input => { const row = input.snapshot.ui[5]!, parsed = JSON.parse(row.payload); parsed.observationTiming.clockDomainId = "foreign"; row.payload = JSON.stringify(parsed); }],
+  ["wrong actual source", "l4_source_binding", input => { input.snapshot.bindings[0]!.source_session_id = "99"; }],
+  ["missing capture", "l4_capture_unavailable", input => { const row = input.snapshot.live[0]!, e = decodeLiveEvidence(row.evidence, row.text); row.evidence = encodeLiveEvidence({ type: e.type, sessionId: e.sessionId, segmentId: e.segmentId, turnId: null, text: e.text, captureUnavailableReason: "capture_timing_missing" }); }],
+  ["false transcript completeness", "l4_transcript_complete_truth", input => { input.artifact.meeting.transcript_complete = true; input.snapshot.deliveries[0]!.transcript_complete = 1; rehash(input); }],
+  ["missing READY", "l4_ready_bundle_missing", input => { input.artifact.files = input.artifact.files.filter(file => file !== "READY"); }],
+  ["extra transcript", "l4_actual_final_count", input => { input.runtimeEvents.push({ type: "voice_transcript_final", session_id: "41", segment_id: "2" }); }],
+];
+for (const [name, code, mutate] of conflictMutants) test(`sent-conflict ${name} fails independently of favorable input`, async () => {
+  const l4 = await load(), input = await component("sent-conflict"); await l4.verifyL4Evidence(input, codecs); mutate(input);
+  await assert.rejects(l4.verifyL4Evidence(input, codecs), error => error instanceof Error && error.message === code);
+});
 for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) test(`readonly oracle ${l4Case} accepts actual production merge/builder/contract component inputs`, async () => {
   const l4 = await load(); assert.equal(typeof l4.verifyL4Evidence, "function", "durable oracle missing");
   const input = await component(l4Case), result = await l4.verifyL4Evidence(input, codecs);
@@ -261,7 +368,7 @@ import { readClosedTimedAttendance, reconcilePersistedTimedSpeakers } from "../s
 import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) test(`owned synthetic SQLite ${l4Case} reaches actual closed production reconciler`, async () => {
+for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop", "sent-conflict"]) test(`owned synthetic SQLite ${l4Case} reaches actual closed production reconciler`, async () => {
   const l4 = await load(), input = await component(l4Case), dir = mkdtempSync(path.join(os.tmpdir(), "meeting-l4-component-")), filename = path.join(dir, "owned.db");
   const store = openSessionStore({ filename });
   try {
@@ -288,11 +395,11 @@ for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) test(`o
     for (const page of input.snapshot.pages) store.appendRecordingAlignment(attempt.attempt, decodeAlignmentPage(page.payload));
     store.completeRecordingAlignment(attempt.attempt, { type: "recording_alignment_complete", source, pageCount: 2n, coverageStatus: "available", warnings: ["local_wall_timestamp_estimate"], traversalSucceeded: true });
     const projected = await l4.readL4Evidence(filename, identity.occurrenceId);
-    assert.equal(projected.owners[0].state, "closed"); assert.equal(projected.ui.length, 40); assert.equal(projected.live.length, 1); assert.equal(projected.pages.length, 2);
+    assert.equal(projected.owners[0].state, "closed"); assert.equal(projected.ui.length, l4Case === "sent-conflict" ? 66 : 40); assert.equal(projected.live.length, 1); assert.equal(projected.pages.length, 2);
     const args = { occurrenceId: identity.occurrenceId, bridgeSessionId: "bridge", recordingHandle: source.recordingHandle, store, nowMs: () => 1001 };
-    const attendance = await readClosedTimedAttendance(args); assert.equal(attendance.attendance.length, 3);
+    const attendance = await readClosedTimedAttendance(args); assert.equal(attendance.attendance.length, l4Case === "sent-conflict" ? 2 : 3);
     const reconciled = await reconcilePersistedTimedSpeakers({ ...args, runtime: { async reconcileFinalizedRecording() { throw new Error("synthetic unavailable"); } } });
-    assert.equal(reconciled.segments[0]?.speaker.kind, l4Case === "sent-named" ? "named" : "anonymous");
+    assert.equal(reconciled.segments[0]?.speaker.kind, l4Case === "sent-named" ? "named" : l4Case === "sent-conflict" ? "ambiguous" : "anonymous");
     assert.equal(reconciled.segments[0]?.text, "The synthetic budget is seven.");
     assert.equal(reconciled.warnings.some(row => row.code === "timed_ui_evidence_loss"), l4Case === "sent-drop");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
@@ -356,6 +463,17 @@ async function reportInput(l4Case = "sent-named") {
   metadata.alignmentAttemptId = "12345678-1234-4234-8234-123456789abc";
   return { l4Case, metadata, checks: ["l4_selected_campaign", "artifact_bundle", "shutdown_clean", "no_key_or_plaintext_audio", "no_orphan_process", "no_closed_store_callback", "single_occurrence_identity"].map(name => ({ name, status: "pass" })), processCleanup: { cleanupConfirmed: true } };
 }
+test("sent-conflict closed report preserves earned sample count ambiguous kind and neither candidate summary", async () => {
+  const l4 = await load(), input = await reportInput("sent-conflict"), report = l4.l4Report(input);
+  assert.equal(report.disposition, "observed-scripted-campaign"); assert.equal(report.facts.conflictingSamples, "12960");
+  assert.equal(report.facts.speakerKind, "ambiguous"); assert.deepEqual(report.facts.summaries, { A: false, B: false });
+  assert.equal(report.facts.transcriptComplete, false); assert.equal(report.publication, "untested");
+  for (const [key, value] of [["conflictingSamples", "12000"], ["conflictingSamples", "11999"], ["conflictingSamples", "24001"], ["speakerKind", "anonymous"], ["rawRows", 38]]) {
+    const mutant = await reportInput("sent-conflict"); mutant.metadata[key as string] = value;
+    assert.throws(() => l4.l4Report(mutant), /^Error: l4_report_input_refused$/);
+  }
+  for (const id of ["A", "B"]) { const mutant = await reportInput("sent-conflict"); mutant.metadata.summaries[id] = true; assert.throws(() => l4.l4Report(mutant), /^Error: l4_report_input_refused$/); }
+});
 for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) test(`safe report ${l4Case} accepts bounded production-derived metadata and required checks`, async () => {
   const l4 = await load(), input = await reportInput(l4Case);
   input.checks.push({ name: "publication_receipt", status: "skipped" });

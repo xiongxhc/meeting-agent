@@ -13,9 +13,10 @@
 // never evidence about a Feishu tenant, a provider, acoustic capture, Linux or
 // a remote split.
 
-import { clearTimeout, setTimeout } from "node:timers";
+import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -35,6 +36,7 @@ import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
 
 import { l4Configuration, l4Report, readL4Evidence, verifyL4Evidence } from "./l4-campaign.mjs";
+import { createReceiptGate, createReceiptGateController, startOwnedPublication } from "./l6-receipt-gate.mjs";
 
 const REPO = path.resolve(import.meta.dirname, "..");
 const LABEL = "scripted local application test readiness";
@@ -67,6 +69,10 @@ export function parseArguments(argv) {
       if (options.r2Baseline) throw new Error("duplicate R2 baseline flag");
       options.r2Baseline = true;
     }
+    else if (argv[index] === "--l6-receipt-gate") {
+      if (options.l6ReceiptGate) throw new Error("duplicate L6 flag");
+      options.l6ReceiptGate = true;
+    }
     else if (argv[index] === "--d2-cut") {
       options.d2Cut = argv[++index];
       if (!["durable", "cancel-wins", "complete-wins", "repeated-close"].includes(options.d2Cut)) throw new Error("invalid D2 cut");
@@ -81,7 +87,98 @@ export function parseArguments(argv) {
   if (options.packageRefusals && !options.onlyRefusals) throw new Error("package refusal cuts require --only-refusals");
   if (options.d2Cut && !options.interactive) throw new Error("D2 cuts require --interactive");
   if (options.d2Cut && options.onlyRefusals) throw new Error("D2 cuts cannot run only refusals");
+  if (options.l6ReceiptGate && (!options.r2Baseline || options.interactive || options.d2Cut || options.onlyRefusals || options.packageRefusals || options.l4Case !== undefined || options.mediaTiming !== undefined))
+    throw new Error("l6_selection_refused");
   return options;
+}
+
+/** The actual entry uses one fixed request/ACK slot. No stale ACK, unbounded
+ * adapter await or raw foreign exception is publication authority. */
+export function createL6Channel({ controlDir, deadlineAtMs, remoteHead, entryFailed }) {
+  if (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= Date.now() || deadlineAtMs > Date.now() + 600000) throw new Error("l6_channel_refused");
+  let sequence = 0, pending = false, status;
+  let remainingDeadline = deadlineAtMs;
+  return {
+    status: () => status,
+    limit: deadline => {
+      if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) throw new Error("l6_channel_deadline");
+      remainingDeadline = Math.min(remainingDeadline, deadline);
+    },
+    async request(op, names = []) {
+      if (pending || sequence >= 65536 || Date.now() >= remainingDeadline) throw new Error("l6_channel_refused");
+      pending = true;
+      try {
+        const request = { sequence: ++sequence, op, names, remoteHead: remoteHead() };
+        const temporary = path.join(controlDir, "l6-request.tmp");
+        writeFileSync(temporary, JSON.stringify(request), { mode: 0o600 }); renameSync(temporary, path.join(controlDir, "l6-request.json"));
+        while (Date.now() < remainingDeadline) {
+          if (entryFailed()) throw new Error("l6_entry_failed");
+          const filename = path.join(controlDir, "l6-response.json");
+          if (existsSync(filename)) {
+            const bytes = readFileSync(filename);
+            if (bytes.length > 8192) throw new Error("l6_ack_refused");
+            const response = JSON.parse(bytes);
+            if (response.sequence === sequence) {
+              if (Object.keys(response).sort().join() !== "outcomes,sequence,state,status" || !Array.isArray(response.outcomes) || response.outcomes.length !== names.length)
+                throw new Error("l6_ack_refused");
+              status = response.status; return response;
+            }
+            if (!Number.isSafeInteger(response.sequence) || response.sequence >= sequence) throw new Error("l6_ack_refused");
+          }
+          await pause(10);
+        }
+        throw new Error("l6_channel_deadline");
+      } finally { pending = false; }
+    },
+  };
+}
+/** Selected pre-arm boundary. Ports below are the actual ordinary predicates,
+ * readonly preflight/Git, gate installer and seed handoff at the call site. */
+export function prepareL6Gate({ artifact, allowPush, seedPushed, preflight, remoteHead, arm, handoff, observe }) {
+  let phase = "artifact", gate;
+  const report = (state, cleanupFailed = false) => observe({ schema: "l6-preparation/v1", phase, state,
+    code: state === "failed" ? "l6_preparation_failed" : null, cleanupFailed });
+  try {
+    report("pending");
+    if (!allowPush || !artifact?.meeting.organizer || !seedPushed) throw new Error("l6_actual_publication_required");
+    phase = "preflight"; report("pending"); preflight();
+    phase = "remote-head"; report("pending"); const seedCommit = remoteHead();
+    phase = "gate-arm"; report("pending"); gate = arm(seedCommit);
+    phase = "seed-handoff"; report("pending"); handoff(seedCommit);
+    report("ready"); return { gate, seedCommit };
+  } catch (error) {
+    let cleanupFailed = false;
+    if (gate) { try { gate.close(); } catch { cleanupFailed = true; } }
+    report("failed", cleanupFailed); throw error;
+  }
+}
+/** Shared C/actual sequencing; actual callers supply verified source adapters.
+ * Cleanup precedes the parent entry's ordinary application close request. */
+export async function runL6Publication({ gate, publisher, channel, verifyRemote, settleDescendants, notificationBudgetMs }) {
+  if (!Number.isSafeInteger(notificationBudgetMs) || notificationBudgetMs < 1 || notificationBudgetMs > 120000) throw new Error("l6_notification_budget_refused");
+  const controller = createReceiptGateController({ gate, publisher,
+    observe: async () => (await channel.request("observe")).state,
+    maintenanceBatch: async names => (await channel.request("poll", names)).outcomes,
+    maintenanceStatus: () => channel.status(),
+  });
+  let report = null, failure = null, cleanup = false;
+  try {
+    const permit = await controller.hold();
+    report = await controller.release(permit, async candidate => {
+      const verified = await verifyRemote(candidate);
+      gate.deadlineAtMs = Math.min(gate.deadlineAtMs, Date.now() + notificationBudgetMs);
+      channel.limit(gate.deadlineAtMs);
+      return verified;
+    });
+  } catch { failure = "l6_publication_prerequisite_failed"; }
+  finally {
+    // Abort releases a held receive hook to fail before stopping its parent.
+    try { gate.close(); } catch { failure ??= "l6_owned_cleanup_unconfirmed"; }
+    try { await controller.close(); } catch { failure ??= "l6_owned_cleanup_unconfirmed"; }
+    try { cleanup = await settleDescendants() === true; } catch { cleanup = false; }
+    if (!cleanup) failure ??= "l6_descendant_cleanup_unconfirmed";
+  }
+  return { report, failure, cleanup, evidence: controller.evidence() };
 }
 
 /** The real parent uses this decision before its publication block. */
@@ -156,7 +253,9 @@ function sourceTreeId() {
 
 function snapshotProcessTree(rootPid, evidence, owner, options = {}) {
   let result;
-  try { result = run("/bin/ps", ["-eo", "pid=,ppid=,comm="]); }
+  try { result = run("/bin/ps", ["-eo", "pid=,ppid=,comm="], options.deadlineAtMs === undefined ? {} : {
+    timeout: Math.max(1, Math.min(5000, options.deadlineAtMs - Date.now())),
+  }); }
   catch { result = null; }
   return observeProcessSnapshot(evidence, { result, rootPid, owner, ...options });
 }
@@ -255,7 +354,7 @@ async function refusalRuns(staged, processEvidence) {
 // The live run
 // ---------------------------------------------------------------------------
 
-async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut, mediaTiming, l4Case, processEvidence }) {
+async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut, mediaTiming, l4Case, l6ReceiptGate, processEvidence }) {
   const meeting = {
     eventId: "e2e-invite-1",
     providerMeetingId: "9007199254740993",
@@ -276,6 +375,7 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     vaultRevision: staged.vaultRevision,
     interactive,
     r2Baseline,
+    ...(l6ReceiptGate ? { l6ReceiptGate: true } : {}),
     ...(l4Case === undefined ? {} : { l4Case }),
     d2Cut,
     ...driveCaptureConfiguration({ mediaTiming, interactive, r2Baseline, d2Cut }),
@@ -312,6 +412,8 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
   let teammemResult = null;
   let receipt = null;
   let artifact = null;
+  let l6 = null;
+  let l6Preparation = null;
 
   const waitForAnyEvent = async (names, budgetMs) => {
     const deadline = Date.now() + budgetMs;
@@ -373,6 +475,117 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     // The consumer runs either way: a dry run over an empty inbox still proves
     // the wheel, the 0600 env file and the isolated paths are wired.
     const pushAllowed = process.env.E2E_ALLOW_LOCAL_BARE_PUSH === "1";
+    if (l6ReceiptGate) {
+      const { preflightR2Database } = await import("./r2-baseline.mjs");
+      let deadlineAtMs;
+      const git = argv => run("/usr/bin/git", ["-C", teammem.paths.bare, ...argv], { env: teammem.env, timeout: Math.max(1, Math.min(5000, deadlineAtMs - Date.now())) });
+      const remoteHead = () => {
+        const result = git(["rev-parse", "--verify", "refs/heads/e2e"]);
+        if (result.exit !== 0 || !/^[0-9a-f]{40}\n$/.test(result.stdout)) throw new Error("l6_remote_head_refused");
+        return result.stdout.trim();
+      };
+      const { gate } = prepareL6Gate({ artifact, allowPush: pushAllowed,
+        seedPushed: teammem.steps.some(row => row.name === "git_seed_push" && row.exit === 0),
+        preflight: () => { preflightR2Database(path.join(staged.directories.stateRoot, "orchestration.db")); deadlineAtMs = Date.now() + plan.budgets.teammemMs; },
+        remoteHead, arm: seedCommit => createReceiptGate({ privateRoot: staged.root, teammem, seedCommit, deadlineAtMs }),
+        handoff: seedCommit => writeFileSync(path.join(staged.directories.control, "l6-seed.json"), JSON.stringify({ seedCommit, deadlineAtMs }), { mode: 0o600 }),
+        observe: value => { l6Preparation = value; } });
+      const channel = createL6Channel({ controlDir: staged.directories.control, deadlineAtMs, remoteHead,
+        entryFailed: () => owned.record.outcome !== null || readEvents(eventsPath).some(row => ["entry_failed", "drive_failed"].includes(row.name)) });
+      const consumerChildren = [], groups = [];
+      let inventoryFailed = false;
+      const sampleConsumers = () => {
+        const trees = [];
+        for (const consumer of consumerChildren) {
+          try { trees.push(snapshotProcessTree(consumer.record.pid, processEvidence, "l6_consumer_descendants", { deadlineAtMs })); }
+          catch { inventoryFailed = true; }
+        }
+        return trees;
+      };
+      let publisher, timer, descendantsClosed = false, settleDescendants;
+      try {
+        // Prime actual state/status and establish the fresh peer's zero-IM
+        // precondition before starting the genuine consumer.
+        const before = (await channel.request("observe")).state;
+        if (before.messageCount !== 0 || before.notificationCount !== 0 || before.receiptPresent || !before.remoteSeed)
+          throw new Error("l6_fresh_authority_required");
+        publisher = startOwnedPublication({ privateRoot: staged.root, teammem, nowIso: new Date().toISOString(), allowPush: true,
+          deadlineAtMs, processGroup: true, register: value => { publisher = value; },
+          onChild: consumer => { consumerChildren.push(ownedChild(consumer, "l6_consumer", processEvidence)); groups.push(consumer.pid); sampleConsumers(); } });
+        const entered = gate.waitEntered;
+        gate.waitEntered = async () => {
+          const state = await entered();
+          // Sample the actual pending consumer's descendants at the barrier,
+          // not just after its parent exits and ownership becomes ambiguous.
+          if (inventoryFailed || !sampleConsumers().some(tree => tree.length >= 2)) throw new Error("l6_descendant_barrier_unproved");
+          return state;
+        };
+        timer = setInterval(sampleConsumers, 25);
+        settleDescendants = async () => {
+          sampleConsumers();
+          let confirmed = !inventoryFailed && publisher.childrenSettled();
+          for (const pid of groups) {
+            let absent = false;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              try { process.kill(-pid, 0); }
+              catch (error) { if (error?.code === "ESRCH") { absent = true; break; } confirmed = false; break; }
+              // The detached group is owned exclusively by this invocation.
+              // TERM/KILL cleanup does not turn a failure into publication.
+              try { process.kill(-pid, attempt === 0 ? "SIGTERM" : "SIGKILL"); } catch { confirmed = false; }
+              await pause(1000);
+            }
+            if (!absent) { try { process.kill(-pid, 0); } catch (error) { absent = error?.code === "ESRCH"; } }
+            confirmed &&= absent;
+          }
+          descendantsClosed = confirmed && consumerChildren.every(row => row.record.outcome?.exitObserved === true);
+          return descendantsClosed;
+        };
+        const { readPublicationReceipt } = await import("../dist/src/adapters/receipt-inbox.js");
+        l6 = await runL6Publication({ gate, publisher, channel, settleDescendants, notificationBudgetMs: plan.budgets.notifyMs,
+          verifyRemote: async candidate => {
+            sampleConsumers();
+            const accepted = readPublicationReceipt({ receiptsDir: staged.directories.receiptsDir, occurrenceId: artifact.occurrenceId, revision: 1, artifactHash: artifact.hash });
+            if (!accepted || accepted.vault_commit !== candidate) throw new Error("l6_actual_receipt_refused");
+            const commitExists = git(["cat-file", "-e", `${candidate}^{commit}`]).exit === 0;
+            const commitIsAncestorOfRef = git(["merge-base", "--is-ancestor", candidate, "refs/heads/e2e"]).exit === 0;
+            const note = git(["show", `${candidate}:${accepted.markdown_path}`]);
+            const localNote = readFileSync(path.join(teammem.paths.vault, accepted.markdown_path));
+            const noteMatchesArtifact = note.exit === 0 && note.stdout.includes(artifact.occurrenceId) && note.stdout.includes(artifact.meeting.title) &&
+              localNote.length > 0 && localNote.length <= 1048576 && localNote.equals(Buffer.from(note.stdout, "utf8")) &&
+              !note.stdout.includes(artifact.audioPath) && accepted.artifact_hash === artifact.actualHash;
+            // Reuse these bounded actual checks in the ordinary R2 oracle;
+            // do not repeat its unselected synchronous Git calls afterward.
+            receipt = { receipts: [accepted.occurrence_id], status: "present", valid: true, checks: [{
+              schema: accepted.schema, markdownUrl: accepted.markdown_url, vaultCommit: accepted.vault_commit,
+              commitExists, commitIsAncestorOfRef, noteBytes: Buffer.byteLength(note.stdout),
+              occurrenceMatchesArtifact: accepted.occurrence_id === artifact.occurrenceId,
+              revisionMatchesArtifact: accepted.revision === artifact.revision,
+              artifactHashMatches: accepted.artifact_hash === artifact.actualHash,
+              noteNamesOccurrence: note.stdout.includes(artifact.occurrenceId),
+              noteWithholdsAudioPath: !note.stdout.includes(artifact.audioPath),
+              urlNamesCommit: accepted.markdown_url.includes(`/-/blob/${candidate}/`), noteMatchesArtifact,
+            }] };
+            return { commitExists, commitIsAncestorOfRef, noteMatchesArtifact, receiptCanonical: true };
+          } });
+        check("l6_receipt_gate", l6.failure === null && l6.report?.exactlyOneSend && l6.cleanup, l6.failure ?? "actual held polls, remote receipt and one durable send verified");
+        teammemResult = await publisher.result;
+      } finally {
+        clearInterval(timer);
+        let closeFailed = false;
+        try { gate.close(); } catch { closeFailed = true; }
+        if (publisher) { try { await publisher.close(); } catch { closeFailed = true; } }
+        if (settleDescendants && !descendantsClosed) { try { await settleDescendants(); } catch { closeFailed = true; } }
+        if (publisher && !descendantsClosed) {
+          // Registration/adapter failure may precede the shared controller.
+          // Preserve non-pass, still stop only these exclusively owned groups.
+          for (const pid of groups) {
+            try { process.kill(-pid, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") inventoryFailed = true; }
+          }
+          oracle("l6_descendant_cleanup", "fail", "full consumer descendant settlement unconfirmed");
+        }
+        if (closeFailed) oracle("l6_owned_cleanup", "fail", "external publication owner close refused");
+      }
+    } else {
     teammemResult = publish({
       teammem, nowIso: new Date().toISOString(),
       allowPush: artifact !== null && pushAllowed,
@@ -382,7 +595,8 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     });
     step("teammem_dry_run", teammemResult.dryRun);
     if (teammemResult.publishRun) step("teammem_publish", teammemResult.publishRun);
-    receipt = receiptOracle({ teammem, receiptsDir: staged.directories.receiptsDir, artifact });
+    }
+    if (!l6ReceiptGate) receipt = receiptOracle({ teammem, receiptsDir: staged.directories.receiptsDir, artifact });
     if (r2Baseline) {
       const { readPublicationReceipt } = await import("../dist/src/adapters/receipt-inbox.js");
       const accepted = readPublicationReceipt({ receiptsDir: staged.directories.receiptsDir,
@@ -397,7 +611,11 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     if (receipt.status === "present") await waitForEvent("organizer_dm", plan.budgets.notifyMs + 30_000).catch(() => undefined);
     }
   } catch (error) {
-    oracle("live_run", "fail", l4Case === undefined ? error?.message ?? String(error) : "l4_drive_prerequisite_failed");
+    oracle("live_run", "fail", l6ReceiptGate ? "l6_run_prerequisite_failed" : l4Case === undefined ? error?.message ?? String(error) : "l4_drive_prerequisite_failed");
+    if (l6ReceiptGate) {
+      try { writeFileSync(path.join(staged.directories.control, "l6-abort"), "aborted", { mode: 0o600 }); }
+      catch { oracle("l6_abort_request", "fail", "selected parent abort request could not be written"); }
+    }
   } finally {
     if (owned.record.outcome === null) {
       try { if (mediaTiming === undefined && l4Case === undefined) writeFileSync(path.join(staged.directories.control, "teammem-done"), "done"); }
@@ -423,7 +641,7 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
   writeFileSync(path.join(outDir, "entry.stderr.log"), stderr);
   writeFileSync(path.join(outDir, "events.ndjson"), existsSync(eventsPath) ? readFileSync(eventsPath, "utf8") : "");
 
-  return { meeting, plan, events, summary, childState, outcome, peakTree, processEvidence, teammemResult, receipt, artifact, stdout, stderr };
+  return { meeting, plan, events, summary, childState, outcome, peakTree, processEvidence, teammemResult, receipt, artifact, stdout, stderr, ...(l6ReceiptGate ? { l6, l6Preparation } : {}) };
 }
 
 function interactiveOracles(live) {
@@ -559,7 +777,7 @@ async function main() {
         staged.digests[name] = sha256;
       }
       staged.helperDigests = {};
-      for (const name of ["entry.mjs", "r2-baseline.mjs", "r2-gateway-config.mjs", "r2-provider.mjs", "interactive-provider.mjs", "gateway-config.mjs", "composition-lifecycle.mjs"])
+      for (const name of ["entry.mjs", "r2-baseline.mjs", "r2-gateway-config.mjs", "r2-provider.mjs", "interactive-provider.mjs", "gateway-config.mjs", "composition-lifecycle.mjs", ...(options.l6ReceiptGate ? ["l6-receipt-gate.mjs"] : [])])
         staged.helperDigests[name] = await sha256File(path.join(staged.directories.app, "e2e", name));
     }
     if (options.packageRefusals) packageCuts = runPackageRefusalCuts({ staged, check, run: (command, argv, options) => step("package_refusal_process", run(command, argv, options)) });
@@ -584,7 +802,7 @@ async function main() {
         } });
         step("runtime_argument_refusal_preflight", { ...prepared, command: [executable], loadAverage: loadAverage() });
       }
-      const result = await liveRun({ staged, teammem, outDir: options.out, interactive: options.interactive, r2Baseline: options.r2Baseline, d2Cut: options.d2Cut, mediaTiming: options.mediaTiming, l4Case: options.l4Case, processEvidence: live.processEvidence });
+      const result = await liveRun({ staged, teammem, outDir: options.out, interactive: options.interactive, r2Baseline: options.r2Baseline, d2Cut: options.d2Cut, mediaTiming: options.mediaTiming, l4Case: options.l4Case, l6ReceiptGate: options.l6ReceiptGate, processEvidence: live.processEvidence });
       live = { ...live, ...result };
       const databasePath = path.join(staged.directories.stateRoot, "orchestration.db");
       try {
@@ -712,12 +930,12 @@ async function main() {
       }
       const dry = live.teammemResult?.dryRun;
       check("teammem_dry_run", dry !== undefined && dry !== null && (dry.exit === 0 || dry.exit === 1),
-        dry ? `exit ${dry.exit}: ${dry.stdout.trim().slice(0, 400)}` : "not run");
+        dry ? options.l6ReceiptGate ? `exit ${dry.exit}; consumer output discarded` : `exit ${dry.exit}: ${dry.stdout.trim().slice(0, 400)}` : "not run");
       oracle("teammem_isolation", "pass",
         `env file ${teammem.paths.envFile} at 0600; inbox ${teammem.paths.inbox} is the application outbox; receipts ${teammem.paths.receipts}; bare remote ${teammem.paths.bare}; no path under ~/.local/share/teammem, ~/.config/teammem or the overlay`);
       if (live.teammemResult?.publishRun) {
         check("teammem_publish", live.teammemResult.publishRun.exit === 0,
-          `exit ${live.teammemResult.publishRun.exit}: ${live.teammemResult.publishRun.stdout.trim().slice(0, 400)} ${live.teammemResult.publishRun.stderr.trim().slice(0, 400)}`);
+          options.l6ReceiptGate ? `exit ${live.teammemResult.publishRun.exit}; consumer output discarded` : `exit ${live.teammemResult.publishRun.exit}: ${live.teammemResult.publishRun.stdout.trim().slice(0, 400)} ${live.teammemResult.publishRun.stderr.trim().slice(0, 400)}`);
         const checks = live.receipt?.checks ?? [];
         check("publication_receipt", checks.length === 1 && checks.every((entry) => entry.commitExists && entry.commitIsAncestorOfRef && entry.noteBytes > 0
           && entry.occurrenceMatchesArtifact && entry.revisionMatchesArtifact && entry.artifactHashMatches && entry.noteNamesOccurrence && entry.urlNamesCommit),
@@ -878,9 +1096,10 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
   const bundle = {
     label: LABEL,
     generatedAt: new Date().toISOString(),
-    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...mediaTimingArguments(options), ...(options.l4Case === undefined ? [] : ["--l4-case", options.l4Case]), ...(options.packageRefusals ? ["--package-refusals"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : []), ...(options.interactive ? ["--interactive"] : []), ...(options.r2Baseline ? ["--r2-baseline"] : []), ...(options.d2Cut ? ["--d2-cut", options.d2Cut] : []), ...(options.dependencyWheelhouse ? ["--dependency-wheelhouse", options.dependencyWheelhouse] : [])],
+    command: [NODE24, path.join(REPO, "e2e/run.mjs"), "--out", options.out, ...(options.keep ? ["--keep"] : []), ...mediaTimingArguments(options), ...(options.l4Case === undefined ? [] : ["--l4-case", options.l4Case]), ...(options.packageRefusals ? ["--package-refusals"] : []), ...(options.onlyRefusals ? ["--only-refusals"] : []), ...(options.interactive ? ["--interactive"] : []), ...(options.r2Baseline ? ["--r2-baseline"] : []), ...(options.l6ReceiptGate ? ["--l6-receipt-gate"] : []), ...(options.d2Cut ? ["--d2-cut", options.d2Cut] : []), ...(options.dependencyWheelhouse ? ["--dependency-wheelhouse", options.dependencyWheelhouse] : [])],
+    ...(options.l6ReceiptGate ? { l6ReceiptGate: live.l6 ?? null, l6Preparation: live.l6Preparation ?? null } : {}),
     l4: live.l4 ?? null,
-    mode: options.l4Case !== undefined ? "selected-l4" : options.mediaTiming !== undefined ? "media-timing-recording-conformance" : options.onlyRefusals ? "refusals" : options.r2Baseline ? "r2-baseline" : options.interactive ? "interactive" : "full",
+    mode: options.l4Case !== undefined ? "selected-l4" : options.mediaTiming !== undefined ? "media-timing-recording-conformance" : options.onlyRefusals ? "refusals" : options.l6ReceiptGate ? "l6-receipt-gate" : options.r2Baseline ? "r2-baseline" : options.interactive ? "interactive" : "full",
     d2Cut: options.d2Cut,
     mediaTiming: live.mediaTiming ?? null,
     packageRefusalCuts: packageCuts,
@@ -915,7 +1134,7 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
     stateDatabase: live.reopen,
     durableEvidence: live.durable ?? null,
     artifact: live.artifact === null ? null : { files: live.artifact.files, revision: live.artifact.revision, hash: live.artifact.hash, occurrenceId: live.artifact.occurrenceId, manifest: live.artifact.manifest },
-    teammemRuns: live.teammemResult === null ? null : {
+    teammemRuns: live.teammemResult === null ? null : options.l6ReceiptGate ? { ...live.teammemResult, outputRetained: false } : {
       dryRun: live.teammemResult.dryRun === null ? null : { exit: live.teammemResult.dryRun.exit, stdout: live.teammemResult.dryRun.stdout.slice(0, 4000), stderr: live.teammemResult.dryRun.stderr.slice(0, 4000) },
       publishRun: live.teammemResult.publishRun === null ? null : { exit: live.teammemResult.publishRun.exit, stdout: live.teammemResult.publishRun.stdout.slice(0, 4000), stderr: live.teammemResult.publishRun.stderr.slice(0, 4000) },
       skipped: live.teammemResult.skipped,
@@ -930,6 +1149,6 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main().catch((error) => {
-  process.stderr.write(`${error?.stack ?? String(error)}\n`);
+  process.stderr.write(process.argv.includes("--l6-receipt-gate") ? "l6_run_prerequisite_failed\n" : `${error?.stack ?? String(error)}\n`);
   process.exitCode = 1;
 });

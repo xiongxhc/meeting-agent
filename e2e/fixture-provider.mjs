@@ -24,7 +24,7 @@ function schemaShapedAnswer(prompt, messages, l4Case) {
   if (prompt.includes("meeting synthesis")) {
     return JSON.stringify({
       summary: PLACEHOLDER, projects: [], decisions: [],
-      action_items: [], discussion_points: [], person_summaries: l4Case === undefined ? [] : l4PersonSummaries(messages),
+      action_items: [], discussion_points: [], person_summaries: l4Case === undefined ? [] : l4PersonSummaries(messages, l4Case),
     });
   }
   return JSON.stringify({ summary: PLACEHOLDER });

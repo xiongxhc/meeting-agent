@@ -30,6 +30,11 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as pause } from "node:timers/promises";
 
 import { defaultHttpInstance } from "@larksuiteoapi/node-sdk";
+import Database from "better-sqlite3";
+import { readPublicationReceipt } from "../dist/src/adapters/receipt-inbox.js";
+import { canonicalArtifactHash } from "../dist/src/contracts/teammem-meeting-v1.js";
+import { parseSupportedTeamMemMeetingArtifact } from "../dist/src/contracts/teammem-meeting-v2.js";
+import { receiptGateState } from "./l6-receipt-gate.mjs";
 
 import { acquireApplicationOwnerLock } from "../dist/src/adapters/application-owner-lock.js";
 import { createFeishuSdkHttp } from "../dist/src/adapters/feishu-sdk-http.js";
@@ -94,16 +99,19 @@ function event(name, detail = {}) {
   const line = { at: new Date().toISOString(), monotonicNs: process.hrtime.bigint().toString(), name, ...detail };
   appendFileSync(eventsPath, `${JSON.stringify(line)}\n`);
 }
-export function waitFor(check, { budgetMs, name, signal }) {
+export function waitFor(check, { budgetMs, name, signal, pollMs = 25 }) {
   return new Promise((resolve, reject) => {
+    if (![5, 25].includes(pollMs) || pollMs === 5 && (!Number.isFinite(budgetMs) || budgetMs <= 0)) throw new Error("l4_poll_refused");
     const deadline = Date.now() + budgetMs;
     const timer = setInterval(() => {
       if (signal?.aborted) { clearInterval(timer); reject(new Error("l4_drive_cancelled")); return; }
+      if (pollMs === 5 && Date.now() >= deadline) { clearInterval(timer); reject(new Error(`e2e_timeout:${name}`)); return; }
       let value;
       try { value = check(); } catch { value = undefined; }
+      if (pollMs === 5 && Date.now() >= deadline) { clearInterval(timer); reject(new Error(`e2e_timeout:${name}`)); return; }
       if (value) { clearInterval(timer); resolve(value); return; }
       if (Date.now() >= deadline) { clearInterval(timer); reject(new Error(`e2e_timeout:${name}`)); }
-    }, 25);
+    }, pollMs);
   });
 }
 function readJson(filename) {
@@ -111,6 +119,77 @@ function readJson(filename) {
 }
 function controlFileExists(name) {
   try { readFileSync(path.join(plan.controlDir, name)); return true; } catch { return false; }
+}
+
+/** Selected-only, read-only projection. No claims, recovery bytes or SQL rows
+ * cross the entry boundary; the shared gate oracle consumes the same fields
+ * as the production store's pending()/notifications() read methods. */
+export function l6ReadStore(database) {
+  if (!database.readonly) throw new Error("l6_readonly_store_required");
+  const camel = row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase()), value]));
+  return {
+    pending: () => database.prepare(`SELECT occurrence_id,revision,artifact_hash,transcript_complete,retry_count,next_retry_at_ms,
+      published_at_ms,deleted_at_ms,publication_url,vault_commit FROM delivery_journal WHERE deleted_at_ms IS NULL
+      ORDER BY next_retry_at_ms,occurrence_id,revision`).all().map(row => ({ ...camel(row), transcriptComplete: row.transcript_complete === 1 })),
+    notifications: () => database.prepare(`SELECT occurrence_id,revision,artifact_hash,publication_url,vault_commit,recipient_id,title,message_text,request_uuid,
+      state,first_attempt_at_ms,last_attempt_at_ms,attempt_count,claim_token,provider_message_id,sent_at_ms FROM notification_intents ORDER BY occurrence_id,revision`).all().map(camel),
+    getSession: id => database.prepare("SELECT state FROM sessions WHERE occurrence_id=?").get(id),
+  };
+}
+export function assertL6HeldReceiptAbsence({ receiptsDir, remoteHead, seedCommit }) {
+  if (remoteHead === seedCommit && readdirSync(receiptsDir).length !== 0) throw new Error("l6_held_receipt_directory_refused");
+}
+export function l6LaneStatus(status) {
+  if (status.codes.length !== 0) throw new Error("l6_lane_status_refused");
+  return { codes: [], lanes: ["outbox", "notification"].map(name => {
+    const rows = status.lanes.filter(row => row.lane === name);
+    if (rows.length !== 1 || rows[0].failures.length !== 0 || !Number.isSafeInteger(rows[0].ticks) || rows[0].ticks < 0)
+      throw new Error("l6_lane_status_refused");
+    const row = rows[0];
+    if (row.lastOutcome !== null && row.lastOutcome !== "outbox_reconciled" && row.lastOutcome !== "notification_polled") throw new Error("l6_lane_status_refused");
+    return { lane: name, ticks: row.ticks, failures: [], inFlight: row.inFlight, lastOutcome: row.lastOutcome };
+  }) };
+}
+/** One finite selected channel; concurrent lane work occurs inside the actual
+ * Promise.all before its acknowledgment. A prior/duplicate ACK is never reused. */
+export async function answerL6Request({ request, previous, deadlineAtMs, observe, tick, status }) {
+  if (!request || Object.getPrototypeOf(request) !== Object.prototype || Object.keys(request).sort().join() !== "names,op,remoteHead,sequence" ||
+    Object.keys(request).some(name => !("value" in Object.getOwnPropertyDescriptor(request, name))) ||
+    !Number.isSafeInteger(request.sequence) || request.sequence !== previous + 1 || request.sequence > 65536 || Date.now() >= deadlineAtMs ||
+    !["observe", "poll"].includes(request.op) || !/^[0-9a-f]{40}$/.test(request.remoteHead) || !Array.isArray(request.names) ||
+    (request.op === "observe" ? request.names.length !== 0 : request.names.length < 1 || request.names.length > 2 ||
+      new Set(request.names).size !== request.names.length || request.names.some(name => !["outbox", "notification"].includes(name)))) throw new Error("l6_request_refused");
+  const outcomes = request.op === "poll" ? await Promise.all(request.names.map(name => tick(name))) : [];
+  if (Date.now() >= deadlineAtMs) throw new Error("l6_entry_deadline");
+  return { sequence: request.sequence, outcomes, status: l6LaneStatus(status()), state: request.op === "observe" ? observe(request.remoteHead) : null };
+}
+export async function waitForL6Seed({ wait, seedReady, done, budgetMs }) {
+  const state = await wait(() => done() ? "aborted" : seedReady() ? "ready" : false, { budgetMs, name: "l6_seed" });
+  // waitFor deliberately swallows predicate exceptions. Refuse only after its
+  // closed abort sentinel resolves, so parent failure cannot become a timeout.
+  if (state !== "ready") throw new Error("l6_parent_aborted");
+}
+export async function serveL6Entry({ controlDir, deadlineAtMs, observe, tick, status, done, aborted = () => false }) {
+  let previous = 0;
+  for (;;) {
+    if (aborted()) throw new Error("l6_parent_aborted");
+    if (done()) return;
+    if (Date.now() >= deadlineAtMs) throw new Error("l6_entry_deadline");
+    const filename = path.join(controlDir, "l6-request.json");
+    if (existsSync(filename)) {
+      const bytes = readFileSync(filename);
+      if (bytes.length > 1024) throw new Error("l6_request_refused");
+      const request = JSON.parse(bytes);
+      if (request.sequence !== previous) {
+        const response = await answerL6Request({ request, previous, deadlineAtMs, observe, tick, status });
+        if (aborted()) throw new Error("l6_parent_aborted");
+        const temporary = path.join(controlDir, "l6-response.tmp");
+        writeFileSync(temporary, JSON.stringify(response), { mode: 0o600 });
+        renameSync(temporary, path.join(controlDir, "l6-response.json")); previous = request.sequence;
+      }
+    }
+    await pause(10);
+  }
 }
 
 /** Atomically swaps the gateway deployment configuration between lanes. A
@@ -131,6 +210,8 @@ async function main() {
   l4Configuration(plan);
   mediaTimingConfiguration(plan);
   assertR2Plan(plan);
+  if (plan.l6ReceiptGate && (!plan.r2Baseline || plan.interactive || plan.d2Cut || plan.l4Case !== undefined || plan.mediaTiming !== undefined || plan.initialR1))
+    throw new Error("l6_selection_refused");
   writeFileSync(eventsPath, "");
   if (plan.initialR1) event("entry_environment", { keys: Object.keys(process.env).sort() });
   const result = await withOwnedPeers({
@@ -178,6 +259,13 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     await driveWaitFor(() => peer.acknowledgements.some((value) => value?.code === 200), { budgetMs: plan.budgets.admitMs, name: "invite_ack" });
     event("invite_acknowledged");
 
+    // Conflict recognition readiness precedes the generic capture threshold.
+    // The actual capture check below and final recording oracles still apply.
+    if (plan.l4Case === "sent-conflict") {
+      l4Drive = await driveL4Capture({ l4Case: plan.l4Case, provider: interactive,
+        child: () => readJson(path.join(plan.controlDir, "state.json")), runtimeEvents, waitFor: driveWaitFor, budgetMs: plan.budgets.captureMs });
+    }
+
     // 3. The scripted client reports its own media stream.
     const child = await driveWaitFor(() => {
       const state = readJson(path.join(plan.controlDir, "state.json"));
@@ -186,8 +274,10 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     event("media_capture", { framesSent: child.framesSent, endpoint: child.mediaEndpoint });
 
     if (plan.l4Case !== undefined) {
-      l4Drive = await driveL4Capture({ l4Case: plan.l4Case, provider: interactive,
-        child: () => readJson(path.join(plan.controlDir, "state.json")), runtimeEvents, waitFor: driveWaitFor, budgetMs: plan.budgets.captureMs });
+      if (plan.l4Case !== "sent-conflict") {
+        l4Drive = await driveL4Capture({ l4Case: plan.l4Case, provider: interactive,
+          child: () => readJson(path.join(plan.controlDir, "state.json")), runtimeEvents, waitFor: driveWaitFor, budgetMs: plan.budgets.captureMs });
+      }
       const selectedChild = readJson(path.join(plan.controlDir, "state.json"));
       l4Drive.bridgeSessionId = selectedChild.l4.bridgeSessionId;
       l4Drive.disclosureCommandId = selectedChild.l4.disclosureCommandId;
@@ -273,6 +363,35 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
       event("artifact_blocked", { reason: String(error?.message ?? error) });
     }
 
+    if (plan.l6ReceiptGate) {
+      if (!bundle || peer.messages.length !== 0) throw new Error("l6_fresh_peer_required");
+      const artifact = parseSupportedTeamMemMeetingArtifact(JSON.parse(readFileSync(path.join(bundle, "meeting.json"), "utf8")));
+      if (artifact.revision !== 1 || artifact.transcript_complete !== false || !artifact.organizer) throw new Error("l6_artifact_refused");
+      const databasePath = path.join(JSON.parse(readFileSync(plan.standaloneConfigPath, "utf8")).stateRoot, "orchestration.db");
+      const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+      try {
+        const store = l6ReadStore(database), artifactHash = canonicalArtifactHash(artifact);
+        // The actual parent supplies only its measured seed/remote head. No
+        // test receipt writer, sender or synthetic clock enters this adapter.
+        await waitForL6Seed({ wait: driveWaitFor, seedReady: () => controlFileExists("l6-seed.json"),
+          done: () => controlFileExists("teammem-done") || controlFileExists("l6-abort"), budgetMs: plan.budgets.teammemMs });
+        const seed = readJson(path.join(plan.controlDir, "l6-seed.json"));
+        if (!seed || Object.keys(seed).sort().join() !== "deadlineAtMs,seedCommit" || !/^[0-9a-f]{40}$/.test(seed.seedCommit) ||
+          !Number.isSafeInteger(seed.deadlineAtMs) || seed.deadlineAtMs <= Date.now() || seed.deadlineAtMs > Date.now() + plan.budgets.teammemMs) throw new Error("l6_seed_refused");
+        const receiptsDir = JSON.parse(readFileSync(plan.standaloneConfigPath, "utf8")).dataPaths.receiptsDir;
+        const observe = remoteHead => {
+          assertL6HeldReceiptAbsence({ receiptsDir, remoteHead, seedCommit: seed.seedCommit });
+          return database.transaction(() => receiptGateState({ store, occurrenceId: artifact.occurrence_id,
+          artifactHash, creatorId: artifact.organizer.person_id, title: artifact.title, seedCommit: seed.seedCommit, remoteHead,
+          receipt: readPublicationReceipt({ receiptsDir, occurrenceId: artifact.occurrence_id, revision: 1, artifactHash }), messages: peer.messages, nowMs: Date.now() }))();
+        };
+        await serveL6Entry({ controlDir: plan.controlDir, deadlineAtMs: seed.deadlineAtMs, observe,
+          tick: name => compositionHandle.maintenanceTick(name), status: () => compositionHandle.maintenanceStatus(),
+          done: () => controlFileExists("teammem-done"), aborted: () => controlFileExists("l6-abort") });
+        event("l6_public_controller_settled");
+      } finally { database.close(); }
+    }
+
     // 6. The harness runs the real TeamMem consumer; the shipped outbox worker
     //    journals its receipt and the notification lane delivers one DM.
     await driveWaitFor(() => controlFileExists("teammem-done"), { budgetMs: plan.budgets.teammemMs, name: "teammem_done" });
@@ -341,7 +460,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
       if (driveFailure) event("drive_failed", { reason: driveFailure });
       event("long_tail_public_close_settled");
     });
-  } else drive.then(() => undefined, (error) => { driveFailure = String(error?.message ?? error); event("drive_failed", { reason: driveFailure }); })
+  } else drive.then(() => undefined, (error) => { driveFailure = plan.l6ReceiptGate ? "l6_entry_prerequisite_failed" : String(error?.message ?? error); event("drive_failed", { reason: driveFailure }); })
     .then(() => {
       shuttingDown = true;
       event("shutdown_signalled");
@@ -492,7 +611,8 @@ async function driveInteractive(provider, getComposition) {
 }
 
 if (isMain) main().catch((error) => {
-  event("entry_failed", { reason: String(error?.message ?? error) });
-  writeFileSync(path.join(plan.controlDir, "summary.json"), JSON.stringify({ exit: null, driveFailure: String(error?.message ?? error), trace }));
+  const reason = plan.l6ReceiptGate ? "l6_entry_prerequisite_failed" : String(error?.message ?? error);
+  event("entry_failed", { reason });
+  writeFileSync(path.join(plan.controlDir, "summary.json"), JSON.stringify({ exit: null, driveFailure: reason, trace }));
   process.exit(71);
 });
