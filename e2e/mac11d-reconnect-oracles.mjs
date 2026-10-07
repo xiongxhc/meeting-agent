@@ -103,8 +103,11 @@ export function reconnectOracle({ result, events, drain, shutdown, finalized, pa
     assert.ok(typeof entry.epoch.clockDomainId === "string" && entry.epoch.clockDomainId.length > 0);
   });
   const discontinuities = entries.filter(entry => entry.kind === "discontinuity");
-  assert.equal(discontinuities.length, 1); assert.equal(discontinuities[0].reason, "reconnect");
-  assert.equal(discontinuities[0].captureEpoch, 2n);
+  assert.equal(discontinuities.length, 2, "recorded reconnect discontinuity count");
+  discontinuities.forEach((entry, index) => {
+    assert.equal(entry.reason, "reconnect", "reconnect discontinuity reason");
+    assert.equal(entry.captureEpoch, BigInt(index + 1), "reconnect discontinuity epoch");
+  });
   assert.ok(!entries.some(entry => entry.kind === "alignment_limit"));
   const gaps = entries.filter(entry => entry.kind === "audio_gap"); assert.equal(gaps.length, 1);
   assert.equal(gaps[0].reason, "capture_discontinuity"); assert.equal(gaps[0].startedAtMs, 40n);
@@ -146,9 +149,11 @@ export function reconnectOracle({ result, events, drain, shutdown, finalized, pa
     frameIndex += 1;
   }
   assert.ok(pairsByEpoch[0] >= 1 && pairsByEpoch[1] >= 2);
-  assert.ok(entries.indexOf(discontinuities[0]) > entries.indexOf(epochs[1]) &&
-    entries.indexOf(discontinuities[0]) < entries.indexOf(frames[2]), "reconnect discontinuity order");
-  assert.ok(entries.indexOf(gaps[0]) > entries.indexOf(discontinuities[0]) &&
+  assert.ok(entries.indexOf(discontinuities[0]) > entries.indexOf(frames[1]) &&
+    entries.indexOf(discontinuities[0]) < entries.indexOf(epochs[1]), "old reconnect closure order");
+  assert.ok(entries.indexOf(discontinuities[1]) > entries.indexOf(epochs[1]) &&
+    entries.indexOf(discontinuities[1]) < entries.indexOf(frames[2]), "reconnect discontinuity order");
+  assert.ok(entries.indexOf(gaps[0]) > entries.indexOf(discontinuities[1]) &&
     entries.indexOf(gaps[0]) < entries.indexOf(frames[2]), "closed reconnect gap order");
   const pairs = entries.filter(entry => entry.kind === "clock_pair");
   assert.equal(pairs.at(-1).pair.sequence, BigInt(boundary.finalClockPairSequence));

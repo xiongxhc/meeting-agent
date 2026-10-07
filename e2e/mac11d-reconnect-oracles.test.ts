@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { RecordingAlignmentEntry, RecordingAlignmentPage } from "@conversation/runtime";
 import type { BridgeEventMessageV2 } from "../src/contracts/bridge-session-v2.ts";
+import { pageWarnings } from "../src/sessions/recording-alignment.ts";
 // @ts-expect-error Private test-only JavaScript helper has no public declaration.
 import { parseReconnectTelemetry, reconnectOracle } from "./mac11d-reconnect-oracles.mjs";
 
@@ -42,6 +43,7 @@ function fixture() {
   };
   const first = cycle(0, [480, 480], 0n), second = cycle(1, [480, 480, 137], 125n);
   const entries: Entry[] = [{ kind: "epoch", epoch: epochs[0]! }, pair(1n), ...first,
+    { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" },
     { kind: "epoch", epoch: epochs[1]! }, { kind: "discontinuity", captureEpoch: 2n, reason: "reconnect" },
     pair(3n), { kind: "audio_gap", startedAtMs: 40n, endedAtMs: 165n, reason: "capture_discontinuity" },
     ...second, pair(5n)];
@@ -76,6 +78,52 @@ test("component-only reconnect oracle separates emitted 2194 samples from authen
   assert.equal(reconnectOracle(fixture())?.recordedFrames, 5);
   assert.equal(reconnectOracle(fixture())?.scope, "component_only_reconnect_oracle");
 });
+test("component-only reconnect retains the old epoch closure and new epoch discontinuity", () => {
+  const f = fixture(), entries = f.pages[0]!.entries;
+  assert.deepEqual(entries.filter(entry => entry.kind === "discontinuity"), [
+    { kind: "discontinuity", captureEpoch: 1n, reason: "reconnect" },
+    { kind: "discontinuity", captureEpoch: 2n, reason: "reconnect" },
+  ]);
+  assert.equal(reconnectOracle(f)?.recordedSamples, "2057");
+});
+for (const fault of ["missing_old", "missing_new", "duplicate_old", "duplicate_new", "reversed",
+  "old_reason", "new_reason", "old_epoch", "new_epoch", "old_before_last_frame", "old_after_epoch2",
+  "new_before_epoch2", "new_after_first_frame", "gap_before_new", "gap_after_first_frame"] as const) {
+  test(`component-only reconnect rejects ${fault} without masking the discontinuity predicate`, () => {
+    const f = fixture(), entries = f.pages[0]!.entries;
+    const discontinuities = entries.filter((entry): entry is Extract<Entry, { kind: "discontinuity" }> => entry.kind === "discontinuity");
+    const old = discontinuities[0]!, next = discontinuities[1]!;
+    const epoch2 = entries.filter(entry => entry.kind === "epoch")[1]!;
+    const gap = entries.find(entry => entry.kind === "audio_gap")!;
+    const firstLast = frame(f, 1), secondFirst = frame(f, 2);
+    const moveBefore = (entry: Entry, target: Entry) => {
+      entries.splice(entries.indexOf(entry), 1); entries.splice(entries.indexOf(target), 0, entry);
+    };
+    let failure = /recorded reconnect discontinuity count/;
+    if (fault === "missing_old" || fault === "missing_new") entries.splice(entries.indexOf(fault === "missing_old" ? old : next), 1);
+    if (fault === "duplicate_old" || fault === "duplicate_new") entries.splice(entries.indexOf(next), 0, structuredClone(fault === "duplicate_old" ? old : next));
+    if (fault === "reversed") {
+      const oldIndex = entries.indexOf(old), nextIndex = entries.indexOf(next);
+      [entries[oldIndex], entries[nextIndex]] = [next, old]; failure = /reconnect discontinuity epoch/;
+    }
+    if (fault === "old_reason" || fault === "new_reason") {
+      (fault === "old_reason" ? old : next).reason = "pause"; failure = /reconnect discontinuity reason/;
+    }
+    if (fault === "old_epoch" || fault === "new_epoch") {
+      (fault === "old_epoch" ? old : next).captureEpoch = 3n; failure = /reconnect discontinuity epoch/;
+    }
+    if (fault === "old_before_last_frame") { moveBefore(old, firstLast); failure = /old reconnect closure order/; }
+    if (fault === "old_after_epoch2") { moveBefore(old, next); failure = /old reconnect closure order/; }
+    if (fault === "new_before_epoch2") { moveBefore(next, epoch2); failure = /reconnect discontinuity order/; }
+    if (fault === "new_after_first_frame") { moveBefore(next, frame(f, 3)); failure = /reconnect discontinuity order/; }
+    if (fault === "gap_before_new") { moveBefore(gap, next); failure = /closed reconnect gap order/; }
+    if (fault === "gap_after_first_frame") { moveBefore(gap, frame(f, 3)); failure = /closed reconnect gap order/; }
+    assert.ok(entries.includes(secondFirst));
+    // Keep decoded-page warnings coherent so an earlier warning mismatch cannot mask a missing predicate.
+    f.complete.warnings = [...new Set(f.pages.flatMap(pageWarnings))].sort();
+    assert.throws(() => reconnectOracle(f), failure);
+  });
+}
 test("component-only telemetry validates closed records while allowing two native cycles", () => {
   const f = fixture(), barrier = { schema: f.result.schema, type: "barrier", name: "capture_started" };
   assert.deepEqual(parseReconnectTelemetry(line(barrier) + line(barrier) + line(f.result)), [barrier, barrier, f.result]);
