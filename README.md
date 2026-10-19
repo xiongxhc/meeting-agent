@@ -35,11 +35,26 @@ SHIPPED standalone admission and composition against scripted local peers:
 
 ```sh
 export PATH=/opt/homebrew/opt/node@24/bin:$PATH
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
+export MEETING_E2E_ARTIFACTS_DIR=/absolute/path/to/artifacts   # only outside the default layout
 npm run e2e -- --out /absolute/evidence/dir            # add --keep to retain the temp root
 npm run e2e -- --out /absolute/evidence/dir --only-refusals
 npm run e2e -- --out /absolute/evidence/interactive --interactive
 npm run test:e2e                                    # sequential spines and focused peer checks
 ```
+
+Two environment variables locate inputs that live outside this repository. Both
+must be absolute paths.
+
+- `MEETING_E2E_TEAMMEM_REPOSITORY` names the TeamMem meeting-storage checkout
+  the pinned TeamMem tree is archived from. Every `e2e/run.mjs` mode except
+  `--only-refusals` requires it and refuses to start without it, before pin
+  verification, the build or staging.
+- `MEETING_E2E_ARTIFACTS_DIR` names the directory holding the pinned Runtime
+  artefacts and their review records. It defaults to `../../artifacts` relative
+  to this checkout. Set it whenever the checkout is not at that location
+  relative to the artifacts directory, for example a copy made elsewhere to run
+  tests; the pins and `npm run test:e2e` read it too.
 
 The application spine is excluded from `npm test`. Run it separately on an idle
 machine, with only one spine running at a time; it builds and launches the whole
@@ -91,6 +106,7 @@ prerequisite for later R2 recovery. Run it on a permitted host with an explicit
 validated wheelhouse and local bare publication opt-in:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 E2E_ALLOW_LOCAL_BARE_PUSH=1 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/r2-baseline --r2-baseline --dependency-wheelhouse /absolute/validated/wheelhouse --keep
 ```
 
@@ -237,6 +253,7 @@ The prepared recording timing command changes only frame 26's nominal start by
 two nanoseconds while retaining all 51 frames and their PCM samples:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/invalid2ns --keep --media-timing invalid2ns
 ```
 
@@ -252,6 +269,7 @@ The selected L4 command prepares three separate attribution cases. Use a fresh
 private output directory for each case:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case sent-named --keep --out /absolute/private/evidence/l4-sent-named
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case unavailable-missing --keep --out /absolute/private/evidence/l4-unavailable-missing
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --interactive --l4-case sent-drop --keep --out /absolute/private/evidence/l4-sent-drop
@@ -275,6 +293,7 @@ The final-pair omission selection captures 49 frames below the 50-frame periodic
 clock-pair cadence, then omits the final pair and finish exchange:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/omit-final-pair --keep --media-timing omit-final-pair
 ```
 
@@ -291,6 +310,7 @@ The separate long omission selection captures 99 frames across the periodic
 clock-pair cadence, retaining two actual pairs and omitting the final exchange:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 /opt/homebrew/opt/node@24/bin/node e2e/run.mjs --out /absolute/private/evidence/omit-final-pair-long --keep --media-timing omit-final-pair-long
 ```
 
@@ -350,6 +370,7 @@ The prepared D2 harness adds four independent cuts. Each requires real localhost
 listeners and a fresh absolute output directory; run them sequentially:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 export E2E_ALLOW_LOCAL_BARE_PUSH=0
 npm run e2e -- --interactive --d2-cut durable --out /absolute/evidence/durable
 npm run e2e -- --interactive --d2-cut cancel-wins --out /absolute/evidence/cancel-wins
@@ -438,6 +459,7 @@ media and cannot accept these media scenarios.
 An explicit private wheelhouse can supply offline TeamMem dependencies:
 
 ```sh
+export MEETING_E2E_TEAMMEM_REPOSITORY=/absolute/path/to/teammem-checkout
 npm run e2e -- --out /absolute/evidence/offline --dependency-wheelhouse /absolute/private/dependencies
 npm run e2e -- --out /absolute/evidence/package-refusals --only-refusals --package-refusals
 ```

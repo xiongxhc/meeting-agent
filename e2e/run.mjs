@@ -94,6 +94,13 @@ export function parseArguments(argv) {
   return options;
 }
 
+/** Every mode except `--only-refusals` stages TeamMem from a local checkout.
+ * Reading the location here refuses a missing or relative value before pins,
+ * build or staging run. */
+export function requireTeamMemSource(options) {
+  if (!options.onlyRefusals) void TEAMMEM_SOURCE.repository;
+}
+
 /** The actual entry uses one fixed request/ACK slot. No stale ACK, unbounded
  * adapter await or raw foreign exception is publication authority. */
 export function createL6Channel({ controlDir, deadlineAtMs, remoteHead, entryFailed }) {
@@ -756,6 +763,7 @@ export function finishPrivateRoot({ staged, options, live, runFailed = false, re
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
+  requireTeamMemSource(options);
   mkdirSync(options.out, { recursive: true, mode: 0o700 });
 
   if (options.dependencyWheelhouse !== undefined) await validateDependencyWheelhouse(options.dependencyWheelhouse);
