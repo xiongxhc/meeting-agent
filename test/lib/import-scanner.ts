@@ -579,8 +579,9 @@ export function findOpaqueConstructs(
 }
 
 /** Explicit owners of filesystem writes. The application may create its own
- * outbox directory; the filesystem adapters own durable publication and
- * private operator warnings. No Team Vault module appears here, so its
+ * outbox directory; the filesystem adapters own durable publication,
+ * private operator warnings and the private join-failure diagnostic file.
+ * No Team Vault module appears here, so its
  * read-only git index cannot gain an fs write capability by renaming a path
  * variable. */
 export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string>>> = {
@@ -590,6 +591,7 @@ export const WRITE_CAPABILITY_OWNERS: Readonly<Record<string, ReadonlySet<string
     "appendFile", "appendFileSync", "createWriteStream", "mkdir", "mkdirSync", "rm", "rmSync", "rmdirSync", "writeFile", "writeFileSync",
   ]),
   "src/adapters/filesystem-operator-warning.ts": new Set(["linkSync", "mkdirSync", "unlinkSync", "writeFileSync"]),
+  "src/adapters/filesystem-join-failure-diagnostic.ts": new Set(["writeSync"]),
 };
 
 /** Direct HTTP is an adapter capability, never an endpoint-text exception. */

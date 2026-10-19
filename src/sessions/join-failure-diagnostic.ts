@@ -1,7 +1,6 @@
 // PRIVATE observation only: one attempt, one closed failure row, exit-only IO.
-import { constants, closeSync, lstatSync, openSync, realpathSync, writeSync } from "node:fs";
-import path from "node:path";
 import { types } from "node:util";
+import { writeJoinFailureDiagnostic } from "../adapters/filesystem-join-failure-diagnostic.ts";
 
 type Phase = "lease_setup" | "timed_control" | "subscriptions" | "join_send" | "join_cancel_check" |
   "runtime_admission" | "admitted_binding" | "admission_cancel_check" | "connect_media_send" |
@@ -16,18 +15,9 @@ let record: Failure | undefined;
 function flushJoinFailureDiagnostic(): void {
   if (flushed) return;
   flushed = true;
-  let fd: number | undefined;
-  try {
-    if (!directory || invalid || !record) return;
-    const stat = lstatSync(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || realpathSync(directory) !== directory) return;
-    fd = openSync(path.join(directory, "join-failure.json"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    writeSync(fd, JSON.stringify(record) + "\n");
-  } catch { /* Missing/partial export is missing evidence, never admission. */ }
-  finally {
-    if (fd !== undefined) { try { closeSync(fd); } catch { /* Exit status is untouched. */ } }
-    record = undefined;
-  }
+  // The sink never throws, so the exit status is untouched.
+  try { if (directory && !invalid && record) writeJoinFailureDiagnostic(directory, record); }
+  finally { record = undefined; }
 }
 // Disabled imports register no listener and factories return no observer.
 if (directory) { try { process.once("exit", flushJoinFailureDiagnostic); } catch { invalid = true; } }
