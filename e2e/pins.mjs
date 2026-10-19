@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 // Packaged Runtime artefacts and their review records live outside this
 // repository. A location set in the environment must be absolute; an empty
 // value counts as unset.
-const REPOSITORY_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const REPOSITORY_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 function fromEnvironment(name) {
   const value = process.env[name];
   if (!value) return undefined;
