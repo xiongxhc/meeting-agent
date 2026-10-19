@@ -2,11 +2,13 @@
 // It forwards the packaged child's actual control bytes and persists only safe event fields.
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, openSync, readFileSync, writeSync } from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
 import { FrameDecoder } from "@conversation/runtime";
 import { createExpiryEvidenceCollector } from "./expiry-evidence-collector.mjs";
+import { LIFECYCLE_FILE, clientCommandRow, gatewayExitRow, gatewayMessageRow } from "./voice-end-evidence.mjs";
 
 let argv = process.argv.slice(2), collector, child;
 try {
@@ -30,6 +32,20 @@ try {
 const [, , eventsPath, pidsPath] = argv;
 const decoder = new FrameDecoder();
 let failed = false, reapTimer, evidenceTimer;
+// Voice-end lifecycle beside the voice events, opened once on first use. Best
+// effort: a failure disables it once and never terminates or recodes the gateway.
+const lifecyclePath = path.join(path.dirname(eventsPath), LIFECYCLE_FILE);
+let lifecycleOpen = true, lifecycleFd = null;
+function lifecycle(row) {
+  if (!lifecycleOpen || failed) return;
+  try {
+    lifecycleFd ??= openSync(lifecyclePath, "a", 0o600);
+    writeSync(lifecycleFd, `${JSON.stringify({ ...row, observerPid: process.pid, at: Date.now(), monotonicNs: process.hrtime.bigint().toString() })}\n`);
+  } catch {
+    lifecycleOpen = false;
+    try { process.stderr.write("gateway_observer_lifecycle_unavailable\n"); } catch { /* diagnostics only; never fail the gateway */ }
+  }
+}
 function terminate(failure) {
   if (failure && !failed) { failed = true; collector?.fail(); process.stderr.write("gateway_observer_failed\n"); }
   process.stdin.unpipe(child.stdin);
@@ -43,6 +59,15 @@ if (collector) evidenceTimer = setInterval(() => { try { collector.readTail(); }
 // Forward the original bytes before observation. The tap never re-encodes them.
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
+// Client commands are observed after the pipe has forwarded the same chunk.
+const clientDecoder = new FrameDecoder();
+let clientObserved = true;
+process.stdin.on("data", (chunk) => {
+  if (!clientObserved) return;
+  try { for (const bytes of clientDecoder.push(chunk)) lifecycle(clientCommandRow(JSON.parse(Buffer.from(bytes).toString("utf8")))); }
+  catch { clientObserved = false; lifecycle({ event: "client_decode_failed" }); }
+});
+process.stdin.on("end", () => lifecycle({ event: "client_eof" }));
 child.stdout.on("data", (chunk) => {
   if (failed) return;
   try {
@@ -57,16 +82,19 @@ child.stdout.on("data", (chunk) => {
       if (event.event) detail.event = { type: event.event.type, turn_id: event.event.turn_id };
       appendFileSync(eventsPath, `${JSON.stringify(detail)}\n`);
     }
+    const row = gatewayMessageRow(frame);
+    if (row !== null) lifecycle(row);
   }
   } catch { terminate(true); }
 });
-child.stdout.on("end", () => { try { decoder.finish(); } catch { terminate(true); } });
+child.stdout.on("end", () => { lifecycle({ event: "gateway_stdout_end" }); try { decoder.finish(); } catch { terminate(true); } });
 child.stdin.on("error", () => terminate(true));
 process.stdout.on("error", () => terminate(true));
-for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => terminate(false));
+for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => { lifecycle({ event: "observer_signal", signal }); terminate(false); });
 child.on("error", () => terminate(true));
 try { appendFileSync(pidsPath, `${child.pid}\n`); } catch { terminate(true); }
-child.on("close", async (code) => {
+child.on("close", async (code, signal) => {
+  lifecycle(gatewayExitRow(code, signal));
   clearTimeout(reapTimer);
   clearInterval(evidenceTimer);
   process.stdin.destroy();

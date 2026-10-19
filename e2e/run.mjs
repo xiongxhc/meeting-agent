@@ -32,6 +32,7 @@ import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-pro
 import { preflightLauncher } from "./launcher-preflight.mjs";
 import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, longTailOmissionMetadata, longTailOmissionOracles, longTailReport, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
 import { d2OrderingOracles } from "./d2-oracles.mjs";
+import { voiceEndFromControl } from "./voice-end-evidence.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
 
@@ -1128,6 +1129,7 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
     interactiveCalls: live.summary?.interactiveCalls ?? [],
     runtimeEvents: live.summary?.runtimeEvents ?? [],
     vaultReads: live.summary?.vaultReads ?? [],
+    voiceEnd: voiceEndFromControl(staged?.directories?.control, { childState: live.childState, summary: live.summary }),
     bridgeChild: live.childState === null ? null : { pid: live.childState.pid, joined: live.childState.joined, mediaConnected: live.childState.mediaConnected, framesSent: live.childState.framesSent, left: live.childState.left, commands: live.childState.commands, playback: live.childState.playback, flushes: live.childState.flushes, ...captureFinishMetadata(live.childState) },
     processTreeAtPeak: live.peakTree,
     processEvidence: live.processEvidence,

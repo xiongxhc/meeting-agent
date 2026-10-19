@@ -23,11 +23,12 @@ function wav() {
 
 export async function startInteractiveProvider() {
   const submitted = createSubmittedFrameTracker();
-  let connectionOrdinal = 0;
+  let connectionOrdinal = 0, httpRequests = 0, firstRecognitionMonotonicNs = null;
   const calls = [], sockets = new Set(), heldResponses = new Set();
   let holdLanguage = false, bargeOnSpeech = false;
   let recognition = null, previous = null, ordinal = 0, appended = 0;
   const server = createServer((request, response) => {
+    httpRequests += 1;
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
     request.on("end", () => {
@@ -57,6 +58,7 @@ export async function startInteractiveProvider() {
   });
   const websocket = new WebSocketServer({ server });
   websocket.on("connection", (socket) => {
+    firstRecognitionMonotonicNs ??= process.hrtime.bigint().toString();
     const connection = `recognition-${++connectionOrdinal}`;
     submitted.connect(connection);
     sockets.add(socket);
@@ -88,6 +90,7 @@ export async function startInteractiveProvider() {
     get ready() { return recognition !== null && appended > 0; },
     get submitted() { return submitted.snapshot(); },
     get appended() { return appended; },
+    get connections() { return { recognition: connectionOrdinal, http: httpRequests, firstRecognitionMonotonicNs }; },
     holdLanguage() { holdLanguage = true; },
     armBargeOnSpeech() { bargeOnSpeech = true; },
     releaseLanguage() { holdLanguage = false; for (const response of heldResponses) response.end("data: [DONE]\n\n"); heldResponses.clear(); },

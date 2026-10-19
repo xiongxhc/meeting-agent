@@ -23,6 +23,7 @@ import { createPhysicalOutcomeEmitter, parsePhysicalOutcomeScenario, readPhysica
 import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge-observations.mjs";
 
 import { compileL4Plan, l4Configuration, l4PlanHash } from "../l4-campaign.mjs";
+import { bridgeLeaveFact } from "../voice-end-evidence.mjs";
 
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -45,7 +46,7 @@ const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, left: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], disclosure: null,
+  mediaClosedReason: null, left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], disclosure: null,
   capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [],
 };
 const FRAME_MS = 20;
@@ -187,6 +188,7 @@ lines.on("line", (line) => {
     const command = JSON.parse(line);
     state.commands.push(command.type);
     if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
+    if (command.type === "leave" && state.leave === null) state.leave = bridgeLeaveFact(command.reason, process.hrtime.bigint());
     if (command.type === "join") {
       const joinTiming = timing();
       observations?.prepareJoin(joinTiming);

@@ -494,7 +494,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
   return { exit, summary: {
     exit, driveFailure, shuttingDown, trace,
     feishuRequests: peer.requests, feishuMessages: peer.messages, providerCalls: provider.calls,
-    interactiveCalls: interactive?.calls ?? [], runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
+    interactiveCalls: interactive?.calls ?? [], interactiveConnections: interactive?.connections ?? null, runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
     ...(plan.l4Case === undefined ? {} : { l4Drive }),
     r2Maintenance: plan.r2Baseline ? compositionHandle?.maintenanceStatus() ?? r2Maintenance : null,
     unusedVoice: unusedVoice ? { calls: unusedVoice.calls, appended: unusedVoice.appended, ready: unusedVoice.ready } : null,
