@@ -1315,7 +1315,7 @@ test("finalizeRecording runs exactly once, however many terminal signals arrive"
 });
 
 test("the recordings table refuses a handle outside ^[a-z0-9]{1,128}$ (ruling R56)", async () => {
-  // The interim runtime handoff gives the real rule: lowercase hexadecimal
+  // The Runtime SDK contract gives the real rule: lowercase hexadecimal
   // spelling of a random binding, so lowercase alphanumerics only, at most
   // MAX_RECORDING_HANDLE_BYTES (128). The old CHECK was a guessed superset that
   // let an underscore through; a handle that the runtime could never have

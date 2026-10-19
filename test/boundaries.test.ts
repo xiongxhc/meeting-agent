@@ -1,5 +1,5 @@
-// Structural dependency-boundary test. Per LANE-CONSTRAINTS.md and the design
-// spec's ownership table, Meeting Agent production code must never:
+// Structural dependency-boundary test. Per the design spec's ownership table,
+// Meeting Agent production code must never:
 //   - call OpenAI directly (all provider work flows through Conversation Runtime);
 //   - import a TeamMem Python/module path or open TeamMem's SQLite ledger file;
 //   - import a Team Vault write helper (Meeting Agent only reads rendered Markdown).

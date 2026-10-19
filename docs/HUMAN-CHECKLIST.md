@@ -729,8 +729,8 @@ section is `not tested`. They are below.
 
 ### 6.0 Prerequisites
 
-- An isolated agent-box test session (LANE-CONSTRAINTS forbids touching
-  agent-box from this repo's own work; this is a separate human action on
+- An isolated agent-box test session (this repository's own work never
+  touches agent-box; this is a separate human action on
   the box itself, not something run from a checkout of this repository).
 - A real Feishu web client login in a test tenant, in a throwaway browser
   profile — never the operator's own Feishu account.
