@@ -62,6 +62,7 @@ import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCom
 import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "../ports/session-store.ts";
 import { LiveProvisionalCorrelator, type LiveCatchupClock, type ProvisionalResolution } from "./live-provisional.ts";
+import { createJoinFailureDiagnostic } from "./join-failure-diagnostic.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { ActiveSpeakerObservation } from "../domain/transcript.ts";
@@ -1229,6 +1230,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     else if (existing?.state !== "listening") {
       throw new Error(`occurrence cannot start a bridge generation from state "${existing?.state ?? "missing"}"`);
     }
+    const joinDiagnostic = createJoinFailureDiagnostic();
     try {
       const lease = coordinator.acquireBridgeLease(identity.occurrenceId, {
         bridgeId,
@@ -1238,6 +1240,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       coordinator.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
       reconciliationGenerationStarted = true;
 
+      joinDiagnostic?.phase("timed_control");
       if (options.timedEvidence) {
         const controlId = runtime.currentSessionId;
         if (typeof controlId !== "bigint" || controlId <= 0n) throw new Error("timed session requires actual connected v4 control identity");
@@ -1249,6 +1252,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           ...(options.timedEvidence.onResult ? { onResult: options.timedEvidence.onResult } : {}) });
       }
 
+      joinDiagnostic?.phase("subscriptions");
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });
       });
@@ -1256,19 +1260,23 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         enqueue({ source: "runtime", event });
       });
 
+      joinDiagnostic?.phase("join_send");
       await issue({
         type: "join",
         meetingOccurrenceId: identity.occurrenceId,
         meetingNo: identity.meetingNo,
         leaseId: lease.leaseId,
       });
+      joinDiagnostic?.phase("join_cancel_check");
       assertJoinCanContinue();
 
+      joinDiagnostic?.phase("runtime_admission");
       runtimeStartAttempted = true;
       const runtimeAdmission = runtime.startVoiceSession(options.timedEvidence
         ? { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE, timingContract: "capture-clock/v1", bridgeSessionId }
         : { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE });
       const handle = await runtimeAdmission;
+      joinDiagnostic?.phase("admitted_binding");
       if (options.timedEvidence && (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId ||
         handle.bridgeSessionId !== bridgeSessionId || handle.mediaLease.sessionId !== evidenceControlId ||
         (handle.mediaLease.mediaProtocolVersion !== 2 && handle.mediaLease.mediaProtocolVersion !== 3) ||
@@ -1276,11 +1284,14 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms")) throw new Error("timed media lease changed admitted binding or format");
       runtimeSessionId = handle.sessionId;
       if (!options.timedEvidence) coordinator.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, handle.sessionId);
+      joinDiagnostic?.phase("admission_cancel_check");
       assertJoinCanContinue();
+      joinDiagnostic?.phase("admitted_binding");
       if (options.timedEvidence) {
         if (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId || handle.bridgeSessionId !== bridgeSessionId ||
           handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms") throw new Error("timed media lease changed admitted binding or format");
         timedVoiceAdmitted = true;
+        joinDiagnostic?.phase("connect_media_send");
         await issue({ type: "connect_media", mediaLease: { sessionId: handle.sessionId.toString(), bridgeSessionId,
           connectEndpoint: handle.mediaLease.connectEndpoint, credential: handle.mediaLease.credential,
           expiresAtMs: handle.mediaLease.expiresAtMs.toString(), reconnectWindowMs: handle.mediaLease.reconnectWindowMs.toString(),
@@ -1299,17 +1310,22 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         abortSpeaking(`runtime_${handle.status}`);
       }
 
+      joinDiagnostic?.phase("connect_media_send");
       await issue({ type: "connect_media", ...handle.media });
       }
+      joinDiagnostic?.phase("media_cancel_check");
       assertJoinCanContinue();
 
+      joinDiagnostic?.phase("disclosure");
       try {
         await disclosurePublisher.publish(disclosureText);
       } catch {
         disclosure = "failed";
       }
+      joinDiagnostic?.phase("disclosure_cancel_check");
       assertJoinCanContinue();
     } catch (error) {
+      joinDiagnostic?.fail(error);
       await failJoin(error instanceof BridgeContractError ? "media_format_rejected" : "join_failed");
       throw error;
     }

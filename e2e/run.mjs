@@ -400,7 +400,8 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
   const startedAt = Date.now();
   const child = spawn(NODE24, [staged.entryPath, "--plan", planPath], {
     cwd: staged.directories.app, stdio: ["ignore", "pipe", "pipe"],
-    env: { HOME: process.env.HOME, PATH: `${staged.directories.traceBin}:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8" },
+    env: { HOME: process.env.HOME, PATH: `${staged.directories.traceBin}:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8",
+      ...(process.env.MEETING_PRIVATE_JOIN_DIAGNOSTIC_DIR === undefined ? {} : { MEETING_PRIVATE_JOIN_DIAGNOSTIC_DIR: process.env.MEETING_PRIVATE_JOIN_DIAGNOSTIC_DIR }) },
   });
   let stdout = "", stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
