@@ -10,10 +10,11 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { boundedBytes, boundedJson, ingressData, ingressPathExists, ingressReceiverFact } from "./ingress-run.mjs";
 import { readR2BaselineState, measureR2Sources } from "./r2-baseline.mjs";
+import { ARTIFACTS } from "./pins.mjs";
 
 export const ACCEPTED_R2_BUNDLE = "8dca90932fe04c98c21f50346287eb13702f28832be3e0c5ef83985862705d81";
 const ACCEPTED_R2_DATABASE = "1e98c702dfc328265fb9ced908ba94140bda3446d30650e63c2739af73f86489";
-const REVIEW_PATH = "<notes>/meeting-workspace-r2-baseline-review-20261007.md";
+const REVIEW_PATH = path.join(ARTIFACTS, "../handoff/meeting-workspace-r2-baseline-review-20261007.md");
 const REVIEW_HASH = "2aa22be3c9b7574d7610eb3f7d43d8b32f2875fb0079ce915bae775ebe23f014";
 const ACCEPTED_ROOT_IDENTITY = { device: "16777230", inode: "66498747" };
 const ACCEPTED_DATABASE_IDENTITY = { device: "16777230", inode: "66505036" };

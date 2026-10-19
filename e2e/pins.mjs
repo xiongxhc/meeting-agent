@@ -9,9 +9,14 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, createReadStream, fstatSync, lstatSync, openSync, readdirSync, readSync } from "node:fs";
 import { Buffer } from "node:buffer";
+import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
-const ARTIFACTS = "<artifacts>";
+// Packaged Runtime artefacts and their review records live outside this
+// repository. Each location can be overridden; the defaults are home-relative.
+const fromEnvironment = (name, fallback) => path.resolve(process.env[name] || path.join(os.homedir(), fallback));
+export const ARTIFACTS = fromEnvironment("MEETING_E2E_ARTIFACTS_DIR", "<artifacts>");
 
 /** Every Runtime build this harness knows how to run against. Switching is the
  * one-line change at `RUNTIME_PIN` below; nothing else in e2e/ names a build. */
@@ -134,7 +139,7 @@ export const RUNTIME_PIN = RUNTIME_PROFILES.runtime14d;
 
 /** The accepted TeamMem staged tree the wheel is built from (D003 scope). */
 export const TEAMMEM_SOURCE = {
-  repository: "<teammem-checkout>",
+  repository: fromEnvironment("MEETING_E2E_TEAMMEM_REPOSITORY", "<teammem-checkout>"),
   /** Tree of 1ebf774, the accepted head of the TeamMem meeting-storage lane. */
   tree: "6ad2443462a283a4a66e33389068f70b5984df5a",
 };

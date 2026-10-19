@@ -126,9 +126,8 @@ integration evidence (I); higher revisions, replay and early cleanup remain
 separate R2 work. “VAD check gates speech recognition, not encrypted recording.
 Recording must remain independent of provider failures.”
 
-Run the prepared commands below from the reviewed preparation checkout at
-`<source-workspace>`, after matching its
-source inventory to the matching versioned source manifest. Later reviewed
+Run the prepared commands below from a reviewed preparation checkout, after
+matching its source inventory to the matching versioned source manifest. Later reviewed
 commits have successor manifests; V7 describes only its original source cut.
 The raw development checkout includes an
 excluded partial implementation and is not the packaged source for these commands.

@@ -1,7 +1,6 @@
 // Occurrence identity tests, written before src/domain/occurrence-id.ts exists
-// (TDD). The cross-repository schema this module must match byte for byte is
-// <workspace>'s docs/planning/meeting-agent handoff:
-//   teammem-meeting-v1.md, "Occurrence identity" section.
+// (TDD). The module must match the frozen cross-repository schema
+// teammem-meeting-v1, "Occurrence identity" section, byte for byte.
 //
 // The single most important property here: occurrencePathSegment must be
 // byte-identical to TeamMem's Python

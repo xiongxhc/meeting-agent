@@ -4,9 +4,8 @@
 // all key off it.
 //
 // This module must match TeamMem's Python implementation byte for byte. The
-// frozen cross-repository schema is
-// <notes>/teammem-meeting-v1/teammem-meeting-v1.md,
-// "Occurrence identity" section:
+// frozen cross-repository schema (teammem-meeting-v1, "Occurrence identity")
+// defines both forms:
 //
 //   logical (JSON):  <meeting-id>@<UTC start>
 //   path / URL:      <encoded meeting-id>_<compact>
