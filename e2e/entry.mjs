@@ -44,6 +44,7 @@ import { runStandalone } from "../dist/src/main.js";
 import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-config.js";
 
 import { startFixtureProvider } from "./fixture-provider.mjs";
+import { readStateFile } from "./state-file.mjs";
 import { interactiveGatewayToml, liveGatewayToml, postmeetingGatewayToml } from "./gateway-config.mjs";
 import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { RESERVE_ID, SCOPE, inviteEnvelope, startFeishuPeer } from "./feishu-peer.mjs";
@@ -115,7 +116,7 @@ export function waitFor(check, { budgetMs, name, signal, pollMs = 25 }) {
   });
 }
 function readJson(filename) {
-  try { return JSON.parse(readFileSync(filename, "utf8")); } catch { return null; }
+  return readStateFile(filename);
 }
 function controlFileExists(name) {
   try { readFileSync(path.join(plan.controlDir, name)); return true; } catch { return false; }

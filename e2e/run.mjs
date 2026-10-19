@@ -35,6 +35,7 @@ import { d2OrderingOracles } from "./d2-oracles.mjs";
 import { voiceEndFromControl } from "./voice-end-evidence.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
+import { readStateFile } from "./state-file.mjs";
 
 import { l4Configuration, l4Report, readL4Evidence, verifyL4Evidence } from "./l4-campaign.mjs";
 import { createReceiptGate, createReceiptGateController, startOwnedPublication } from "./l6-receipt-gate.mjs";
@@ -285,6 +286,9 @@ async function waitOwnedExit(owned, budgetMs) {
   finally { clearTimeout(timeout); }
 }
 
+export function readChildState(controlDir) {
+  return readStateFile(path.join(controlDir, "state.json"));
+}
 function readEvents(filename) {
   if (!existsSync(filename)) return [];
   return readFileSync(filename, "utf8").split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
@@ -635,8 +639,7 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
   const events = readEvents(eventsPath);
   const summary = existsSync(path.join(staged.directories.control, "summary.json"))
     ? JSON.parse(readFileSync(path.join(staged.directories.control, "summary.json"), "utf8")) : null;
-  const childState = existsSync(path.join(staged.directories.control, "state.json"))
-    ? JSON.parse(readFileSync(path.join(staged.directories.control, "state.json"), "utf8")) : null;
+  const childState = readChildState(staged.directories.control);
 
   steps.push({ name: "entry", command: [NODE24, staged.entryPath], exit: outcome.code, durationMs: Date.now() - startedAt, loadAverage: loadAverage() });
   writeFileSync(path.join(outDir, "entry.stdout.log"), stdout);
