@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -26,15 +26,19 @@ test("a state read concurrent with an in-place rewrite returns a complete docume
     `;
     const writer = spawn(process.execPath, ["--input-type=module", "-e", writerSource], { stdio: ["ignore", "pipe", "inherit"] });
     await new Promise<void>((resolve) => writer.stdout.once("data", () => resolve()));
-    let reads = 0, torn = 0, writerDone = false;
+    let reads = 0, torn = 0, rawTorn = 0, writerDone = false;
     const exited = new Promise<number | null>((resolve) => writer.once("exit", (code) => { writerDone = true; resolve(code); }));
     while (!writerDone) {
-      for (let i = 0; i < 200; i++, reads++) if (readStateFile(filename)?.capturePosition == null) torn++;
+      for (let i = 0; i < 200; i++, reads++) {
+        // A plain parse first, to prove reads really overlap writes.
+        try { JSON.parse(readFileSync(filename, "utf8")); } catch { rawTorn++; }
+        if (readStateFile(filename)?.capturePosition == null) torn++;
+      }
       await new Promise((resolve) => setImmediate(resolve));
     }
     assert.equal(await exited, 0);
-    assert.ok(reads > 1000, `too few concurrent reads: ${reads}`);
-    assert.equal(torn, 0, `torn reads ${torn} of ${reads}`);
+    assert.ok(rawTorn >= 10, `race not exercised: ${rawTorn} raw tears in ${reads} reads`);
+    assert.equal(torn, 0, `torn reads ${torn} of ${reads} (raw tears ${rawTorn})`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
