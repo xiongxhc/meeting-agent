@@ -182,6 +182,10 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     failInviteClaim: (claim, result, nowMs, retryDelayMs) => failInviteClaim(db, claim, result, nowMs, retryDelayMs),
     completeInviteClaim: (claim, result, nowMs) => completeInviteClaim(db, claim, result, nowMs),
     retryInviteMetadata: (id, operator, nowMs) => retryInviteMetadata(db, id, operator, nowMs),
+    admitInviteJoin: (id, nowMs, refusal) => admitInviteJoin(db, id, nowMs, refusal),
+    resolvedOrganizerId: (id) => resolvedInviteOrganizer(db, id)?.feishuUserId ?? null,
+    inviteJoinStatus: (id) => inviteJoinStatus(db, id),
+    inviteJoinAllowed: (id) => inviteJoinAllowed(db, id),
     claimPhysicalClient: (binding, nowMs) => claimPhysicalClient(db, binding, nowMs),
     listPhysicalCustody: () => listPhysicalCustody(db),
     recordPhysicalOutcome: (binding, result, nowMs) => recordPhysicalOutcome(db, binding, result, nowMs),
@@ -352,7 +356,11 @@ function acceptInvite(db: Database.Database, v: NormalizedInvite, now: number): 
       if (["region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt"].some((key) =>
         old[key as keyof InviteOccurrence] !== v[key as keyof NormalizedInvite])) throw new Error("invite_conflict");
     } else {
-      const count = db.prepare("SELECT count(*) AS n FROM feishu_invite_occurrences WHERE state IN ('pending_metadata','metadata_blocked')").get() as {n:number};
+      // Unresolved rows count, as before, unless their meeting is already over (a finished instant meeting keeps a blocked
+      // organizer forever) or their invite was refused: neither may refuse a later invite.
+      const count = db.prepare(`SELECT count(*) AS n FROM feishu_invite_occurrences o WHERE o.state IN ('pending_metadata','metadata_blocked')
+        AND NOT (o.state='metadata_blocked' AND o.last_blocked_reason IN ('inviter_not_allowed','inviter_unverified','invite_stale'))
+        AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.occurrence_id=o.occurrence_id AND s.state NOT IN ('discovered','joining','listening'))`).get() as {n:number};
       if (count.n >= 256) throw new Error("invite_capacity");
       db.prepare(`INSERT INTO feishu_invite_occurrences(occurrence_id,region,tenant_key,app_id,provider_meeting_id,meeting_no,
         occurrence_started_at,title,state,accepted_at_ms,last_observed_at_ms,next_attempt_at_ms) VALUES(?,?,?,?,?,?,?,?,'pending_metadata',?,?,?)`)
@@ -427,10 +435,10 @@ function completeInviteClaim(db: Database.Database, claim: InviteClaim, result: 
     if (Buffer.byteLength(reference)>8192) throw new Error("invalid_invite_reference");
     const session = getSession(db,row.occurrenceId);
     if (session && (session.providerMeetingId !== row.providerMeetingId || session.occurrenceStartedAt !== row.occurrenceStartedAt)) throw new Error("invite_conflict");
-    if (!session) createSession(db,{occurrenceId:row.occurrenceId,providerMeetingId:row.providerMeetingId,occurrenceStartedAt:row.occurrenceStartedAt,nowMs:now});
-    db.prepare(`UPDATE feishu_invite_occurrences SET state=?,organizer_source=?,organizer_id_type='open_id',organizer_open_id=?,organizer_display_name=?,
+    // Organizer metadata only addresses the notification; it never creates, gates or changes a session.
+    db.prepare(`UPDATE feishu_invite_occurrences SET state='admitted',organizer_source=?,organizer_id_type='open_id',organizer_open_id=?,organizer_display_name=?,
       reference_kind=?,reference_json=?,admitted_at_ms=?,claim_token=NULL,claim_expires_at_ms=NULL WHERE occurrence_id=?`)
-      .run(session ? "existing_session":"admitted",organizer.source,organizer.id,organizer.displayName,result.reference.kind,reference,now,row.occurrenceId);
+      .run(organizer.source,organizer.id,organizer.displayName,result.reference.kind,reference,now,row.occurrenceId);
   }).immediate();
 }
 function retryInviteMetadata(db: Database.Database, id: string, operator: string, now: number): "pending" | "already_pending" | "counter_exhausted" {
@@ -438,7 +446,7 @@ function retryInviteMetadata(db: Database.Database, id: string, operator: string
   if (!/^[A-Za-z0-9._@-]{1,128}$/.test(operator)) throw new Error("invalid_invite_operator");
   return db.transaction(() => {
     const row = getInviteOccurrence(db,id);
-    if (!row || getSession(db,id) || now < Math.max(row.lastAttemptAtMs ?? 0,row.lastOperatorRetryAtMs ?? 0,row.acceptedAtMs)) throw new Error("invite_retry_fenced");
+    if (!row || now < Math.max(row.lastAttemptAtMs ?? 0,row.lastOperatorRetryAtMs ?? 0,row.acceptedAtMs)) throw new Error("invite_retry_fenced");
     if (row.state === "pending_metadata") return "already_pending" as const;
     if (row.state !== "metadata_blocked" || row.claimToken !== null) throw new Error("invite_retry_fenced");
     if (row.retryGeneration >= 1_000_000 || row.operatorRetryCount >= 1_000_000 || row.totalAttempts >= 1_000_000) {
@@ -449,6 +457,70 @@ function retryInviteMetadata(db: Database.Database, id: string, operator: string
       .run(operator,now,now,id);
     return "pending" as const;
   }).immediate();
+}
+
+/** An allowed invite alone admits its occurrence for joining: one session per occurrence, created whatever the
+ * organizer lane says. A refused or stale invite never creates or consumes a session: the refusal is recorded on
+ * the invite row (its organizer lane is parked as `metadata_blocked` with the refusal as reason, so no organizer
+ * lookup runs for it), and a later allowed invite for the same occurrence is judged on its own. Stale compares the
+ * newer of Feishu's invite_time and the local receipt with the clock, so host clock skew alone never refuses. The
+ * 10-minute window is an operational choice, not a spec rule. */
+export const INVITE_JOIN_WINDOW_MS = 600_000;
+export type InviteJoinRefusal = "inviter_not_allowed" | "inviter_unverified";
+const JOIN_REFUSALS = ["inviter_not_allowed", "inviter_unverified", "invite_stale"];
+const INVITE_ALLOWED = "invite_allowed";
+function inviteJoinAllowed(db: Database.Database, id: string): boolean {
+  return db.prepare("SELECT 1 FROM transitions WHERE occurrence_id=? AND reason=? LIMIT 1").get(id, INVITE_ALLOWED) !== undefined;
+}
+function inviteJoinRefusal(row: InviteOccurrence): string | null {
+  return row.state === "metadata_blocked" && row.lastBlockedReason !== null && JOIN_REFUSALS.includes(row.lastBlockedReason) ? row.lastBlockedReason : null;
+}
+function admitInviteJoin(db: Database.Database, id: string, now: number, refusal?: InviteJoinRefusal):
+    "admitted" | "existing_session" | "invite_stale" | InviteJoinRefusal {
+  inviteTime(now);
+  if (refusal !== undefined && refusal !== "inviter_not_allowed" && refusal !== "inviter_unverified") throw new Error("invalid_invite_refusal");
+  return db.transaction(() => {
+    const row = getInviteOccurrence(db,id);
+    if (!row) throw new Error("unknown_invite_occurrence");
+    const session = getSession(db,id);
+    if (session) {
+      if (session.providerMeetingId !== row.providerMeetingId || session.occurrenceStartedAt !== row.occurrenceStartedAt) throw new Error("invite_conflict");
+      // A session that predates the allowlist (no allowed decision) launches only once an allowed invite admits it.
+      if (refusal === undefined && session.state === "discovered" && !inviteJoinAllowed(db,id)) {
+        db.prepare(`INSERT INTO transitions (occurrence_id, from_state, to_state, reason, terminal_reason, occurred_at_ms)
+          VALUES (?, 'discovered', 'discovered', ?, NULL, ?)`).run(id, INVITE_ALLOWED, now);
+        return "admitted" as const;
+      }
+      return "existing_session" as const;
+    }
+    const newest = db.prepare("SELECT max(CAST(invite_seconds AS INTEGER)) AS seconds FROM feishu_invite_events WHERE occurrence_id=?").get(id) as {seconds:number|null};
+    const observedAtMs = Math.max(row.lastObservedAtMs, newest.seconds === null ? 0 : newest.seconds * 1000);
+    const outcome = refusal ?? (now - observedAtMs > INVITE_JOIN_WINDOW_MS ? "invite_stale" as const : null);
+    if (outcome !== null) {
+      // Recorded on the invite row; an in-flight organizer claim is left to settle and the next decision records it.
+      if ((row.state === "pending_metadata" && row.claimToken === null) || row.state === "metadata_blocked") blockInvite(db,id,outcome,now);
+      return outcome;
+    }
+    createSession(db,{occurrenceId:row.occurrenceId,providerMeetingId:row.providerMeetingId,occurrenceStartedAt:row.occurrenceStartedAt,nowMs:now});
+    db.prepare("UPDATE transitions SET reason=? WHERE occurrence_id=? AND from_state IS NULL").run(INVITE_ALLOWED, id);
+    // A refusal parked the organizer lane; the now-joined meeting gets a fresh organizer generation.
+    if (inviteJoinRefusal(row) !== null) {
+      db.prepare(`UPDATE feishu_invite_occurrences SET state='pending_metadata',generation_attempts=0,generation_started_at_ms=NULL,
+        retry_generation=min(retry_generation+1,1000000),next_attempt_at_ms=? WHERE occurrence_id=?`).run(now,id);
+    }
+    return "admitted" as const;
+  }).immediate();
+}
+/** The join decision for the operator: the session, a recorded refusal, or none yet. */
+function inviteJoinStatus(db: Database.Database, id: string): { readonly session: string | null; readonly terminalReason: string | null; readonly refusal: string | null; readonly allowed: boolean } | null {
+  const row = getInviteOccurrence(db,id);
+  if (!row) return null;
+  const session = getSession(db,id);
+  return { session: session?.state ?? null, terminalReason: session?.terminalReason ?? null, refusal: session ? null : inviteJoinRefusal(row), allowed: session !== null && inviteJoinAllowed(db,id) };
+}
+function resolvedInviteOrganizer(db: Database.Database, id: string): BackfillSeedFinalizationInput["identity"]["organizer"] {
+  const organizer = getInviteOccurrence(db,id)?.organizer ?? null;
+  return organizer === null ? null : { feishuUserId: organizer.id, displayName: organizer.displayName, source: organizer.source };
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,7 +1179,10 @@ function assertBackfillRecordingBindingUnchanged(expected: BackfillRecordingBind
 }
 
 function prepareBackfillSeed(db: Database.Database, value: FinalizeSessionInput): PreparedBackfillSeed {
-  const input = value.backfillSeed;
+  const given = value.backfillSeed;
+  // The join never waits for the organizer, so one resolved after the launch is bound here, at the seed.
+  const input = given === undefined || given.identity.organizer !== null ? given
+    : { ...given, identity: { ...given.identity, organizer: resolvedInviteOrganizer(db, value.transition.occurrenceId) } };
   if (input === undefined || (input as { terminalReason?: unknown }).terminalReason !== "ended" ||
       (input as { terminalSource?: unknown }).terminalSource !== "bridge_observed" ||
       value.transition.toState !== "finalizing" || value.transition.terminalReason !== null ||

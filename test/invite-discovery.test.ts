@@ -19,6 +19,11 @@ test("invite normalization preserves original identity/seconds and rejects colli
   const value = normalizeInvite(envelope(), scope);
   assert.equal(value.occurrenceId, "9007199254740993@2026-09-02T14:00:00Z");
   assert.equal(value.providerMeetingId, "9007199254740993");
+  const invited = normalizeInvite({ ...envelope(), event: { ...envelope().event, inviter: { id: "ou_inviter", user_type: 1 } } }, scope);
+  assert.equal(invited.inviterId, "ou_inviter");
+  assert.equal(invited.normalizedSha256, value.normalizedSha256, "the inviter is outside the replay identity");
+  assert.equal("inviterId" in value, false);
+  assert.equal("inviterId" in normalizeInvite({ ...envelope(), event: { ...envelope().event, inviter: { id: 7 } } }, scope), false);
   assert.equal("unexpected" in normalizeInvite(envelope(),{...scope,unexpected:"CANARY"} as typeof scope),false);
   for (const raw of [
     { ...envelope(), schema: "1.0" },
@@ -80,8 +85,8 @@ test("actual SQLite invite replay is atomic across handles/reopen and retains fi
     const next = second.claimInviteMetadata(8)!;
     assert.throws(() => first.completeInviteClaim(claim, resolved(), 9), /invite_claim_fenced/);
     second.completeInviteClaim(next, resolved(), 9);
-    assert.equal(first.getSession(invite.occurrenceId)?.state, "discovered");
-    assert.equal(first.listTransitions(invite.occurrenceId).length, 1);
+    assert.equal(first.getSession(invite.occurrenceId), null, "organizer completion never creates a session");
+    assert.equal(first.getInviteOccurrence(invite.occurrenceId)?.state, "admitted");
     assert.throws(() => first.retryInviteMetadata(invite.occurrenceId, "operator", 10), /invite_retry_fenced/);
   } finally { first.close(); second.close(); }
   const reopened = openSessionStore({ filename });
@@ -98,7 +103,7 @@ export function resolved() {
     reference: { kind: "reservation" as const, reserveId: "reserve" } };
 }
 
-test("blocked work counts toward256; harmless replay works at capacity; DB failure rolls both rows back", () => {
+test("unresolved work counts toward256 until its meeting is over; harmless replay works at capacity; DB failure rolls both rows back", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "invite-bound-")), filename = path.join(dir, "db");
   const store = openSessionStore({ filename }), other = openSessionStore({ filename }), raw = new Database(filename);
   try {
@@ -107,11 +112,21 @@ test("blocked work counts toward256; harmless replay works at capacity; DB failu
       const claim = store.claimInviteMetadata(2)!;
       store.failInviteClaim(claim, { status: "blocked", reason: "reference_missing", retryable: false }, 3, 1000);
     }
+    assert.throws(() => other.acceptInvite(normalizeInvite(envelope("overflow", "overflow"), scope), 4), /invite_capacity/, "the257th unresolved invite is refused");
+    // A joined session still counts; once its meeting is over the blocked organizer stops counting.
+    assert.equal(store.admitInviteJoin("m0@2026-09-02T14:00:00Z", 4), "admitted");
+    assert.throws(() => other.acceptInvite(normalizeInvite(envelope("overflow", "overflow"), scope), 4), /invite_capacity/);
+    raw.prepare("UPDATE sessions SET state='failed',terminal_reason='bridge_failure' WHERE occurrence_id='m0@2026-09-02T14:00:00Z'").run();
+    assert.equal(other.acceptInvite(normalizeInvite(envelope("instant", "instant"), scope), 4), "accepted", "a finished instant meeting never refuses the next invite");
+    assert.throws(() => other.acceptInvite(normalizeInvite(envelope("overflow", "overflow"), scope), 4), /invite_capacity/);
+    // A refused invite is decided, not unresolved work: it never fills the cap.
+    assert.equal(store.admitInviteJoin("m1@2026-09-02T14:00:00Z", 4, "inviter_not_allowed"), "inviter_not_allowed");
+    assert.equal(other.acceptInvite(normalizeInvite(envelope("after-refusal", "after-refusal"), scope), 4), "accepted");
     assert.throws(() => other.acceptInvite(normalizeInvite(envelope("overflow", "overflow"), scope), 4), /invite_capacity/);
     assert.equal(other.acceptInvite(normalizeInvite(envelope("e0", "m0"), scope), 4), "replay");
     raw.exec("CREATE TRIGGER fail_invite BEFORE INSERT ON feishu_invite_events BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END");
     assert.throws(() => other.acceptInvite(normalizeInvite(envelope("new-event", "m0"), scope), 4));
-    assert.equal((raw.prepare("SELECT count(*) AS n FROM feishu_invite_events").get() as { n: number }).n, 256);
+    assert.equal((raw.prepare("SELECT count(*) AS n FROM feishu_invite_events").get() as { n: number }).n, 258);
   } finally { raw.close(); store.close(); other.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -154,20 +169,64 @@ test("close aborts the owned metadata operation, waits settlement and persists f
   assert.equal(store.listInviteOccurrences()[0]?.claimToken,null);store.close();
 });
 
-test("SQLite completion is atomic with session creation and existing terminal sessions never rejoin",()=>{
+test("organizer completion is atomic, never creates a session, and leaves an existing terminal session untouched",()=>{
   const dir=mkdtempSync(path.join(os.tmpdir(),"invite-atomic-")),filename=path.join(dir,"db");
   const store=openSessionStore({filename}),raw=new Database(filename),invite=normalizeInvite(envelope(),scope);
   try{
     store.acceptInvite(invite,1);const claim=store.claimInviteMetadata(2)!;
     raw.exec("CREATE TRIGGER fail_admit BEFORE UPDATE OF admitted_at_ms ON feishu_invite_occurrences BEGIN SELECT RAISE(ABORT,'synthetic'); END");
-    assert.throws(()=>store.completeInviteClaim(claim,resolved(),3));assert.equal(store.getSession(invite.occurrenceId),null);assert.equal(store.listTransitions(invite.occurrenceId).length,0);
+    assert.throws(()=>store.completeInviteClaim(claim,resolved(),3));assert.equal(store.getInviteOccurrence(invite.occurrenceId)?.organizer,null);
     raw.exec("DROP TRIGGER fail_admit");
-    store.createSession({occurrenceId:invite.occurrenceId,providerMeetingId:invite.providerMeetingId,occurrenceStartedAt:invite.occurrenceStartedAt,nowMs:3});
-    raw.prepare("UPDATE sessions SET state='failed',terminal_reason='bridge_failure' WHERE occurrence_id=?").run(invite.occurrenceId);
-    store.completeInviteClaim(claim,resolved(),4);assert.equal(store.getInviteOccurrence(invite.occurrenceId)?.state,"existing_session");
-    assert.equal(store.getSession(invite.occurrenceId)?.state,"failed");assert.equal(store.listTransitions(invite.occurrenceId).length,1);
-    assert.throws(()=>store.retryInviteMetadata(invite.occurrenceId,"human",5),/invite_retry_fenced/);
+    store.completeInviteClaim(claim,resolved(),3);assert.equal(store.getSession(invite.occurrenceId),null,"organizer metadata never creates or gates a session");
+    assert.equal(store.getInviteOccurrence(invite.occurrenceId)?.state,"admitted");
+    const other=normalizeInvite(envelope("event-2","9007199254740995"),scope);store.acceptInvite(other,4);
+    store.createSession({occurrenceId:other.occurrenceId,providerMeetingId:other.providerMeetingId,occurrenceStartedAt:other.occurrenceStartedAt,nowMs:4});
+    raw.prepare("UPDATE sessions SET state='failed',terminal_reason='bridge_failure' WHERE occurrence_id=?").run(other.occurrenceId);
+    const late=store.claimInviteMetadata(5)!;assert.equal(late.occurrenceId,other.occurrenceId);
+    store.completeInviteClaim(late,resolved(),6);assert.equal(store.getInviteOccurrence(other.occurrenceId)?.state,"admitted");
+    assert.equal(store.getSession(other.occurrenceId)?.state,"failed");assert.equal(store.listTransitions(other.occurrenceId).length,1);
+    assert.equal(store.admitInviteJoin(other.occurrenceId,7),"existing_session","a terminal session is never re-admitted");
+    assert.equal(store.getSession(other.occurrenceId)?.state,"failed");
   }finally{raw.close();store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("join admission creates one session per occurrence on an allowed invite; refusals and stale drops are recorded on the invite row and never consume the occurrence",()=>{
+  const store=openSessionStore({filename:":memory:"}),invite=normalizeInvite(envelope(),scope);
+  const inviteMs=1788357601*1000;
+  try{
+    store.acceptInvite(invite,1);
+    assert.equal(store.admitInviteJoin(invite.occurrenceId,inviteMs+600_000),"admitted");
+    assert.equal(store.getSession(invite.occurrenceId)?.state,"discovered");
+    assert.equal(store.inviteJoinAllowed(invite.occurrenceId),true);
+    assert.equal(store.getInviteOccurrence(invite.occurrenceId)?.state,"pending_metadata","the organizer lane is untouched");
+    assert.equal(store.admitInviteJoin(invite.occurrenceId,inviteMs+600_001),"existing_session");
+    assert.equal(store.listTransitions(invite.occurrenceId).length,1);
+    // Stale needs both Feishu's invite_time and the local receipt to be old.
+    const stale=normalizeInvite(envelope("event-2","9007199254740995"),scope);store.acceptInvite(stale,1);
+    assert.equal(store.admitInviteJoin(stale.occurrenceId,inviteMs+600_001),"invite_stale");
+    assert.equal(store.getSession(stale.occurrenceId),null);
+    assert.deepEqual(store.inviteJoinStatus(stale.occurrenceId),{session:null,terminalReason:null,refusal:"invite_stale",allowed:false});
+    const skewed=normalizeInvite(envelope("event-4","9007199254740999"),scope);store.acceptInvite(skewed,inviteMs+600_001);
+    assert.equal(store.admitInviteJoin(skewed.occurrenceId,inviteMs+600_001),"admitted","a fresh receipt tolerates a fast host clock");
+    // A refusal parks the organizer lane and never consumes the occurrence; a later allowed invite admits it.
+    const refused=normalizeInvite(envelope("event-3","9007199254740997"),scope);store.acceptInvite(refused,2);
+    assert.equal(store.admitInviteJoin(refused.occurrenceId,3,"inviter_not_allowed"),"inviter_not_allowed");
+    assert.equal(store.getSession(refused.occurrenceId),null);
+    assert.equal(store.getInviteOccurrence(refused.occurrenceId)?.state,"metadata_blocked");
+    for(let claim=store.claimInviteMetadata(4);claim!==null;claim=store.claimInviteMetadata(4)) assert.notEqual(claim.occurrenceId,refused.occurrenceId,"no organizer lookup is claimed for a refused invite");
+    assert.equal(store.admitInviteJoin(refused.occurrenceId,5),"admitted");
+    assert.equal(store.getInviteOccurrence(refused.occurrenceId)?.state,"pending_metadata","the organizer lane reopens for the joined meeting");
+    assert.equal(store.admitInviteJoin(refused.occurrenceId,6,"inviter_not_allowed"),"existing_session","a later refusal never touches the admitted session");
+    // A session from before the allowlist is admitted by an allowed invite, once.
+    const legacy=normalizeInvite(envelope("event-5","9007199254741001"),scope);store.acceptInvite(legacy,7);
+    store.createSession({occurrenceId:legacy.occurrenceId,providerMeetingId:legacy.providerMeetingId,occurrenceStartedAt:legacy.occurrenceStartedAt,nowMs:7});
+    assert.equal(store.inviteJoinAllowed(legacy.occurrenceId),false);
+    assert.equal(store.admitInviteJoin(legacy.occurrenceId,8),"admitted");
+    assert.equal(store.inviteJoinAllowed(legacy.occurrenceId),true);
+    assert.equal(store.admitInviteJoin(legacy.occurrenceId,9),"existing_session");
+    assert.throws(()=>store.admitInviteJoin(refused.occurrenceId,4,"other" as "inviter_not_allowed"),/invalid_invite_refusal/);
+    assert.throws(()=>store.admitInviteJoin("unknown@2026-09-02T14:00:00Z",11),/unknown_invite_occurrence/);
+  }finally{store.close();}
 });
 
 test("expired claims fence stale completion and clock regression blocks without new attempt",()=>{

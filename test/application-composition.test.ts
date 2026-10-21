@@ -349,6 +349,7 @@ test("shutdown during a pending SDK connect aborts the launch, closes the retain
   try {
     seed.acceptInvite(invite(1), 1); const claim = seed.claimInviteMetadata(2)!;
     seed.completeInviteClaim(claim, { status: "resolved", organizer: { ...scope, idType: "open_id", id: "ou_creator", displayName: "Creator", source: "reservation" }, reference: { kind: "reservation", reserveId: "reserve" } }, 3);
+    assert.equal(seed.admitInviteJoin(invite(1).occurrenceId, 3), "admitted");
   } finally { seed.close(); }
   try {
     const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], shutdownSignal: controller.signal, metadata: resolvedLookup(["900000001"]) });
@@ -419,7 +420,7 @@ test("the real Feishu SDK ingress commits the normalized envelope before ACK; DB
   }
 });
 
-test("process death after commit before callback: reopened bounded discovery launches an eligible occurrence exactly once; duplicates, terminal sessions and blocked metadata never launch", async () => {
+test("process death after commit before callback: reopened bounded discovery launches each eligible occurrence exactly once whatever its organizer metadata; duplicates and terminal sessions never launch", async () => {
   const f = fixture(2);
   const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
   const slots = [scriptedSlot(1, { joinMode: "silent" }), scriptedSlot(2, { joinMode: "silent" })];
@@ -429,10 +430,13 @@ test("process death after commit before callback: reopened bounded discovery lau
     // A dead process committed three invites and never ran its callbacks.
     seed.acceptInvite(eligible, 1); seed.acceptInvite(blocked, 1); seed.acceptInvite(terminal, 1);
     assert.equal(seed.acceptInvite(eligible, 2), "replay");
-    // The terminal one was admitted and failed in an earlier life.
+    // Both were admitted at accept time (allowlisted inviters) before the process died.
+    assert.equal(seed.admitInviteJoin(eligible.occurrenceId, 2), "admitted"); assert.equal(seed.admitInviteJoin(blocked.occurrenceId, 2), "admitted");
+    // The terminal one was joined and failed in an earlier life.
     const claims = [seed.claimInviteMetadata(3)!, seed.claimInviteMetadata(3)!, seed.claimInviteMetadata(3)!];
     const terminalClaim = claims.find((claim) => claim.occurrenceId === terminal.occurrenceId)!;
     seed.completeInviteClaim(terminalClaim, { status: "resolved", organizer: { ...scope, idType: "open_id", id: "ou_creator", displayName: "Creator", source: "reservation" }, reference: { kind: "reservation", reserveId: "reserve" } }, 4);
+    assert.equal(seed.admitInviteJoin(terminal.occurrenceId, 4), "admitted");
     f.raw((db) => db.prepare("UPDATE sessions SET state='failed', terminal_reason='bridge_failure' WHERE occurrence_id=?").run(terminal.occurrenceId));
     for (const claim of claims) if (claim.occurrenceId !== terminal.occurrenceId) seed.failInviteClaim(claim, { status: "blocked", reason: "timeout", retryable: true }, 5, 1000);
   } finally { seed.close(); }
@@ -440,42 +444,361 @@ test("process death after commit before callback: reopened bounded discovery lau
     const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: slots, metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 } });
     await app.start();
     const first = await app.discover();
-    assert.equal(first.launched, 1);
-    await until(() => slots[0]!.launches.length + slots[1]!.launches.length === 1);
+    assert.equal(first.launched, 2, "metadata never gates the join");
+    await until(() => slots[0]!.launches.length + slots[1]!.launches.length === 2);
     const second = await app.discover();
     assert.equal(second.launched, 0, "a second tick never relaunches a live occurrence");
-    assert.deepEqual(app.liveOccurrenceIds(), [eligible.occurrenceId]);
+    assert.deepEqual([...app.liveOccurrenceIds()].sort(), [eligible.occurrenceId, blocked.occurrenceId].sort());
     const store = f.reopen();
     try {
       assert.equal(store.getInviteOccurrence(eligible.occurrenceId)?.state, "admitted");
+      assert.equal(store.getInviteOccurrence(eligible.occurrenceId)?.organizer?.id, "ou_creator");
       assert.equal(store.getInviteOccurrence(blocked.occurrenceId)?.state, "metadata_blocked");
       assert.equal(store.getInviteOccurrence(blocked.occurrenceId)?.lastBlockedReason, "reference_missing");
       assert.equal(store.getInviteOccurrence(blocked.occurrenceId)?.organizer, null, "no host/inviter organizer is fabricated");
-      assert.equal(store.getSession(blocked.occurrenceId), null);
+      assert.equal(store.getSession(blocked.occurrenceId)?.state, "joining");
       assert.equal(store.getSession(terminal.occurrenceId)?.state, "failed");
       assert.equal(store.getSession(eligible.occurrenceId)?.state, "joining");
     } finally { store.close(); }
-    const launched = slots.find((slot) => slot.launches.length === 1)!;
-    assert.equal(launched.launches[0]!.occurrenceId, eligible.occurrenceId);
-    const identity = app.occurrenceOutcomes().find((outcome) => outcome.occurrenceId === eligible.occurrenceId)!;
-    assert.deepEqual(identity.organizer, { feishuUserId: "ou_creator", displayName: "Creator", source: "reservation" });
+    assert.deepEqual(slots.flatMap((slot) => slot.launches.map((launch) => launch.occurrenceId)).sort(), [eligible.occurrenceId, blocked.occurrenceId].sort());
     await app.close();
-    // Reopen after this life: the blocked invite is still visible and only the exact operator retry moves it.
+    // Reopen after this life: terminal rows never rejoin; the operator retry only re-resolves the organizer.
     const again = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [scriptedSlot(1, { joinMode: "silent" }), scriptedSlot(2, { joinMode: "silent" })],
       metadata: resolvedLookup(["900000001", "900000002"]), clock: { now: () => 20_000 } });
     await again.start();
     assert.equal((await again.discover()).launched, 0, "a terminal row from an earlier life is never auto-rejoined");
     const earlier = f.reopen();
-    try { assert.equal(earlier.getSession(eligible.occurrenceId)?.state, "failed"); } finally { earlier.close(); }
-    const reopened = f.reopen();
-    try { assert.equal(reopened.getInviteOccurrence(blocked.occurrenceId)?.state, "metadata_blocked"); } finally { reopened.close(); }
+    try { assert.equal(earlier.getSession(eligible.occurrenceId)?.state, "failed"); assert.equal(earlier.getInviteOccurrence(blocked.occurrenceId)?.state, "metadata_blocked"); }
+    finally { earlier.close(); }
     assert.equal(again.retryInviteMetadata(blocked.occurrenceId, "operator"), "pending");
     const tick = await again.discover();
-    assert.equal(tick.launched, 1);
+    assert.equal(tick.launched, 0);
+    assert.equal(tick.resolved, 1);
     await again.close();
     const final = f.reopen();
     try { assert.equal(final.getInviteOccurrence(blocked.occurrenceId)?.state, "admitted"); assert.equal(final.getInviteOccurrence(blocked.occurrenceId)?.organizer?.id, "ou_creator"); }
     finally { final.close(); }
+  } finally { f.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Join never waits on the organizer
+//
+// "VAD check gates speech recognition, not encrypted recording. Recording must
+// remain independent of provider failures." The organizer only addresses the
+// post-publication DM, so no organizer outcome may block or delay the join.
+// ---------------------------------------------------------------------------
+
+const CREATOR = { feishuUserId: "ou_creator", displayName: "Creator", source: "reservation" } as const;
+
+function heldLookup() {
+  let release!: (value: Awaited<ReturnType<FeishuOrganizerLookup["resolve"]>>) => void;
+  const answer = new Promise<Awaited<ReturnType<FeishuOrganizerLookup["resolve"]>>>((resolve) => { release = resolve; });
+  let calls = 0;
+  const lookup: FeishuOrganizerLookup = { resolve: () => { calls += 1; return answer; } };
+  return { lookup, calls: () => calls, release,
+    resolved: () => release({ status: "resolved", organizer: { ...scope, idType: "open_id", id: "ou_creator", displayName: "Creator", source: "reservation" }, reference: { kind: "reservation", reserveId: "reserve-900000001" } }) };
+}
+
+test("an invite with no organizer reference is launched and recorded through the production resolver; no organizer is fabricated", async () => {
+  const f = fixture();
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+  const http = createFeishuSdkHttp({ request: async () => { throw new Error("must_not_call"); } });
+  try {
+    const [id] = await admitted(f, 1);
+    // No metadata seam and no references: the resolver main.ts composes.
+    const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], feishu: { http }, clock: { now: () => 10_000 } });
+    await app.start();
+    assert.equal((await app.discover()).launched, 1);
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    slot.left("ended");
+    const outcome = await app.awaitOccurrence(id!);
+    assert.equal(outcome.failure, null);
+    const store = f.reopen();
+    try {
+      const seed = store.getBackfillSeed(id!);
+      assert.ok(seed, "the instant meeting is recorded and queued for publication");
+      assert.equal(seed.organizer, null, "no host, inviter or attendee is substituted");
+      assert.equal(store.getRecording(id!)?.handle, runtimes.owned[0]!.handle);
+      assert.equal(store.getSession(id!)?.state, "finalizing");
+      assert.equal(store.getInviteOccurrence(id!)?.state, "metadata_blocked");
+      assert.equal(store.getInviteOccurrence(id!)?.lastBlockedReason, "reference_missing", "the unresolved organizer stays operator-visible");
+    } finally { store.close(); }
+    await app.close();
+  } finally { await http.close(); f.close(); }
+});
+
+test("an organizer API 5xx, a permission error or a lookup that never answers never blocks or delays the join", async () => {
+  for (const variant of ["http_503", "http_403", "held"] as const) {
+    const f = fixture();
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+    const slot = scriptedSlot(1, { joinMode: "silent" });
+    const held = heldLookup();
+    const peer = await httpPeer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url!.includes("/auth/")) { res.end(JSON.stringify({ code: 0, tenant_access_token: "synthetic", expire: 7200 })); return; }
+      res.writeHead(variant === "http_403" ? 403 : 503); res.end("{}");
+    });
+    const http = createFeishuSdkHttp({ request: peer.request, connection: createFeishuSocketOwner(Agent) });
+    try {
+      const [id] = await admitted(f, 1);
+      const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], feishu: { http }, clock: { now: () => 10_000 },
+        ...(variant === "held" ? { metadata: held.lookup }
+          : { organizerReferences: [{ ...scope, meetingNo: "900000001", reference: { kind: "reservation" as const, reserveId: "reserve" } }] }) });
+      await app.start();
+      const tick = app.discover();
+      await until(() => slot.launches.length === 1);
+      assert.deepEqual(app.liveOccurrenceIds(), [id], variant);
+      if (variant === "held") { assert.equal(held.calls(), 1, "the lookup is still outstanding while the join proceeds"); held.release({ status: "blocked", reason: "metadata_unavailable", retryable: true }); }
+      await tick;
+      const store = f.reopen();
+      try {
+        assert.notEqual(store.getSession(id!)?.state, "discovered", variant);
+        assert.equal(store.getInviteOccurrence(id!)?.organizer, null, variant);
+        assert.equal(store.getInviteOccurrence(id!)?.lastBlockedReason, variant === "http_403" ? "permission_denied" : "metadata_unavailable", variant);
+      } finally { store.close(); }
+      await app.close();
+    } finally { held.release({ status: "blocked", reason: "cancelled", retryable: true }); await http.close(); await peer.close(); f.close(); }
+  }
+});
+
+test("an organizer resolved after the join addresses the seed, and so the notification", async () => {
+  const f = fixture();
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+  const held = heldLookup();
+  try {
+    const [id] = await admitted(f, 1);
+    const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: held.lookup, clock: { now: () => 10_000 } });
+    await app.start();
+    const tick = app.discover();
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    held.resolved();
+    await tick;
+    const before = f.reopen();
+    try { assert.deepEqual(before.getInviteOccurrence(id!)?.organizer?.id, "ou_creator"); } finally { before.close(); }
+    slot.left("ended");
+    assert.equal((await app.awaitOccurrence(id!)).failure, null);
+    const store = f.reopen();
+    try { assert.deepEqual(store.getBackfillSeed(id!)?.organizer, CREATOR); } finally { store.close(); }
+    await app.close();
+  } finally { held.resolved(); f.close(); }
+});
+
+test("recurring occurrences of one meeting are distinct sessions; a repeated invite for one occurrence never adds a session", async () => {
+  const f = fixture();
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+  const occurrence = (eventId: string, start: string) => {
+    const raw = envelope(eventId, "9007199254740993", "Weekly");
+    return normalizeInvite({ ...raw, event: { ...raw.event, meeting: { ...raw.event.meeting, start_time: start } } }, scope);
+  };
+  const first = occurrence("event-a", "1788357600"), second = occurrence("event-b", "1788962400"), again = occurrence("event-c", "1788357600");
+  try {
+    const seed = f.reopen();
+    try { seed.acceptInvite(first, 1); seed.admitInviteJoin(first.occurrenceId, 1); } finally { seed.close(); }
+    const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup([]), clock: { now: () => 10_000 } });
+    await app.start();
+    await app.discover();
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    slot.left("ended");
+    assert.equal((await app.awaitOccurrence(first.occurrenceId)).failure, null);
+    const store = f.reopen();
+    try {
+      assert.equal(store.acceptInvite(second, 10_000), "accepted"); assert.equal(store.admitInviteJoin(second.occurrenceId, 10_000), "admitted");
+      assert.equal(store.acceptInvite(again, 10_000), "existing_occurrence"); assert.equal(store.admitInviteJoin(again.occurrenceId, 10_000), "existing_session");
+    } finally { store.close(); }
+    await app.discover();
+    await until(() => slot.launches.length === 2);
+    await app.discover();
+    assert.deepEqual(slot.launches.map((launch) => launch.occurrenceId), [first.occurrenceId, second.occurrenceId], "the next occurrence joins; the repeated invite never rejoins the first");
+    const after = f.reopen();
+    try {
+      assert.equal(after.getSession(first.occurrenceId)?.state, "finalizing");
+      assert.equal(after.listTransitions(first.occurrenceId).filter((row) => row.toState === "discovered").length, 1);
+      assert.notEqual(after.getSession(second.occurrenceId), null);
+      assert.ok(after.getBackfillSeed(first.occurrenceId), "the recurring instant occurrence is recorded and queued for publication");
+    } finally { after.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("an invite whose Feishu invite_time and local receipt are both beyond the window is a recorded stale drop on the invite row, never joined; host clock skew alone never drops", async () => {
+  const f = fixture();
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const log: string[] = [];
+  const stale = invite(1), fresh = invite(2, "900000002");
+  const inviteMs = 1788357601 * 1000;
+  try {
+    const seed = f.reopen();
+    // The stale invite was received long ago; the fresh one carries the same old Feishu invite_time (a host clock
+    // running fast relative to Feishu) but was received just now.
+    try { seed.acceptInvite(stale, 1); seed.acceptInvite(fresh, inviteMs + 600_001); } finally { seed.close(); }
+    const decide = f.reopen();
+    try {
+      assert.equal(decide.admitInviteJoin(stale.occurrenceId, inviteMs + 600_001), "invite_stale");
+      assert.equal(decide.admitInviteJoin(fresh.occurrenceId, inviteMs + 600_001), "admitted");
+    } finally { decide.close(); }
+    const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup([]), clock: { now: () => inviteMs + 600_001 } });
+    await app.start();
+    await app.discover();
+    await until(() => slot.launches.length === 1);
+    assert.deepEqual(slot.launches.map((launch) => launch.occurrenceId), [fresh.occurrenceId]);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(stale.occurrenceId), null, "a stale drop never consumes the occurrence");
+      assert.equal(store.getInviteOccurrence(stale.occurrenceId)?.lastBlockedReason, "invite_stale");
+      assert.equal(store.inviteJoinStatus(stale.occurrenceId)?.refusal, "invite_stale");
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("one row whose admission throws is isolated with backoff; later occurrences still join", async () => {
+  const f = fixture(2);
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slots = [scriptedSlot(1, { joinMode: "silent" }), scriptedSlot(2, { joinMode: "silent" })];
+  const log: string[] = [];
+  const bad = invite(1), good = invite(2, "900000002");
+  try {
+    const seed = f.reopen();
+    try { seed.acceptInvite(bad, 1); seed.acceptInvite(good, 1); seed.admitInviteJoin(good.occurrenceId, 1); } finally { seed.close(); }
+    // The first row in scan order fails inside its admission transaction.
+    f.raw((db) => db.exec(`CREATE TRIGGER reject_bad BEFORE UPDATE ON feishu_invite_occurrences WHEN NEW.occurrence_id='${bad.occurrenceId}' AND NEW.last_blocked_reason LIKE 'inviter_%' BEGIN SELECT RAISE(ABORT,'synthetic'); END`));
+    const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots, metadata: resolvedLookup([]), clock: { now: () => 10_000 } });
+    await app.start();
+    await app.discover();
+    await until(() => slots[0]!.launches.length + slots[1]!.launches.length === 1);
+    assert.deepEqual(app.liveOccurrenceIds(), [good.occurrenceId]);
+    assert.ok(log.includes("invite_admission_failed"));
+    f.raw((db) => db.exec("DROP TRIGGER reject_bad"));
+    assert.equal((await app.discover()).launched, 0, "the failed row waits for its backoff");
+    await app.close();
+  } finally { f.close(); }
+});
+
+async function liveIngress(f: Fixture, config: StandaloneConfigV1, slots: readonly ScriptedSlot[], frames: readonly unknown[], seedRows: (store: ReturnType<typeof openSessionStore>) => void = () => {}) {
+  const peer = await httpPeer((_request, response) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ code: 0, data: {
+    URL: peer.origin.replace("http:", "ws:") + "/ws?device_id=synthetic&service_id=1", ClientConfig: { PingInterval: 100, ReconnectCount: 1, ReconnectInterval: 0, ReconnectNonce: 0 } } })); });
+  const server = new WebSocketServer({ server: peer.server, perMessageDeflate: false, maxPayload: 65536 });
+  const connected = once(server, "connection");
+  const http = createFeishuSdkHttp({ request: peer.request, connection: createFeishuSocketOwner(Agent) });
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const log: string[] = [];
+  const seed = f.reopen();
+  try { seedRows(seed); } finally { seed.close(); }
+  const app = await composeApplication(config, f.owner, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots,
+    metadata: resolvedLookup([]), clock: { now: () => 10_000 }, feishu: { http, connection: createFeishuSocketOwner(Agent), readyTimeoutMs: 2000, handshakeTimeoutMs: 500 } });
+  await app.start();
+  const [socket] = await connected as [WebSocket];
+  const responses: unknown[] = [];
+  socket.on("message", (bytes) => { const payload = framePayload(Buffer.from(bytes as Buffer)); if (payload) responses.push(payload); });
+  frames.forEach((frame, index) => socket.send(eventFrame(frame, `m${index}`)));
+  await until(() => responses.length >= frames.length);
+  await app.discover();
+  return { app, log, responses, async close() {
+    const closed = once(socket, "close");
+    await app.close(); await closed;
+    for (const client of server.clients) client.terminate();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await http.close().catch(() => {}); await peer.close();
+  } };
+}
+
+function invitedBy(eventId: string, id: string, inviter?: string) {
+  const raw = envelope(eventId, id);
+  return inviter === undefined ? raw : { ...raw, event: { ...raw.event, inviter: { id: inviter, user_type: 1 } } };
+}
+
+const ALLOWED = { allowedInviterIds: ["ou_allowed"], allowedChatIds: [] };
+
+test("only allowlisted inviters are joined; others are recorded on the invite row and never joined; a lost decision fails closed", async () => {
+  const f = fixture(2);
+  const slots = [scriptedSlot(1, { joinMode: "silent" }), scriptedSlot(2, { joinMode: "silent" })];
+  const orphan = invite(9, "900000009");
+  try {
+    const live = await liveIngress(f, { ...f.config, admission: ALLOWED }, slots,
+      [invitedBy("allowed", "9007199254740993", "ou_allowed"), invitedBy("stranger", "9007199254740994", "ou_stranger"), invitedBy("anonymous", "9007199254740995")],
+      (store) => { store.acceptInvite(orphan, 1); });
+    try {
+      assert.deepEqual(live.responses, [{ code: 200 }, { code: 200 }, { code: 200 }], "a refused invite is still ACKed: it is durably recorded");
+      assert.equal(live.log.includes("invite_admission_no_inviters_configured"), false);
+      assert.equal(live.app.maintenanceStatus().inviteAdmission, "allowlist");
+      await until(() => slots[0]!.launches.length + slots[1]!.launches.length === 1);
+      assert.deepEqual(slots.flatMap((slot) => slot.launches.map((launch) => launch.occurrenceId)), ["9007199254740993@2026-09-02T14:00:00Z"]);
+      const store = f.reopen();
+      try {
+        for (const [id, reason] of [["9007199254740994@2026-09-02T14:00:00Z", "inviter_not_allowed"], ["9007199254740995@2026-09-02T14:00:00Z", "inviter_not_allowed"],
+          [orphan.occurrenceId, "inviter_unverified"]] as const) {
+          assert.equal(store.getSession(id), null, `${id} is not consumed`);
+          assert.deepEqual(store.inviteJoinStatus(id), { session: null, terminalReason: null, refusal: reason, allowed: false });
+          assert.equal(store.getInviteOccurrence(id)?.totalAttempts, 0, "no organizer lookup runs for a refused invite");
+        }
+      } finally { store.close(); }
+      assert.ok(live.log.includes("invite_admission_inviter_not_allowed"));
+    } finally { await live.close(); }
+  } finally { f.close(); }
+});
+
+test("a meeting a stranger invited first is still joined when an allowed inviter invites it (0 launches, then 1)", async () => {
+  const f = fixture();
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  try {
+    const first = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [invitedBy("stranger", "9007199254740993", "ou_stranger")]);
+    try { assert.equal(slot.launches.length, 0); } finally { await first.close(); }
+    const second = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [invitedBy("organizer", "9007199254740993", "ou_allowed")]);
+    try {
+      await until(() => slot.launches.length === 1);
+      const store = f.reopen();
+      try {
+        assert.equal(store.inviteJoinStatus("9007199254740993@2026-09-02T14:00:00Z")?.allowed, true);
+        assert.equal(store.getInviteOccurrence("9007199254740993@2026-09-02T14:00:00Z")?.state === "metadata_blocked" &&
+          store.getInviteOccurrence("9007199254740993@2026-09-02T14:00:00Z")?.lastBlockedReason === "inviter_not_allowed", false, "the organizer lane reopens");
+      } finally { store.close(); }
+    } finally { await second.close(); }
+  } finally { f.close(); }
+});
+
+test("with the allowlist absent, empty, or chat IDs only, a live invite is refused, recorded and warned about", async () => {
+  for (const [label, admission, status] of [["absent", undefined, "no_inviters_configured"], ["empty", { allowedInviterIds: [], allowedChatIds: [] }, "no_inviters_configured"],
+    ["chat_only", { allowedInviterIds: [], allowedChatIds: ["oc_team"] }, "chat_ids_only_unverified"]] as const) {
+    const f = fixture();
+    const slot = scriptedSlot(1, { joinMode: "silent" });
+    try {
+      const config = admission === undefined ? f.config : { ...f.config, admission };
+      const live = await liveIngress(f, config, [slot], [invitedBy("live", "9007199254740993", "ou_anyone")]);
+      try {
+        assert.equal(live.app.maintenanceStatus().inviteAdmission, status, label);
+        assert.equal(live.log.includes(status === "no_inviters_configured" ? "invite_admission_no_inviters_configured" : "invite_admission_refuses_all_invites"), true, label);
+        if (label === "chat_only") assert.ok(live.log.includes("invite_admission_chat_ids_unverified"));
+        assert.equal(slot.launches.length, 0, label);
+        const store = f.reopen();
+        try { assert.equal(store.inviteJoinStatus("9007199254740993@2026-09-02T14:00:00Z")?.refusal, "inviter_not_allowed", label); } finally { store.close(); }
+      } finally { await live.close(); }
+    } finally { f.close(); }
+  }
+});
+
+test("a discovered session from before the allowlist never launches until an allowed invite admits it", async () => {
+  const f = fixture();
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const legacy = invite(1);
+  try {
+    const legacyRows = (store: ReturnType<typeof openSessionStore>) => {
+      store.acceptInvite(legacy, 1);
+      store.createSession({ occurrenceId: legacy.occurrenceId, providerMeetingId: legacy.providerMeetingId, occurrenceStartedAt: legacy.occurrenceStartedAt, nowMs: 1 });
+    };
+    const before = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [], legacyRows);
+    try {
+      assert.equal(slot.launches.length, 0);
+      assert.ok(before.log.includes("invite_admission_session_unverified"));
+    } finally { await before.close(); }
+    const raw = envelope("allowed-again", legacy.providerMeetingId, "Meeting 1");
+    const again = { ...raw, event: { ...raw.event, meeting: { ...raw.event.meeting, meeting_no: "900000001" }, inviter: { id: "ou_allowed", user_type: 1 } } };
+    const after = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [again]);
+    try { await until(() => slot.launches.length === 1); } finally { await after.close(); }
   } finally { f.close(); }
 });
 
@@ -487,7 +810,8 @@ async function admitted(f: Fixture, count: number, meetingNo = "900000001"): Pro
   const store = f.reopen();
   try {
     const ids: string[] = [];
-    for (let index = 1; index <= count; index += 1) { const value = invite(index, meetingNo); store.acceptInvite(value, index); ids.push(value.occurrenceId); }
+    // Each invite is admitted as an allowlisted inviter's would be, right after its commit.
+    for (let index = 1; index <= count; index += 1) { const value = invite(index, meetingNo); store.acceptInvite(value, index); store.admitInviteJoin(value.occurrenceId, index); ids.push(value.occurrenceId); }
     return ids;
   } finally { store.close(); }
 }

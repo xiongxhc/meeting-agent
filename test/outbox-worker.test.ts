@@ -16,6 +16,8 @@ import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurren
 import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../src/delivery/outbox-worker.ts";
 import { createNotificationWorker } from "../src/delivery/notification-worker.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
+import { envelope as inviteEnvelope, scope as inviteScope } from "./lib/feishu-fixtures.ts";
 import type { AcceptPublicationInput, SavePendingDeliveryResult } from "../src/ports/session-store.ts";
 import { buildTimedTeamMemMeetingArtifactV2 } from "../src/delivery/artifact-builder.ts";
 import { createOwnedTimedSampleEvidence } from "../src/domain/attribution-evidence.ts";
@@ -459,6 +461,27 @@ test("null-organizer artifact never derives its attendee as recipient and sends 
     let sends = 0;
     await createNotificationWorker({ store: d.store(), sender: { sendText: async () => { sends += 1; return { messageId: "impossible" }; } }, clock: { now: d.now }, random: () => 0, requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000 }).poll();
     assert.equal(sends, 0);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("an organizer the invite lane resolved after the artifact was sealed still addresses the DM", async () => {
+  const h = harness();
+  const built = artifactAndAudio("teammem-meeting-v1.minimal.json");
+  const d = durableWorker(h, built);
+  try {
+    assert.equal(built.artifact.organizer, null);
+    const raw = inviteEnvelope("late-organizer", "vc:7f21/instant");
+    const invite = normalizeInvite({ ...raw, event: { ...raw.event, meeting: { ...raw.event.meeting, start_time: "1788340500" } } }, inviteScope);
+    assert.equal(invite.occurrenceId, built.artifact.occurrence_id);
+    d.store().acceptInvite(invite, 1);
+    const claim = d.store().claimInviteMetadata(2)!;
+    d.store().completeInviteClaim(claim, { status: "resolved", organizer: { ...inviteScope, idType: "open_id", id: "ou_late", displayName: "Late", source: "reservation" },
+      reference: { kind: "reservation", reserveId: "reserve" } }, 3);
+    d.receipt();
+    d.worker().reconcile();
+    const intent = d.store().notifications()[0]!;
+    assert.equal(intent.terminalReason, null);
+    assert.equal(intent.recipientId, "ou_late");
   } finally { d.close(); h.cleanup(); }
 });
 

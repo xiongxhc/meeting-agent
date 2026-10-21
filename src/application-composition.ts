@@ -155,7 +155,9 @@ export type ComposedApplication = {
   occurrenceOutcomes(): readonly OccurrenceOutcome[];
   awaitOccurrence(occurrenceId: string): Promise<OccurrenceOutcome>;
   /** Cut C: static per-lane counters (cadence, delay, outcomes, custody settlements). */
-  maintenanceStatus(): MaintenanceStatus;
+  /** `inviteAdmission` is not `allowlist` while every invite is refused: no inviters configured, or only chat IDs,
+   * which the invite event is not known to carry. */
+  maintenanceStatus(): MaintenanceStatus & { readonly inviteAdmission: "allowlist" | "no_inviters_configured" | "chat_ids_only_unverified" };
   /** Cut C: run (or join) one lane tick now; resolves to its static outcome code. */
   maintenanceTick(lane: MaintenanceLane): Promise<string>;
   close(): Promise<void>;
@@ -569,10 +571,21 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
   } catch { store.close(); storeOpen = false; throw new Error("feishu_scope_invalid"); }
   const discovery = createInviteDiscovery({ store, metadata, now: () => clock.now(), ...(options.discoveryJitter ? { jitter: options.discoveryJitter } : {}) });
 
+  // Invite allowlist (ruling: only invites from configured people or chats are joined). Unset or empty refuses
+  // every invite, recorded as inviter_not_allowed.
+  const allowedInviters = new Set(config.admission?.allowedInviterIds ?? []);
+  const allowedChats = new Set(config.admission?.allowedChatIds ?? []);
+  const inviteAdmission = allowedInviters.size > 0 ? "allowlist" as const
+    : allowedChats.size > 0 ? "chat_ids_only_unverified" as const : "no_inviters_configured" as const;
   const accept = (invite: NormalizedInvite): void => {
     if (closing) throw new Error("composition_closing");
     const result = store.acceptInvite(invite, clock.now()); // Durable before the SDK ACK.
     log("invite_committed");
+    // The inviter is known only here, so the join decision is made right after the commit. A failure is left to
+    // the next tick, which fails closed because the inviter is no longer known.
+    const allowed = (invite.inviterId !== undefined && allowedInviters.has(invite.inviterId)) || (invite.chatId !== undefined && allowedChats.has(invite.chatId));
+    try { admitOne(invite.occurrenceId, allowed ? undefined : "inviter_not_allowed"); }
+    catch { log("invite_admission_failed"); }
     if (result !== "replay" && started) void discoverTick().catch(() => undefined);
   };
   let ingress: ReturnType<typeof createFeishuInviteIngress> | null = null;
@@ -791,36 +804,81 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     log("occurrence_launched");
   }
 
-  function discoverTick(): Promise<DiscoveryTick> {
-    if (closing) return Promise.reject(new Error("composition_closed"));
-    if (discoveryInFlight !== null) return discoveryInFlight;
-    discoveryInFlight = (async (): Promise<DiscoveryTick> => {
-      log("discovery_tick");
-      let resolved = 0, launched = 0, deferred = 0;
-      for (let count = 0; count < MAX_METADATA_RESOLUTIONS_PER_TICK && !closing; count += 1) {
-        if (!await discovery.runOnce()) break;
-        resolved += 1;
-      }
-      let after = "";
-      while (!closing) {
-        const page = store.listInviteOccurrences(after, DISCOVERY_PAGE);
-        if (page.length === 0) break;
-        for (const occurrence of page) {
-          if (closing || occurrence.state !== "admitted") continue;
+  /** One durable join decision; every refusal or stale drop is a failed session with its reason. */
+  function admitOne(occurrenceId: string, refusal?: "inviter_not_allowed" | "inviter_unverified"): void {
+    // A refusal never touches an existing session; an allowed invite may admit a session that predates the allowlist.
+    if (refusal !== undefined && store.getSession(occurrenceId) !== null) return;
+    const outcome = store.admitInviteJoin(occurrenceId, clock.now(), refusal);
+    if (outcome !== "admitted" && outcome !== "existing_session") log(`invite_admission_${outcome}`);
+  }
+
+  const unadmittedLogged = new Set<string>();
+  // Per-row admission failures back off in memory so one bad row never stops later joins.
+  const admissionBackoff = new Map<string, { failures: number; retryAtMs: number }>();
+
+  /** Join lane: a valid invite alone admits and launches its occurrence. Synchronous, so it never
+   * waits on the organizer lane; terminal or already-generated sessions never rejoin here. */
+  function admitAndLaunch(): { launched: number; deferred: number } {
+    let launched = 0, deferred = 0, after = "";
+    while (!closing) {
+      const page = store.listInviteOccurrences(after, DISCOVERY_PAGE);
+      if (page.length === 0) break;
+      for (const occurrence of page) {
+        if (closing) continue;
+        const backoff = admissionBackoff.get(occurrence.occurrenceId);
+        if (backoff !== undefined && clock.now() < backoff.retryAtMs) continue;
+        try {
           // A settled entry that never created a session (Runtime startup
           // failed before custody/spawn) leaves the durable row discovered and
           // may be retried by a later tick; anything else never relaunches here.
           const previous = entries.get(occurrence.occurrenceId);
           if (previous !== undefined && (previous.phase !== "settled" || previous.session !== null)) continue;
-          if (store.getSession(occurrence.occurrenceId)?.state !== "discovered") continue; // Terminal or already-generated rows never rejoin here.
+          const session = store.getSession(occurrence.occurrenceId);
+          if (session === null) {
+            // A recorded refusal is final for that invite; only a later allowed invite (at accept) reopens it.
+            if (occurrence.state === "metadata_blocked" && ["inviter_not_allowed", "inviter_unverified", "invite_stale"].includes(occurrence.lastBlockedReason ?? "")) continue;
+            // Otherwise the accept-time decision was lost (crash): the inviter is no longer known, so it fails closed.
+            admitOne(occurrence.occurrenceId, inviteAdmission === "allowlist" ? "inviter_unverified" : "inviter_not_allowed");
+            admissionBackoff.delete(occurrence.occurrenceId);
+            continue;
+          }
+          admissionBackoff.delete(occurrence.occurrenceId);
+          if (session.state !== "discovered") continue;
+          // A session from before the allowlist launches only after an allowed invite admits it.
+          if (!store.inviteJoinAllowed(occurrence.occurrenceId)) {
+            if (!unadmittedLogged.has(occurrence.occurrenceId)) { unadmittedLogged.add(occurrence.occurrenceId); log("invite_admission_session_unverified"); }
+            continue;
+          }
           const slot = freeSlot();
           if (slot === null) { deferred += 1; continue; }
           launchOccurrence(occurrence, slot);
           launched += 1;
+        } catch {
+          const failures = (backoff?.failures ?? 0) + 1;
+          admissionBackoff.set(occurrence.occurrenceId, { failures, retryAtMs: clock.now() + Math.min(60_000, 1000 * 2 ** Math.min(failures - 1, 6)) });
+          log("invite_admission_failed");
         }
-        after = page[page.length - 1]!.occurrenceId;
       }
-      return { resolved, launched, deferred };
+      after = page[page.length - 1]!.occurrenceId;
+    }
+    return { launched, deferred };
+  }
+
+  /** One tick: launch first, then resolve organizer metadata (notification addressing only). */
+  function discoverTick(): Promise<DiscoveryTick> {
+    if (closing) return Promise.reject(new Error("composition_closed"));
+    let early: { launched: number; deferred: number };
+    try { early = admitAndLaunch(); } catch (error) { return Promise.reject(error); }
+    if (discoveryInFlight !== null) return discoveryInFlight;
+    discoveryInFlight = (async (): Promise<DiscoveryTick> => {
+      log("discovery_tick");
+      let resolved = 0;
+      for (let count = 0; count < MAX_METADATA_RESOLUTIONS_PER_TICK && !closing; count += 1) {
+        if (!await discovery.runOnce()) break;
+        resolved += 1;
+      }
+      const late = admitAndLaunch();
+      return { resolved, launched: early.launched + late.launched, deferred: late.deferred };
     })().finally(() => { discoveryInFlight = null; });
     return discoveryInFlight;
   }
@@ -837,10 +895,13 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       // Maintenance lanes start before, and never wait on, Feishu ingress readiness.
       maintenance.start();
       if (ingress !== null) await ingress.start();
+      if (inviteAdmission === "no_inviters_configured") log("invite_admission_no_inviters_configured");
+      if (allowedChats.size > 0) log("invite_admission_chat_ids_unverified"); // The invite event is not known to carry a chat ID.
+      if (inviteAdmission === "chat_ids_only_unverified") log("invite_admission_refuses_all_invites");
       log("composition_started");
     },
     discover: discoverTick,
-    maintenanceStatus: () => maintenance.status(),
+    maintenanceStatus: () => ({ ...maintenance.status(), inviteAdmission }),
     maintenanceTick: (lane) => maintenance.tick(lane),
     retryInviteMetadata(occurrenceId, operator) {
       if (closing) throw new Error("composition_closed");

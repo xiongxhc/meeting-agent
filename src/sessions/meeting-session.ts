@@ -887,6 +887,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
     switch (event.type) {
       case "joined":
+        // The bridge reports which meeting it joined: anything but the invited occurrence is left at once,
+        // never treated as listening.
+        if (event.meetingOccurrenceId !== identity.occurrenceId) {
+          routingErrors.push({ source: "bridge", error: new Error("joined_meeting_mismatch") });
+          await issue({ type: "leave", reason: "coordinator_stop" });
+          return;
+        }
         phase = "listening";
         if (coordinator.get(identity.occurrenceId)?.state === "joining") {
           coordinator.advance(identity.occurrenceId, "listening");

@@ -189,6 +189,7 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
     stateRoot: directories.stateRoot,
     feishu: { region: "feishu", tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef", appSecretFile },
     agentIdentity: { aliases: ["Meetbot"] },
+    admission: { allowedInviterIds: ["ou_e2e_inviter"] },
     dataPaths: {
       recordingsDir: directories.recordingsDir, outboxDir: directories.outboxDir,
       receiptsDir: directories.receiptsDir, teamVaultDir: directories.teamVaultDir,

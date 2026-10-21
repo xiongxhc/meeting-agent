@@ -28,7 +28,8 @@ const STATIC_DIAGNOSTICS = new Map([
 ]);
 const GRAMMAR_FIELDS = ["config", "schema", "stateRoot", "feishu", "feishu.region", "feishu.tenantKey", "feishu.appId", "feishu.appSecretFile",
   "agentIdentity", "agentIdentity.aliases", "dataPaths", "dataPaths.recordingsDir", "dataPaths.outboxDir", "dataPaths.receiptsDir", "dataPaths.teamVaultDir",
-  "runtime", "runtime.launcherPath", "runtime.gatewayConfigPath", "runtime.protocolVersion", "bridgeSlots", ...Array.from({ length: 8 }, (_, i) => `bridgeSlots[${i}]`)];
+  "runtime", "runtime.launcherPath", "runtime.gatewayConfigPath", "runtime.protocolVersion", "bridgeSlots", ...Array.from({ length: 8 }, (_, i) => `bridgeSlots[${i}]`),
+  "admission", "admission.allowedInviterIds", "admission.allowedChatIds"];
 for (const field of GRAMMAR_FIELDS) STATIC_DIAGNOSTICS.set(`meeting-agent: standalone config grammar error in ${field}`, "config_grammar_refusal");
 for (const field of ["config", "stateRoot", "dataPaths.recordingsDir", "dataPaths.outboxDir", "dataPaths.receiptsDir", "dataPaths.teamVaultDir"])
   STATIC_DIAGNOSTICS.set(`meeting-agent: standalone config reference error in ${field}`, "config_reference_refusal");

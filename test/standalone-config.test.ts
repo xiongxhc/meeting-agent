@@ -132,6 +132,24 @@ test("a complete valid config is read through a descriptor and parsed exactly", 
   } finally { f.close(); }
 });
 
+test("the invite allowlist parses exactly: open_ids and chat ids, empty or absent allowed (refuse all); malformed lists are grammar errors", (t) => {
+  const f = fixture();
+  try {
+    guarded(t, () => {
+      const base = validConfig(f) as Record<string, unknown>;
+      assert.equal(Object.hasOwn(parseStandaloneConfig(bytes(JSON.stringify(base))), "admission"), false);
+      assert.deepEqual(parseStandaloneConfig(bytes(JSON.stringify({ ...base, admission: { allowedInviterIds: ["ou_a", "ou_b"], allowedChatIds: ["oc_c"] } }))).admission,
+        { allowedInviterIds: ["ou_a", "ou_b"], allowedChatIds: ["oc_c"] });
+      assert.deepEqual(parseStandaloneConfig(bytes(JSON.stringify({ ...base, admission: {} }))).admission, { allowedInviterIds: [], allowedChatIds: [] });
+      for (const [admission, field] of [
+        [{ allowedInviterIds: ["ou_a", "ou_a"] }, "admission.allowedInviterIds"], [{ allowedInviterIds: [" "] }, "admission.allowedInviterIds"],
+        [{ allowedInviterIds: [7] }, "admission.allowedInviterIds"], [{ allowedChatIds: "oc_a" }, "admission.allowedChatIds"],
+        [{ allowedInviterIds: ["ou_a"], departments: ["d"] }, "admission"], [[], "admission"],
+      ] as const) rejects(() => parseStandaloneConfig(bytes(JSON.stringify({ ...base, admission }))), "grammar", field);
+    });
+  } finally { f.close(); }
+});
+
 test("invalid JSON, invalid UTF-8 and a BOM are grammar errors naming the config", (t) => {
   guarded(t, () => {
     rejects(() => parseStandaloneConfig(bytes("{ not json")), "grammar", "config");

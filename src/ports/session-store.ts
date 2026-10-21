@@ -740,6 +740,16 @@ export type SessionStore = {
   failInviteClaim(claim: import("./feishu-ingress.ts").InviteClaim, result: Extract<import("./feishu.ts").OrganizerResolution, {status: "blocked"}>, nowMs: number, retryDelayMs: number): void;
   completeInviteClaim(claim: import("./feishu-ingress.ts").InviteClaim, result: Extract<import("./feishu.ts").OrganizerResolution, {status: "resolved"}>, nowMs: number): void;
   retryInviteMetadata(occurrenceId: string, operator: string, nowMs: number): "pending" | "already_pending" | "counter_exhausted";
+  /** Join admission on an allowed invite alone; organizer metadata never gates it. A refusal or a stale invite is
+   * recorded on the invite row and never creates or consumes a session. */
+  admitInviteJoin(occurrenceId: string, nowMs: number, refusal?: "inviter_not_allowed" | "inviter_unverified"):
+    "admitted" | "existing_session" | "invite_stale" | "inviter_not_allowed" | "inviter_unverified";
+  /** The organizer the invite lane resolved, at any time; addressing only. */
+  resolvedOrganizerId(occurrenceId: string): string | null;
+  /** Operator view of the join decision. */
+  inviteJoinStatus(occurrenceId: string): { readonly session: string | null; readonly terminalReason: string | null; readonly refusal: string | null; readonly allowed: boolean } | null;
+  /** True once an allowed invite admitted the occurrence's session. */
+  inviteJoinAllowed(occurrenceId: string): boolean;
   claimPhysicalClient(binding: CustodyBinding, nowMs: number): PhysicalCustodyRow;
   listPhysicalCustody(): readonly PhysicalCustodyRow[];
   recordPhysicalOutcome(binding: CustodyBinding, result: BridgeShutdownResult, nowMs: number): void;

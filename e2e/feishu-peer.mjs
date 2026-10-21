@@ -20,13 +20,16 @@ import { createFeishuUpgradeControls } from "./feishu-upgrade-controls.mjs";
 export { ORGANIZER, RESERVE_ID } from "./feishu-peer-controls.mjs";
 
 export const SCOPE = { region: "feishu", tenantKey: "e2e-tenant", appId: "cli_0123456789abcdef" };
+/** The scripted inviter every e2e config lists in its invite allowlist. */
+export const E2E_INVITER = "ou_e2e_inviter";
 
 /** One scheduled-meeting invite; `startSeconds` is chosen by the harness. */
 export function inviteEnvelope({ eventId, providerMeetingId, meetingNo, title, startSeconds, inviteSeconds, createTimeMs }) {
   return {
     schema: "2.0",
     header: { event_id: eventId, event_type: "vc.bot.meeting_invited_v1", app_id: SCOPE.appId, tenant_key: SCOPE.tenantKey, create_time: String(createTimeMs) },
-    event: { meeting: { id: providerMeetingId, meeting_no: meetingNo, topic: title, start_time: String(startSeconds) }, invite_time: String(inviteSeconds), call_id: "e2e-call" },
+    event: { meeting: { id: providerMeetingId, meeting_no: meetingNo, topic: title, start_time: String(startSeconds) }, invite_time: String(inviteSeconds), call_id: "e2e-call",
+      inviter: { id: E2E_INVITER, user_type: 1 } },
   };
 }
 

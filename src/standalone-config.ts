@@ -54,6 +54,9 @@ export type StandaloneConfigV1 = {
     readonly protocolVersion: 4;
   };
   readonly bridgeSlots: readonly StandaloneBridgeSlot[];
+  /** Invite allowlist. Only invites from a listed inviter (Feishu user open_id, matched against the event's
+   * `inviter.id`) or chat are joined; absent or empty refuses every invite. */
+  readonly admission?: { readonly allowedInviterIds: readonly string[]; readonly allowedChatIds: readonly string[] };
 };
 
 export type StandaloneConfigErrorCategory = "grammar" | "reference";
@@ -145,7 +148,7 @@ export function parseStandaloneConfig(bytes: Uint8Array): StandaloneConfigV1 {
   } catch {
     throw grammar("config");
   }
-  const root = expectObject(value, "config", ["schema", "stateRoot", "feishu", "agentIdentity", "dataPaths", "runtime", "bridgeSlots"]);
+  const root = expectObject(value, "config", ["schema", "stateRoot", "feishu", "agentIdentity", "dataPaths", "runtime", "bridgeSlots"], ["admission"]);
   if (root.schema !== STANDALONE_SCHEMA) throw grammar("schema");
   const stateRoot = expectPath(root.stateRoot, "stateRoot");
 
@@ -180,6 +183,20 @@ export function parseStandaloneConfig(bytes: Uint8Array): StandaloneConfigV1 {
   try { validateBridgeSlots(bridgeSlots); }
   catch { throw grammar("bridgeSlots"); }
 
+  let admission: StandaloneConfigV1["admission"];
+  if (Object.hasOwn(root, "admission")) {
+    const record = expectObject(root.admission, "admission", [], ["allowedInviterIds", "allowedChatIds"]);
+    const list = (field: "allowedInviterIds" | "allowedChatIds"): string[] => {
+      const ids = record[field] ?? [];
+      if (!Array.isArray(ids) || ids.length > 256 ||
+          ids.some((id) => typeof id !== "string" || !/^[\x21-\x7e]{1,128}$/.test(id)) || new Set(ids).size !== ids.length) {
+        throw grammar(`admission.${field}`);
+      }
+      return [...(ids as string[])];
+    };
+    admission = { allowedInviterIds: list("allowedInviterIds"), allowedChatIds: list("allowedChatIds") };
+  }
+
   return {
     schema: STANDALONE_SCHEMA,
     stateRoot,
@@ -188,6 +205,7 @@ export function parseStandaloneConfig(bytes: Uint8Array): StandaloneConfigV1 {
     dataPaths,
     runtime: { launcherPath, gatewayConfigPath, protocolVersion: 4 },
     bridgeSlots,
+    ...(admission === undefined ? {} : { admission }),
   };
 }
 

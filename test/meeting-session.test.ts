@@ -263,6 +263,21 @@ test("a joined event advances the coordinator to listening", async () => {
   }
 });
 
+test("a joined event for any other meeting than the invited occurrence is left at once and never listens", async () => {
+  const h = harness();
+  try {
+    await h.session.join();
+    h.bridge.emit(h.bridge.event({ type: "joined", meetingOccurrenceId: "other-meeting@2026-09-02T14:00:00Z" }));
+    await h.session.settled();
+    assert.notEqual(h.session.state().phase, "listening");
+    assert.equal(h.coordinator.get(IDENTITY.occurrenceId)?.state, "joining");
+    assert.deepEqual(commandOfType(h.bridge, "leave"), { ...commandOfType(h.bridge, "leave"), type: "leave", reason: "coordinator_stop" });
+    assert.ok(h.session.state().routingErrors.some((failure) => failure.error instanceof Error && failure.error.message === "joined_meeting_mismatch"));
+  } finally {
+    await h.cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 1b. Profile / status mismatch: abort SPEAKING, keep CAPTURE
 // ---------------------------------------------------------------------------

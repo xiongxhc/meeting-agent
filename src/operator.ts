@@ -31,7 +31,10 @@ export function runOperator(args: readonly string[]): string {
   if (!lstatSync(filename).isFile()) throw new Error("invalid_operator_database");
   const store = openSessionStore({ filename });
   try {
-    if(command === "invite-metadata-status")return JSON.stringify(store.getInviteOccurrence(options.get("--occurrence")!));
+    if(command === "invite-metadata-status"){
+      const row=store.getInviteOccurrence(options.get("--occurrence")!);
+      return JSON.stringify(row === null ? null : { ...row, join: store.inviteJoinStatus(row.occurrenceId) });
+    }
     if(command === "invite-metadata-retry")return store.retryInviteMetadata(options.get("--occurrence")!,options.get("--operator")!,Date.now());
     if (command === "physical-client-status") return JSON.stringify(store.listPhysicalCustody());
     const row = store.listPhysicalCustody().find((row) => row.physicalClientId === options.get("--slot") && row.physicalGenerationId === options.get("--generation") && row.state === "quarantined");

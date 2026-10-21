@@ -46,6 +46,8 @@ export type DeliveryJournal = {
   /** Optional: without them a refusal is recorded with `update` and never re-synthesised. */
   publicationResynthesisEligible?: SessionStore["publicationResynthesisEligible"];
   recordPublicationRefusal?: SessionStore["recordPublicationRefusal"];
+  /** An organizer the invite lane resolved after the artifact was sealed; addresses the DM only. */
+  resolvedOrganizerId?(occurrenceId: string): string | null;
 };
 
 /** TeamMem refused this exact revision for good: operator metadata only, no
@@ -182,7 +184,7 @@ export function createOutboxWorker(options: {
               options.journal.acceptPublication({
                 occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
                 publishedAtMs: current.publishedAtMs, publicationUrl: current.publicationUrl, vaultCommit: current.vaultCommit,
-                notification: notificationFromRecovery(current),
+                notification: notificationFromRecovery(current, options.journal),
               });
               options.journal.update({ ...current, recoveryArtifact: null });
             }
@@ -198,7 +200,7 @@ export function createOutboxWorker(options: {
               options.journal.acceptPublication({
                 occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
                 publishedAtMs: current.publishedAtMs, publicationUrl: current.publicationUrl, vaultCommit: current.vaultCommit,
-                notification: notificationFromRecovery(current),
+                notification: notificationFromRecovery(current, options.journal),
               });
             } catch (error) {
               if (!retentionExpired) throw error;
@@ -292,7 +294,7 @@ export function createOutboxWorker(options: {
           options.journal.acceptPublication({
             occurrenceId: current.occurrenceId, revision: current.revision, artifactHash: current.artifactHash,
             publishedAtMs: now, publicationUrl: receipt.markdown_url, vaultCommit: receipt.vault_commit,
-            notification: notificationForArtifact(artifact, current, receipt.markdown_url, receipt.vault_commit),
+            notification: notificationForArtifact(artifact, current, receipt.markdown_url, receipt.vault_commit, lateOrganizer(options.journal, current.occurrenceId)),
             ...(consumed ? { consumedInboxAudio: true as const } : {}),
           });
           options.log?.("delivery_published");
@@ -336,7 +338,11 @@ function raiseRefusalAlert(options: Pick<Parameters<typeof createOutboxWorker>[0
   }
 }
 
-function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["notification"] {
+function lateOrganizer(journal: DeliveryJournal, occurrenceId: string): string | null {
+  try { return journal.resolvedOrganizerId?.(occurrenceId) ?? null; } catch { return null; }
+}
+
+function notificationFromRecovery(row: DeliveryRow, journal: DeliveryJournal): AcceptPublicationInput["notification"] {
   if (row.recoveryArtifact === null || row.publicationUrl === null || row.vaultCommit === null) {
     return { terminalReason: "notification_inputs_unavailable" };
   }
@@ -348,7 +354,7 @@ function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["not
       || artifact.revision !== row.revision) {
       return { terminalReason: "notification_inputs_unavailable" };
     }
-    return notificationForArtifact(artifact, row, row.publicationUrl, row.vaultCommit);
+    return notificationForArtifact(artifact, row, row.publicationUrl, row.vaultCommit, lateOrganizer(journal, row.occurrenceId));
   } catch {
     return { terminalReason: "notification_inputs_unavailable" };
   }
@@ -359,11 +365,14 @@ function notificationForArtifact(
   row: Pick<DeliveryRow, "occurrenceId" | "revision" | "artifactHash">,
   publicationUrl: string,
   vaultCommit: string,
+  lateOrganizerId: string | null,
 ): AcceptPublicationInput["notification"] {
-  return artifact.organizer === null
+  // The organizer is addressing only: one resolved after the seed was written still receives the DM.
+  const recipientId = artifact.organizer?.person_id ?? lateOrganizerId;
+  return recipientId === null
     ? { terminalReason: "organizer_unresolved" }
     : {
-        recipientId: artifact.organizer.person_id,
+        recipientId,
         title: artifact.title,
         messageText: `Meeting notes: ${artifact.title}\n${publicationUrl}`,
         requestUuid: notificationRequestUuid({ occurrenceId: row.occurrenceId, revision: row.revision, artifactHash: row.artifactHash, publicationUrl, vaultCommit }),

@@ -9,6 +9,12 @@ export type NormalizedInvite = FeishuScope & {
   readonly endSeconds: string | null; readonly inviteSeconds: string; readonly callId: string;
   readonly occurrenceId: OccurrenceId; readonly occurrenceStartedAt: string;
   readonly normalizedJson: string; readonly normalizedSha256: string; readonly normalizedBytes: number;
+  /** The event's `inviter.id`, used only for the optional inviter allowlist. Outside the normalized hash,
+   * so replay identity is unchanged; never persisted. */
+  readonly inviterId?: string;
+  /** A chat ID, if the event carries one (`chat_id`). The pinned SDK typing for this event has none, so chat
+   * allowlist entries match only once a live payload is shown to carry it. Outside the hash; never persisted. */
+  readonly chatId?: string;
 };
 export type InviteOccurrence = FeishuScope & {
   readonly occurrenceId: OccurrenceId; readonly providerMeetingId: string; readonly meetingNo: string;
@@ -65,12 +71,19 @@ export function normalizeInvite(raw: unknown, scope: FeishuScope): NormalizedInv
   if (endSeconds !== null) inviteSecondsToUtc(endSeconds);
   const inviteSeconds = decimal(event.invite_time); inviteSecondsToUtc(inviteSeconds);
   const callId = boundedInviteString(event.call_id);
+  let inviterId: string | undefined;
+  if (event.inviter !== null && typeof event.inviter === "object" && !Array.isArray(event.inviter)) {
+    try { inviterId = boundedInviteString((event.inviter as Record<string, unknown>).id); } catch { inviterId = undefined; }
+  }
+  let chatId: string | undefined;
+  if (event.chat_id !== undefined) { try { chatId = boundedInviteString(event.chat_id); } catch { chatId = undefined; } }
   const normalizedJson = JSON.stringify(["feishu-invite/v1", scope.region, scope.tenantKey, scope.appId, "2.0", INVITE_EVENT,
     eventId, createTime, providerMeetingId, meetingNo, title, startSeconds, endSeconds, inviteSeconds, callId]);
   const normalizedBytes = Buffer.byteLength(normalizedJson, "utf8");
   if (normalizedBytes > 65536) throw new Error("invalid_invite");
   return { region: scope.region, tenantKey: scope.tenantKey, appId: scope.appId, eventId, createTime, providerMeetingId, meetingNo, title, startSeconds, endSeconds, inviteSeconds, callId,
-    occurrenceId, occurrenceStartedAt, normalizedJson, normalizedBytes, normalizedSha256: createHash("sha256").update(normalizedJson).digest("hex") };
+    occurrenceId, occurrenceStartedAt, normalizedJson, normalizedBytes, normalizedSha256: createHash("sha256").update(normalizedJson).digest("hex"),
+    ...(inviterId === undefined ? {} : { inviterId }), ...(chatId === undefined ? {} : { chatId }) };
 }
 /** Revalidate the store boundary, including caller-supplied hash/derived identity. */
 export function validateNormalizedInvite(value: NormalizedInvite): void {

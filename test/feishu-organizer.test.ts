@@ -43,7 +43,7 @@ test("real SDK reservation reads require exact active occurrence before reserve/
   }
 });
 
-test("missing reference is blocked, never instant, and never performs HTTP", async () => {
+test("missing reference resolves no organizer and never performs HTTP; the join does not wait on it (instant meeting)", async () => {
   const http = createFeishuSdkHttp({request:async()=>{throw new Error("must_not_call");}});
   const adapter = createFeishuOrganizerMetadata({...scope,appSecret:new RedactedSecret("synthetic"),http,references:[]});
   const store = openSessionStore({filename:":memory:"}); store.acceptInvite(normalizeInvite(envelope(),scope),1);
@@ -62,14 +62,14 @@ test("owned SDK HTTP timeout aborts actual socket work and close waits for settl
   } finally { await http.close(); await peer.close(); }
 });
 
-test("calendar GET requires exact occurrence/event and actual organizer, not host/recurrence guesses",async()=>{
-  for(const mode of ["ok","wrong_event","recurrence","conflict","missing_display"]){
+test("calendar GET requires exact occurrence/event and actual organizer, not host guesses; a recurring series or instance yields its organizer",async()=>{
+  for(const mode of ["ok","wrong_event","recurrence","instance","cancelled","conflict","missing_display"]){
     const peer=await httpPeer((req,res)=>{
       const url=new URL(req.url!,"http://fixture");res.setHeader("content-type","application/json");
       if(url.pathname.includes("/auth/")){res.end(JSON.stringify({code:0,tenant_access_token:"synthetic",expire:7200}));return;}
       assert.equal(req.method,"GET");assert.equal(url.pathname,"/open-apis/calendar/v4/calendars/calendar/events/event");assert.equal(url.searchParams.get("user_id_type"),"open_id");
       res.end(JSON.stringify({code:0,data:{event:{event_id:mode==="wrong_event"?"wrong":"event",start_time:{timestamp:"1788357000"},end_time:{timestamp:"1788361200"},
-        recurrence:mode==="recurrence"?"FREQ=DAILY":"",event_organizer:{user_id:"ou_calendar",display_name:mode==="missing_display"?undefined:"Calendar creator"},
+        recurrence:mode==="recurrence"?"FREQ=DAILY":"",...(mode==="instance"?{recurring_event_id:"series",is_exception:true}:{}),...(mode==="cancelled"?{status:"cancelled"}:{}),event_organizer:{user_id:"ou_calendar",display_name:mode==="missing_display"?undefined:"Calendar creator"},
         host_user:{id:"ou_host"},attendees:[{id:"ou_inviter",is_organizer:true}]}}}));
     });
     const store=openSessionStore({filename:":memory:"}),invite=normalizeInvite(envelope(),scope);store.acceptInvite(invite,1);
@@ -79,7 +79,7 @@ test("calendar GET requires exact occurrence/event and actual organizer, not hos
       occurrenceStartedAt:invite.occurrenceStartedAt,...(mode==="conflict"?{vcOrganizerOpenId:"ou_other"}:{})}}]});
     try{
       const result=await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal);
-      assert.equal(result.status,mode==="ok"?"resolved":"blocked");
+      assert.equal(result.status,["ok","recurrence","instance"].includes(mode)?"resolved":"blocked",mode);
       if(result.status === "resolved"){assert.equal(result.organizer.id,"ou_calendar");assert.equal(result.organizer.source,"calendar_event");}
     }finally{await http.close();store.close();await peer.close();}
   }

@@ -29,6 +29,7 @@ async function fixture() {
   const invite = normalizeInvite(envelope, SCOPE), store = openSessionStore({ filename: databasePath, nowMs: END });
   store.acceptInvite(invite, END - 1000); const claim = store.claimInviteMetadata(END - 1000)!;
   store.completeInviteClaim(claim, { status: "resolved", reference: { kind: "reservation", reserveId: "synthetic" }, organizer: { ...SCOPE, idType: "open_id", id: "ou_owner", displayName: "Owner", source: "reservation" } }, END - 999);
+  assert.equal(store.admitInviteJoin(invite.occurrenceId, END - 999), "admitted");
   const identity = buildMeetingIdentity({ providerMeetingId: invite.providerMeetingId, meetingNo: invite.meetingNo, occurrenceStartedAt: invite.occurrenceStartedAt,
     title: invite.title, organizer: { feishuUserId: "ou_owner", displayName: "Owner", source: "reservation" } });
   const coordinator = createCoordinator({ store, clock: { now: () => END }, bridgeLeaseTtlMs: 30000, maxConcurrentSessions: 1 });

@@ -59,7 +59,8 @@ export function createFeishuOrganizerMetadata(options: FeishuScope & {
         const response = await client.calendar.v4.calendarEvent.get({path:{calendar_id:reference.calendarId,event_id:reference.eventId},params:{user_id_type:"open_id"}});
         if (response.code !== 0) return blocked("permission_denied");
         const event = response.data?.event;
-        if (event?.event_id !== reference.eventId || event.recurrence || event.recurring_event_id || event.is_exception || event.status === "cancelled") return blocked("reference_invalid");
+        // The reference already binds the exact occurrence; a recurring series or instance carries its own organizer.
+        if (event?.event_id !== reference.eventId || event.status === "cancelled") return blocked("reference_invalid");
         if (event.vchat?.vc_info && (event.vchat.vc_info.unique_id !== invite.providerMeetingId || event.vchat.vc_info.meeting_no !== invite.meetingNo)) return blocked("reference_invalid");
         id = event.event_organizer?.user_id; displayName = event.event_organizer?.display_name;
         if (reference.vcOrganizerOpenId !== undefined && reference.vcOrganizerOpenId !== id) return blocked("identity_invalid");

@@ -13,6 +13,12 @@ discovery, verified against local HTTP/WebSocket peers and SQLite only. See
 [invitation discovery](docs/feishu-invite-ingress.md) for explicit configuration,
 shutdown ownership, operator commands and remaining human prerequisites.
 
+Only invites from inviters listed in the standalone config's `admission` block are
+joined; with none configured every invite is refused and recorded, and the start logs
+`invite_admission_no_inviters_configured`. Also restrict the Feishu app's availability
+scope to the intended team, since it decides who can invite the bot at all. See
+[who may make the agent join](docs/feishu-invite-ingress.md#who-may-make-the-agent-join).
+
 ```
 protocols/          bridge-session/v1 JSON Schema — the normative contract
 fixtures/contracts/ the frozen contract bytes both languages test against
