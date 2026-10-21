@@ -192,7 +192,7 @@ function fixture() {
   const messages: Array<{ receiveId: string; text: string; uuid: string }> = [];
   const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir, teamVaultDir: path.join(root, "vault") },
     runtime: { launcherPath: path.join(root, "unused-launcher"), gatewayConfigPath: path.join(root, "unused.toml") }, env: {},
-    supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false }, discover: async () => undefined,
+    supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false, anyOccurrenceLive: () => false }, discover: async () => undefined,
     notificationSender: { async sendText(input) { messages.push(input); return { messageId: `om_e2e_${messages.length}` }; } }, options: { random: () => 0 } });
   // Actual migrated store/public worker; only this C clock/sender/receipt/remote
   // fixture is synthetic. Neither maintenance.start nor an app/SDK is run.

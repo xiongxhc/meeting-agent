@@ -119,7 +119,7 @@ test('reader refuses header/WAL/symlinks/loose parent before SQL side effects', 
   try { writeFileSync(filename, Buffer.alloc(100), { mode: 0o600 }); const read = () => h.readCapacityState({ databasePath: filename, occurrenceIds: ['synthetic'] }); assert.throws(read, /header/); assert.equal(existsSync(filename + '-wal'), false);
     writeFileSync(filename + '-wal', ''); assert.throws(read, /WAL/); rmSync(filename + '-wal'); symlinkSync(filename, path.join(root, 'link')); assert.throws(() => h.readCapacityState({ databasePath: path.join(root, 'link'), occurrenceIds: ['synthetic'] }), /symlink/);
     chmodSync(root, 0o755); assert.throws(read, /private_database/); chmodSync(root, 0o700);
-    const { db, filename: sql } = syntheticDatabase(root); db.prepare('DELETE FROM schema_migrations WHERE version=29').run(); db.close(); assert.throws(() => h.readCapacityState({ databasePath: sql, occurrenceIds: ['synthetic'] }), /schema29/);
+    const { db, filename: sql } = syntheticDatabase(root); db.prepare('DELETE FROM schema_migrations WHERE version=30').run(); db.close(); assert.throws(() => h.readCapacityState({ databasePath: sql, occurrenceIds: ['synthetic'] }), /schema29/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 test('synthetic SELECT reader projects actual recovery/unknown columns without capability authorization', async () => {

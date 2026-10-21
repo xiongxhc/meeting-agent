@@ -473,6 +473,43 @@ export type UnknownEndCustodyCleanupClaim = {
   readonly deadlineMs: number;
 };
 
+/** One regular `<handle>.crsr` file observed in the recordings root. */
+export type RecordingFileObservation = {
+  readonly handle: string;
+  readonly recordingPath: string;
+  readonly device: string;
+  readonly inode: string;
+  readonly bytes: number;
+  readonly lastWriteMs: number;
+};
+
+export type RecordingRetentionState = "assigned" | "released" | "deleted";
+
+/** Retention for a recording no delivery, seed or unknown-end custody row
+ * covers: one immutable deadline (last write, never later than detection, plus
+ * 14 days, but at least 72 hours after detection) and the last observed identity. `referencedBy` names the
+ * occurrence whose persisted finalization names this handle, if any. */
+export type RecordingRetention = {
+  readonly recordingHandle: string;
+  readonly recordingPath: string;
+  readonly recordingDevice: string;
+  readonly recordingInode: string;
+  readonly recordingBytes: number;
+  readonly detectedAtMs: number;
+  /** Last write, never later than detection; the 14 days run from here. */
+  readonly retentionFromMs: number;
+  readonly deadlineMs: number;
+  readonly state: RecordingRetentionState;
+  readonly referencedBy: string | null;
+};
+
+/** Capture rows a live entry may own: sessions still joining/listening and
+ * Runtime-admitted generations without a terminal. */
+export type OpenCaptureRows = {
+  readonly sessions: readonly { readonly occurrenceId: string; readonly state: "joining" | "listening" }[];
+  readonly generations: readonly { readonly occurrenceId: string; readonly bridgeSessionId: string }[];
+};
+
 export type FinalizeSessionInput = {
   readonly transition: TransitionInput;
   readonly recording: RecordingInput;
@@ -741,6 +778,15 @@ export type SessionStore = {
   failUnknownEndCustodyCleanup(claim: Pick<UnknownEndCustodyCleanupClaim, "source" | "claimToken">, failedAtMs: number,
     reason: UnknownEndCustodyFailureReason): void;
   authorizeDeliveryEvidenceCleanup(input: { readonly occurrenceId: string; readonly nowMs: number }): boolean;
+  /** Records one observed recording file. A file a covering policy owns gets
+   * no row (an assigned row is released) and returns null; otherwise the row
+   * is created with its deadline or its identity refreshed while assigned. */
+  observeRecordingRetention(file: RecordingFileObservation, nowMs: number): { readonly outcome: "adopted" | "existing"; readonly retention: RecordingRetention } | null;
+  /** Assigned rows, each with its current referencing occurrence. */
+  listAssignedRecordingRetention(): readonly RecordingRetention[];
+  /** Final, monotonic settlement; a deletion only at or after the deadline. */
+  settleRecordingRetention(handle: string, outcome: "released" | "deleted", nowMs: number): void;
+  listOpenCaptureRows(): OpenCaptureRows;
   getRecordingRecovery(occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null;
   beginRecordingAlignment(generationId: string, ownerId: string, replace?: boolean):
     { readonly kind: "selected"; readonly selected: SelectedAlignment } | { readonly kind: "claimed"; readonly attempt: AlignmentAttempt };

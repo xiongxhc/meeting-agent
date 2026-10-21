@@ -561,6 +561,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
         assertOwnership: () => owner.assertCurrentOwnership(),
         occurrenceIsLive: (occurrenceId) => { const entry = entries.get(occurrenceId); return entry !== undefined && entry.phase !== "settled"; },
         holdsFinalizedRecording: () => [...entries.values()].some((entry) => entry.phase !== "settled" && entry.session !== null && entry.session.state().recording !== null),
+        anyOccurrenceLive: () => [...entries.values()].some((entry) => entry.phase !== "settled"),
       },
       ...(options.maintenance ? { options: options.maintenance } : {}),
     }); } catch (error) {
@@ -701,6 +702,9 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       if (closing) throw new Error("composition_closed");
       if (started) throw new Error("composition_already_started");
       started = true;
+      // Before any occurrence launches, so no live entry exists: recordings and
+      // capture rows a previous process left get their retention now.
+      log(maintenance.sweepRetention());
       // Maintenance lanes start before, and never wait on, Feishu ingress readiness.
       maintenance.start();
       if (ingress !== null) await ingress.start();

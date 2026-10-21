@@ -157,7 +157,7 @@ function component(h: ReturnType<typeof fixture>) {
   const messages: Array<{ receiveId: string; text: string; uuid: string; messageId: string }> = [];
   const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir, teamVaultDir: path.join(h.root, "vault") },
     runtime: { launcherPath: path.join(h.root, "unused-launcher"), gatewayConfigPath: path.join(h.root, "unused.toml") }, env: ENV,
-    supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false }, discover: async () => undefined,
+    supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false, anyOccurrenceLive: () => false }, discover: async () => undefined,
     notificationSender: { async sendText(input) { const messageId = `om_e2e_${messages.length + 1}`; messages.push({ receiveId: input.receiveId, text: input.text, uuid: input.uuid, messageId }); return { messageId }; } },
     options: { random: () => 0 },
   }); // No application/composition, SDK client, maintenance.start or backfill tick.

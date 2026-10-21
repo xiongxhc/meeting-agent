@@ -158,7 +158,7 @@ for (const table of tables) test(`component reader refuses any ${table} row`, ()
 for (const kind of ["wrong schema", "WAL header", "WAL sidecar", "SHM sidecar", "symlink file", "symlink parent", "directory file", "overlarge", "unsafe parent", "short header"]) test(`component reader guards ${kind}`, () => {
   const f = fixture(); let readPath = f.databasePath;
   try {
-    if (kind === "wrong schema") { const db = new Database(readPath); db.exec("DELETE FROM schema_migrations WHERE version=29"); db.close(); }
+    if (kind === "wrong schema") { const db = new Database(readPath); db.exec("DELETE FROM schema_migrations WHERE version=30"); db.close(); }
     else if (kind === "WAL header") { const b = readFileSync(readPath); b[18] = 2; b[19] = 2; writeFileSync(readPath, b); }
     else if (kind === "WAL sidecar") writeFileSync(`${readPath}-wal`, "private-wal"); else if (kind === "SHM sidecar") writeFileSync(`${readPath}-shm`, "private-shm");
     else if (kind === "symlink file") { renameSync(readPath, `${readPath}.real`); symlinkSync(`${readPath}.real`, readPath); }

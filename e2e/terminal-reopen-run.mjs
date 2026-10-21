@@ -33,7 +33,7 @@ const ACCEPTED_FILES = {
   "runtime/launcher.stderr.log": "f4c287e4ccfbf3343c9e9e04e4b7e9b98b9d7b3d732be29d356203f8897a7062",
 };
 const ABSENT_FILES = ["bridge-control/runtime-events.ndjson"];
-const TABLES = ["schema_migrations", "sessions", "transitions", "bridge_leases", "recordings", "recording_gaps", "bridge_recoveries", "bridge_recovery_gaps", "bridge_failure_recordings", "recording_runtime_gaps", "bridge_failure_recording_runtime_gaps", "reconciliation_generations", "reconciliation_bridge_events", "reconciliation_live_segments", "delivery_journal", "delivery_recording_owners", "delivery_recording_owners_v17", "notification_intents", "physical_client_custody", "feishu_invite_occurrences", "feishu_invite_events", "recording_recovery_bindings", "recording_alignment_attempts", "recording_alignment_pages", "recording_alignment_selected", "timed_evidence_owners", "timed_ui_evidence", "timed_live_evidence", "backfill_seeds", "backfill_seed_lifecycle", "backfill_jobs", "backfill_warning_intents", "unknown_end_custody"].sort();
+const TABLES = ["schema_migrations", "sessions", "transitions", "bridge_leases", "recordings", "recording_gaps", "bridge_recoveries", "bridge_recovery_gaps", "bridge_failure_recordings", "recording_runtime_gaps", "bridge_failure_recording_runtime_gaps", "reconciliation_generations", "reconciliation_bridge_events", "reconciliation_live_segments", "delivery_journal", "delivery_recording_owners", "delivery_recording_owners_v17", "notification_intents", "physical_client_custody", "feishu_invite_occurrences", "feishu_invite_events", "recording_recovery_bindings", "recording_alignment_attempts", "recording_alignment_pages", "recording_alignment_selected", "timed_evidence_owners", "timed_ui_evidence", "timed_live_evidence", "backfill_seeds", "backfill_seed_lifecycle", "backfill_jobs", "backfill_warning_intents", "unknown_end_custody", "recording_retention"].sort();
 const CLOSE = ["shutdown_fenced", "shutdown_owned_work_settled", "shutdown_application_closed", "shutdown_runtime_owners_closed", "shutdown_transports_closed", "shutdown_store_closed"];
 export function requireTerminal(value, code) { if (!value) throw new Error(`terminal_${code}`); }
 export function terminalFailure(error, fallback = "terminal_failed") {
@@ -112,7 +112,7 @@ export function readTerminalState({ root, databasePath, occurrenceId }) {
     const result = db.transaction(() => {
       const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name);
       requireTerminal(same(tables, TABLES), "schema_tables");
-      requireTerminal(same(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map(row => row.version), Array.from({ length: 29 }, (_, i) => i + 1)), "schema_versions");
+      requireTerminal(same(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map(row => row.version), Array.from({ length: 30 }, (_, i) => i + 1)), "schema_versions");
       const schemaSha256 = hash(JSON.stringify({ definitions: db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all(),
         migrations: db.prepare("SELECT * FROM schema_migrations ORDER BY version").all() }));
       const one = (table, sql) => { requireTerminal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n === 1, "cardinality"); const row = db.prepare(sql).get(occurrenceId); requireTerminal(row, "occurrence_binding"); return row; };

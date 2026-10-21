@@ -42,7 +42,7 @@ test("deadline detects synchronous overrun after the effect returns", async () =
 
 test("reader refuses migration/schema drift and private filesystem substitution", async () => {
   const r = await runner(), f = fixture(), store = openSessionStore({ filename: f.databasePath }); chmodSync(f.databasePath, 0o600);
-  try { const baseline = r.readBacklogProjection(f.databasePath); assert.equal(baseline.migrations.length, 29); const db = new Database(f.databasePath); db.prepare("UPDATE schema_migrations SET name='drift' WHERE version=29").run(); db.close(); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_schema/); chmodSync(f.root, 0o755); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_reader/); } finally { store.close(); rmSync(f.root, { recursive: true, force: true }); }
+  try { const baseline = r.readBacklogProjection(f.databasePath); assert.equal(baseline.migrations.length, 30); const db = new Database(f.databasePath); db.prepare("UPDATE schema_migrations SET name='drift' WHERE version=30").run(); db.close(); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_schema/); chmodSync(f.root, 0o755); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_reader/); } finally { store.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
 async function synthetic() {

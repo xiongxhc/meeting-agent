@@ -5,7 +5,8 @@
 // warning, outbox reconcile (receipts, D016 early cleanup, exact endedAt+14d
 // expiry, seed cleanup, reconciliation purge), organizer notification, durable
 // discovery (Cut B's own tick, reused) and unknown-end custody cleanup
-// (D002/D007, custody M1/M2). Every lane admits AT MOST ONE in-flight tick and
+// (D002/D007, custody M1/M2) plus the recording retention sweep, which also
+// runs once at composition start. Every lane admits AT MOST ONE in-flight tick and
 // schedules its next tick only after that tick settled: no overlapping
 // interval promises, no backlog. Lanes never wait on Feishu readiness, live
 // admission or a quarantined slot; a slow backfill never serializes the others.
@@ -28,7 +29,7 @@ import path from "node:path";
 import type { StdioGatewayCleanupTimeouts } from "@conversation/runtime";
 
 import { createFilesystemOperatorWarningSink } from "./adapters/filesystem-operator-warning.ts";
-import { deleteSeedRecordingEvidence } from "./adapters/filesystem-outbox.ts";
+import { deleteSeedRecordingEvidence, listRecordingSources } from "./adapters/filesystem-outbox.ts";
 import { readTeamVaultProjects } from "./adapters/team-vault-projects.ts";
 import { createBackfillWarningWorker, createBackfillWorker, type BackfillWorkerOptions } from "./delivery/backfill-worker.ts";
 import { createNotificationWorker, type NotificationSender } from "./delivery/notification-worker.ts";
@@ -75,6 +76,9 @@ export type MaintenanceSupervisor = {
   occurrenceIsLive(occurrenceId: string): boolean;
   /** Some live/starting entry in this process still holds a finalized recording. */
   holdsFinalizedRecording(): boolean;
+  /** Any live or starting entry exists; its Runtime may be writing a recording
+   * whose handle nothing in the store names yet. */
+  anyOccurrenceLive(): boolean;
 };
 
 export type LaneStatus = {
@@ -108,6 +112,9 @@ export type MaintenanceStatus = {
   readonly custody: readonly CustodyOutcome[];
   /** Static sorted codes; empty means no lane failed. */
   readonly codes: readonly string[];
+  /** Operator warnings with a count, never identifiers: recordings adopted
+   * already past last write + 14 days, held for the 72-hour grace instead. */
+  readonly warnings: readonly { readonly code: "retention_grace_applied"; readonly count: number }[];
 };
 
 export type MaintenanceOwner = {
@@ -115,6 +122,8 @@ export type MaintenanceOwner = {
   /** Runs one tick now (or joins the in-flight one); resolves to the static outcome code. */
   tick(lane: MaintenanceLane): Promise<string>;
   status(): MaintenanceStatus;
+  /** One retention sweep now (composition start); returns its static code. */
+  sweepRetention(): string;
   close(): Promise<void>;
 };
 
@@ -209,6 +218,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
       publish: () => { throw new Error("outbox_publish_owned_by_store"); } },
     reconciliationEvidence: input.store,
     onMaintenanceFailure: (reason) => { lanes.outbox.failures.add(`outbox_${reason}`); log(`maintenance_outbox_${reason}`); },
+    log,
   });
   /** The composition's own trusted proof for a stale alignment attempt: this
    * process holds the exclusive owner lock (so the attempt's previous owner
@@ -280,6 +290,65 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
     }
   }
 
+  // --- recording retention sweep ----------------------------------------------
+  // Adopts what no other owner deletes: capture rows a crash left open (no live
+  // entry owns them) get a terminal, and every `.crsr` file no delivery, seed
+  // or unknown-end custody row covers gets a deadline of its last write plus
+  // 14 days (at least 72 hours after it is first seen, reported once per sweep
+  // as a counted warning). A due file is deleted with the identity-checked seed tombstone
+  // operation, never while a live entry could own it.
+  const RETENTION_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+  const retentionWarnings: { code: "retention_grace_applied"; count: number }[] = [];
+  function sweepRetention(): string {
+    try {
+      input.supervisor.assertOwnership();
+      const now = clock.now();
+      const open = input.store.listOpenCaptureRows();
+      for (const row of open.sessions) {
+        if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
+        input.store.transition({ occurrenceId: row.occurrenceId, fromState: row.state, toState: "failed", reason: "fail", terminalReason: "capture_interrupted", nowMs: now });
+        log("retention_capture_adopted");
+      }
+      for (const row of open.generations) {
+        if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
+        input.store.completeReconciliationGeneration(row.occurrenceId, row.bridgeSessionId, now, "local_clock");
+        log("retention_generation_adopted");
+      }
+      let graced = 0;
+      for (const file of listRecordingSources(input.dataPaths.recordingsDir)) {
+        const observed = input.store.observeRecordingRetention(file, now);
+        if (observed?.outcome !== "adopted") continue;
+        log("retention_recording_adopted");
+        if (observed.retention.deadlineMs > observed.retention.retentionFromMs + RETENTION_WINDOW_MS) graced += 1;
+      }
+      if (graced > 0) {
+        retentionWarnings.push({ code: "retention_grace_applied", count: graced });
+        if (retentionWarnings.length > 16) retentionWarnings.shift();
+        log("maintenance_retention_grace_applied");
+      }
+      let outcome = "retention_swept";
+      for (const row of input.store.listAssignedRecordingRetention()) {
+        if (row.deadlineMs > now) continue;
+        if (row.referencedBy !== null ? input.supervisor.occurrenceIsLive(row.referencedBy) : input.supervisor.anyOccurrenceLive()) { outcome = "retention_deferred_live"; continue; }
+        try {
+          deleteSeedRecordingEvidence({ recordingsDir: input.dataPaths.recordingsDir, recordingPath: row.recordingPath, recordingHandle: row.recordingHandle,
+            recordingBytes: row.recordingBytes, recordingDevice: row.recordingDevice, recordingInode: row.recordingInode });
+          input.store.settleRecordingRetention(row.recordingHandle, "deleted", now);
+          log("retention_recording_deleted");
+        } catch {
+          lanes.custody.failures.add("retention_delete_failed");
+          log("maintenance_retention_delete_failed");
+          outcome = "retention_delete_failed";
+        }
+      }
+      return outcome;
+    } catch {
+      lanes.custody.failures.add("retention_sweep_failed");
+      log("maintenance_retention_sweep_failed");
+      return "retention_sweep_failed";
+    }
+  }
+
   // --- lanes ------------------------------------------------------------------
   let started = false, closing = false;
   let closePromise: Promise<void> | null = null;
@@ -321,7 +390,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
       await notification.poll(); return "notification_polled";
     }),
     discovery: lane("discovery", async () => { await input.discover(); return "discovery_ticked"; }),
-    custody: lane("custody", runCustody),
+    custody: lane("custody", async () => { const outcome = await runCustody(); sweepRetention(); return outcome; }),
   };
 
   function schedule(entry: Lane): void {
@@ -383,10 +452,15 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
       log("maintenance_started");
     },
     tick,
+    sweepRetention(): string {
+      if (closing) return "retention_sweep_closed";
+      return sweepRetention();
+    },
     status(): MaintenanceStatus {
       const codes = new Set<string>(closeCodes);
       for (const name of MAINTENANCE_LANES) for (const failure of lanes[name].failures) codes.add(`${name}:${failure}`);
-      return { started, closing, lanes: MAINTENANCE_LANES.map((name) => laneStatus(lanes[name])), custody: [...custodyOutcomes], codes: [...codes].sort() };
+      return { started, closing, lanes: MAINTENANCE_LANES.map((name) => laneStatus(lanes[name])), custody: [...custodyOutcomes], codes: [...codes].sort(),
+        warnings: retentionWarnings.map((warning) => ({ ...warning })) };
     },
     close(): Promise<void> {
       if (closePromise !== null) return closePromise;

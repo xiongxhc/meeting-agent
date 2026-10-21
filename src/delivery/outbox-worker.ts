@@ -2,7 +2,7 @@
 // receipt is deliberately the only thing this worker ever does beyond it.
 
 import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
-import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, verifyConsumedMeetingBundle, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
+import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, meetingBundleReady, verifyConsumedMeetingBundle, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
 import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
 import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
@@ -13,6 +13,17 @@ import type { AcceptPublicationInput, BackfillDeliveryAuthority, BackfillSeedCle
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024;
+/** Errors a later attempt can outlive. They back off and retry; only parse,
+ * path and integrity failures make a delivery terminal. */
+const TRANSIENT_ERRNO = new Set(["EACCES", "EPERM", "EAGAIN", "EBUSY", "EINTR", "EIO", "EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "ETIMEDOUT"]);
+
+class TransientRecoveryError extends Error {}
+
+function isTransient(error: unknown): boolean {
+  if (error instanceof TransientRecoveryError) return true;
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && (TRANSIENT_ERRNO.has(code) || /^SQLITE_(BUSY|LOCKED|IOERR)/.test(code));
+}
 
 export type DeliveryRow = StoreDeliveryRow;
 
@@ -53,7 +64,9 @@ export function createOutboxWorker(options: {
   readonly random: () => number;
   readonly session: { state(occurrenceId: string): string | null; publish(occurrenceId: string): void };
   readonly reconciliationEvidence: { purgeExpiredReconciliationEvidence(nowMs: number): number };
-  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed" | "backfill_seed_cleanup_failed") => void;
+  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed" | "backfill_seed_cleanup_failed" | "delivery_recovery_unavailable") => void;
+  /** Static delivery state-change codes only; never identifiers, paths or content. */
+  readonly log?: (code: string) => void;
 }): OutboxWorker {
   if (options.reconciliationEvidence === undefined) throw new Error("reconciliation purge dependency is required");
   if (typeof options.journal.acceptPublication !== "function") throw new Error("atomic publication and notification intent journal capability is required");
@@ -181,7 +194,10 @@ export function createOutboxWorker(options: {
             if ((state === "published" || state === "notified") && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
             continue;
           }
-          const receipt = now < current.nextRetryAtMs ? null : readPublicationReceipt({
+          // The retry gate comes before any I/O: a waiting delivery costs
+          // nothing between attempts.
+          if (now < current.nextRetryAtMs) continue;
+          const receipt = readPublicationReceipt({
             receiptsDir: options.receiptsDir,
             occurrenceId: current.occurrenceId,
             revision: current.revision,
@@ -191,11 +207,7 @@ export function createOutboxWorker(options: {
           // verified consumed-bundle metadata. Other terminal rows stay inert.
           const consumedOnly = current.retryReason === "recovery_unavailable";
           if (consumedOnly && receipt === null) continue;
-          const recovered = recoverBundle(options, current, consumedOnly);
-          if (recovered === null) continue;
-          const { artifact, consumed } = recovered;
-          if (now < current.nextRetryAtMs) continue;
-          if (receipt === null) {
+          const waitReceipt = (): void => {
             const retryCount = current.retryCount + 1;
             options.journal.update({
               ...current,
@@ -203,8 +215,15 @@ export function createOutboxWorker(options: {
               retryReason: "receipt_unavailable",
               nextRetryAtMs: now + retryDelayMs(retryCount, options.random),
             });
-            continue;
-          }
+            if (current.retryReason !== "receipt_unavailable") options.log?.("delivery_receipt_waiting");
+          };
+          // Still waiting: the recording was verified and hashed when the
+          // bundle was written; only a missing READY bundle needs that again.
+          if (receipt === null && meetingBundleReady({ outboxDir: options.outboxDir, bundlePath: current.bundlePath })) { waitReceipt(); continue; }
+          const recovered = recoverBundle(options, current, consumedOnly);
+          if (recovered === null) continue;
+          const { artifact, consumed } = recovered;
+          if (receipt === null) { waitReceipt(); continue; }
           // A receipt is evidence, not authorization to mutate an arbitrary
           // orchestration state. Only the legal edge and an interrupted replay
           // are allowed to record it or release encrypted evidence.
@@ -224,15 +243,24 @@ export function createOutboxWorker(options: {
             notification: notificationForArtifact(artifact, current, receipt.markdown_url, receipt.vault_commit),
             ...(consumed ? { consumedInboxAudio: true as const } : {}),
           });
+          options.log?.("delivery_published");
           if (current.transcriptComplete) {
             deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
           }
-        } catch {
+        } catch (error) {
+          // A transient I/O or busy-store failure before publication acceptance
+          // backs off and retries; it never makes the delivery terminal.
+          if (!publicationAccepted && isTransient(error)) {
+            const retryCount = current.retryCount + 1;
+            try { options.journal.update({ ...current, retryCount, nextRetryAtMs: now + retryDelayMs(retryCount, options.random) }); } catch { /* retried next tick */ }
+            options.log?.("delivery_recovery_retry");
+            continue;
+          }
           // A malformed legacy row is terminal and isolated. Classify a row
           // that failed before publication acceptance, but never let it abort
           // siblings or overwrite monotonic publication/deletion evidence.
           if (!publicationAccepted && current.retryReason !== "recovery_unavailable") {
-            try { options.journal.update({ ...current, retryReason: "recovery_unavailable" }); } catch { /* keep the row isolated even if it cannot be updated */ }
+            try { markRecoveryUnavailable(options, current); } catch { /* keep the row isolated even if it cannot be updated */ }
           }
         }
       }
@@ -274,8 +302,16 @@ function notificationForArtifact(
       };
 }
 
+type WorkerOptions = Parameters<typeof createOutboxWorker>[0];
+
+function markRecoveryUnavailable(options: Pick<WorkerOptions, "journal" | "log" | "onMaintenanceFailure">, row: DeliveryRow): void {
+  options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+  options.log?.("delivery_recovery_unavailable");
+  options.onMaintenanceFailure?.("delivery_recovery_unavailable");
+}
+
 function deleteOccurrenceEvidence(
-  options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
+  options: Pick<WorkerOptions, "recordingsDir" | "outboxDir" | "journal" | "log">,
   accepted: DeliveryRow,
   now: number,
   rows: readonly DeliveryRow[],
@@ -295,15 +331,16 @@ function deleteOccurrenceEvidence(
       recoveryArtifact: retainRecoveryArtifact ? row.recoveryArtifact : null,
     });
   }
+  options.log?.("delivery_evidence_deleted");
 }
 
 function recoverBundle(
-  options: Pick<Parameters<typeof createOutboxWorker>[0], "recordingsDir" | "outboxDir" | "journal">,
+  options: Pick<WorkerOptions, "recordingsDir" | "outboxDir" | "journal" | "log" | "onMaintenanceFailure">,
   row: DeliveryRow,
   consumedOnly = false,
 ): { artifact: SupportedTeamMemMeetingArtifact; consumed: boolean } | null {
   if (row.recoveryArtifact === null || row.stageToken === null) {
-    if (!consumedOnly) options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    if (!consumedOnly) markRecoveryUnavailable(options, row);
     return null;
   }
   try {
@@ -327,8 +364,9 @@ function recoverBundle(
     };
     let written: string, consumed = false;
     try { written = verifyConsumedMeetingBundle(input); consumed = true; }
-    catch {
+    catch (error) {
       if (consumedOnly) return null;
+      if (isTransient(error)) throw new TransientRecoveryError("transient");
       written = writeMeetingBundle(input);
     }
     if (written !== row.bundlePath) throw new Error("recovered bundle path differs from durable journal");
@@ -336,12 +374,13 @@ function recoverBundle(
     return { artifact, consumed };
   } catch (error) {
     if ((error as Error).message === "recovery bundle path differs from durable journal") throw error;
-    if (!consumedOnly) options.journal.update({ ...row, retryReason: "recovery_unavailable" });
+    if (!consumedOnly && isTransient(error)) throw error instanceof TransientRecoveryError ? error : new TransientRecoveryError("transient");
+    if (!consumedOnly) markRecoveryUnavailable(options, row);
     return null;
   }
 }
 
-function eligibleRows(options: Pick<Parameters<typeof createOutboxWorker>[0], "journal">, accepted: DeliveryRow): readonly DeliveryRow[] {
+function eligibleRows(options: Pick<WorkerOptions, "journal">, accepted: DeliveryRow): readonly DeliveryRow[] {
   return options.journal.pending().filter((row) => row.occurrenceId === accepted.occurrenceId && row.revision <= accepted.revision);
 }
 

@@ -133,7 +133,7 @@ export function readCapacityState({ databasePath, occurrenceIds }) {
     guard(); db = new Database(databasePath, { readonly: true, fileMustExist: true }); guard();
     requireCapacity(db.readonly && db.pragma('journal_mode', { simple: true }) !== 'wal', 'reader_WAL');
     const state = db.transaction(() => {
-      requireCapacity(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()?.version === 29, 'schema29_required');
+      requireCapacity(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()?.version === 30, 'schema29_required');
       const state = { fileIdentity: `${parent.dev}:${parent.ino}:${parent.birthtimeMs}:${held.dev}:${held.ino}:${held.birthtimeMs}`, counts: {} }, maximum = Math.min(8, occurrenceIds.length);
       for (const [name, [table, columns]] of Object.entries(projections)) {
         const limit = ['invites', 'events', 'sessions'].includes(name) ? occurrenceIds.length : ['recoveries', 'failedRecordings'].includes(name) ? 1 : maximum;

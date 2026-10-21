@@ -151,6 +151,40 @@ export function verifyConsumedMeetingBundle(input: WriteMeetingBundleInput): str
   return destination;
 }
 
+/** Cheap waiting check: the journal-derived bundle still has its READY commit.
+ * Reads no payload; any doubt answers false so the caller runs full recovery. */
+export function meetingBundleReady(input: { readonly outboxDir: string; readonly bundlePath: string }): boolean {
+  try {
+    const outbox = safeDirectory(input.outboxDir, false, "outbox");
+    const destination = path.resolve(input.bundlePath);
+    assertPathUnderRoot(outbox, destination, true);
+    const ready = lstatSync(path.join(destination, "READY"));
+    return ready.isFile() && !ready.isSymbolicLink();
+  } catch { return false; }
+}
+
+/** Every regular `<handle>.crsr` direct child of the recordings root, with the
+ * identity and last-write time the retention sweep records. Read-only. */
+export type RecordingSourceFile = {
+  readonly handle: string; readonly recordingPath: string; readonly device: string; readonly inode: string;
+  readonly bytes: number; readonly lastWriteMs: number;
+};
+export function listRecordingSources(recordingsDir: string): readonly RecordingSourceFile[] {
+  const root = safeDirectory(recordingsDir, false, "recordings");
+  const found: RecordingSourceFile[] = [];
+  for (const name of readdirSync(root)) {
+    const handle = /^([0-9a-f]{32})\.crsr$/.exec(name)?.[1];
+    if (handle === undefined) continue;
+    let stat;
+    try { stat = lstatSync(path.join(root, name), { bigint: true }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (stat.isSymbolicLink() || !stat.isFile()) continue;
+    found.push({ handle, recordingPath: path.join(root, name), device: stat.dev.toString(), inode: stat.ino.toString(),
+      bytes: Number(stat.size), lastWriteMs: Number(stat.mtimeMs) });
+  }
+  return found;
+}
+
 function checkpoint(input: WriteMeetingBundleInput, step: OutboxFaultPoint): void {
   input.fault?.(step);
 }
@@ -201,7 +235,7 @@ export function deleteSeedRecordingEvidence(input: {
   const target = path.resolve(input.recordingPath);
   const handle = requireRecordingHandle(target, input.recordingHandle);
   if (!/^[0-9]+$/.test(input.recordingDevice) || !/^[0-9]+$/.test(input.recordingInode) ||
-      !Number.isSafeInteger(input.recordingBytes) || input.recordingBytes < 1) {
+      !Number.isSafeInteger(input.recordingBytes) || input.recordingBytes < 0) {
     throw new Error("invalid seed recording identity");
   }
   const tombstoneName = `.recording-delete-seed-${handle}-${input.recordingDevice}-${input.recordingInode}`;

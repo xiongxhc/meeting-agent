@@ -66,6 +66,9 @@ import {
   type SettleBackfillProcessInput,
   type BackfillWarningClaim,
   type BackfillSeedCleanupClaim,
+  type OpenCaptureRows,
+  type RecordingFileObservation,
+  type RecordingRetention,
   type UnknownEndCustody,
   type UnknownEndCustodyAssignment,
   type UnknownEndCustodyCleanupClaim,
@@ -212,6 +215,10 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     completeUnknownEndCustodyCleanup: (claim, deletedAtMs) => completeUnknownEndCustodyCleanup(db, claim, deletedAtMs),
     failUnknownEndCustodyCleanup: (claim, failedAtMs, reason) => failUnknownEndCustodyCleanup(db, claim, failedAtMs, reason),
     authorizeDeliveryEvidenceCleanup: (input) => authorizeDeliveryEvidenceCleanup(db, input.occurrenceId, input.nowMs),
+    observeRecordingRetention: (file, nowMs) => observeRecordingRetention(db, file, nowMs),
+    listAssignedRecordingRetention: () => listAssignedRecordingRetention(db),
+    settleRecordingRetention: (handle, outcome, nowMs) => settleRecordingRetention(db, handle, outcome, nowMs),
+    listOpenCaptureRows: () => listOpenCaptureRows(db),
     getRecordingRecovery: (occurrenceId, bridgeSessionId, recordingHandle) => getRecordingRecovery(db, occurrenceId, bridgeSessionId, recordingHandle),
     beginRecordingAlignment: (generationId, ownerId, replace) => beginRecordingAlignment(db, generationId, ownerId, replace),
     appendRecordingAlignment: (attempt, page) => appendRecordingAlignment(db, attempt, page),
@@ -3570,4 +3577,80 @@ function failUnknownEndCustodyCleanup(
       cleanup_claim_expires_at_ms=NULL WHERE ${UNKNOWN_END_CUSTODY_KEY} AND state='cleanup_claimed'
       AND cleanup_claim_token=? AND cleanup_claim_expires_at_ms>?`)
       .run(reason, key.occurrenceId, key.kind, key.attempt, claim.claimToken, effective).changes));
+}
+
+// ---------------------------------------------------------------------------
+// Recording retention (migration 030): files no deletion policy covers
+// ---------------------------------------------------------------------------
+
+const RECORDING_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+/** Floor after first detection, so a file found already past its window is not deleted by the sweep that finds it. */
+const RECORDING_RETENTION_GRACE_MS = 72 * 60 * 60 * 1000;
+type RecordingRetentionRaw = { recording_handle: string; recording_path: string; recording_device: string; recording_inode: string;
+  recording_bytes: number; detected_at_ms: number; retention_from_ms: number; deadline_ms: number; state: RecordingRetention["state"]; referenced_by: string | null };
+const RECORDING_RETENTION_SELECT = `SELECT r.recording_handle,r.recording_path,r.recording_device,r.recording_inode,r.recording_bytes,
+  r.detected_at_ms,r.retention_from_ms,r.deadline_ms,r.state,
+  (SELECT occurrence_id FROM recordings WHERE handle=r.recording_handle
+   UNION ALL SELECT occurrence_id FROM bridge_failure_recordings WHERE handle=r.recording_handle
+   UNION ALL SELECT occurrence_id FROM reconciliation_generations WHERE recording_handle=r.recording_handle LIMIT 1) AS referenced_by
+  FROM recording_retention AS r`;
+
+function toRecordingRetention(row: RecordingRetentionRaw): RecordingRetention {
+  return { recordingHandle: row.recording_handle, recordingPath: row.recording_path, recordingDevice: row.recording_device,
+    recordingInode: row.recording_inode, recordingBytes: row.recording_bytes, detectedAtMs: row.detected_at_ms, retentionFromMs: row.retention_from_ms,
+    deadlineMs: row.deadline_ms, state: row.state, referencedBy: row.referenced_by };
+}
+
+/** A delivery, seed or unknown-end custody row owns deletion of this file. */
+function recordingCoveredByPolicy(db: Database.Database, handle: string, recordingPath: string): boolean {
+  return db.prepare(`SELECT EXISTS(SELECT 1 FROM delivery_journal WHERE recording_handle=@handle OR recording_path=@path)
+      OR EXISTS(SELECT 1 FROM delivery_recording_owners_v17 WHERE recording_handle=@handle OR canonical_path=@path)
+      OR EXISTS(SELECT 1 FROM backfill_seeds WHERE capability_recording_handle=@handle OR recording_path=@path)
+      OR EXISTS(SELECT 1 FROM unknown_end_custody WHERE recording_handle=@handle) AS covered`)
+    .pluck().get({ handle, path: recordingPath }) === 1;
+}
+
+function observeRecordingRetention(db: Database.Database, file: RecordingFileObservation, nowMs: number): { outcome: "adopted" | "existing"; retention: RecordingRetention } | null {
+  if (!/^[0-9a-f]{32}$/.test(file.handle) || path.basename(file.recordingPath) !== `${file.handle}.crsr`) throw new Error("invalid recording retention observation");
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0 || !Number.isFinite(file.lastWriteMs)) throw new Error("invalid recording retention clock");
+  return db.transaction((): { outcome: "adopted" | "existing"; retention: RecordingRetention } | null => {
+    const existing = db.prepare(`${RECORDING_RETENTION_SELECT} WHERE r.recording_handle=?`).get(file.handle) as RecordingRetentionRaw | undefined;
+    if (recordingCoveredByPolicy(db, file.handle, file.recordingPath)) {
+      if (existing?.state === "assigned") settleRecordingRetention(db, file.handle, "released", nowMs);
+      return null;
+    }
+    if (existing !== undefined) {
+      if (existing.state !== "assigned") return { outcome: "existing", retention: toRecordingRetention(existing) };
+      db.prepare(`UPDATE recording_retention SET recording_path=?,recording_device=?,recording_inode=?,recording_bytes=?
+        WHERE recording_handle=? AND state='assigned'`).run(file.recordingPath, file.device, file.inode, file.bytes, file.handle);
+    } else {
+      const from = Math.max(0, Math.min(nowMs, Math.floor(file.lastWriteMs)));
+      db.prepare(`INSERT INTO recording_retention (recording_handle,recording_path,recording_device,recording_inode,recording_bytes,
+          detected_at_ms,retention_from_ms,deadline_ms,state) VALUES (?,?,?,?,?,?,?,?,'assigned')`)
+        .run(file.handle, file.recordingPath, file.device, file.inode, file.bytes, nowMs, from, Math.max(from + RECORDING_RETENTION_MS, nowMs + RECORDING_RETENTION_GRACE_MS));
+    }
+    return { outcome: existing === undefined ? "adopted" : "existing",
+      retention: toRecordingRetention(db.prepare(`${RECORDING_RETENTION_SELECT} WHERE r.recording_handle=?`).get(file.handle) as RecordingRetentionRaw) };
+  }).immediate();
+}
+
+function listAssignedRecordingRetention(db: Database.Database): readonly RecordingRetention[] {
+  return (db.prepare(`${RECORDING_RETENTION_SELECT} WHERE r.state='assigned' ORDER BY r.deadline_ms,r.recording_handle`).all() as RecordingRetentionRaw[])
+    .map(toRecordingRetention);
+}
+
+function settleRecordingRetention(db: Database.Database, handle: string, outcome: "released" | "deleted", nowMs: number): void {
+  const changed = db.prepare(`UPDATE recording_retention SET state=?,settled_at_ms=? WHERE recording_handle=? AND state='assigned'
+      AND (?='released' OR ?>=deadline_ms)`).run(outcome, nowMs, handle, outcome, nowMs).changes;
+  if (changed !== 1) throw new Error("recording retention settlement refused");
+}
+
+function listOpenCaptureRows(db: Database.Database): OpenCaptureRows {
+  return {
+    sessions: db.prepare("SELECT occurrence_id AS occurrenceId, state FROM sessions WHERE state IN ('joining','listening') ORDER BY occurrence_id")
+      .all() as OpenCaptureRows["sessions"][number][],
+    generations: db.prepare(`SELECT occurrence_id AS occurrenceId, bridge_session_id AS bridgeSessionId FROM reconciliation_generations
+      WHERE terminal_at_ms IS NULL ORDER BY occurrence_id, bridge_session_id`)
+      .all() as OpenCaptureRows["generations"][number][],
+  };
 }

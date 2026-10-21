@@ -32,8 +32,40 @@ Retention is unchanged: complete-transcript publication authorizes the existing
 cleanup path; an incomplete original remains until the existing deadline.
 No new acknowledgement, consumer storage access or bundle schema is introduced.
 
+A pending delivery does no I/O before its retry time. While it only waits for
+a receipt, Meeting checks that the READY bundle still exists; the encrypted
+recording is read and hashed again only to rebuild a missing bundle or to
+accept a receipt. A transient read or store error (for example a permission,
+descriptor or disk error) backs off for one to sixty seconds and never makes
+the delivery terminal. Only parse, path and integrity failures do, and they
+report `delivery_recovery_unavailable` to the maintenance lane. State changes
+are logged as static `delivery_*` codes.
+
+A recording that no delivery row, delivery recording owner, backfill seed or
+unknown-end custody row covers still has a deadline. This happens when stop or
+finalize fails, when the finalize transaction fails, or when the process stops
+mid-meeting. The Runtime creates `<handle>.crsr` under its final name when the
+recording starts and appends to it in place, so a crash leaves a partial file
+under that name. At composition start and on every custody-lane tick, Meeting
+records each such file in `recording_retention` with a fixed deadline of its
+last write, never later than first detection, plus 14 days, and never less
+than 72 hours after first detection. It deletes the file at that deadline
+through the identity-checked tombstone operation.
+
+The 72-hour floor matters on the first start after this table exists, and
+after a long outage. Files whose window already ended are adopted, not
+deleted, and the sweep reports one `retention_grace_applied` warning with
+their count in the maintenance status. The operator has 72 hours to inspect
+the recordings directory before they go. It never deletes while a live occurrence could still be writing or
+reading the file, and a file a covering policy later claims is released to
+that policy. The same sweep fails `joining`/`listening` sessions and closes
+open capture generations that no live occurrence owns, so their evidence gets
+its normal 14-day expiry.
+
 Regression evidence lives in `test/outbox-worker.test.ts` (D033 cases) and
-`test/backfill-journal-handoff.test.ts` (atomic handoff and legacy repair).
+`test/backfill-journal-handoff.test.ts` (atomic handoff and legacy repair),
+`test/outbox-retry-gate.test.ts` (retry gate and transient errors) and
+`test/recording-retention.test.ts` (uncovered recordings and open captures).
 The publishing `e2e/run.mjs` command exercises the real TeamMem importer and
 the shipped Feishu sender against local scripted peers; it requires one sent
 intent and one DM with the matching UUID, organizer and published note URL.

@@ -136,7 +136,7 @@ function sender(): Sender {
   return { calls, async sendText(input) { calls.push({ receiveId: input.receiveId, text: input.text, uuid: input.uuid }); return { messageId: `om_${calls.length}` }; } };
 }
 
-const quiet: MaintenanceSupervisor = { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false };
+const quiet: MaintenanceSupervisor = { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false, anyOccurrenceLive: () => false };
 
 function maintenance(store: SessionStore, r: Roots, wall: () => number, overrides: Partial<CreateMaintenanceInput> = {}): MaintenanceOwner {
   return createApplicationMaintenance({

@@ -133,7 +133,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
   mkdirSync(oldMigrations);
   cpSync(path.resolve("migrations"), oldMigrations, {
     recursive: true,
-    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028|029)_/.test(path.basename(source)),
+    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028|029|030)_/.test(path.basename(source)),
   });
   try {
     const oldStore = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
@@ -144,7 +144,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
 
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 29);
+      assert.equal(upgraded.schemaVersion, 30);
       assert.equal(upgraded.getBackfillSeed(identity.occurrenceId), null);
       const schema = new Map(upgraded.describeSchema().map((table) => [table.name, table]));
       assert.match(schema.get("backfill_seeds")?.sql ?? "", /STRICT/);
