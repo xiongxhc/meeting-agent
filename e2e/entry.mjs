@@ -216,7 +216,7 @@ async function main() {
   writeFileSync(eventsPath, "");
   if (plan.initialR1) event("entry_environment", { keys: Object.keys(process.env).sort() });
   const result = await withOwnedPeers({
-    interactive: async () => plan.interactive ? startInteractiveProvider() : null,
+    interactive: async () => plan.interactive ? startInteractiveProvider({ refuseRecognition: plan.providerFault === "connect" }) : null,
     provider: async () => plan.r2Baseline ? startR2Provider({ segmentText: "Scripted fixture R2 baseline segment.", segmentStartMs: 100, segmentEndMs: 200 }) : startFixtureProvider({ l4Case: plan.l4Case }),
     unusedVoice: async () => plan.r2Baseline ? startInteractiveProvider() : null,
     peer: async () => startFeishuPeer({ meeting: plan.meeting }),
@@ -495,7 +495,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
   return { exit, summary: {
     exit, driveFailure, shuttingDown, trace,
     feishuRequests: peer.requests, feishuMessages: peer.messages, providerCalls: provider.calls,
-    interactiveCalls: interactive?.calls ?? [], interactiveConnections: interactive?.connections ?? null, runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
+    interactiveCalls: interactive?.calls ?? [], interactiveConnections: interactive?.connections ?? null, providerFault: interactive?.fault ?? null, runtimeEvents: runtimeEvents(), vaultReads: vaultReads(), entryEnvKeys: Object.keys(process.env).sort(),
     ...(plan.l4Case === undefined ? {} : { l4Drive }),
     r2Maintenance: plan.r2Baseline ? compositionHandle?.maintenanceStatus() ?? r2Maintenance : null,
     unusedVoice: unusedVoice ? { calls: unusedVoice.calls, appended: unusedVoice.appended, ready: unusedVoice.ready } : null,
@@ -513,6 +513,7 @@ function vaultReads() {
 
 async function driveInteractive(provider, getComposition) {
   const state = () => readJson(path.join(plan.controlDir, "state.json"));
+  if (plan.providerFault === "connect") return await driveProviderFault(provider, state, null);
   await waitFor(() => provider.ready, { budgetMs: 15_000, name: "recognition_ready" });
   event("silent_capture", { frames: state().framesSent, disclosure: state().disclosure, languageCalls: provider.calls.length, playback: state().playback.length, authorizations: runtimeEvents().filter((entry) => entry.type === "response_authorized").length });
   async function turn(name, text, authorized, awaitCompletion = authorized) {
@@ -526,6 +527,7 @@ async function driveInteractive(provider, getComposition) {
     if (awaitCompletion) await waitFor(() => runtimeEvents().slice(before).some((entry) => entry.event?.type === "turn_completed" && entry.event.turn_id === decision.turn_id), { budgetMs: 15_000, name: "turn_completed" });
     return binding;
   }
+  if (plan.providerFault !== undefined) return await driveProviderFault(provider, state, turn);
   await turn("current_fact", "Copper budget is seven. Copper budget is approved.", false);
   await turn("incidental_name", "Meetbot is useful.", false);
   await turn("near_name", "Meetbop, please summarize.", false);
@@ -609,6 +611,49 @@ async function driveInteractive(provider, getComposition) {
     scriptedMonotonicLatencyMs: activity ? Number(BigInt(flush.monotonicNs) - BigInt(activity.monotonicNs)) / 1_000_000 : null,
     latencyEndpoints: "provider_onset_send_to_peer_flush_ack_write_callback_shared_host",
     captureAtFlush: flush.capturePosition, captureAfterFlush: state().capturePosition, renderCallbacks: callbacks });
+}
+
+/** Provider-fault cut. One negative turn proves recognition was live, then the
+ * scripted recognizer fails mid-capture (connect mode: it refused every upgrade
+ * from the start). Speaking variants first hold an authorized answer's playback
+ * frame, so the failure arrives while the agent is speaking; the flush-timeout
+ * variant also has the bridge withhold every flush ACK. The drive only observes:
+ * it never stops capture, the voice session or the bridge, and the meeting then
+ * ends through the ordinary path. */
+async function driveProviderFault(provider, state, turn) {
+  let armedCapture, armedMonotonicNs, speaking = null;
+  const hold = path.join(plan.controlDir, "hold-playback"), withhold = path.join(plan.controlDir, "withhold-flush-ack");
+  try {
+    if (turn === null) {
+      armedMonotonicNs = provider.fault.monotonicNs;
+      armedCapture = { ...state().capturePosition, sequence: "0", outputEndSample: "0" };
+    } else {
+      await turn("current_fact", "Copper budget is seven. Copper budget is approved.", false);
+      if (plan.providerFaultSpeaking) {
+        writeFileSync(hold, "hold");
+        const beforePlayback = state().playback.length, beforeEvents = runtimeEvents().length;
+        provider.holdLanguage();
+        const story = await turn("story", "Meetbot, please tell us a long story?", true, false);
+        const frame = await waitFor(() => state().playback.slice(beforePlayback).find((entry) => entry.turn === story.turn && entry.held), { budgetMs: 15_000, name: "held_playback" });
+        const accepted = await waitFor(() => runtimeEvents().slice(beforeEvents).find((row) => row.type === "voice_playback" &&
+          row.state === "accepted" && row.session_id === story.sessionId && row.generation_id === frame.generation), { budgetMs: 15_000, name: "held_runtime_accepted" });
+        if (plan.providerFaultWithholdFlushAck) writeFileSync(withhold, "withhold");
+        speaking = { ...story, generation: frame.generation, acceptedMonotonicNs: accepted.monotonicNs, withholdFlushAck: plan.providerFaultWithholdFlushAck === true };
+        event("provider_fault_speaking", speaking);
+      }
+      armedCapture = state().capturePosition; armedMonotonicNs = process.hrtime.bigint().toString();
+      provider.armRecognitionFault(plan.providerFault);
+    }
+    event("provider_fault_armed", { mode: plan.providerFault, armedMonotonicNs, armedCapture });
+    const failure = await waitFor(() => runtimeEvents().find((row) => row.type === "voice_session_failed" && BigInt(row.monotonicNs) >= BigInt(armedMonotonicNs)),
+      { budgetMs: 60_000, name: "provider_fault_runtime_failure" });
+    const captureAtFailure = state().capturePosition;
+    await waitFor(() => BigInt(state().capturePosition.sequence) >= BigInt(captureAtFailure.sequence) + 100n, { budgetMs: 15_000, name: "capture_after_provider_fault" });
+    event("provider_fault_observed", { mode: plan.providerFault, armedMonotonicNs, armedCapture, fault: provider.fault, speaking,
+      failureMonotonicNs: failure.monotonicNs, failureSessionId: failure.session_id ?? null, captureAtFailure, captureAfterFailure: state().capturePosition });
+  } finally {
+    if (plan.providerFaultSpeaking) { provider.releaseLanguage(); rmSync(hold, { force: true }); rmSync(withhold, { force: true }); }
+  }
 }
 
 if (isMain) main().catch((error) => {

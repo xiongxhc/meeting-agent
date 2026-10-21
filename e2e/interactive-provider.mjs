@@ -21,12 +21,19 @@ function wav() {
   return Buffer.concat([header, pcm]);
 }
 
-export async function startInteractiveProvider() {
+/** `refuseRecognition` answers every recognition upgrade with HTTP 503 from
+ * the start. `armRecognitionFault("error" | "stall")` faults the live socket at
+ * its next append (provider error event, or never read again) and refuses
+ * every later upgrade. */
+export async function startInteractiveProvider({ refuseRecognition = false } = {}) {
   const submitted = createSubmittedFrameTracker();
   let connectionOrdinal = 0, httpRequests = 0, firstRecognitionMonotonicNs = null;
   const calls = [], sockets = new Set(), heldResponses = new Set();
   let holdLanguage = false, bargeOnSpeech = false;
   let recognition = null, previous = null, ordinal = 0, appended = 0;
+  // Fault state: `armed` waits for the next append; `fault` records what was injected.
+  let armed = null, fault = null, refused = 0, appendedAfterFault = 0;
+  if (refuseRecognition) fault = { mode: "connect", at: Date.now(), monotonicNs: process.hrtime.bigint().toString(), appendedBefore: 0 };
   const server = createServer((request, response) => {
     httpRequests += 1;
     const chunks = [];
@@ -56,7 +63,11 @@ export async function startInteractiveProvider() {
       } else { response.statusCode = 404; response.end(); }
     });
   });
-  const websocket = new WebSocketServer({ server });
+  const websocket = new WebSocketServer({ server, verifyClient: (info, accept) => {
+    if (fault === null) { accept(true); return; }
+    refused += 1;
+    accept(false, 503, "Service Unavailable");
+  } });
   websocket.on("connection", (socket) => {
     firstRecognitionMonotonicNs ??= process.hrtime.bigint().toString();
     const connection = `recognition-${++connectionOrdinal}`;
@@ -71,7 +82,15 @@ export async function startInteractiveProvider() {
         recognition = socket;
         submitted.update(connection, event.session);
       } else if (event.type === "input_audio_buffer.append") {
+        if (fault !== null) { appendedAfterFault += 1; return; }
         appended += 1;
+        if (armed !== null && socket === recognition) {
+          fault = { mode: armed, at: Date.now(), monotonicNs: process.hrtime.bigint().toString(), appendedBefore: appended };
+          armed = null;
+          if (fault.mode === "error") socket.send(JSON.stringify({ type: "error", error: { type: "server_error", message: "scripted provider fault" } }));
+          else socket.pause(); // stall: never read or write on this socket again
+          return;
+        }
         submitted.append(connection, event.audio);
         if (bargeOnSpeech && Buffer.from(event.audio, "base64").some((byte) => byte !== 0)) {
           bargeOnSpeech = false; ordinal += 1;
@@ -91,6 +110,11 @@ export async function startInteractiveProvider() {
     get submitted() { return submitted.snapshot(); },
     get appended() { return appended; },
     get connections() { return { recognition: connectionOrdinal, http: httpRequests, firstRecognitionMonotonicNs }; },
+    get fault() { return fault === null ? null : { ...fault, refusedConnections: refused, appendedAfterFault }; },
+    armRecognitionFault(mode) {
+      if (!["error", "stall"].includes(mode) || armed !== null || fault !== null || recognition === null) throw new Error("recognition fault refused");
+      armed = mode;
+    },
     holdLanguage() { holdLanguage = true; },
     armBargeOnSpeech() { bargeOnSpeech = true; },
     releaseLanguage() { holdLanguage = false; for (const response of heldResponses) response.end("data: [DONE]\n\n"); heldResponses.clear(); },

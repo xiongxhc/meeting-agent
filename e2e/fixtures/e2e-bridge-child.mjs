@@ -46,7 +46,7 @@ const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], disclosure: null,
+  mediaClosedReason: null, left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
   capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [],
 };
 const FRAME_MS = 20;
@@ -222,6 +222,9 @@ lines.on("line", (line) => {
           holdPlayback: () => { try { readFileSync(path.join(control, "hold-playback")); return true; } catch { return false; } },
           onPlayback: (detail) => { state.playback.push(detail); persist(); },
           onFlush: (detail) => { state.flushes.push(detail); persist(); },
+          // Test-only fault: while this control file exists no flush is acknowledged.
+          withholdFlushAck: () => { try { readFileSync(path.join(control, "withhold-flush-ack")); return true; } catch { return false; } },
+          onFlushWithheld: (detail) => { state.withheldFlushes.push(detail); persist(); },
           onRenderCallback: (detail) => { state.renderCallbacks.push(detail); persist(); },
         });
         const connected = await connectionWork;

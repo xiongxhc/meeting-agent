@@ -67,6 +67,8 @@ export function createPlaybackAcks(sessionId, sendAck, onCallback = () => {}, ad
       flushed.add(String(generation));
       await sendAck(5, Buffer.concat([u64(sessionId), u64(generation)]), onWritten);
     },
+    /** Test-only fault: fence the generation like a flush but never send its ACK. */
+    withhold(generation) { if (admits()) flushed.add(String(generation)); },
     isFlushed: (generation) => flushed.has(String(generation)),
   };
 }
@@ -106,7 +108,7 @@ function record(kind, sessionId, body) {
 /** The same connected-stream core used by TCP and byte-only component peers. */
 export function createConnectedMediaClient({ socket, credential, sessionId, bridgeSessionId, authTimeoutMs, signal,
   clockDomainId = "e2e-clock", captureEpoch = 1n, mediaTiming, holdPlayback = () => false,
-  onPlayback = () => {}, onFlush = () => {}, onRenderCallback = () => {} }) {
+  onPlayback = () => {}, onFlush = () => {}, onRenderCallback = () => {}, withholdFlushAck = () => false, onFlushWithheld = () => {} }) {
   mediaTiming = parseMediaTiming(mediaTiming);
   sessionId = BigInt(sessionId); captureEpoch = BigInt(captureEpoch);
   u64(sessionId); u64(captureEpoch);
@@ -223,7 +225,10 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
               if (!detail.afterFlush) void playback.accept({ sequence: seq, generation, held: detail.held }).catch(() => fail("playback_write_failed"));
             } else {
               const generation = packet.readBigUInt64BE(14);
-              void playback.flush(generation, () => onFlush({ generation: String(generation), at: Date.now(),
+              if (withholdFlushAck()) {
+                playback.withhold(generation);
+                onFlushWithheld({ generation: String(generation), at: Date.now(), monotonicNs: process.hrtime.bigint().toString(), capturePosition: capturePosition() });
+              } else void playback.flush(generation, () => onFlush({ generation: String(generation), at: Date.now(),
                 monotonicNs: process.hrtime.bigint().toString(), capturePosition: capturePosition() })).catch(() => fail("playback_write_failed"));
             }
           }

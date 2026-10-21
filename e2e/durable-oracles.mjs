@@ -41,7 +41,7 @@ export function readRuntimeTrace(filename) {
   return rows;
 }
 
-function selectedAlignment(snapshot) {
+export function selectedAlignment(snapshot) {
   const recording = one(snapshot.recordings, "missing or ambiguous finalized recording");
   const binding = one(snapshot.bindings.filter(row => row.recording_kind === "final"), "missing or ambiguous final recovery binding");
   const selected = one(snapshot.selected.filter(row => row.generation_id === binding.generation_id), "missing selected attempt");

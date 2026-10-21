@@ -66,3 +66,13 @@ test("flush snapshot is taken at its actual ACK write callback rather than a lat
   await pending;
   assert.equal(snapshot, "1");
 });
+
+test("a withheld flush fences its generation like a flush but writes no ACK", async () => {
+  const writes: number[] = [];
+  const peer = createPlaybackAcks(17n, async (kind: number) => { writes.push(kind); });
+  await peer.accept({ sequence: 1n, generation: 4n, held: true });
+  peer.withhold(4n);
+  assert.equal(peer.isFlushed(4n), true);
+  assert.equal((await peer.render(1n, 4n)).status, "suppressed_flushed");
+  assert.deepEqual(writes, [3]);
+});

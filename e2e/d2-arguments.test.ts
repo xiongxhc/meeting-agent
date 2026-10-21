@@ -34,3 +34,28 @@ for (const [args, expected] of [
     assert.equal(result.stdout, "");
   });
 }
+
+test("provider-fault cuts parse and select the provider-fault TEST package; every other mode keeps the default pin", async () => {
+  const module = await import(path.join(import.meta.dirname, "run.mjs"));
+  const pins = await import(path.join(import.meta.dirname, "pins.mjs"));
+  assert.equal(pins.RUNTIME_PIN.name, "runtime14d");
+  for (const cut of ["provider-connect", "provider-error", "provider-stall", "provider-error-speaking", "provider-error-speaking-flush-timeout"]) {
+    const options = module.parseArguments(["--interactive", "--d2-cut", cut, "--out", "/private/tmp/unused-provider-fault"]);
+    assert.equal(options.d2Cut, cut);
+    assert.equal(module.runtimeProfileFor(options), pins.PROVIDER_FAULT_TEST_PROFILE);
+    assert.equal(pins.resolveRuntimeProfile("runtime-provider-fault-test-20261021"), pins.PROVIDER_FAULT_TEST_PROFILE);
+  }
+  for (const d2Cut of [null, "durable", "cancel-wins", "complete-wins", "repeated-close"])
+    assert.equal(module.runtimeProfileFor({ d2Cut }), pins.RUNTIME_PIN);
+  assert.throws(() => module.parseArguments(["--d2-cut", "provider-error", "--out", "/private/tmp/unused-provider-fault"]), /D2 cuts require --interactive/);
+});
+
+test("the source tree id fails closed outside the repository's own git work tree", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const module = await import(path.join(import.meta.dirname, "run.mjs"));
+  const scratch = mkdtempSync(path.join(tmpdir(), "meeting-source-tree-"));
+  try {
+    assert.throws(() => module.sourceTreeId(scratch), /source tree requires the repository's own git work tree/);
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+});

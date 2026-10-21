@@ -16,14 +16,14 @@
 import { clearInterval, clearTimeout, setInterval, setTimeout } from "node:timers";
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
-import { RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
+import { PROVIDER_FAULT_TEST_PROFILE, RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
 import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, mediaTimingConfiguration, run, stage } from "./stage.mjs";
 import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 
@@ -32,7 +32,8 @@ import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-pro
 import { preflightLauncher } from "./launcher-preflight.mjs";
 import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, longTailOmissionMetadata, longTailOmissionOracles, longTailReport, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
 import { d2OrderingOracles } from "./d2-oracles.mjs";
-import { voiceEndFromControl } from "./voice-end-evidence.mjs";
+import { PROVIDER_FAULT_CUTS, providerFaultMetadata, providerFaultOracles, providerFaultPlan } from "./provider-fault-oracles.mjs";
+import { LIFECYCLE_FILE, readVoiceEndRows, voiceEndFromControl } from "./voice-end-evidence.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
 import { readStateFile } from "./state-file.mjs";
@@ -77,7 +78,7 @@ export function parseArguments(argv) {
     }
     else if (argv[index] === "--d2-cut") {
       options.d2Cut = argv[++index];
-      if (!["durable", "cancel-wins", "complete-wins", "repeated-close"].includes(options.d2Cut)) throw new Error("invalid D2 cut");
+      if (!["durable", "cancel-wins", "complete-wins", "repeated-close", ...Object.keys(PROVIDER_FAULT_CUTS)].includes(options.d2Cut)) throw new Error("invalid D2 cut");
     }
     else throw new Error(`unknown argument ${argv[index]}`);
   }
@@ -190,6 +191,12 @@ export async function runL6Publication({ gate, publisher, channel, verifyRemote,
   return { report, failure, cleanup, evidence: controller.evidence() };
 }
 
+/** Provider-fault cuts run against the provider-fault TEST package; every other
+ * mode keeps the default pin. */
+export function runtimeProfileFor({ d2Cut }) {
+  return Object.hasOwn(PROVIDER_FAULT_CUTS, d2Cut ?? "") ? PROVIDER_FAULT_TEST_PROFILE : RUNTIME_PIN;
+}
+
 /** The real parent uses this decision before its publication block. */
 export function publicationRequired({ mediaTiming, d2Cut, l4Case }) {
   return l4Case === undefined && mediaTiming === undefined && d2Cut !== "repeated-close";
@@ -246,14 +253,20 @@ function check(name, condition, detail) {
 }
 
 /** The exact source tree the run exercised, via a temp index (no checkout is touched). */
-function sourceTreeId() {
+export function sourceTreeId(repository = REPO) {
   const indexDir = mkdtempSync(path.join(tmpdir(), "meeting-e2e-index-"));
   const env = { ...process.env, GIT_INDEX_FILE: path.join(indexDir, "index") };
   try {
-    const baseline = step("git_read_tree", run("/usr/bin/git", ["-C", REPO, "read-tree", "HEAD"], { env }));
+    // Fail closed unless the repository is itself the work-tree root: from a copy
+    // inside another checkout, git would describe (and write objects into) that one.
+    const top = step("git_toplevel", run("/usr/bin/git", ["-C", repository, "rev-parse", "--show-toplevel"], { env }));
+    if (top.exit !== 0 || realpathSync(top.stdout.trim()) !== realpathSync(repository)) throw new Error("source tree requires the repository's own git work tree");
+    const baseline = step("git_read_tree", run("/usr/bin/git", ["-C", repository, "read-tree", "HEAD"], { env }));
     if (baseline.exit !== 0) throw new Error("source tree baseline failed");
-    step("git_add_tree", run("/usr/bin/git", ["-C", REPO, "add", "-A", "."], { env }));
-    const written = step("git_write_tree", run("/usr/bin/git", ["-C", REPO, "write-tree"], { env }));
+    const added = step("git_add_tree", run("/usr/bin/git", ["-C", repository, "add", "-A", "."], { env }));
+    if (added.exit !== 0) throw new Error("source tree add failed");
+    const written = step("git_write_tree", run("/usr/bin/git", ["-C", repository, "write-tree"], { env }));
+    if (written.exit !== 0 || !/^[0-9a-f]{40}$/.test(written.stdout.trim())) throw new Error("source tree write failed");
     return written.stdout.trim();
   } finally {
     rmSync(indexDir, { recursive: true, force: true });
@@ -390,6 +403,7 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
     ...(l6ReceiptGate ? { l6ReceiptGate: true } : {}),
     ...(l4Case === undefined ? {} : { l4Case }),
     d2Cut,
+    ...providerFaultPlan(d2Cut),
     ...driveCaptureConfiguration({ mediaTiming, interactive, r2Baseline, d2Cut }),
     recordingKeyEnv: RECORDING_KEY_ENV,
     providerCredentialEnv: PROVIDER_CREDENTIAL_ENV,
@@ -767,7 +781,8 @@ async function main() {
   mkdirSync(options.out, { recursive: true, mode: 0o700 });
 
   if (options.dependencyWheelhouse !== undefined) await validateDependencyWheelhouse(options.dependencyWheelhouse);
-  const pins = await verifyPins();
+  const runtimeProfile = runtimeProfileFor(options);
+  const pins = await verifyPins(runtimeProfile);
   oracle("runtime_pins", "pass", `gateway ${pins.gateway.sha256}; sdk tarball ${pins.sdkTarball.sha256}`);
 
   const build = step("npm_build", run("/opt/homebrew/opt/node@24/bin/npm", ["run", "build"], {
@@ -776,7 +791,7 @@ async function main() {
   if (build.exit !== 0) throw new Error(`npm run build failed: ${build.stderr.slice(0, 2000)}`);
   const treeId = sourceTreeId();
 
-  const staged = stage({ repository: REPO, interactive: options.interactive, r2Baseline: options.r2Baseline, mediaTiming: options.mediaTiming, l4Case: options.l4Case });
+  const staged = stage({ repository: REPO, interactive: options.interactive, r2Baseline: options.r2Baseline, mediaTiming: options.mediaTiming, l4Case: options.l4Case, runtimeProfile });
   let teammem = null;
   let live = { events: [], summary: null, childState: null, outcome: { code: null }, peakTree: [], processEvidence: createProcessEvidence(), teammemResult: null, receipt: null, artifact: null, reopen: null };
   let runFailed = true;
@@ -843,19 +858,29 @@ async function main() {
           check("r2_observed_order", indexes.every((index, i) => index >= 0 && (i === 0 || index > indexes[i - 1])), "actual capture/config/settlement/build/receipt/shutdown ordering");
         } catch { oracle("r2_baseline_read", "fail", "mandatory retained-source, publication or durable baseline facts absent or invalid"); }
       }
-      if (options.interactive && options.l4Case === undefined) interactiveOracles(live);
+      const providerFaultCut = Object.hasOwn(PROVIDER_FAULT_CUTS, options.d2Cut ?? "");
+      if (options.interactive && options.l4Case === undefined && !providerFaultCut) interactiveOracles(live);
       if (options.d2Cut) {
         try {
         const runtimeEvents = readRuntimeTrace(path.join(staged.directories.control, "runtime-events.ndjson"));
         live.summary.runtimeEvents = runtimeEvents;
-        for (const row of d2OrderingOracles({ ...live, cut: options.d2Cut, runtimeEvents })) oracle(row.name, row.status, row.detail);
+        if (!providerFaultCut) for (const row of d2OrderingOracles({ ...live, cut: options.d2Cut, runtimeEvents })) oracle(row.name, row.status, row.detail);
         if (options.d2Cut !== "repeated-close") {
           const occurrence = `${live.meeting.providerMeetingId}@${new Date(live.meeting.startSeconds * 1000).toISOString().replace(".000Z", "Z")}`;
           const facts = readDurableEvidence(live.reopen.filename, occurrence);
           const tested = live.events.filter(row => row.name === "transcript_tested");
           const interval = live.events.find(row => row.name === "interruption_acknowledged");
-          for (const row of durableOracles(facts, { tested, runtimeEvents, interval, requirePostFlush: options.d2Cut !== "complete-wins" })) {
+          // A refused connect never transcribes, so it has no live rows to bind.
+          const rows = durableOracles(facts, { tested, runtimeEvents, interval, requirePostFlush: !providerFaultCut && options.d2Cut !== "complete-wins" });
+          for (const row of rows.filter(row => !providerFaultCut || tested.length > 0 || row.name === "selected_recording_alignment")) {
             oracle(row.name, row.status, row.detail);
+          }
+          if (providerFaultCut) {
+            if (tested.length === 0) check("durable_live_evidence", facts.live.length === 0, `${facts.live.length} live rows without recognition`);
+            const lifecycle = readVoiceEndRows(path.join(staged.directories.control, LIFECYCLE_FILE));
+            const input = { cut: options.d2Cut, events: live.events, runtimeEvents, lifecycle, childState: live.childState, snapshot: facts, artifact: live.artifact, summary: live.summary };
+            for (const row of providerFaultOracles(input)) oracle(row.name, row.status, row.detail);
+            live.providerFault = providerFaultMetadata(input);
           }
           // Persist reopened metadata only. No audio, decryption key, private
           // recovery authorization or speculative hand-built alignment data.
@@ -1118,7 +1143,8 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
     packageRefusalCuts: packageCuts,
     repository: REPO,
     sourceTreeId: treeId,
-    runtimePins: { ...pins, name: RUNTIME_PIN.name, revision: RUNTIME_PIN.revision },
+    runtimePins: { ...pins, name: runtimeProfileFor(options).name, revision: runtimeProfileFor(options).revision },
+    providerFault: live.providerFault ?? null,
     stagedRuntimeDigests: staged.digests ?? null,
     stagedHelperDigests: staged.helperDigests ?? null,
     r2Baseline: live.r2Baseline ?? null,
