@@ -25,6 +25,10 @@ import { getOwnedUiExactMsSnapshot, getOwnedTimedSampleSnapshot, namedTimedCandi
 import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, TranscriptWarning, TimedReconciledTranscript } from "../domain/transcript.ts";
 import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 import type { SelectedAlignment } from "../ports/session-store.ts";
+import { resolveProjects, synthesisProjectVocabulary } from "./project-resolution.ts";
+
+/** The artifact contract's bound on processing warnings. */
+const MAX_PROCESSING_WARNINGS = 500;
 
 const text = z.string().min(1).max(20_000);
 const evidence = z.array(z.string().min(1).max(200)).min(1).max(100);
@@ -149,6 +153,10 @@ export type ArtifactBuildInput = {
   };
   /** In-memory test boundary only. It is deliberately not Task 9 persistence. */
   readonly revisionGuard?: ArtifactRevisionGuard;
+  /** Exact project names TeamMem has published; null when that list could not
+   * be read. Supplied, only these names are published (project-resolution.ts).
+   * Omitted, the model's names pass through unchanged. */
+  readonly knownProjects?: readonly string[] | null;
 };
 
 export type BuiltTeamMemMeetingArtifact = {
@@ -273,15 +281,18 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
   const processed = await input.runtime.processText({
     sessionId: input.sessionId,
     instructions: version === "v1"
-      ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects."
-      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, dates, or projects. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.",
-    input: canonicalTranscriptInput(transcript, version),
+      ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies."
+      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.",
+    input: canonicalSynthesisInput(transcript, version, input.knownProjects),
     outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
     maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES,
   });
   const synthesis = textSynthesisContract.parse(processed.output);
   const runtimeWarnings = processed.warnings.map(runtimeTextWarning);
-  if (input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length > 500) {
+  const baseWarnings = input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length;
+  const projects = input.knownProjects === undefined ? { projects: synthesis.projects, warnings: [] }
+    : resolveProjects(synthesis.projects, input.knownProjects, MAX_PROCESSING_WARNINGS - baseWarnings);
+  if (baseWarnings + projects.warnings.length > MAX_PROCESSING_WARNINGS) {
     throw new Error("processing warning limit exceeded");
   }
   const artifactValue = {
@@ -300,13 +311,13 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
     summary: synthesis.summary,
     participants,
     transcript,
-    projects: synthesis.projects,
+    projects: projects.projects,
     decisions: synthesis.decisions,
     action_items: synthesis.action_items,
     discussion_points: synthesis.discussion_points,
     person_summaries: synthesis.person_summaries,
     recording_gaps: input.recordingGaps.map((gap) => ({ started_at: gap.startedAt, ended_at: gap.endedAt, reason: gap.reason })),
-    processing_warnings: [...input.processingWarnings, ...transcriptWarnings, ...runtimeWarnings],
+    processing_warnings: [...input.processingWarnings, ...transcriptWarnings, ...runtimeWarnings, ...projects.warnings],
     provenance: {
       runtime_profile: input.provenance.runtimeProfile,
       stt_provider: input.provenance.sttProvider,
@@ -483,11 +494,13 @@ function runtimeTextWarning(warning: string): { readonly code: string; readonly 
   return { code: "runtime_text_warning", detail: `Runtime text processing warning (sha256:${digest})` };
 }
 
-function canonicalTranscriptInput(transcript: TeamMemMeetingArtifact["transcript"], version: "v1" | "v2"): string {
-  return JSON.stringify(transcript.map((segment) => version === "v1"
+/** The published project names, then the transcript the synthesis cites. */
+function canonicalSynthesisInput(transcript: TeamMemMeetingArtifact["transcript"], version: "v1" | "v2",
+  knownProjects: readonly string[] | null | undefined): string {
+  return JSON.stringify({ known_projects: synthesisProjectVocabulary(knownProjects), transcript: transcript.map((segment) => version === "v1"
     ? { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker }
     : { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker, started_at: segment.started_at,
-        ended_at: segment.ended_at, provenance: segment.provenance }));
+        ended_at: segment.ended_at, provenance: segment.provenance }) });
 }
 
 function evidenceSchema(): Record<string, unknown> {

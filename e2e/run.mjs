@@ -823,7 +823,7 @@ async function main() {
       // Complete macOS executable/temporary-script assessment before the
       // unchanged protocol/admission deadlines. No arguments makes Runtime
       // refuse before configuration or provider startup; each child is reaped.
-      for (const executable of [staged.gatewayPath, ...(options.interactive || options.r2Baseline ? [staged.scriptedGatewayPath] : []), staged.launcherPath]) {
+      for (const executable of [staged.gatewayPath, staged.scriptedGatewayPath, staged.launcherPath]) {
         const prepared = preflightLauncher(executable, { env: {
           HOME: process.env.HOME, PATH: `${staged.directories.traceBin}:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin`,
           TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "C.UTF-8",
@@ -1153,7 +1153,7 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
     teammem: teammem === null ? null : { source: TEAMMEM_SOURCE, wheel: path.basename(teammem.wheel), wheelSha256: teammem.wheelSha256, envFile: path.basename(teammem.paths.envFile) },
     gatewayConfigurations: {
       live: options.interactive ? "online profile; feature-only scripted gateway, loopback external transports, byte-preserving control observation" : "online profile, unreachable .invalid providers (the only profile the shipped client admits)",
-      postmeeting: options.r2Baseline ? "online profile; feature-only scripted gateway, unavailable final diarization and healthy synthesis; same recording directory and key" : "offline profile, local fixture provider host, same recording directory and key",
+      postmeeting: options.r2Baseline ? "online profile; feature-only scripted gateway, unavailable final diarization and healthy synthesis; same recording directory and key" : "online profile; feature-only scripted gateway, local fixture synthesis, idle voice peer; same recording directory and key",
     },
     privateRoot: staged.root,
     steps,

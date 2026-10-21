@@ -190,7 +190,7 @@ function fixture() {
     session: { state: id => store.getSession(id)?.state ?? null, publish() { throw new Error("unused authority"); } }, reconciliationEvidence: store });
   journal.enqueue({ artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash, recordingPath });
   const messages: Array<{ receiveId: string; text: string; uuid: string }> = [];
-  const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir },
+  const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir, teamVaultDir: path.join(root, "vault") },
     runtime: { launcherPath: path.join(root, "unused-launcher"), gatewayConfigPath: path.join(root, "unused.toml") }, env: {},
     supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false }, discover: async () => undefined,
     notificationSender: { async sendText(input) { messages.push(input); return { messageId: `om_e2e_${messages.length}` }; } }, options: { random: () => 0 } });

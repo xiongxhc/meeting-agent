@@ -99,6 +99,8 @@ test("selected controller waits observed readiness/range/real final and watermar
       waitFor: async (check: () => unknown) => { if (!check()) throw new Error("prerequisite_missing"); return check(); }, nowHostNs: () => BigInt(origin.hostNs) + 1400000000n, budgetMs: 100 }));
   }
 });
+/** The builder's synthesis input: published project names, then the canonical transcript. */
+const synthesisInput = (transcript: unknown[]) => JSON.stringify({ known_projects: [], transcript });
 function answer(messages: Array<{ content: string }>, options: Record<string, unknown> = {}) {
   const { handler } = createFixtureProviderHandler(options), request = new EventEmitter();
   Object.assign(request, { url: "/api/chat" }); let output = "";
@@ -108,11 +110,11 @@ function answer(messages: Array<{ content: string }>, options: Record<string, un
 }
 test("opt-in HTTP synthesis reads canonical transcript content only, never a roster or case label", () => {
   const named = [{ segment_id: "live:1", text: "Synthetic non-name wording.", speaker: { kind: "person", person_id: "ou_l4_speaker", display_name: "Speaker A", reconciled: true }, started_at: "2026-10-06T12:00:01.500000Z", ended_at: "2026-10-06T12:00:02.500000Z", provenance: { stage: "live_stream", model: "synthetic" } }];
-  const prompt = [{ content: "Produce meeting synthesis" }, { content: JSON.stringify(named) }];
+  const prompt = [{ content: "Produce meeting synthesis" }, { content: synthesisInput(named) }];
   assert.equal(answer(prompt).person_summaries.length, 0);
   assert.equal(answer(prompt, { l4Case: "sent-named" }).person_summaries.length, 1);
-  assert.equal(answer([{ content: "meeting synthesis; participant roster ou_l4_speaker Speaker A" }, { content: "[]" }], { l4Case: "sent-named" }).person_summaries.length, 0);
-  assert.equal(answer([{ content: "meeting synthesis" }, { content: JSON.stringify([{ ...named[0], speaker: { kind: "anonymous", label: "speaker_01" } }]) }], { l4Case: "sent-named" }).person_summaries.length, 0);
+  assert.equal(answer([{ content: "meeting synthesis; participant roster ou_l4_speaker Speaker A" }, { content: synthesisInput([]) }], { l4Case: "sent-named" }).person_summaries.length, 0);
+  assert.equal(answer([{ content: "meeting synthesis" }, { content: synthesisInput([{ ...named[0], speaker: { kind: "anonymous", label: "speaker_01" } }]) }], { l4Case: "sent-named" }).person_summaries.length, 0);
 });
 test("ordinary selected public close always settles controller and preserves close rejection", async () => {
   const l4 = await load(); const controller = new AbortController(); let closes = 0;
@@ -203,11 +205,11 @@ test("sent-conflict synthesis detects wrongly named A and B independently throug
   for (const id of ["ou_l4_speaker", "ou_l4_candidate_b"]) {
     const named = [{ segment_id: "live:1", text: "Synthetic contribution.", speaker: { kind: "person", person_id: id, display_name: id === "ou_l4_speaker" ? "Speaker A" : "Candidate B", reconciled: true },
       started_at: "2026-10-06T12:00:01.500000Z", ended_at: "2026-10-06T12:00:02.500000Z", provenance: { stage: "live_stream", model: "synthetic" } }];
-    const messages = [{ content: "meeting synthesis" }, { content: JSON.stringify(named) }];
+    const messages = [{ content: "meeting synthesis" }, { content: synthesisInput(named) }];
     assert.equal(l4.l4PersonSummaries(messages, "sent-conflict").length, 1);
     assert.equal(answer(messages, { l4Case: "sent-conflict" }).person_summaries[0].person_id, id);
     if (id === "ou_l4_candidate_b") assert.equal(l4.l4PersonSummaries(messages, "sent-named").length, 0);
-    assert.equal(answer([{ content: "meeting synthesis" }, { content: JSON.stringify([{ ...named[0], speaker: { kind: "ambiguous", label: "speaker_01" } }]) }], { l4Case: "sent-conflict" }).person_summaries.length, 0);
+    assert.equal(answer([{ content: "meeting synthesis" }, { content: synthesisInput([{ ...named[0], speaker: { kind: "ambiguous", label: "speaker_01" } }]) }], { l4Case: "sent-conflict" }).person_summaries.length, 0);
   }
 });
 test("sent-conflict oracle earns positive samples from actual production cursor merger builder and artifact contract", async () => {

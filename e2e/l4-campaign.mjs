@@ -159,7 +159,11 @@ export async function closeL4Composition({ getApplication, controller }) {
 export function l4PersonSummaries(messages, l4Case) {
   requireFact(plainData(messages, true) && messages.length <= 32 && messages.every(message => plainData(message)), "l4_synthesis_input_refused");
   const canonical = messages.filter(message => typeof message.content === "string").flatMap(message => {
-    try { const parsed = JSON.parse(message.content); return Array.isArray(parsed) ? [parsed] : []; } catch { return []; }
+    // The synthesis input is { known_projects, transcript }; its transcript is the canonical array.
+    try {
+      const parsed = JSON.parse(message.content);
+      return plainData(parsed) && Object.keys(parsed).sort().join() === "known_projects,transcript" && Array.isArray(parsed.transcript) ? [parsed.transcript] : [];
+    } catch { return []; }
   });
   if (canonical.length !== 1 || canonical[0].length > 256 || canonical[0].some(row => !plainData(row) ||
     Object.keys(row).length !== 6 || !["segment_id", "text", "speaker", "started_at", "ended_at", "provenance"].every(key => Object.hasOwn(row, key)) ||

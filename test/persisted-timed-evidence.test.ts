@@ -241,8 +241,9 @@ test("v2 timed builder retains overlapping observations and sends exact interval
     ]);
     assert.deepEqual(reversed.map(({ segmentId }) => segmentId), ["obs-final", "obs-live"], "builder sorts a copy, not private evidence");
     assert.match(request?.instructions ?? "", /overlapping live\/final entries are observations.*same speech.*not proof of repeated events/i);
-    assert.deepEqual(JSON.parse(request?.input ?? ""), built.artifact.transcript.map(({ segment_id, text, speaker, started_at, ended_at, provenance }) =>
-      ({ segment_id, text, speaker, started_at, ended_at, provenance })));
+    assert.match(request?.instructions ?? "", /Do not infer identities, owners, or dates\. Under projects, list each project[^.]*known_projects/);
+    assert.deepEqual(JSON.parse(request?.input ?? ""), { known_projects: [], transcript: built.artifact.transcript.map(({ segment_id, text, speaker, started_at, ended_at, provenance }) =>
+      ({ segment_id, text, speaker, started_at, ended_at, provenance })) });
     assert.deepEqual(built.artifact.decisions[0]?.evidence_segment_ids, ["obs-live", "obs-final"]);
     await assert.rejects(builder.buildTimedTeamMemMeetingArtifactV2({ ...input, transcript: { ...transcript, segments: [{ ...live, sampleEvidence: { ...live.sampleEvidence! } }] } }), /evidence/);
     await assert.rejects(builder.buildTimedTeamMemMeetingArtifactV2({ ...input, selectedAlignment: { ...f.selected, attemptId: "wrong" } }), /provenance/);

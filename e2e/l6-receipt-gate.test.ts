@@ -155,7 +155,7 @@ function component(h: ReturnType<typeof fixture>) {
     session: { state: id => store.getSession(id)?.state ?? null, publish() { throw new Error("not an authority seam"); } }, reconciliationEvidence: store });
   journal.enqueue({ artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: hash, recordingPath });
   const messages: Array<{ receiveId: string; text: string; uuid: string; messageId: string }> = [];
-  const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir },
+  const maintenance = createApplicationMaintenance({ store, clock: { now: () => now }, dataPaths: { recordingsDir, outboxDir, receiptsDir, teamVaultDir: path.join(h.root, "vault") },
     runtime: { launcherPath: path.join(h.root, "unused-launcher"), gatewayConfigPath: path.join(h.root, "unused.toml") }, env: ENV,
     supervisor: { assertOwnership() {}, occurrenceIsLive: () => false, holdsFinalizedRecording: () => false }, discover: async () => undefined,
     notificationSender: { async sendText(input) { const messageId = `om_e2e_${messages.length + 1}`; messages.push({ receiveId: input.receiveId, text: input.text, uuid: input.uuid, messageId }); return { messageId }; } },

@@ -86,9 +86,11 @@ and recorded, and no transcript turn is produced or faked. Every bundle therefor
 carries an expected speech-recognition failure with `recovery: continue_session`
 from those unreachable providers; it is the configuration working as designed,
 not a fault of the run. The post-meeting lane
-runs the same gateway binary in the `offline` profile against a local fixture
-provider so the alignment traversal and the one synthesis call are answered
-rather than invented.
+stays in the meeting's pinned `online` profile, because Meeting refuses a
+post-meeting Runtime in any other profile: the launcher runs the separately
+pinned scripted gateway with loopback providers, a local fixture answers the one
+synthesis call and an idle peer stands in for recognition and speech, so the
+alignment traversal and the synthesis are answered rather than invented.
 
 `--interactive` selects the separately packaged feature-only scripted gateway
 for the live lane, with loopback Feishu and speech/language transports. It drives

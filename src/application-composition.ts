@@ -553,7 +553,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     const notificationSender = options.maintenance?.notificationSender
       ?? createFeishuOrganizerSender({ ...scope, appSecret, http, log });
     maintenance = createApplicationMaintenance({
-      store, clock, dataPaths: { recordingsDir: dataPaths.recordingsDir, outboxDir: dataPaths.outboxDir, receiptsDir: dataPaths.receiptsDir },
+      store, clock, dataPaths: { recordingsDir: dataPaths.recordingsDir, outboxDir: dataPaths.outboxDir, receiptsDir: dataPaths.receiptsDir, teamVaultDir: dataPaths.teamVaultDir },
       runtime: { launcherPath: config.runtime.launcherPath, gatewayConfigPath: config.runtime.gatewayConfigPath },
       env: allowlistedEnvironment(), log, notificationSender,
       discover: () => discoverTick(),

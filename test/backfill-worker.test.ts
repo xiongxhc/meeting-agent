@@ -12,7 +12,7 @@ import { createBackfillWarningWorker, createBackfillWorker } from "../src/delive
 import type { BackfillGatewayTransport } from "../src/delivery/backfill-worker.ts";
 import { createOutboxWorker, type OutboxWorker } from "../src/delivery/outbox-worker.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
-import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "../src/ports/conversation-runtime.ts";
+import type { PostmeetingRuntime } from "../src/adapters/conversation-runtime-client.ts";
 import type { AlignmentAttempt, BackfillSeed, SessionStore } from "../src/ports/session-store.ts";
 import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { ALIGNMENT_POLICY } from "../src/sessions/recording-alignment.ts";
@@ -39,7 +39,7 @@ const seed: BackfillSeed = {
 function options(overrides: Partial<Parameters<typeof createBackfillWorker>[0]> = {}): Parameters<typeof createBackfillWorker>[0] {
   return {
     store, outbox, gatewayPath: absoluteGateway, configPath: absoluteConfig,
-    env: { PATH: "/usr/bin:/bin" }, clock: { now: () => 1, monotonicNow: () => 1 }, random: () => 0,
+    env: { PATH: "/usr/bin:/bin" }, clock: { now: () => 1, monotonicNow: () => 1 }, random: () => 0, readKnownProjects: () => [],
     ...overrides,
   };
 }
@@ -186,8 +186,8 @@ test("failed process cleanup after replaying a selected alignment poisons the in
   const transport = { cleanupOutcome: { status: "failed" as const, reason: "process_not_reaped" as const },
     messages: { async *[Symbol.asyncIterator]() { /* injected adapter does not consume transport */ } },
     async send() {}, async close() {} } as BackfillGatewayTransport;
-  const runtime = { currentSessionId: 99n, readRecordingAlignment() { throw new Error("selected alignment must not be read"); },
-    async close() {} } as unknown as ConversationRuntimePort & FinalizedRecordingRuntime & { readonly currentSessionId: bigint };
+  const runtime = { currentSessionId: 99n, runtimeProfile: "online", readRecordingAlignment() { throw new Error("selected alignment must not be read"); },
+    async close() {} } as unknown as PostmeetingRuntime & { readonly currentSessionId: bigint };
   const worker = createBackfillWorker(options({ store: fakeStore, operationBudgetMs: 1_000,
     cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 },
     startTransport: async () => { transports++; return transport; }, connectRuntime: async () => runtime,
@@ -224,9 +224,9 @@ test("unresolved alignment without trusted ownership proof stays blocked without
   const transport = { cleanupOutcome: { status: "graceful" as const },
     messages: { async *[Symbol.asyncIterator]() { /* injected adapter does not consume transport */ } },
     async send() {}, async close() {} } as BackfillGatewayTransport;
-  const runtime = { currentSessionId: 99n,
+  const runtime = { currentSessionId: 99n, runtimeProfile: "online",
     readRecordingAlignment() { alignmentReads++; throw new Error("must not read without ownership"); },
-    async close() {} } as unknown as ConversationRuntimePort & FinalizedRecordingRuntime & { readonly currentSessionId: bigint };
+    async close() {} } as unknown as PostmeetingRuntime & { readonly currentSessionId: bigint };
   const worker = createBackfillWorker(options({ store: fakeStore, operationBudgetMs: 1_000,
     cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 },
     startTransport: async () => transport, connectRuntime: async () => runtime }));
@@ -438,14 +438,14 @@ test("real SQLite worker hands off an incomplete initial artifact then a complet
   const worker = createBackfillWorker({ store, outbox, gatewayPath: "/synthetic/gateway", configPath: "/synthetic/config.json",
     env: { PATH: "/usr/bin:/bin" }, operationBudgetMs: 1_000,
     cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 },
-    clock: { now: () => wall, monotonicNow: () => 1 }, random: () => 0,
+    clock: { now: () => wall, monotonicNow: () => 1 }, random: () => 0, readKnownProjects: () => [],
     startTransport: async () => {
       transports++;
       return { cleanupOutcome: { status: "graceful" as const },
         messages: { async *[Symbol.asyncIterator]() { /* injected adapter does not consume transport */ } },
         async send() {}, async close() {} } as BackfillGatewayTransport;
     },
-    connectRuntime: async () => ({ currentSessionId: 99n,
+    connectRuntime: async () => ({ currentSessionId: 99n, runtimeProfile: "online",
       readRecordingAlignment() { throw new Error("selected alignment must replay without a new Runtime read"); },
       async reconcileFinalizedRecording() {
         finalCalls++;
@@ -455,7 +455,7 @@ test("real SQLite worker hands off an incomplete initial artifact then a complet
       async processText() { return { output: { summary: "Worker summary", projects: [], decisions: [], action_items: [],
         discussion_points: [], person_summaries: [] }, warnings: [] }; },
       async close() {},
-    } as unknown as ConversationRuntimePort & FinalizedRecordingRuntime & { readonly currentSessionId: bigint }),
+    } as unknown as PostmeetingRuntime & { readonly currentSessionId: bigint }),
   });
 
   try {

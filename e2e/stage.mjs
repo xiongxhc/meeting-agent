@@ -111,7 +111,10 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
   }
   chmodSync(gatewayPath, 0o700);
   const scriptedGatewayPath = path.join(directories.runtimeRoot, "conversation-runtime-gateway-scripted");
-  if (interactive || r2Baseline) {
+  // Every post-meeting lane runs the scripted gateway in the live session's
+  // online profile, so it is staged unless this build has no scripted gateway.
+  const scripted = !expiryEvidence;
+  if (scripted) {
     const copied = run("/bin/cp", [runtimeProfile.scriptedGateway.path, scriptedGatewayPath]);
     if (copied.exit !== 0) throw new Error("staging scripted gateway failed");
     chmodSync(scriptedGatewayPath, 0o700);
@@ -154,7 +157,7 @@ export function stage({ repository, interactive = false, r2Baseline = false, med
     observerPath: path.join(directories.app, "e2e/gateway-observer.mjs"),
     eventsPath: path.join(directories.control, "runtime-events.ndjson"),
     pidsPath: path.join(directories.runtimeRoot, "gateway-pids.txt"),
-    scripted: interactive || r2Baseline, expiryEvidenceDescriptorPath,
+    scripted, expiryEvidenceDescriptorPath,
     journalPath: expiryEvidenceDescriptor?.journalPath, receiptPath: expiryEvidenceDescriptor?.receiptPath,
   }), { mode: 0o700 });
 

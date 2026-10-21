@@ -1,6 +1,8 @@
 // The local fixture provider host the post-meeting gateway configuration
-// names. It answers the gateway's readiness poll and the one ollama-compatible
-// NDJSON chat stream the artifact build's `processText` makes. It is a
+// names. It answers the gateway's readiness poll and the one chat stream the
+// artifact build's `processText` makes: OpenAI-compatible server-sent events
+// for the online post-meeting lane, ollama-compatible NDJSON for the offline
+// configuration. It is a
 // fixture, not a model: it returns a fixed, clearly synthetic body that
 // satisfies the requested output schema and states nothing about the meeting
 // it did not receive.
@@ -52,7 +54,8 @@ export function createFixtureProviderHandler({ l4Case } = {}) {
     let route;
     try { route = new URL(request.url ?? "/", "http://fixture.invalid").pathname; }
     catch { reject(400, "Invalid fixture provider request.", "invalid_request", false); return; }
-    const chatRoute = route.endsWith("/api/chat");
+    const openAiChat = route.endsWith("/v1/chat/completions");
+    const chatRoute = openAiChat || route.endsWith("/api/chat");
     request.on("data", (chunk) => {
       if (finished) return;
       requestBytes += chunk.length;
@@ -88,6 +91,11 @@ export function createFixtureProviderHandler({ l4Case } = {}) {
         }
         recordChat("ok", promptBytes);
         const content = schemaShapedAnswer(text, body.messages ?? [], l4Case);
+        if (openAiChat) {
+          response.setHeader("content-type", "text/event-stream");
+          response.end(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\ndata: [DONE]\n\n`);
+          return;
+        }
         response.setHeader("content-type", "application/x-ndjson");
         response.write(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content }, done: false })}\n`);
         response.end(`${JSON.stringify({ model: "synthetic", message: { role: "assistant", content: "" }, done: true, total_duration: 1000, load_duration: 1, prompt_eval_count: 1, prompt_eval_duration: 1, eval_count: 1, eval_duration: 1 })}\n`);

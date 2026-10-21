@@ -16,7 +16,8 @@ test("public connected postmeeting runtime retains its actual finalized recovery
     last_context_seed_operation_id: null } });
   transport.onSend = (command) => {
     transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
-    transport.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId, reconciliation: { segments: [], warnings: [] } });
+    if (command.type === "status") transport.push({ type: "status", protocol_version: 4, request_id: command.requestId, status: postmeetingStatus("offline") });
+    else transport.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId, reconciliation: { segments: [], warnings: [] } });
   };
   const connected = await connectPostmeetingRuntime(transport);
   try {
@@ -26,6 +27,32 @@ test("public connected postmeeting runtime retains its actual finalized recovery
     assert.equal(result.source.sourceSessionId, 41n);
     assert.deepEqual(result.segments, []);
   } finally { await connected.close(); }
+});
+
+function postmeetingStatus(profile: "offline" | "online") {
+  return { profile, transport: "stdio", privacy_mode: profile === "offline" ? "local_only" : "hybrid",
+    language_location: profile === "offline" ? "local" : "remote", model_id: "synthetic", memory_enabled: false, memory_location: null,
+    telemetry_enabled: false, capabilities: ["text"], components: [{ kind: "language_model",
+      execution_location: profile === "offline" ? "local" : "remote", provider_label: "Synthetic" }],
+    last_context_seed_operation_id: null };
+}
+
+test("the post-meeting connection carries the profile the connected Runtime reports, not an assumed one", async () => {
+  for (const profile of ["offline", "online"] as const) {
+    const transport = new RuntimeTestTransport();
+    // The handshake states the other profile; only the Runtime's own status answer counts.
+    transport.push({ type: "ready", protocol_version: 4, current_session_id: "99",
+      status: postmeetingStatus(profile === "offline" ? "online" : "offline") });
+    transport.onSend = (command) => {
+      transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+      if (command.type === "status") transport.push({ type: "status", protocol_version: 4, request_id: command.requestId, status: postmeetingStatus(profile) });
+    };
+    const connected = await connectPostmeetingRuntime(transport);
+    try {
+      assert.equal(connected.runtimeProfile, profile);
+      assert.deepEqual(transport.commands.map((command) => command.type), ["status"]);
+    } finally { await connected.close(); }
+  }
 });
 
 test("finalized reconciliation preserves historical samples through actual SDK with a different current control identity", async () => {

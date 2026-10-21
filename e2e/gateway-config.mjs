@@ -12,12 +12,15 @@
 // speech recognition fails with `recovery: "continue_session"`. No transcript
 // turn can be produced that way, and none is faked.
 //
-// The post-meeting configuration is the accepted offline fixture-provider
-// shape (the pattern in test/application-composition.test.ts) pointed at the
+// A meeting's profile is pinned for its post-meeting processing too, and
+// Meeting refuses a post-meeting Runtime in another profile. The post-meeting
+// configuration is therefore the same online deployment plus loopback
+// scripted providers (the launcher routes a `[scripted_providers]`
+// configuration to the separately pinned scripted gateway), pointed at the
 // SAME recordings directory and recording key, so the backfill lane's
 // alignment traversal and its one `processText` call are answered by a local
-// fixture rather than invented. Both are the same packaged binary; the
-// evidence bundle records which lane ran under which configuration.
+// fixture rather than invented. The offline fixture-provider configuration
+// remains for runs whose live session is itself offline (calibration).
 
 const PERSONA = `[persona]
 mode = "direct-answer"
@@ -118,6 +121,17 @@ ${recording(recordingsDir, keyEnv)}`;
 /** Test-only entry; the production loader continues to refuse this table. */
 export function interactiveGatewayToml(options) {
   return `${liveGatewayToml(options)}\n[scripted_providers]\nlanguage = "${options.endpoint}"\nrecognition = "${options.recognitionEndpoint}"\nspeech = "${options.endpoint}"\n`;
+}
+
+/** Post-meeting lane in the live session's online profile. Language answers
+ * the synthesis; recognition and speech are an idle peer post-meeting work
+ * never calls. Every scripted endpoint is loopback with an explicit port. */
+export function postmeetingOnlineGatewayToml({ recordingsDir, keyEnv, credentialEnv, languageEndpoint, recognitionEndpoint, speechEndpoint }) {
+  for (const [value, scheme] of [[languageEndpoint, "http"], [recognitionEndpoint, "ws"], [speechEndpoint, "http"]]) {
+    if (typeof value !== "string" || !new RegExp(`^${scheme}://127\\.0\\.0\\.1:[1-9][0-9]*/`).test(value) || /["\\\s]/.test(value))
+      throw new Error("invalid scripted post-meeting endpoint");
+  }
+  return `${liveGatewayToml({ recordingsDir, keyEnv, credentialEnv })}\n[scripted_providers]\nlanguage = "${languageEndpoint}"\nrecognition = "${recognitionEndpoint}"\nspeech = "${speechEndpoint}"\n`;
 }
 
 /** Offline profile with the accepted local fixture provider host. */

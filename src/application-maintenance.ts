@@ -29,6 +29,7 @@ import type { StdioGatewayCleanupTimeouts } from "@conversation/runtime";
 
 import { createFilesystemOperatorWarningSink } from "./adapters/filesystem-operator-warning.ts";
 import { deleteSeedRecordingEvidence } from "./adapters/filesystem-outbox.ts";
+import { readTeamVaultProjects } from "./adapters/team-vault-projects.ts";
 import { createBackfillWarningWorker, createBackfillWorker, type BackfillWorkerOptions } from "./delivery/backfill-worker.ts";
 import { createNotificationWorker, type NotificationSender } from "./delivery/notification-worker.ts";
 import { createOutboxWorker } from "./delivery/outbox-worker.ts";
@@ -120,7 +121,7 @@ export type MaintenanceOwner = {
 export type CreateMaintenanceInput = {
   readonly store: SessionStore;
   readonly clock: Clock;
-  readonly dataPaths: { readonly recordingsDir: string; readonly outboxDir: string; readonly receiptsDir: string };
+  readonly dataPaths: { readonly recordingsDir: string; readonly outboxDir: string; readonly receiptsDir: string; readonly teamVaultDir: string };
   readonly runtime: { readonly launcherPath: string; readonly gatewayConfigPath: string };
   /** The composition's allowlisted child environment. */
   readonly env: Readonly<Record<string, string>>;
@@ -223,6 +224,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
     operationBudgetMs: options.backfill?.operationBudgetMs ?? BACKFILL_OPERATION_BUDGET_MS,
     cleanupTimeouts: options.backfill?.cleanupTimeouts ?? BACKFILL_CLEANUP_TIMEOUTS,
     clock, random, proveExclusiveOwnership,
+    readKnownProjects: () => readTeamVaultProjects({ teamVaultDir: input.dataPaths.teamVaultDir }),
     ...(options.backfill?.startTransport ? { startTransport: options.backfill.startTransport } : {}),
     ...(options.backfill?.connectRuntime ? { connectRuntime: options.backfill.connectRuntime } : {}),
   });
@@ -290,7 +292,17 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
   }
   const lanes: Record<MaintenanceLane, Lane> = {
     backfill: lane("backfill", async () => {
-      try { return `backfill_${(await backfill.pollOnce()).kind}`; }
+      try {
+        const result = await backfill.pollOnce();
+        // A profile refusal will not clear by retrying. It stays a visible
+        // lane code from the first refusal, logged once, long before the
+        // original-deadline stop warning.
+        if (result.kind === "rescheduled" && result.refusal !== undefined && !lanes.backfill.failures.has(`backfill_${result.refusal}`)) {
+          lanes.backfill.failures.add(`backfill_${result.refusal}`);
+          log(`maintenance_backfill_${result.refusal}`);
+        }
+        return `backfill_${result.kind}`;
+      }
       catch (error) {
         // D020: unconfirmed process cleanup poisons the worker; it stays a
         // visible code on every later tick, never an idle result. The other

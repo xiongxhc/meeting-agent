@@ -1,5 +1,5 @@
 // The installed reviewed SDK owns framing, validation and credit/cancellation.
-import { RuntimeClient, type DrainableTimedVoiceSession, type RuntimeTransport, type TimedVoiceSession } from "@conversation/runtime";
+import { RuntimeClient, type DrainableTimedVoiceSession, type RuntimeProfile, type RuntimeTransport, type TimedVoiceSession } from "@conversation/runtime";
 
 import type {
   ConversationContextExchange,
@@ -11,9 +11,20 @@ import type { InvocationDecisionReason, InvocationSink } from "../sessions/invoc
 
 export type ConversationRuntimeSdk = RuntimeClient<4>;
 
+/** A post-meeting connection and the profile its Runtime reports for itself:
+ * the profile every batch call on this connection actually runs in. */
+export type PostmeetingRuntime = ConversationRuntimePort & FinalizedRecordingRuntime & {
+  readonly runtimeProfile: RuntimeProfile;
+};
+
 /** Explicit version negotiation; transport ownership stays with the caller. */
-export async function connectPostmeetingRuntime(transport: RuntimeTransport): Promise<ConversationRuntimePort & FinalizedRecordingRuntime> {
-  return createConversationRuntimeClient(await RuntimeClient.connect(transport, 4));
+export async function connectPostmeetingRuntime(transport: RuntimeTransport): Promise<PostmeetingRuntime> {
+  const sdk = await RuntimeClient.connect(transport, 4);
+  const port = createConversationRuntimeClient(sdk);
+  let runtimeProfile: RuntimeProfile;
+  try { runtimeProfile = (await sdk.status()).profile; }
+  catch (error) { await port.close().catch(() => undefined); throw error; }
+  return Object.assign(port, { runtimeProfile });
 }
 
 export type ConversationRuntimeClientOptions = {

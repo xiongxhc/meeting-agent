@@ -45,7 +45,7 @@ import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-c
 
 import { startFixtureProvider } from "./fixture-provider.mjs";
 import { readStateFile } from "./state-file.mjs";
-import { interactiveGatewayToml, liveGatewayToml, postmeetingGatewayToml } from "./gateway-config.mjs";
+import { interactiveGatewayToml, liveGatewayToml, postmeetingOnlineGatewayToml } from "./gateway-config.mjs";
 import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { RESERVE_ID, SCOPE, inviteEnvelope, startFeishuPeer } from "./feishu-peer.mjs";
 import { closeRepeatedly, runExposedComposition } from "./composition-lifecycle.mjs";
@@ -196,15 +196,17 @@ export async function serveL6Entry({ controlDir, deadlineAtMs, observe, tick, st
 /** Atomically swaps the gateway deployment configuration between lanes. A
  * running gateway read its configuration at start and never re-reads it, so
  * this is done while the live gateway is still up and strictly before any
- * finalization seed -- and therefore any backfill claim -- can exist. */
-function selectPostmeetingGatewayConfig(fixtureEndpoint) {
+ * finalization seed -- and therefore any backfill claim -- can exist. The
+ * post-meeting lane keeps the live session's online profile (scripted
+ * gateway, loopback providers); Meeting refuses a Runtime in another one. */
+function selectPostmeetingGatewayConfig(fixtureEndpoint, idleVoice) {
   const next = `${plan.gatewayConfigPath}.postmeeting`;
-  writeFileSync(next, postmeetingGatewayToml({
-    recordingsDir: plan.runtimeRecordingsDir, keyEnv: plan.recordingKeyEnv,
-    modelsDir: plan.runtimeModelsDir, fixtureEndpoint,
+  writeFileSync(next, postmeetingOnlineGatewayToml({
+    recordingsDir: plan.runtimeRecordingsDir, keyEnv: plan.recordingKeyEnv, credentialEnv: plan.providerCredentialEnv,
+    languageEndpoint: `${fixtureEndpoint}/v1`, recognitionEndpoint: idleVoice.recognitionEndpoint, speechEndpoint: idleVoice.endpoint,
   }), { mode: 0o600 });
   renameSync(next, plan.gatewayConfigPath);
-  event("gateway_config_postmeeting");
+  event("gateway_config_postmeeting", { mode: "online", gateway: "scripted" });
 }
 
 async function main() {
@@ -218,7 +220,8 @@ async function main() {
   const result = await withOwnedPeers({
     interactive: async () => plan.interactive ? startInteractiveProvider({ refuseRecognition: plan.providerFault === "connect" }) : null,
     provider: async () => plan.r2Baseline ? startR2Provider({ segmentText: "Scripted fixture R2 baseline segment.", segmentStartMs: 100, segmentEndMs: 200 }) : startFixtureProvider({ l4Case: plan.l4Case }),
-    unusedVoice: async () => plan.r2Baseline ? startInteractiveProvider() : null,
+    // Idle recognition/speech peer for the post-meeting scripted gateway.
+    unusedVoice: async () => plan.d2Cut === "repeated-close" ? null : startInteractiveProvider(),
     peer: async () => startFeishuPeer({ meeting: plan.meeting }),
   }, driveApplication);
   event("owned_peers_closed");
@@ -304,7 +307,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
       }), { mode: 0o600 });
       renameSync(next, plan.gatewayConfigPath);
       event("gateway_config_postmeeting", { mode: "r2-baseline", gateway: "scripted" });
-    } else selectPostmeetingGatewayConfig(provider.endpoint);
+    } else selectPostmeetingGatewayConfig(provider.endpoint, unusedVoice);
     if (plan.initialR1) { provider.armNextChatFailure(); event("r1_initial_failure_armed"); }
     writeFileSync(path.join(plan.controlDir, "end"), "ended");
     event("meeting_ended_signalled");

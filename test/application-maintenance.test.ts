@@ -8,6 +8,7 @@
 // key is touched. Crash = abandon the handle and reopen; never a fake state.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,13 +27,13 @@ import type { BackfillGatewayTransport } from "../src/delivery/backfill-worker.t
 import { notificationRequestUuid, type NotificationSender } from "../src/delivery/notification-worker.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { occurrencePathSegment } from "../src/domain/occurrence-id.ts";
-import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "../src/ports/conversation-runtime.ts";
+import type { PostmeetingRuntime } from "../src/adapters/conversation-runtime-client.ts";
 import type { OperatorWarningSink } from "../src/ports/operator-warning.ts";
 import type { SessionStore, UnknownEndCustodySource } from "../src/ports/session-store.ts";
 import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { ALIGNMENT_POLICY } from "../src/sessions/recording-alignment.ts";
 import { STANDALONE_SCHEMA, type StandaloneConfigV1 } from "../src/standalone-config.ts";
-import { testCapability } from "./lib/runtime-sdk.ts";
+import { RuntimeTestTransport, testCapability } from "./lib/runtime-sdk.ts";
 import { scope } from "./lib/feishu-fixtures.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -116,12 +117,12 @@ function seedKnownEnded(store: SessionStore, r: Roots, wall: () => number, withA
 function scriptedRuntime(source: { sourceSessionId: bigint; recordingHandle: string; sha256: string }, finalFailures: number) {
   let finalCalls = 0;
   const runtime = {
-    currentSessionId: 99n,
+    currentSessionId: 99n, runtimeProfile: "online",
     readRecordingAlignment() { throw new Error("selected alignment must replay without a new Runtime read"); },
     async reconcileFinalizedRecording() { finalCalls += 1; if (finalCalls <= finalFailures) throw new Error("synthetic final unavailable"); return { source, segments: [], warnings: [] }; },
     async processText() { return { output: { summary: "Maintenance summary", projects: [], decisions: [], action_items: [], discussion_points: [], person_summaries: [] }, warnings: [] }; },
     async close() {},
-  } as unknown as ConversationRuntimePort & FinalizedRecordingRuntime & { readonly currentSessionId: bigint };
+  } as unknown as PostmeetingRuntime & { readonly currentSessionId: bigint };
   return { runtime, finalCalls: () => finalCalls };
 }
 
@@ -139,7 +140,7 @@ const quiet: MaintenanceSupervisor = { assertOwnership() {}, occurrenceIsLive: (
 
 function maintenance(store: SessionStore, r: Roots, wall: () => number, overrides: Partial<CreateMaintenanceInput> = {}): MaintenanceOwner {
   return createApplicationMaintenance({
-    store, clock: { now: wall }, dataPaths: { recordingsDir: r.recordingsDir, outboxDir: r.outboxDir, receiptsDir: r.receiptsDir },
+    store, clock: { now: wall }, dataPaths: { recordingsDir: r.recordingsDir, outboxDir: r.outboxDir, receiptsDir: r.receiptsDir, teamVaultDir: path.join(r.dir, "vault") },
     runtime: { launcherPath: path.join(r.dir, "launcher"), gatewayConfigPath: path.join(r.dir, "gateway.toml") }, env: { PATH: "/usr/bin:/bin" },
     supervisor: quiet, discover: async () => undefined, notificationSender: sender(),
     ...overrides,
@@ -329,6 +330,109 @@ test("R2: an incomplete revision publishes through the real builder/outbox, noti
     assert.equal(store.getBackfillSeed(seeded.identity.occurrenceId)?.expiresAtMs, EXPIRES_AT_MS, "exact expiry never shifts");
     assert.equal(await owner.tick("notification"), "notification_polled");
     assert.equal(organizer.calls.length, 2, "the complete revision has its own verified-receipt notification");
+    await owner.close();
+  } finally { store.close(); r.close(); }
+});
+
+/** A committed Team Vault with one published project page, in TeamMem's render shape. */
+function publishedVault(dir: string, project: string): string {
+  const vault = path.join(dir, "vault");
+  mkdirSync(path.join(vault, "Projects", project), { recursive: true });
+  writeFileSync(path.join(vault, "Projects", project, "README.md"), `---\nproject: ${project}\ngenerated: 2026-09-01\n---\n# ${project}\n`);
+  const git = (...args: string[]) => execFileSync("git", ["-C", vault, ...args], { stdio: "ignore", env: { ...process.env,
+    GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid",
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
+  git("init", "-q"); git("add", "-A"); git("commit", "-q", "-m", "render");
+  return vault;
+}
+
+/** The post-meeting gateway child at the wire: the shipped connection reads its
+ * status, reconciles the finalized recording and runs one synthesis. */
+function postmeetingGateway(profile: "offline" | "online", proposedProject: string) {
+  const status = { profile, transport: "stdio", privacy_mode: profile === "online" ? "hybrid" : "local_only",
+    language_location: profile === "online" ? "remote" : "local", model_id: "scripted-text-model", memory_enabled: false, memory_location: null,
+    telemetry_enabled: false, capabilities: ["text"], components: [{ kind: "language_model", execution_location: profile === "online" ? "remote" : "local",
+      provider_label: "scripted-text" }], last_context_seed_operation_id: null };
+  const commands: string[] = [], inputs: string[] = [];
+  const start = async (): Promise<BackfillGatewayTransport> => {
+    const transport = Object.assign(new RuntimeTestTransport(), { cleanupOutcome: { status: "graceful" as const } });
+    transport.push({ type: "ready", protocol_version: 4, current_session_id: "99", status });
+    transport.onSend = (command) => {
+      commands.push(command.type);
+      transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+      if (command.type === "status") transport.push({ type: "status", protocol_version: 4, request_id: command.requestId, status });
+      if (command.type === "reconcile_finalized_recording") transport.push({ type: "recording_reconciled", protocol_version: 4, request_id: command.requestId,
+        reconciliation: { segments: [{ segment_id: "final-1", started_at_ms: "0", ended_at_ms: "20", text: "Atlas is ready.", speaker_cluster: "cluster-1",
+          media_sample_range: { start_sample_inclusive: "0", end_sample_exclusive: "480", sample_rate_hz: 24000, gap_offset_ms: "0",
+            quantization_policy: "provider_seconds_outward_samples/v1" } }], warnings: [] } });
+      if (command.type === "process_text") {
+        inputs.push(String((command as { input?: unknown }).input));
+        const segment = /segment_id\\?":\\?"([^"\\]+)/u.exec(String((command as { input?: unknown }).input))?.[1] ?? "absent";
+        transport.push({ type: "text_processed", protocol_version: 4, request_id: command.requestId, processed: { output: { summary: "Scripted summary",
+          projects: [{ name: proposedProject, evidence_segment_ids: [segment] }], decisions: [], action_items: [], discussion_points: [], person_summaries: [] },
+          warnings: [] } });
+      }
+    };
+    return transport;
+  };
+  return { start, commands, inputs };
+}
+
+test("D2: the ordinary pipeline builds through the shipped post-meeting connection in the meeting's profile, resolves projects from the published vault and publishes", async () => {
+  const r = roots();
+  const wall = ENDED_AT_MS + 1;
+  const store = openSessionStore({ filename: r.filename, nowMs: ENDED_AT_MS });
+  const organizer = sender();
+  const seeded = seedKnownEnded(store, r, () => wall, true);
+  const vault = publishedVault(r.dir, "Atlas");
+  const gateway = postmeetingGateway("online", "  atlas ");
+  const owner = createApplicationMaintenance({
+    store, clock: { now: () => wall }, dataPaths: { recordingsDir: r.recordingsDir, outboxDir: r.outboxDir, receiptsDir: r.receiptsDir, teamVaultDir: vault },
+    runtime: { launcherPath: path.join(r.dir, "launcher"), gatewayConfigPath: path.join(r.dir, "gateway.toml") }, env: { PATH: "/usr/bin:/bin" },
+    supervisor: quiet, discover: async () => undefined, notificationSender: organizer,
+    options: { random: () => 0, intervalsMs: { backfill: 3_600_000, warning: 3_600_000, outbox: 3_600_000, notification: 3_600_000, discovery: 3_600_000, custody: 3_600_000 },
+      backfill: { operationBudgetMs: 1_000, cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 }, startTransport: gateway.start } },
+  });
+  try {
+    assert.equal(await owner.tick("backfill"), "backfill_enqueued");
+    assert.deepEqual(gateway.commands.slice(0, 1), ["status"], "the profile is read from the Runtime before any processing");
+    assert.deepEqual((JSON.parse(gateway.inputs[0]!) as { known_projects: string[] }).known_projects, ["Atlas"],
+      "synthesis is given the published project names from the vault");
+    const row = store.pending().find((entry) => entry.occurrenceId === seeded.identity.occurrenceId && entry.revision === 1)!;
+    const artifact = JSON.parse(row.recoveryArtifact!) as { provenance: { runtime_profile: string }; projects: { name: string }[];
+      processing_warnings: { code: string }[] };
+    assert.equal(artifact.provenance.runtime_profile, "online");
+    assert.deepEqual(artifact.projects.map(({ name }) => name), ["Atlas"], "the model's variant resolves to the exact published name");
+    assert.equal(artifact.processing_warnings.some(({ code }) => code.startsWith("project_")), false);
+    writeReceipt(r, seeded.identity.occurrenceId, 1, row.artifactHash);
+    assert.equal(await owner.tick("outbox"), "outbox_reconciled");
+    assert.deepEqual(raw(r.filename, (db) => db.prepare("SELECT revision, published_at_ms FROM delivery_journal").all()),
+      [{ revision: 1, published_at_ms: wall }], "the verified receipt publishes the one revision");
+    assert.equal(await owner.tick("notification"), "notification_polled");
+    assert.equal(organizer.calls.length, 1);
+    await owner.close();
+  } finally { store.close(); r.close(); }
+});
+
+test("D2: a post-meeting gateway configured in another profile builds nothing and the meeting stays pending", async () => {
+  const r = roots();
+  const wall = ENDED_AT_MS + 1;
+  const store = openSessionStore({ filename: r.filename, nowMs: ENDED_AT_MS });
+  seedKnownEnded(store, r, () => wall, true);
+  const gateway = postmeetingGateway("offline", "Atlas");
+  const logged: string[] = [];
+  let current = wall;
+  const owner = maintenance(store, r, () => current, { log: (code) => { logged.push(code); }, options: { backfill: { operationBudgetMs: 1_000,
+    cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 }, startTransport: gateway.start } } });
+  try {
+    assert.equal(await owner.tick("backfill"), "backfill_rescheduled");
+    assert.deepEqual(gateway.commands, ["status"], "nothing but the status read runs in a switched profile");
+    assert.deepEqual(store.pending(), []);
+    assert.deepEqual(owner.status().codes, ["backfill:backfill_profile_mismatch"], "the first refusal is a visible maintenance code");
+    assert.deepEqual(logged.filter((code) => code.includes("profile")), ["maintenance_backfill_profile_mismatch"]);
+    current += 120_000;
+    assert.equal(await owner.tick("backfill"), "backfill_rescheduled");
+    assert.deepEqual(logged.filter((code) => code.includes("profile")), ["maintenance_backfill_profile_mismatch"], "logged once, not on every retry");
     await owner.close();
   } finally { store.close(); r.close(); }
 });

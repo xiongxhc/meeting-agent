@@ -16,7 +16,8 @@ import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-c
 import { runExposedComposition } from "./composition-lifecycle.mjs";
 import { startFeishuPeer } from "./feishu-peer.mjs";
 import { startFixtureProvider } from "./fixture-provider.mjs";
-import { postmeetingGatewayToml } from "./gateway-config.mjs";
+import { postmeetingOnlineGatewayToml } from "./gateway-config.mjs";
+import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { createRecoveryClock, readKnownEndRecoveryState } from "./recovery-state.mjs";
 import { sha256File } from "./pins.mjs";
 import { createWarningReceiptBarrier, measureWarningFile } from "./warning-commit-cut.mjs";
@@ -43,16 +44,18 @@ async function main() {
   const clock = createRecoveryClock(plan.recoveryPhase === "warning-boundary" ? original.stopAtMs - 60000 :
     plan.recoveryPhase === "warning-replay" ? replayAtMs - 1 : original.expiresAtMs - 1);
   const shutdown = new globalThis.AbortController();
-  let provider, peer, app, runPromise, admissionExit = null;
+  let provider, idleVoice, peer, app, runPromise, admissionExit = null;
   const trace = [];
   let warningFaults = 0, driveFailure = null;
   const warningCheckpoints = [];
   const measure = () => measureWarningFile({ outboxDir: config.dataPaths.outboxDir, occurrenceId: plan.occurrenceId,
     stopAtMs: original.stopAtMs, expiresAtMs: original.expiresAtMs });
   try {
-    provider = await startFixtureProvider(); peer = await startFeishuPeer({ meeting: plan.meeting });
-    writeFileSync(plan.gatewayConfigPath, postmeetingGatewayToml({ recordingsDir: plan.runtimeRecordingsDir,
-      modelsDir: plan.runtimeModelsDir, keyEnv: plan.recordingKeyEnv, fixtureEndpoint: provider.endpoint }), { mode: 0o600 });
+    provider = await startFixtureProvider(); idleVoice = await startInteractiveProvider(); peer = await startFeishuPeer({ meeting: plan.meeting });
+    // The seed's pinned profile is online; post-meeting work must run in it.
+    writeFileSync(plan.gatewayConfigPath, postmeetingOnlineGatewayToml({ recordingsDir: plan.runtimeRecordingsDir,
+      keyEnv: plan.recordingKeyEnv, credentialEnv: plan.providerCredentialEnv, languageEndpoint: `${provider.endpoint}/v1`,
+      recognitionEndpoint: idleVoice.recognitionEndpoint, speechEndpoint: idleVoice.endpoint }), { mode: 0o600 });
     if (plan.recoveryPhase === "warning-boundary") provider.armNextChatFailure();
     const realWarningSink = createFilesystemOperatorWarningSink({ outboxDir: config.dataPaths.outboxDir, durabilityCheckpoint: step => {
       warningCheckpoints.push(step);
@@ -215,7 +218,7 @@ async function main() {
       event("standalone_closed", { exit });
       if (exit !== 0) driveFailure ??= "recovery_admission_or_cleanup_failed";
     }
-    await provider?.close(); await peer?.close();
+    await provider?.close(); await idleVoice?.close(); await peer?.close();
   }
   if (driveFailure) process.exitCode = 1;
 }

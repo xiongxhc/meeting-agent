@@ -652,3 +652,33 @@ test("revision guard makes same revision byte-stable, rejects conflict and lower
   assert.notEqual(higher.artifact_hash, first.artifact_hash);
   await assert.rejects(buildTeamMemMeetingArtifact({ ...buildInput(runtimeReturning(synthesis).runtime, 1, { transcript: aligned }), revisionGuard: guard }), /lower/i);
 });
+
+test("builder publishes only project names from the supplied published list and flags the rest", async () => {
+  const proposed = { ...synthesis, projects: [{ name: " PROJECT-ATLAS", evidence_segment_ids: ["seg_001"] },
+    { name: "project-atlas", evidence_segment_ids: ["seg_001"] }, { name: "Unlisted", evidence_segment_ids: ["seg_001"] }] };
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(proposed).runtime, 1, { knownProjects: ["project-atlas"] }));
+  assert.deepEqual(built.artifact.projects, [{ name: "project-atlas", evidence_segment_ids: ["seg_001"] }]);
+  assert.deepEqual(built.artifact.processing_warnings.at(-1), { code: "project_unassigned", detail: "Unlisted" });
+});
+
+test("project warnings never push a meeting over the artifact's warning limit", async () => {
+  const proposed = { ...synthesis, projects: Array.from({ length: 500 }, (_, index) => ({ name: `Unlisted ${index}`, evidence_segment_ids: ["seg_001"] })) };
+  const processingWarnings = Array.from({ length: 498 }, (_, index) => ({ code: "synthetic_warning", detail: `Synthetic ${index}.` }));
+  const built = await buildTeamMemMeetingArtifact(buildInput(runtimeReturning(proposed).runtime, 1, { knownProjects: ["project-atlas"], processingWarnings }));
+  assert.equal(built.artifact.processing_warnings.length, 500);
+  assert.deepEqual(built.artifact.processing_warnings.slice(-2).map(({ code }) => code), ["project_unassigned", "project_unassigned_more"]);
+  assert.deepEqual(built.artifact.projects, []);
+});
+
+test("synthesis is asked for discussed projects, from the published names it is given", async () => {
+  const { runtime, calls } = runtimeReturning(synthesis);
+  await buildTeamMemMeetingArtifact(buildInput(runtime, 1, { knownProjects: ["project-atlas", "Orbit"] }));
+  const request = calls[0]!;
+  assert.doesNotMatch(request.instructions, /Do not infer[^.]*projects/);
+  assert.match(request.instructions, /Do not infer identities, owners, or dates\./);
+  assert.match(request.instructions, /list each project the meeting substantively discussed[^.]*known_projects[^.]*segment IDs/);
+  const input = JSON.parse(request.input) as { known_projects: string[]; transcript: { segment_id: string }[] };
+  assert.deepEqual(Object.keys(input), ["known_projects", "transcript"]);
+  assert.deepEqual(input.known_projects, ["project-atlas", "Orbit"]);
+  assert.deepEqual(input.transcript.map(({ segment_id }) => segment_id), ["seg_001", "seg_002"]);
+});

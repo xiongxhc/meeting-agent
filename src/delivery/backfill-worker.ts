@@ -9,9 +9,8 @@ import {
   type StdioGatewayStartOptions,
 } from "@conversation/runtime";
 
-import { connectPostmeetingRuntime } from "../adapters/conversation-runtime-client.ts";
+import { connectPostmeetingRuntime, type PostmeetingRuntime } from "../adapters/conversation-runtime-client.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
-import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "../ports/conversation-runtime.ts";
 import type { OperatorWarningSink } from "../ports/operator-warning.ts";
 import type {
   AlignmentAttempt,
@@ -41,7 +40,7 @@ type BackfillClaim =
   | ({ readonly kind: "initial" } & BackfillSeedBuildClaim)
   | ({ readonly kind: "retry" } & BackfillJobClaim);
 
-type BackfillRuntime = ConversationRuntimePort & FinalizedRecordingRuntime & { readonly currentSessionId: bigint };
+type BackfillRuntime = PostmeetingRuntime & { readonly currentSessionId: bigint };
 
 export type BackfillGatewayTransport = RuntimeTransport & {
   readonly cleanupOutcome: StdioGatewayCleanupOutcome | undefined;
@@ -52,7 +51,10 @@ export type BackfillPollResult =
   | { readonly kind: "idle" }
   | { readonly kind: "stopped"; readonly occurrenceId: string }
   | { readonly kind: "enqueued"; readonly occurrenceId: string; readonly revision: number; readonly bundlePath: string }
-  | { readonly kind: "rescheduled"; readonly occurrenceId: string; readonly reason: BackfillBuildFailure["reason"] };
+  | { readonly kind: "rescheduled"; readonly occurrenceId: string; readonly reason: BackfillBuildFailure["reason"];
+      /** Set when the post-meeting Runtime reported a profile other than the
+       * meeting's pinned one: a configuration fault no retry will clear. */
+      readonly refusal?: "profile_mismatch" };
 
 export type BackfillWorker = {
   pollOnce(): Promise<BackfillPollResult>;
@@ -81,10 +83,16 @@ export type BackfillWorkerOptions = {
   readonly clock: { now(): number; monotonicNow(): number };
   readonly random: () => number;
   readonly proveExclusiveOwnership?: (attempt: AlignmentAttempt) => Promise<void>;
+  /** Exact project names TeamMem has published, or null when unreadable. */
+  readonly readKnownProjects: () => readonly string[] | null;
   /** Narrow deterministic test seam; production always uses Runtime's owner. */
   readonly startTransport?: (options: StdioGatewayStartOptions) => Promise<BackfillGatewayTransport>;
   readonly connectRuntime?: (transport: RuntimeTransport) => Promise<BackfillRuntime>;
 };
+
+class PostmeetingProfileMismatch extends Error {
+  constructor() { super("postmeeting Runtime profile differs from the meeting's pinned profile"); }
+}
 
 export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWorker {
   if (!path.isAbsolute(options.gatewayPath)) throw new Error("backfill worker requires an absolute gateway path");
@@ -197,6 +205,12 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
         try { await connected.close(); } catch (error) { lateCleanupFailures.push(error); }
         throw new Error("backfill work cancelled during Runtime connect");
       }
+      // The pinned profile binds post-meeting work too: a Runtime reporting
+      // another profile is refused, so the artifact's profile, taken from the
+      // Runtime that runs the synthesis, is always the meeting's.
+      if (connected.runtimeProfile !== claim.seed.provenance.runtimeProfile) {
+        throw new PostmeetingProfileMismatch();
+      }
       alignment = new RecordingAlignmentOwner({ store: options.store, runtime: connected,
         ...(options.proveExclusiveOwnership ? { proveExclusiveOwnership: options.proveExclusiveOwnership } : {}) });
       phase = "alignment_failed";
@@ -234,7 +248,9 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
         recordingGaps: claim.seed.bridgeGaps.map((gap) => ({ startedAt: gap.startedAt,
           endedAt: gap.endedAt ?? claim.seed.endedAt, reason: `bridge_${gap.direction}_gap` })),
         processingWarnings: claim.seed.processingWarnings,
-        provenance: { ...claim.seed.provenance, processedAt: new Date(validClock(options.clock.now())).toISOString() },
+        provenance: { ...claim.seed.provenance, runtimeProfile: connected.runtimeProfile,
+          processedAt: new Date(validClock(options.clock.now())).toISOString() },
+        knownProjects: options.readKnownProjects(),
         audio: { format: claim.seed.recordingFormat, encryption: claim.seed.recordingEncryption,
           durationSeconds: claim.seed.recordingDurationMs / 1000, bytes: claim.seed.recordingBytes,
           sha256: `sha256:${claim.seed.recordingSha256}`, expiresAt: new Date(claim.seed.expiresAtMs).toISOString() },
@@ -271,6 +287,10 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
     } catch (error) {
       poison = new AggregateError([error], "confirmed backfill process cleanup could not be settled");
       throw poison;
+    }
+    if (bodyFailure instanceof PostmeetingProfileMismatch) {
+      const result = reschedule(claim, phase, bodyFailure);
+      return result.kind === "rescheduled" ? { ...result, refusal: "profile_mismatch" } : result;
     }
     if (bodyFailure !== undefined || built === undefined) return reschedule(claim, phase, bodyFailure);
 
