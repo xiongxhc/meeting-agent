@@ -9,6 +9,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { observeProcessSnapshot, processCleanupProof } from "./process-evidence.mjs";
+import { ADMISSION_HELPER_BASENAMES, ADMISSION_HELPER_ROLES, ADMISSION_HELPER_SCHEMA } from "./admission-helper-provenance.mjs";
 
 export function requireIngress(value, reason) { if (!value) throw new Error(`ingress_${reason}`); }
 export function ingressFailure(error, fallback) {
@@ -540,7 +541,18 @@ export function observeIngressInventory(evidence, { result, rootPid, owner, stag
   inventory.outcomes.push(outcome);
   try {
     requireIngress(typeof result?.stdout === "string" && Buffer.byteLength(result.stdout) <= 1048576, "inventory_output_extent");
-    const rows = observeProcessSnapshot(evidence, { result, rootPid, owner, baseline }); outcome.classified = "observed"; return rows;
+    const rows = observeProcessSnapshot(evidence, { result, rootPid, owner, baseline }); outcome.classified = "observed";
+    // Bounded parent edges for owner-rooted samples. Helper attribution needs every sighting to be
+    // the owner's direct child with the role's fixed executable basename; raw comm is not retained.
+    if (!baseline) for (const row of rows) {
+      if (row.pid === rootPid) continue;
+      const edges = evidence.directChildren ??= [], base = row.comm.slice(row.comm.lastIndexOf("/") + 1);
+      const helper = ADMISSION_HELPER_BASENAMES.includes(base) ? base : null;
+      if (edges.some(e => e.owner === owner && e.parentPid === row.ppid && e.pid === row.pid && e.helper === helper)) continue;
+      if (edges.length < 256) edges.push({ owner, parentPid: row.ppid, pid: row.pid, helper });
+      else evidence.directChildrenOverflow = true;
+    }
+    return rows;
   } catch {
     outcome.classified = "refused";
     if (!inventory.failures.includes("process_inventory_unavailable")) inventory.failures.push("process_inventory_unavailable");
@@ -554,19 +566,78 @@ export function ingressProcessProof(evidence, owner, probe) {
   return globalThis.structuredClone(processCleanupProof({ evidence: owned, probe }));
 }
 
-export function assertIngressReopenOrigins(proof, ownerPid) {
+/** Closed owner-side helper record; any extra field, order or shape refuses. */
+export function ingressAdmissionHelperFact(value) {
+  value = ingressData(value);
+  ingressCloseRecord(value, ["schema", "ownerPid", "invalid", "helpers"], ["helpers"]);
+  requireIngress(value.schema === ADMISSION_HELPER_SCHEMA && Number.isSafeInteger(value.ownerPid) && value.ownerPid > 0 && typeof value.invalid === "boolean" &&
+    Array.isArray(value.helpers) && value.helpers.length <= ADMISSION_HELPER_ROLES.length, "admission_helper_record");
+  ingressCloseRows(value.helpers, ["sequence", "role", "pid", "exitObserved", "closeObserved", "code", "signal"]);
+  for (const [index, row] of value.helpers.entries()) requireIngress(row.sequence === index + 1 && row.role === ADMISSION_HELPER_ROLES[index] &&
+    (row.pid === null || Number.isSafeInteger(row.pid) && row.pid > 0) && typeof row.exitObserved === "boolean" && typeof row.closeObserved === "boolean" &&
+    (row.code === null || Number.isInteger(row.code)) && (row.signal === null || /^SIG[A-Z0-9]{1,12}$/.test(row.signal)), "admission_helper_record");
+  requireIngress(new Set(value.helpers.map(row => row.pid)).size === value.helpers.length, "admission_helper_record");
+  return value;
+}
+/** Registered helpers that settled cleanly and are not the owner itself. */
+function settledAdmissionHelpers(helpers, ownerPid) {
+  if (helpers === undefined) return [];
+  const record = ingressAdmissionHelperFact(helpers);
+  if (record.invalid || record.ownerPid !== ownerPid) return [];
+  return record.helpers.filter(row => row.pid !== null && row.pid !== ownerPid && row.exitObserved && row.closeObserved && row.code === 0 && row.signal === null);
+}
+/** Tags an observed phase descendant only when the owner registered it as a settled
+ * lock helper and a sample showed it as the owner's direct child. Never drops a PID. */
+export function attributeIngressAdmissionHelpers(evidence, { role, ownerPid, helpers }) {
+  requireIngress(typeof role === "string" && /^ingress-phase-[0-9]$/.test(role) && Number.isSafeInteger(ownerPid) && ownerPid > 0, "admission_helper_attribution");
+  const tag = `${role}-admission-helper`; let attributed = 0;
+  for (const helper of settledAdmissionHelpers(helpers, ownerPid)) {
+    const row = evidence.observed.find(entry => entry.pid === helper.pid && entry.origins.includes(role));
+    // A reused PID shows up as another parent or executable in some sample and is refused.
+    const sightings = (evidence.directChildren ?? []).filter(edge => edge.owner === role && edge.pid === helper.pid);
+    const basename = ADMISSION_HELPER_BASENAMES[ADMISSION_HELPER_ROLES.indexOf(helper.role)];
+    if (!row || evidence.directChildrenOverflow || !sightings.length || !sightings.every(edge => edge.parentPid === ownerPid && edge.helper === basename)) continue;
+    if (!row.origins.includes(tag)) row.origins.push(tag);
+    attributed++;
+  }
+  return attributed;
+}
+
+/** Exactly one unattributed phase-3 origin, the owner. Any other phase-3 PID must
+ * carry the helper tag and match a settled registered helper in the same record. */
+/** Parent close-time owner proof: helper attribution and the origin oracle only for the reopen owner. */
+export function ingressOwnerCloseProof(evidence, { phasePlan, role, ownerPid, result }, probe) {
+  let failure = false;
+  const reopenOwner = phasePlan?.closedGenerationReopen === true && phasePlan.phase === 3;
+  if (reopenOwner && result?.admissionHelpers !== undefined) {
+    try { attributeIngressAdmissionHelpers(evidence, { role, ownerPid, helpers: result.admissionHelpers }); } catch { failure = true; }
+  }
+  const ownerProcessProof = ingressProcessProof(evidence, role, probe);
+  if (reopenOwner) {
+    try { assertIngressReopenOrigins(ownerProcessProof, ownerPid, result?.admissionHelpers); } catch { failure = true; }
+  }
+  return { ownerProcessProof, failure };
+}
+export function assertIngressReopenOrigins(proof, ownerPid, helpers) {
   proof = ingressReopenProcessFact(proof);
+  const role = "ingress-phase-3", tag = `${role}-admission-helper`;
+  let registered = [];
+  try { registered = settledAdmissionHelpers(helpers, ownerPid).map(row => row.pid); } catch { registered = []; }
+  const owners = proof.pids.filter(row => !row.origins.includes(tag)), attributed = proof.pids.filter(row => row.origins.includes(tag));
+  const samePids = (a, b) => JSON.stringify(a.map(row => row.pid).sort((x, y) => x - y)) === JSON.stringify(b.map(row => row.pid).sort((x, y) => x - y));
   requireIngress(Number.isSafeInteger(ownerPid) && ownerPid > 0 && proof.cleanupConfirmed === true && proof.processInventoryVerified === true &&
-    proof.knownOwnedChildrenReaped === true && proof.pids.length === 1 && proof.pids[0].pid === ownerPid &&
-    proof.pids[0].origins.includes("ingress-phase-3") && proof.probes.length === 1 && proof.probes[0].pid === ownerPid &&
-    proof.probes[0].origins.includes("ingress-phase-3") && proof.probes[0].status === "absent" && proof.children.length === 1 &&
-    proof.children[0].role === "ingress-phase-3" && proof.children[0].pid === ownerPid && proof.children[0].outcome.exitObserved === true &&
+    proof.knownOwnedChildrenReaped === true && owners.length === 1 && owners[0].pid === ownerPid && owners[0].origins.includes(role) &&
+    attributed.length <= ADMISSION_HELPER_ROLES.length && attributed.every(row => row.pid !== ownerPid && row.origins.includes(role) && registered.includes(row.pid)) &&
+    proof.probes.length === proof.pids.length && samePids(proof.probes, proof.pids) &&
+    proof.probes.every(row => row.status === "absent" && row.origins.includes(role) && row.origins.includes(tag) === (row.pid !== ownerPid)) &&
+    proof.children.length === 1 &&
+    proof.children[0].role === role && proof.children[0].pid === ownerPid && proof.children[0].outcome.exitObserved === true &&
     proof.children[0].outcome.code === 0 && proof.children[0].outcome.signal === null, "reopen_process_origins");
 }
 export function ingressReopenPhaseFact(value) {
   value = ingressData(value);
-  ingressCloseRecord(value, ["success", "phase", "root", "databasePath", "state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "processBindingObserved"],
-    ["state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child"]);
+  ingressCloseRecord(value, ["success", "phase", "root", "databasePath", "state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "processBindingObserved", "admissionHelpers"],
+    ["state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "admissionHelpers"]);
   requireIngress(typeof value.success === "boolean" && [1, 2, 3].includes(value.phase) && typeof value.root === "string" && typeof value.databasePath === "string", "reopen_report");
   if (value.state !== undefined) value.state = ingressReopenState(value.state);
   if (value.close !== undefined) {
@@ -597,6 +668,7 @@ export function ingressReopenPhaseFact(value) {
   requireIngress(Array.isArray(value.failures) && value.failures.every(v => typeof v === "string" && /^ingress_[A-Za-z_]{1,120}$/.test(v)), "reopen_report");
   if (value.child !== undefined) ingressCloseRecord(value.child, ["exitObserved", "closeObserved", "code", "signal", "forced", "stdioSettled", "pid"]);
   if (value.ownerProcessProof !== undefined) value.ownerProcessProof = ingressReopenProcessFact(value.ownerProcessProof);
+  if (value.admissionHelpers !== undefined) value.admissionHelpers = ingressAdmissionHelperFact(value.admissionHelpers);
   return value;
 }
 function ingressReopenProcessFact(value) {
@@ -655,7 +727,7 @@ export async function runIngressCampaign(plan, effects, { signal, label = "compo
       const c = result.child;
       requireIngress(c?.closeObserved && c.exitObserved && c.code === 0 && c.signal === null && c.stdioSettled && !c.forced, "child_close");
       requireIngress(result.ownerProcessProof?.cleanupConfirmed === true, "owner_process_cleanup");
-      if (controls.closedGenerationReopen && phase === 3) assertIngressReopenOrigins(result.ownerProcessProof, c.pid);
+      if (controls.closedGenerationReopen && phase === 3) assertIngressReopenOrigins(result.ownerProcessProof, c.pid, result.admissionHelpers);
       if (phase === 1 || controls.closedGenerationReopen) {
         let value;
         if (controls.closedGenerationReopen) {
@@ -776,10 +848,8 @@ async function realMain(argv) {
       if (!ownedPids.every(pid => evidence.observed.some(row => row.pid === pid && row.origins.includes(record.role)))) failure = true;
       result.processBindingObserved = ownedPids.length;
       try { inventory(process.pid, record.role, `phase-${phasePlan.phase}-close`, true); } catch { failure = true; }
-      const ownerProcessProof = ingressProcessProof(evidence, record.role);
-      if (phasePlan.closedGenerationReopen && phasePlan.phase === 3) {
-        try { assertIngressReopenOrigins(ownerProcessProof, child.pid); } catch { failure = true; }
-      }
+      const closeProof = ingressOwnerCloseProof(evidence, { phasePlan, role: record.role, ownerPid: child.pid, result });
+      const ownerProcessProof = closeProof.ownerProcessProof; if (closeProof.failure) failure = true;
       return { ...result, ownerProcessProof, success: result.success && !failure && ownerProcessProof.cleanupConfirmed,
         child: { exitObserved, closeObserved, code, signal: exitSignal, forced, ...(phasePlan.closedGenerationReopen ? { pid: child.pid } : {}),
         stdioSettled: closeObserved && child.stdout.destroyed && child.stderr.destroyed } };

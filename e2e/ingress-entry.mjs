@@ -168,12 +168,14 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
 async function runRealEntry(plan) {
   plan = ingressData(plan); assertIngressSelection(plan);
   // All actual SDK and built composition imports are behind guarded execution.
-  const [sdk, main, configApi, lockApi, composition, httpApi, socketApi, peers, lifecycle] = await Promise.all([
+  const [sdk, main, configApi, lockApi, composition, httpApi, socketApi, peers, lifecycle, childProcess, provenance] = await Promise.all([
     import("@larksuiteoapi/node-sdk"), import("../dist/src/main.js"), import("../dist/src/standalone-config.js"),
     import("../dist/src/adapters/application-owner-lock.js"), import("../dist/src/application-composition.js"),
     import("../dist/src/adapters/feishu-sdk-http.js"), import("../dist/src/adapters/feishu-sdk-connection.js"),
-    import("./feishu-peer.mjs"), import("./composition-lifecycle.mjs"),
+    import("./feishu-peer.mjs"), import("./composition-lifecycle.mjs"), import("node:child_process"), import("./admission-helper-provenance.mjs"),
   ]);
+  // Reopen owner only: record the lock's own helper children for parent origin attribution.
+  const admission = provenance.createReopenAdmission(plan, { childProcessModule: childProcess.default, ownerPid: process.pid });
   const shutdown = new globalThis.AbortController();
   const signal = () => shutdown.abort(); for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(name, signal);
   let peer, app, run, http, connection, standaloneExit, compositionResult, ownerClosed = false, admitted = false, observerFailure = false, overflow = false;
@@ -239,7 +241,7 @@ async function runRealEntry(plan) {
       run = main.runStandalone(["--standalone-config", plan.standaloneConfigPath], {
         readConfig: configApi.readStandaloneConfig, inspectStateRoot: configApi.inspectStateRoot,
         async acquireOwnerLock(root) {
-          const owner = await lockApi.acquireApplicationOwnerLock(root); admitted = true;
+          const owner = await admission.acquire(lockApi, root); admitted = true;
           return { ...owner, close() { owner.close(); ownerClosed = true; } };
         },
         async composeAfterAdmission(config, owner) {
@@ -363,7 +365,10 @@ async function runRealEntry(plan) {
     if (!peerClosePromise) peerClosePromise = peer.close().then(() => { peerClosed = true; });
     return peerClosePromise;
   }
-  try { return await runIngressPhase(plan, effects, { signal: shutdown.signal }); }
+  try {
+    const result = await runIngressPhase(plan, effects, { signal: shutdown.signal });
+    return admission.attach(result);
+  }
   finally { for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.off(name, signal); }
 }
 function readPrivateText(filename) {

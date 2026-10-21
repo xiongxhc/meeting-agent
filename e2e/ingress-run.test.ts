@@ -1037,6 +1037,23 @@ for (const bad of ["extraChild", "wrongOrigin", "historicalPID"]) test(`C third-
   const result = await f.h.runIngressCampaign(f.plan, f.effects); assert.equal(result.success, false); assert.deepEqual(result.failures, ["ingress_reopen_process_origins"]);
 });
 
+for (const bad of [undefined, "noRecord", "untaggedHelper", "unsettledHelper", "ownerMismatch"]) test(`C third-owner registered admission helper ${bad ?? "accepted"} through the campaign transition`, async () => {
+  const tag = "ingress-phase-3-admission-helper";
+  const f = await reopenFixture((stage, v) => {
+    if (stage !== "owner3") return;
+    const p = v.ownerProcessProof as { pids: { pid: number; origins: string[] }[]; probes: { pid: number; origins: string[]; status: string }[] };
+    const origins = bad === "untaggedHelper" ? ["ingress-phase-3"] : ["ingress-phase-3", tag];
+    p.pids.push({ pid: 46, origins }); p.probes.push({ pid: 46, origins, status: "absent" });
+    if (bad !== "noRecord") v.admissionHelpers = { schema: "meeting-ingress-admission-helpers/v1", ownerPid: bad === "ownerMismatch" ? 47 : 45, invalid: false,
+      helpers: [{ sequence: 1, role: "volume_inspection", pid: 46, exitObserved: true, closeObserved: bad !== "unsettledHelper", code: 0, signal: null }] };
+  });
+  const result = await f.h.runIngressCampaign(f.plan, f.effects);
+  if (bad === undefined) {
+    assert.equal(result.success, true, JSON.stringify(result.failures));
+    assert.deepEqual(result.phases[2].ownerProcessProof.pids.map((row: { pid: number }) => row.pid), [45, 46]);
+  } else { assert.equal(result.success, false); assert.deepEqual(result.failures, ["ingress_reopen_process_origins"]); }
+});
+
 test("C real store replay and decoder bytes pass the shared ordinary third-owner consumer", async () => {
   const f = await selectedReaderFixture(), peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
   const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")), decoder = peer.createFeishuFrameReceiver();
