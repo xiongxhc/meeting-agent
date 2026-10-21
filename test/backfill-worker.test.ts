@@ -376,7 +376,9 @@ test("warning worker close awaits its one in-flight durable sink operation", asy
   assert.equal(accepted, 1);
 });
 
-test("real SQLite worker hands off an incomplete initial artifact then a complete reserved retry", async () => {
+for (const outage of [false, true]) test(`real SQLite worker hands off an incomplete initial artifact then a ${outage ? "still incomplete (live recognition outage)" : "complete"} reserved retry`, async () => {
+  const processingWarnings = outage
+    ? [{ code: "live_recognition_outage", detail: "started_at=2026-09-02T14:01:00.000Z;ended_at=2026-09-02T14:02:00.000Z;reason=speech_recognizer" }] : [];
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-backfill-worker-"));
   const recordingsDir = path.join(dir, "recordings"), outboxDir = path.join(dir, "outbox"), receiptsDir = path.join(dir, "receipts");
   mkdirSync(recordingsDir); mkdirSync(outboxDir); mkdirSync(receiptsDir);
@@ -405,7 +407,7 @@ test("real SQLite worker hands off an incomplete initial artifact then a complet
     sha256: capability.sha256, durationMs: 20, format: "pcm_s16le/24000/1/20ms", keyId: capability.keyId,
     gaps: [], runtimeGaps: [],
   }, "bridge", endedAtMs, "bridge_observed", { terminalReason: "ended", terminalSource: "bridge_observed", endedAt,
-    identity, provider: "feishu", encryption: "aes-256-gcm", processingWarnings: [], provenance: {
+    identity, provider: "feishu", encryption: "aes-256-gcm", processingWarnings, provenance: {
       runtimeProfile: "online", sttProvider: "stt", sttModel: "stt-v1", liveStreamModel: "live-v1",
       finalBatchModel: "final-v1", textProvider: "text", textModel: "text-v1", agentVersion: "test" } });
   const recovery = store.getRecordingRecovery(identity.occurrenceId, "bridge", capability.recordingHandle)!;
@@ -474,7 +476,8 @@ test("real SQLite worker hands off an incomplete initial artifact then a complet
     assert.equal(retry.kind, "enqueued");
     if (retry.kind !== "enqueued") throw new Error("retry build was not enqueued");
     assert.equal(retry.revision, 2);
-    assert.equal(store.pending().find(({ revision }) => revision === 2)?.transcriptComplete, true);
+    // A live recognition outage with no final wording to cover it leaves the transcript incomplete; publication still proceeds.
+    assert.equal(store.pending().find(({ revision }) => revision === 2)?.transcriptComplete, !outage);
     assert.equal(transports, 2);
     await worker.close();
   } finally {

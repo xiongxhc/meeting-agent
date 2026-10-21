@@ -16,11 +16,20 @@ export type ChildBridgeOptions = {
   readonly staticConfigPath: string;
   readonly argv?: readonly string[];
   readonly cooperativeGraceMs?: number;
+  /** Test seam: the invalid-control-line rate window (default 5 minutes). */
+  readonly invalidLineWindowMs?: number;
   /** Wire contract for this slot; default v1 keeps the legacy behaviour byte for byte (D026). */
   readonly protocol?: "bridge-session/v1" | "bridge-session/v2";
 };
 
 const PROTOCOLS = ["bridge-session/v1", "bridge-session/v2"] as const;
+/** A control line the validator refuses is dropped, never forwarded, and does
+ * not stop capture. Only a sustained violation is treated as a broken bridge:
+ * more than 8 in a row, or more than 16 within any 5 minutes. A bridge that
+ * misbehaves now and then never loses the meeting however long it runs. */
+const MAX_CONSECUTIVE_INVALID_LINES = 8;
+const MAX_INVALID_LINES_PER_WINDOW = 16;
+const INVALID_LINE_WINDOW_MS = 5 * 60 * 1000;
 
 /** Exactly the `audio` object the accepted Mac executable decodes for feishu-bridge-config/v3. */
 function validAudio(value: unknown): boolean {
@@ -100,6 +109,9 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
     }
     const validator = v2 ? createBridgeSessionValidatorV2(binding.bridgeSessionId) : createBridgeSessionValidator(binding.bridgeSessionId);
     const listeners = new Set<(raw: unknown) => void>();
+    const closedListeners = new Set<() => void>();
+    let invalidLines = 0, consecutiveInvalid = 0, protocolViolation = false, discarding = false;
+    const recentInvalid: number[] = [];
     const pending = new Map<() => void, number>();
     let pendingBytes = 0, sentCount = 0, stopping = false, reaped = false, exited = false;
     let failure: BridgeProcessFailure | null = null;
@@ -122,25 +134,43 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
       if (signal !== null) failure ??= "child_failed";
       else if (code !== 0) exitDiagnostic = "nonzero_exit";
     });
-    child.on("close", () => { reaped = true; closeResolve(); settleSends(); });
+    child.on("close", () => {
+      reaped = true; closeResolve(); settleSends();
+      // After stdout has ended, so every line the child wrote was delivered first.
+      const notify = [...closedListeners]; closedListeners.clear();
+      for (const listener of notify) { try { listener(); } catch { /* a listener's failure is its own */ } }
+    });
     child.stdin!.on("error", () => { settleSends(); if (!stopping) fail("protocol_failed"); });
     child.stdout!.on("error", () => fail("protocol_failed"));
     child.stderr!.on("error", () => fail("protocol_failed"));
-    child.stderr!.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; if (stderrBytes > 8192) fail("protocol_failed"); });
+    // Drained and counted; diagnostic volume never stops capture.
+    child.stderr!.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; });
+    function invalidLine(): boolean {
+      invalidLines += 1; consecutiveInvalid += 1; protocolViolation = true;
+      const now = performance.now();
+      recentInvalid.push(now);
+      while (recentInvalid.length > 0 && now - recentInvalid[0]! > (options.invalidLineWindowMs ?? INVALID_LINE_WINDOW_MS)) recentInvalid.shift();
+      if (consecutiveInvalid > MAX_CONSECUTIVE_INVALID_LINES || recentInvalid.length > MAX_INVALID_LINES_PER_WINDOW) { fail("protocol_failed"); return false; }
+      return true;
+    }
     child.stdout!.on("data", (chunk: Buffer) => {
       if (failure !== null) return;
       for (const byte of chunk) {
         if (byte !== 10) {
-          if (stdoutLength >= stdout.length) { fail("protocol_failed"); return; }
+          if (discarding) continue;
+          if (stdoutLength >= stdout.length) { discarding = true; stdoutLength = 0; if (!invalidLine()) return; continue; }
           stdout[stdoutLength++] = byte; continue;
         }
+        if (discarding) { discarding = false; continue; }
+        let raw: unknown, valid = false;
         try {
-          const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(stdout.subarray(0, stdoutLength)));
-          const result = validator.acceptEvent(raw);
-          if (!result.ok) throw new Error("invalid_control");
-          for (const listener of listeners) listener(raw);
-        } catch { fail("protocol_failed"); return; }
+          raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(stdout.subarray(0, stdoutLength)));
+          valid = validator.acceptEvent(raw).ok;
+        } catch { valid = false; }
         stdoutLength = 0;
+        if (!valid) { if (!invalidLine()) return; continue; }
+        consecutiveInvalid = 0;
+        for (const listener of listeners) listener(raw);
       }
     });
     child.stdout!.on("end", () => { if (stdoutLength !== 0) fail("protocol_failed"); });
@@ -174,6 +204,9 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
           }
         }
         let outcome: BridgeShutdownResult["outcome"] = null;
+        // Tolerated while live, but an invalid control plane still blocks
+        // custody clearing (private custody contract).
+        if (protocolViolation) failure ??= "protocol_failed";
         if (!reaped) failure = "reap_failed";
         if (failure === null) {
           try {
@@ -193,7 +226,7 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
       })();
       return shutdownPromise;
     }
-    return { shutdown, bridge: {
+    return { shutdown, controlNoise: () => ({ invalidLines, stderrBytes }), bridge: {
       send(message) {
         if (stopping || exited || reaped) return Promise.reject(new Error("bridge_closed"));
         const bytes = Buffer.from(JSON.stringify(message) + "\n");
@@ -212,6 +245,10 @@ export function createChildBridgeSlot(options: ChildBridgeOptions): BridgeProces
         });
       },
       subscribe(listener) { if (stopping) return () => {}; listeners.add(listener); return () => { listeners.delete(listener); }; },
+      onClosed(listener: () => void) {
+        if (reaped) { queueMicrotask(listener); return () => {}; }
+        closedListeners.add(listener); return () => { closedListeners.delete(listener); };
+      },
     } };
   } };
 }

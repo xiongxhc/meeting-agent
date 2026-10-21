@@ -7,12 +7,21 @@
 //   anything else: command_result rejected;
 //   stdin EOF:     writes the private outcome on fd 3 (departure_unconfirmed
 //                  after a join, no_join_action otherwise) and exits 0;
-//   hung:          ignores SIGTERM and never exits cooperatively.
+//   hung:          ignores SIGTERM and never exits cooperatively;
+//   noisy:         around the join answer also writes one malformed line, one
+//                  oversized line, one replayed sequence and 64 KiB of stderr;
+//   garbage:       answers the join with nine malformed lines and stays up;
+//   dense:         after the join answer, 17 malformed lines each followed by a
+//                  valid one;
+//   spread:        10 such pairs, a 400 ms pause, 10 more, then one valid line;
+//   crash:         answers the join, then exits 3 without an outcome;
+//   media:         reports connect_media as connected (owns no media stack).
 import { readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
-import { setInterval } from "node:timers";
+import { setInterval, setTimeout } from "node:timers";
+import { Buffer } from "node:buffer";
 
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const bytes = readFileSync(configPath);
@@ -30,7 +39,15 @@ const timing = { clockDomainId: "synthetic-clock", hostBeforeNs: "1000000000", h
 let sequence = 0, joined = false;
 function emit(payload) {
   sequence += 1;
-  writeSync(1, JSON.stringify({ schema: "bridge-session/v2", sessionId, sequence, observedAt: "2026-09-02T14:01:00.000Z", ...payload }) + "\n");
+  writeAll(1, JSON.stringify({ schema: "bridge-session/v2", sessionId, sequence, observedAt: "2026-09-02T14:01:00.000Z", ...payload }) + "\n");
+}
+// Pipes may be non-blocking: retry until every byte is written, in order.
+function writeAll(fd, text) {
+  const bytes = Buffer.from(text);
+  for (let offset = 0; offset < bytes.length;) {
+    try { offset += writeSync(fd, bytes, offset, Math.min(8192, bytes.length - offset)); }
+    catch (error) { if (error.code !== "EAGAIN") throw error; }
+  }
 }
 function result(command, outcome, detail) { emit({ type: "command_result", commandId: command.commandId, outcome, detail }); }
 if (config.bundleVersion === "hung") {
@@ -42,10 +59,26 @@ if (config.bundleVersion === "hung") {
   lines.on("line", (line) => {
     const command = JSON.parse(line);
     if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) process.exit(9);
-    if (command.type === "join") {
+    if (command.type === "join" && config.bundleVersion === "garbage") {
+      for (let index = 0; index < 9; index += 1) writeSync(1, "not-json\n");
+    } else if (command.type === "join") {
       joined = true;
+      const noisy = config.bundleVersion === "noisy";
+      if (noisy) { writeAll(2, "x".repeat(65_536)); writeAll(1, "not-json\n"); }
       emit({ type: "joined", meetingOccurrenceId: command.meetingOccurrenceId, observationTiming: timing, observationTimingReason: null });
+      if (noisy) {
+        writeAll(1, "y".repeat(200_000) + "\n");
+        writeSync(1, JSON.stringify({ schema: "bridge-session/v2", sessionId, sequence, observedAt: "2026-09-02T14:01:00.000Z", type: "chat_disclosure", outcome: "sent" }) + "\n");
+      }
       emit({ type: "ui_snapshot", snapshotSequence: 1, observationTiming: timing, state: "unknown", feishuUserId: null, reason: "no_highlight", barrierBefore: "stream_start" });
+      result(command, "ok", null);
+      if (config.bundleVersion === "crash") process.exit(3);
+      const pairs = (count) => { for (let index = 0; index < count; index += 1) { writeAll(1, "not-json\n"); emit({ type: "chat_disclosure", outcome: "sent" }); } };
+      if (config.bundleVersion === "dense") pairs(17);
+      if (config.bundleVersion === "spread") { pairs(10); setTimeout(() => { pairs(10); emit({ type: "chat_disclosure", outcome: "failed" }); }, 400); }
+    } else if (command.type === "connect_media" && config.bundleVersion === "media") {
+      // Stands in for a bridge whose media stack connected; no media is sent.
+      emit({ type: "media_connected", endpoint: command.mediaLease.connectEndpoint });
       result(command, "ok", null);
     } else if (command.type === "connect_media") result(command, "failed", "synthetic bridge owns no media stack");
     else result(command, "rejected", "unsupported by the synthetic bridge");

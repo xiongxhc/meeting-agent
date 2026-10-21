@@ -25,7 +25,7 @@ import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
 import { createFeishuSocketOwner } from "../src/adapters/feishu-sdk-connection.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { MAINTENANCE_LANES } from "../src/application-maintenance.ts";
-import { composeApplication, stateDatabasePath, RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST, type ComposeApplicationOptions, type ComposedApplication } from "../src/application-composition.ts";
+import { composeApplication, defaultBridgeRecoveryDelayMs, stateDatabasePath, RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST, type ComposeApplicationOptions, type ComposedApplication } from "../src/application-composition.ts";
 import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
 import type { BridgeProcessSlot, BridgeShutdownResult, OwnedBridgeProcess } from "../src/ports/bridge-process.ts";
 import type { FeishuOrganizerLookup } from "../src/ports/feishu.ts";
@@ -93,6 +93,8 @@ type RuntimeScript = {
   /** Keep connect pending: never push ready. */
   holdReady?: boolean;
   startMode?: "accept" | "reject" | "hang";
+  /** Per owner (0-based creation order); overrides startMode. */
+  startModeFor?: (index: number) => "accept" | "reject" | "hang";
   /** already_ended: the gateway ends the voice session before stop is asked. */
   /** reject_as_inactive: the gateway rejects stop with the SDK's own "no longer
    * active" wording but never routed a terminal; that is a stop failure. */
@@ -119,6 +121,8 @@ function scriptedRuntimes(script: RuntimeScript) {
   let next = 100n;
   const factory: NonNullable<ComposeApplicationOptions["startRuntimeTransport"]> = async () => {
     const transport = new RuntimeTestTransport();
+    const ownerIndex = Number(next - 100n);
+    const startMode = script.startModeFor?.(ownerIndex) ?? script.startMode ?? "accept";
     const controlSessionId = next++;
     const id = controlSessionId.toString();
     const handle = id.padStart(32, "0").replaceAll(/[^0-9a-f]/g, "a");
@@ -135,8 +139,8 @@ function scriptedRuntimes(script: RuntimeScript) {
           accept();
           transport.push({ type: "status", protocol_version: 4, request_id: command.requestId, status: readyStatus }); return;
         case "start_drainable_timed_voice_session":
-          if ((script.startMode ?? "accept") === "hang") return;
-          if (script.startMode === "reject") {
+          if (startMode === "hang") return;
+          if (startMode === "reject") {
             transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "scripted start rejection" } }); return;
           }
           accept();
@@ -208,12 +212,15 @@ type ScriptedSlot = BridgeProcessSlot & {
   emit(event: Record<string, unknown>): void;
   left(reason: "ended" | "removed" | "bridge_failure", timing?: boolean): void;
   resolveLaunch(): void;
+  /** The child process ends without a `left`. */
+  crash(): void;
 };
 
 function scriptedSlot(index: number, script: SlotScript = {}): ScriptedSlot {
   const launches: CustodyBinding[] = [];
   const sent: BridgeCommandMessageV2[] = [];
   let listener: ((raw: unknown) => void) | undefined, sequence = 0, shutdowns = 0, binding: CustodyBinding | undefined;
+  let closedListener: (() => void) | undefined;
   let releaseLaunch: (() => void) | undefined;
   const pending = new Promise<void>((resolve) => { releaseLaunch = resolve; });
   const timing = { clockDomainId: "domain", hostBeforeNs: "0", hostAfterNs: "1" };
@@ -222,12 +229,14 @@ function scriptedSlot(index: number, script: SlotScript = {}): ScriptedSlot {
     physicalClientId: `mac-${index}`, bridgeId: `bridge-${index}`, launches, shutdowns: () => shutdowns, sent: () => sent, emit,
     left(reason, withTiming = true) { emit({ type: "left", reason, observationTiming: withTiming ? timing : null, observationTimingReason: withTiming ? null : "timing_unavailable" }); },
     resolveLaunch() { releaseLaunch?.(); },
+    crash() { const notify = closedListener; closedListener = undefined; notify?.(); },
     async launch(value) {
       script.onLaunch?.(value);
       launches.push(value); binding = value;
       if (script.launchMode === "pending") await pending;
       const bridge = {
         subscribe(callback: (raw: unknown) => void) { listener = callback; return () => { listener = undefined; }; },
+        onClosed(callback: () => void) { closedListener = callback; return () => { if (closedListener === callback) closedListener = undefined; }; },
         async send(command: BridgeCommandMessageV2) {
           sent.push(command);
           if (command.type === "join") {
@@ -525,7 +534,8 @@ test("real v2 children: the timed join reaches joined, the owner lock descriptor
   const audio = { captureDisplayId: 1, outputDeviceUid: "synthetic-output-device" };
   for (const name of ["bridge-v2-hung", "bridge-v2-clean", "bridge-v2-view"]) mkdirSync(path.join(f.dir, name));
   writeFileSync(path.join(f.dir, "bridge-hung.json"), JSON.stringify({ schema: "feishu-bridge-config/v1", bundleVersion: "hung", evidenceRoot: path.join(f.dir, "bridge-v2-hung"), audio }), { mode: 0o600 });
-  writeFileSync(path.join(f.dir, "bridge-clean.json"), JSON.stringify({ schema: "feishu-bridge-config/v1", bundleVersion: "clean", evidenceRoot: path.join(f.dir, "bridge-v2-clean"), audio }), { mode: 0o600 });
+  // A media-connecting child: a failed connect_media now ends the generation for recovery.
+  writeFileSync(path.join(f.dir, "bridge-clean.json"), JSON.stringify({ schema: "feishu-bridge-config/v1", bundleVersion: "media", evidenceRoot: path.join(f.dir, "bridge-v2-clean"), audio }), { mode: 0o600 });
   writeFileSync(path.join(f.dir, "bridge-view.json"), JSON.stringify({ schema: "feishu-bridge-config/v1", bundleVersion: "no-join", evidenceRoot: path.join(f.dir, "bridge-v2-view"), audio }), { mode: 0o600 });
   writeFileSync(path.join(f.dir, "bridge-no-audio.json"), JSON.stringify({ schema: "feishu-bridge-config/v1", bundleVersion: "clean", evidenceRoot: path.join(f.dir, "bridge-v2-clean") }), { mode: 0o600 });
   const v2Child = path.resolve("test/fixtures/bridge-v2-child.mjs");
@@ -1100,7 +1110,7 @@ for (const count of [1, 2, 4, 8]) {
     try {
       // Lanes are driven explicitly here; no cadence tick may depend on how long the run takes.
       const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots, metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
-        maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) } });
+        maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) }, bridgeRecoveryDelayMs: () => 0 });
       await app.start();
       const tick = await app.discover();
       assert.equal(tick.launched, count); assert.equal(tick.deferred, 1);
@@ -1126,8 +1136,12 @@ for (const count of [1, 2, 4, 8]) {
       // One failed bridge (the last), the rest end positively.
       const failing = bySlot[bySlot.length - 1]!;
       failing.slot.left("bridge_failure");
-      await app.awaitOccurrence(failing.occurrenceId);
+      // The failed bridge's meeting is recovered on its own slot by a new generation.
+      await until(() => failing.slot.launches.length === 2 && failing.slot.sent().filter((command) => command.type === "connect_media").length === 2, 5000);
       for (const entry of bySlot.slice(0, -1)) assert.ok(app.liveOccurrenceIds().includes(entry.occurrenceId), "a failed bridge cannot cancel the others");
+      assert.equal((await app.discover()).launched, 0, "the recovering occurrence keeps its slot");
+      failing.slot.left("ended");
+      await app.awaitOccurrence(failing.occurrenceId);
       const second = await app.discover();
       assert.equal(second.launched, count > 0 ? 1 : 0, "the deferred occurrence takes the freed slot");
       for (const entry of bySlot.slice(0, -1)) { entry.slot.left("ended"); await app.awaitOccurrence(entry.occurrenceId); }
@@ -1138,7 +1152,8 @@ for (const count of [1, 2, 4, 8]) {
           assert.ok(seed); assert.equal(seed.capability.recordingHandle, entry.runtime.handle);
           assert.equal(seed.capability.sourceSessionId, entry.runtime.controlSessionId);
         }
-        assert.equal(store.getSession(failing.occurrenceId)?.state, "listening", "a bridge_failure generation keeps the occurrence recoverable");
+        assert.equal(store.getSession(failing.occurrenceId)?.state, "finalizing", "the recovered generation ends the meeting normally");
+        assert.ok(store.getBridgeFailureRecording(failing.occurrenceId, 1), "the failed generation's recording is kept");
         const excess = ids[count]!;
         assert.equal(app.liveOccurrenceIds().includes(excess), true);
       } finally { store.close(); }
@@ -1146,3 +1161,286 @@ for (const count of [1, 2, 4, 8]) {
     } finally { f.close(); }
   });
 }
+
+// ---------------------------------------------------------------------------
+// 7. Generation recovery: bounded relaunch with backoff
+// ---------------------------------------------------------------------------
+
+async function recoveringOccurrence(f: Fixture, slotScript: SlotScript = {}) {
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed", ...slotScript });
+  const [id] = await admitted(f, 1);
+  const delays: number[] = [];
+  const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+    bridgeRecoveryDelayMs: (attempt) => { delays.push(attempt); return 0; } });
+  await app.start();
+  assert.equal((await app.discover()).launched, 1);
+  const connects = () => slot.sent().filter((command) => command.type === "connect_media").length;
+  await until(() => connects() === 1);
+  return { app, slot, runtimes, id: id!, delays, connects };
+}
+
+test("a bridge_failure generation is relaunched on the same slot after backoff with a fresh Runtime owner, and the meeting's end seeds one publication of both generations", async () => {
+  const f = fixture();
+  try {
+    const { app, slot, runtimes, id, delays, connects } = await recoveringOccurrence(f);
+    slot.left("bridge_failure");
+    await until(() => slot.launches.length === 2 && connects() === 2, 5000);
+    assert.deepEqual(delays, [1], "one backoff before the first retry");
+    assert.equal(runtimes.owned.length, 2, "each generation has its own Runtime owner");
+    assert.notEqual(slot.launches[1]!.bridgeSessionId, slot.launches[0]!.bridgeSessionId);
+    assert.deepEqual(app.liveOccurrenceIds(), [id]);
+    slot.left("ended");
+    const outcome = await app.awaitOccurrence(id);
+    assert.equal(outcome.generations, 2);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id)?.state, "finalizing");
+      const failed = store.getBridgeFailureRecording(id, 1);
+      assert.equal(failed?.handle, runtimes.owned[0]!.handle, "the first generation's recording is persisted");
+      // The first generation never reported media, so its loss starts at its own start; the
+      // second generation's open transition gap is clamped to the occurrence start.
+      assert.deepEqual(failed?.gaps.map((gap) => [gap.direction, gap.endedAt]), [["capture", null]]);
+      const seed = store.getBackfillSeed(id);
+      assert.ok(seed, "the recovered generation seeds publication");
+      assert.equal(seed.capability.recordingHandle, runtimes.owned[1]!.handle);
+      assert.deepEqual(seed.bridgeGaps.map((gap) => [gap.direction, gap.endedAt]), [["capture", null]]);
+      assert.ok(Date.parse(seed.bridgeGaps[0]!.startedAt) >= Date.parse(seed.occurrenceStartedAt), "inside the meeting window");
+      assert.deepEqual(store.listRecordingGenerations(id).map((generation) => generation.recordingHandle), runtimes.owned.map((runtime) => runtime.handle),
+        "both generations are available to the publication");
+      assert.ok(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt: 1 }), "the earlier recording keeps a deletion deadline");
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("a crashed bridge child (no confirmed departure) keeps its client quarantined, so nothing relaunches, and what it recorded is still published", async () => {
+  const f = fixture();
+  try {
+    const { app, slot, runtimes, id } = await recoveringOccurrence(f, { outcome: "outcome_missing" });
+    slot.crash();
+    const outcome = await app.awaitOccurrence(id);
+    assert.ok(runtimes.owned[0]!.commands().includes("finalize_recording"), "what the dead generation captured is finalized");
+    assert.equal(slot.launches.length, 1, "an unconfirmed physical client is never reused");
+    assert.equal(outcome.failure, "physical_client_quarantined");
+    assert.equal(runtimes.owned.length, 2, "a quarantined client is refused once, never retried");
+    const store = f.reopen();
+    try {
+      assert.equal(store.listPhysicalCustody()[0]?.state, "quarantined");
+      assert.equal(store.getSession(id)?.state, "finalizing", "published, not failed");
+      const seed = store.getBackfillSeed(id);
+      assert.equal(seed?.capability.recordingHandle, runtimes.owned[0]!.handle);
+      assert.deepEqual(seed?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"), [{ code: "meeting_end_unobserved", detail: "bridge_recovery_failed" }]);
+      assert.equal(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt: 1 }), null, "the shipped recording is owned by the publication");
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("relaunch is bounded: past the retry limit the stored generations are published and the slot is freed", async () => {
+  const f = fixture();
+  try {
+    const { app, slot, id, delays, connects } = await recoveringOccurrence(f);
+    for (let generation = 1; generation <= 3; generation += 1) {
+      await until(() => connects() === generation, 5000);
+      slot.left("bridge_failure");
+    }
+    const outcome = await app.awaitOccurrence(id);
+    assert.equal(outcome.generations, 3);
+    assert.deepEqual(delays, [1, 2]);
+    assert.deepEqual(app.liveOccurrenceIds(), []);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id)?.state, "finalizing");
+      for (const attempt of [1, 2, 3]) assert.ok(store.getBridgeFailureRecording(id, attempt), `attempt ${attempt} recording kept`);
+      const seed = store.getBackfillSeed(id);
+      assert.deepEqual(seed?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"), [{ code: "meeting_end_unobserved", detail: "bridge_failure_exhausted" }]);
+      // Equal durations: the latest generation ships; the others keep their 14-day deadline.
+      assert.equal(seed?.capability.recordingHandle, store.getBridgeFailureRecording(id, 3)?.handle);
+      for (const attempt of [1, 2]) assert.ok(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt }), `attempt ${attempt} custody`);
+      assert.equal(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt: 3 }), null);
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("a relaunch the physical client refuses publishes what was recorded instead of leaving the row listening", async () => {
+  const f = fixture();
+  try {
+    const { app, slot, id } = await recoveringOccurrence(f, { outcome: "outcome_missing" });
+    slot.left("bridge_failure");
+    const outcome = await app.awaitOccurrence(id);
+    assert.equal(slot.launches.length, 1, "an unconfirmed physical client is never reused");
+    assert.equal(outcome.failure, "physical_client_quarantined");
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id)?.state, "finalizing");
+      assert.deepEqual(store.getBackfillSeed(id)?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"),
+        [{ code: "meeting_end_unobserved", detail: "bridge_recovery_failed" }]);
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("shutdown during the relaunch backoff publishes what was recorded and never launches again", async () => {
+  const f = fixture();
+  try {
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+    const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+    const [id] = await admitted(f, 1);
+    const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+      bridgeRecoveryDelayMs: () => 60_000 });
+    await app.start();
+    await app.discover();
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    slot.left("bridge_failure");
+    await until(() => slot.shutdowns() === 1);
+    await pause(20);
+    // The retention sweep never adopts the capture rows of an occurrence waiting to relaunch.
+    await app.maintenanceTick("custody");
+    { const store = f.reopen(); try { assert.equal(store.getSession(id!)?.state, "listening"); } finally { store.close(); } }
+    assert.ok(existsSync(runtimes.owned[0]!.recordingPath), "the failed generation's recording is kept while relaunching");
+    await app.close();
+    const outcome = app.occurrenceOutcomes().find((value) => value.occurrenceId === id)!;
+    assert.equal(outcome.failure, "application_closed");
+    assert.equal(slot.launches.length, 1);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id!)?.state, "finalizing");
+      assert.deepEqual(store.getBackfillSeed(id!)?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"),
+        [{ code: "meeting_end_unobserved", detail: "application_closed" }]);
+    } finally { store.close(); }
+  } finally { f.close(); }
+});
+
+test("a relaunch the Runtime refuses is retried within the bound, with the earlier capture loss still the gap", async () => {
+  const f = fixture();
+  try {
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, startModeFor: (index) => index === 1 ? "reject" : "accept" });
+    const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+    const [id] = await admitted(f, 1);
+    const log: string[] = [];
+    const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]),
+      clock: { now: () => 10_000 }, bridgeRecoveryDelayMs: () => 0 });
+    await app.start();
+    await app.discover();
+    const connects = () => slot.sent().filter((command) => command.type === "connect_media").length;
+    await until(() => connects() === 1);
+    slot.left("bridge_failure");
+    await until(() => connects() === 2, 5000);
+    assert.equal(runtimes.owned.length, 3, "the refused owner was followed by a fresh one");
+    assert.ok(log.includes("occurrence_bridge_relaunch_refused"), "the refusal is never silent");
+    slot.left("ended");
+    const outcome = await app.awaitOccurrence(id!);
+    assert.equal(outcome.generations, 3);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id!)?.state, "finalizing");
+      const seed = store.getBackfillSeed(id!);
+      assert.equal(seed?.capability.recordingHandle, runtimes.owned[2]!.handle);
+      assert.deepEqual(seed?.bridgeGaps.map((gap) => [gap.direction, gap.endedAt]), [["capture", null]], "the gap since the first generation's loss");
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("relaunches are bounded at four: a Runtime that keeps refusing ends in publication of what was recorded", async () => {
+  const f = fixture();
+  try {
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, startModeFor: (index) => index === 0 ? "accept" : "reject" });
+    const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+    const [id] = await admitted(f, 1);
+    const log: string[] = [];
+    const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]),
+      clock: { now: () => 10_000 }, bridgeRecoveryDelayMs: () => 0 });
+    await app.start();
+    await app.discover();
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    slot.left("bridge_failure");
+    const outcome = await app.awaitOccurrence(id!);
+    assert.equal(runtimes.owned.length, 5, "the first generation and exactly four relaunches");
+    assert.equal(outcome.generations, 5);
+    assert.equal(log.filter((code) => code === "occurrence_bridge_relaunch_refused").length, 3);
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id!)?.state, "finalizing");
+      assert.deepEqual(store.getBackfillSeed(id!)?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"),
+        [{ code: "meeting_end_unobserved", detail: "bridge_recovery_failed" }]);
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});
+
+test("after a crash in the middle of a relaunched meeting, the restart sweep publishes what was recorded instead of failing it", async () => {
+  const f = fixture();
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+  const [id] = await admitted(f, 1);
+  // The first process: generation 1 fails, generation 2 is running when the process "dies"
+  // (it is simply abandoned, so nothing it holds settles).
+  const crashed = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+    bridgeRecoveryDelayMs: () => 0, maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) } });
+  try {
+    await crashed.start();
+    await crashed.discover();
+    const connects = () => slot.sent().filter((command) => command.type === "connect_media").length;
+    await until(() => connects() === 1);
+    slot.left("bridge_failure");
+    await until(() => connects() === 2, 5000);
+    // The restarted process: its start sweep finds the listening row and the open generation.
+    const log: string[] = [];
+    const restarted = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir }).factory,
+      bridgeSlots: [scriptedSlot(1)], metadata: resolvedLookup(["900000001"]), clock: { now: () => 20_000 },
+      maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) } });
+    await restarted.start();
+    assert.ok(log.includes("retention_capture_published"));
+    assert.ok(!log.includes("retention_capture_adopted"), "the meeting is not failed");
+    const store = f.reopen();
+    try {
+      assert.equal(store.getSession(id!)?.state, "finalizing");
+      const seed = store.getBackfillSeed(id!);
+      assert.equal(seed?.capability.recordingHandle, runtimes.owned[0]!.handle, "generation 1's recording ships");
+      assert.deepEqual(seed?.processingWarnings, [{ code: "meeting_end_unobserved", detail: "capture_interrupted" }]);
+      assert.equal(seed?.provenance.sttProvider, "unavailable_current_sdk", "nothing a Runtime status would supply is invented");
+      assert.equal(store.listOpenCaptureRows().generations.length, 0, "the interrupted generation was completed first");
+    } finally { store.close(); }
+    await restarted.close();
+  } finally {
+    await crashed.close().catch(() => undefined);
+    f.close();
+  }
+});
+
+test("the default backoff grows and is capped", () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 9].map(defaultBridgeRecoveryDelayMs), [1000, 2000, 4000, 8000, 10000, 10000]);
+});
+
+test("recognition outages are persisted with start, end and reason class in the seed the publication is built from; the recording is untouched", async () => {
+  const f = fixture();
+  try {
+    const { app, slot, runtimes, id } = await liveOccurrence(f);
+    const runtime = runtimes.owned[0]!, session = runtime.controlSessionId.toString();
+    const fail = () => runtime.deliver({ type: "voice_session_failed", session_id: session, recovery: "continue_session",
+      error: { code: "adapter_failure", kind: "adapter", stage: "speech_recognizer", message: "synthetic recognizer failure" } });
+    fail();
+    runtime.deliver({ type: "voice_transcript_final", session_id: session, segment_id: "7001", turn_id: null, text: "recognition is back", capture_unavailable_reason: "provider_offsets_unavailable" });
+    fail();
+    await pause(20);
+    assert.equal(runtime.commands().includes("finalize_recording"), false, "a recognition outage never finalizes");
+    assert.equal(slot.sent().some((command) => command.type === "leave"), false, "nor tells the bridge to leave");
+    slot.left("ended");
+    await app.awaitOccurrence(id);
+    const store = f.reopen();
+    try {
+      const seed = store.getBackfillSeed(id);
+      assert.ok(seed);
+      const at = new Date(10_000).toISOString();
+      assert.deepEqual(seed.processingWarnings, [
+        { code: "live_recognition_outage", detail: `started_at=${at};ended_at=${at};reason=speech_recognizer` },
+        { code: "live_recognition_outage", detail: `started_at=${at};ended_at=${OBSERVED_AT};reason=speech_recognizer` },
+      ]);
+      assert.deepEqual(seed.bridgeGaps, [], "the recording has no gap");
+    } finally { store.close(); }
+    await app.close();
+  } finally { f.close(); }
+});

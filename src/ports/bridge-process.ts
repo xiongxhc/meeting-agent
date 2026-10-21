@@ -13,6 +13,9 @@ export type OwnedBridgeProcess = {
   readonly bridge: BridgeTransport;
   /** Idempotent, awaited, bounded cleanup; never equates exit with departure. */
   shutdown(): Promise<BridgeShutdownResult>;
+  /** Control-plane noise tolerated so far: dropped invalid stdout lines and
+   * drained stderr bytes. Counts only, never content. */
+  controlNoise?(): { readonly invalidLines: number; readonly stderrBytes: number };
 };
 export type BridgeProcessSlot = {
   readonly physicalClientId: string;

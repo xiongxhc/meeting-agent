@@ -85,6 +85,9 @@ import {
   type ReconciliationLiveSegmentRow,
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
+  type StoredRecordingGeneration,
+  type PublishStoredGenerationsInput,
+  type PublishStoredGenerationsResult,
   type DeliveryRow,
   type PublicationRefusalInput,
   type AcceptPublicationInput,
@@ -278,6 +281,8 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     purgeExpiredTimedEvidenceBatch: (nowMs) => purgeExpiredTimedEvidenceBatch(db, nowMs),
     recordBridgeFailure: (input) => recordBridgeFailure(db, input),
     getBridgeFailureRecording: (occurrenceId, attempt) => getBridgeFailureRecording(db, occurrenceId, attempt),
+    listRecordingGenerations: (occurrenceId) => listRecordingGenerations(db, occurrenceId),
+    publishStoredGenerations: (input) => publishStoredGenerations(db, input),
     savePending: (row, authority) => savePendingDelivery(db, row, authority, options.deliveryIdentityCheckpoint),
     pending: () => deliveryRows(db, "active"),
     recoverablePublications: () => deliveryRows(db, "deleted_with_recovery"),
@@ -1115,6 +1120,14 @@ function prepareBackfillSeed(db: Database.Database, value: FinalizeSessionInput)
       value.recording.recovery.bridgeSessionId !== value.reconciliationBridgeSessionId) {
     throw seedViolation("backfill seed end, occurrence or generation mismatch");
   }
+  return prepareSeedFields(db, input, value.recording, value.transition.occurrenceId, value.reconciliationBridgeSessionId, endedAtMs);
+}
+
+/** Validation and encoding shared by every seed: the bridge-observed end and a
+ * publication after the bridge-failure retries ran out. */
+function prepareSeedFields(db: Database.Database, input: BackfillSeedFinalizationInput, recording: RecordingInput,
+  occurrenceId: string, bridgeSessionId: string, endedAtMs: number, gapsForSeed: RecordingInput["gaps"] = recording.gaps): PreparedBackfillSeed {
+  const value = { recording, transition: { occurrenceId }, reconciliationBridgeSessionId: bridgeSessionId };
   const stopAtMs = endedAtMs + BACKFILL_STOP_MS;
   const expiresAtMs = endedAtMs + BACKFILL_EXPIRY_MS;
   if (!Number.isSafeInteger(stopAtMs) || !Number.isSafeInteger(expiresAtMs)) throw seedViolation("backfill seed deadline overflow");
@@ -1145,7 +1158,7 @@ function prepareBackfillSeed(db: Database.Database, value: FinalizeSessionInput)
         !/^[a-z][a-z0-9_]{0,39}$/.test(warning.code)) throw seedViolation("invalid backfill seed processing warning");
     boundedSeedText(warning.detail, "processing warning detail", 500, 2000);
   }
-  const bridgeGapsJson = boundedSeedJson(value.recording.gaps, "bridge gaps");
+  const bridgeGapsJson = boundedSeedJson(gapsForSeed, "bridge gaps");
   const runtimeGapsJson = boundedSeedJson(value.recording.runtimeGaps.map((gap) => ({
     startedAtMs: gap.startedAtMs.toString(), endedAtMs: gap.endedAtMs?.toString() ?? null, reason: gap.reason,
   })), "runtime gaps");
@@ -3002,6 +3015,7 @@ function recordBridgeFailure(
     readonly maxRetries: number;
     readonly gaps: FinalizeSessionInput["recording"]["gaps"];
     readonly recording: FinalizeSessionInput["recording"] | null;
+    readonly deferExhaustion?: boolean;
   },
 ): BridgeRecoveryResult {
   const run = db.transaction(() => withConstraintTranslation(() => {
@@ -3040,7 +3054,8 @@ function recordBridgeFailure(
       bindRecordingRecovery(db, input.occurrenceId, input.recording, attempt);
     }
     const retryAllowed = attempt <= input.maxRetries;
-    if (!retryAllowed) {
+    // Deferred: the caller publishes what was recorded, then ends the row.
+    if (!retryAllowed && input.deferExhaustion !== true) {
       // This nested transaction is a SQLite savepoint: the failure count,
       // failed-generation evidence, and terminal occurrence edge commit or
       // roll back together.
@@ -3087,6 +3102,66 @@ function getBridgeFailureRecording(
 }
 
 type RuntimeGapInput = FinalizeSessionInput["recording"]["runtimeGaps"];
+
+/** Every finalized generation of an occurrence that has a private recovery
+ * binding, in order: failed attempts by attempt number, then the final one. */
+function listRecordingGenerations(db: Database.Database, occurrenceId: string): readonly StoredRecordingGeneration[] {
+  const rows = db.prepare(`SELECT binding.bridge_session_id, binding.recording_handle, generation.created_at_ms, generation.terminal_at_ms
+    FROM recording_recovery_bindings AS binding JOIN reconciliation_generations AS generation ON generation.generation_id = binding.generation_id
+    WHERE binding.occurrence_id = ? ORDER BY binding.failure_attempt IS NULL, binding.failure_attempt, generation.created_at_ms`)
+    .all(occurrenceId) as Array<{ bridge_session_id: string; recording_handle: string; created_at_ms: number; terminal_at_ms: number | null }>;
+  return rows.map((row) => ({ ...getRecordingRecovery(db, occurrenceId, row.bridge_session_id, row.recording_handle)!,
+    recordingHandle: row.recording_handle, startedAtMs: row.created_at_ms, terminalAtMs: row.terminal_at_ms }));
+}
+
+/**
+ * Publishes an occurrence whose bridge generations all failed: the longest
+ * failed recording becomes the occurrence's recording and backfill seed, the
+ * end is the last generation's terminal (the end of what was captured, with
+ * `meeting_end_unobserved` saying so), and the row advances to finalizing.
+ * Returns null, changing nothing, when no failed generation was recorded.
+ */
+function publishStoredGenerations(db: Database.Database, input: PublishStoredGenerationsInput): PublishStoredGenerationsResult | null {
+  const failed = (db.prepare(`SELECT failure_attempt FROM recording_recovery_bindings
+    WHERE occurrence_id = ? AND recording_kind = 'bridge_failure' ORDER BY failure_attempt`).all(input.occurrenceId) as Array<{ failure_attempt: number }>)
+    .map((row) => getBridgeFailureRecording(db, input.occurrenceId, row.failure_attempt))
+    .filter((row): row is BridgeFailureRecordingRow & { encryptedPath: string; format: string; keyId: string } =>
+      row !== null && row.encryptedPath !== null && row.format !== null && row.keyId !== null);
+  if (failed.length === 0) return null;
+  const anchor = failed.reduce((best, row) => row.durationMs >= best.durationMs ? row : best);
+  const binding = db.prepare(`SELECT bridge_session_id FROM recording_recovery_bindings WHERE occurrence_id = ? AND failure_attempt = ?`)
+    .get(input.occurrenceId, anchor.attempt) as { bridge_session_id: string };
+  const recovery = getRecordingRecovery(db, input.occurrenceId, binding.bridge_session_id, anchor.handle)!;
+  // The end of capture: the last terminal of a generation that left a recording
+  // (a generation completed later, e.g. by a restart sweep, did not capture).
+  const terminal = db.prepare(`SELECT max(generation.terminal_at_ms) AS at FROM reconciliation_generations AS generation
+    JOIN recording_recovery_bindings AS binding ON binding.generation_id = generation.generation_id
+    WHERE generation.occurrence_id = ?`).get(input.occurrenceId) as { at: number | null };
+  const endedAtMs = terminal.at ?? input.nowMs;
+  const endedAt = new Date(endedAtMs).toISOString();
+  const recording: RecordingInput = {
+    recovery: { bridgeSessionId: binding.bridge_session_id, capability: recovery.capability },
+    handle: anchor.handle, encryptedPath: anchor.encryptedPath, sha256: anchor.sha256, durationMs: anchor.durationMs,
+    format: anchor.format, keyId: anchor.keyId,
+    gaps: anchor.gaps.map((gap) => ({ direction: gap.direction, startedAt: gap.startedAt, endedAt: gap.endedAt })),
+    runtimeGaps: anchor.runtimeGaps.map((gap) => ({ startedAtMs: gap.startedAtMs, endedAtMs: gap.endedAtMs, reason: gap.reason })),
+  };
+  const seedInput = { ...input.seed, terminalReason: "ended" as const, terminalSource: "bridge_observed" as const, endedAt,
+    processingWarnings: [...input.seed.processingWarnings, { code: "meeting_end_unobserved", detail: input.reason }] };
+  // Every gap is derived from the stored generations at build time.
+  const prepared = prepareSeedFields(db, seedInput, recording, input.occurrenceId, binding.bridge_session_id, endedAtMs, []);
+  db.transaction(() => withConstraintTranslation(() => {
+    transition(db, { occurrenceId: input.occurrenceId, fromState: "listening", toState: "finalizing", reason: "advance", terminalReason: null, nowMs: input.nowMs });
+    db.prepare(`INSERT INTO recordings (occurrence_id, handle, encrypted_path, sha256, duration_ms, format, key_id, finalized_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(input.occurrenceId, anchor.handle, anchor.encryptedPath, anchor.sha256, anchor.durationMs, anchor.format, anchor.keyId, input.nowMs);
+    const insertGap = db.prepare("INSERT INTO recording_gaps (occurrence_id, ordinal, direction, started_at, ended_at) VALUES (?, ?, ?, ?, ?)");
+    recording.gaps.forEach((gap, ordinal) => { insertGap.run(input.occurrenceId, ordinal, gap.direction, gap.startedAt, gap.endedAt); });
+    insertRuntimeGaps(db, "recording_runtime_gaps", [input.occurrenceId], recording.runtimeGaps);
+    insertBackfillSeed(db, prepared);
+    assertBackfillRecordingBindingUnchanged(prepared.binding);
+  }))();
+  return { attempt: anchor.attempt, endedAt, generations: failed.length };
+}
 
 function insertRuntimeGaps(
   db: Database.Database,

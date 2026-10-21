@@ -48,10 +48,12 @@ import type { BridgeProcessSlot, OwnedBridgeProcess } from "./ports/bridge-proce
 import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "./ports/conversation-runtime.ts";
 import type { InviteOccurrence, NormalizedInvite } from "./ports/feishu-ingress.ts";
 import type { FeishuOrganizerLookup, OrganizerReferenceEntry } from "./ports/feishu.ts";
-import type { BackfillSeedConfig, SessionStore, UnknownEndCustodySource } from "./ports/session-store.ts";
+import type { BackfillSeedConfig, PublishStoredGenerationsInput, SessionStore, UnknownEndCustodySource } from "./ports/session-store.ts";
+import type { RecordingSummary } from "./ports/conversation-runtime.ts";
 import type { Clock } from "./sessions/coordinator.ts";
 import { createInviteDiscovery } from "./sessions/invite-discovery.ts";
-import type { MeetingSession } from "./sessions/meeting-session.ts";
+import type { CreateMeetingSessionOptions, MeetingSession } from "./sessions/meeting-session.ts";
+import { recognitionOutageWarnings, type RecognitionOutage } from "./domain/transcript.ts";
 import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
 import type { StandaloneConfigV1 } from "./standalone-config.ts";
 
@@ -65,6 +67,17 @@ const BRIDGE_LEASE_TTL_MS = 30_000;
 const MAX_APP_SECRET_BYTES = 4_096;
 const DISCOVERY_PAGE = 64;
 const MAX_METADATA_RESOLUTIONS_PER_TICK = 256;
+
+/** Wait before relaunching a failed bridge generation: 1 s doubling per
+ * attempt, capped at 10 s. The number of attempts is bounded by the store's
+ * bridge failure retry limit. */
+/** Relaunches of any cause per occurrence; the store's bridge failure retry
+ * limit bounds the failures that ended a running generation. */
+const MAX_BRIDGE_RELAUNCHES = 4;
+
+export function defaultBridgeRecoveryDelayMs(attempt: number): number {
+  return Math.min(1000 * 2 ** Math.max(0, attempt - 1), 10_000);
+}
 /** The accepted SDK v4 status exposes no STT/live/batch model or cipher name;
  * the seed records that explicitly instead of inventing a value. */
 const UNAVAILABLE_CURRENT_SDK = "unavailable_current_sdk";
@@ -104,6 +117,8 @@ export type ComposeApplicationOptions = {
   readonly maintenance?: MaintenanceOptions & { readonly notificationSender?: NotificationSender };
   /** Static lifecycle codes only; never paths, identities or secrets. */
   readonly log?: (code: string) => void;
+  /** Backoff before relaunching a failed bridge generation (attempt is 1-based). */
+  readonly bridgeRecoveryDelayMs?: (attempt: number) => number;
   /** PRIVATE test-entry join-latency observer (sessions/join-timing.ts); production never sets it. */
   readonly joinTiming?: JoinTimingObserver;
 };
@@ -124,6 +139,8 @@ export type OccurrenceOutcome = {
   readonly custody: "not_applicable" | "assigned" | "existing" | "refused" | "unpersisted";
   readonly runtimeClose: "pending" | "closed" | "failed";
   readonly runtimeCleanup: StdioGatewayCleanupOutcome["status"] | null;
+  /** Bridge generations started for this occurrence (recoveries + 1). */
+  readonly generations: number;
 };
 
 export type DiscoveryTick = { readonly resolved: number; readonly launched: number; readonly deferred: number };
@@ -303,6 +320,18 @@ function seedConfigFor(status: RuntimeStatus, version: string): BackfillSeedConf
   };
 }
 
+/** A restarted process has no Runtime owner for an interrupted meeting: the
+ * live profile is the pinned one, and every value only a status could supply
+ * is stated as unavailable rather than invented. */
+function interruptedSeedConfig(version: string): BackfillSeedConfig {
+  return {
+    provider: "feishu", encryption: RECORDING_CONTAINER_ENCRYPTION, processingWarnings: [],
+    provenance: { runtimeProfile: "online", sttProvider: UNAVAILABLE_CURRENT_SDK, sttModel: UNAVAILABLE_CURRENT_SDK,
+      liveStreamModel: UNAVAILABLE_CURRENT_SDK, finalBatchModel: UNAVAILABLE_CURRENT_SDK, textProvider: UNAVAILABLE_CURRENT_SDK,
+      textModel: UNAVAILABLE_CURRENT_SDK, agentVersion: version },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Runtime owner: actual SDK client, connected before the bridge exists
 // ---------------------------------------------------------------------------
@@ -420,7 +449,13 @@ type OccurrenceEntry = {
   runtime: RuntimeOwner | null;
   session: MeetingSession | null;
   childLaunched: boolean;
-  readonly childCleanup: Deferred<void>;
+  childCleanup: Deferred<void>;
+  noise: (() => { readonly invalidLines: number; readonly stderrBytes: number }) | null;
+  generations: number;
+  /** Failed generations' recordings awaiting custody until the occurrence
+   * settles, so the one a publication ships is never given a deletion deadline. */
+  failedRecordings: { readonly attempt: number; readonly recording: RecordingSummary }[];
+  seedConfig: BackfillSeedConfig | null;
   phase: OccurrenceOutcome["phase"];
   failure: OccurrenceFailure | null;
   finalization: OccurrenceOutcome["finalization"];
@@ -491,7 +526,9 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       const owned: OwnedBridgeProcess = await slot.launch(binding);
       if (entry === undefined) return owned;
       entry.childLaunched = true;
-      return { bridge: owned.bridge, shutdown: () => owned.shutdown().finally(() => entry.childCleanup.resolve()) };
+      const cleanup = entry.childCleanup;
+      entry.noise = owned.controlNoise ?? null;
+      return { bridge: owned.bridge, shutdown: () => owned.shutdown().finally(() => cleanup.resolve()) };
     },
   }));
 
@@ -510,7 +547,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
   try {
     application = createMeetingAgentApplication({
       config: legacyConfig, store, clock, liveEvidence: "timed", bridgeLeaseTtlMs: BRIDGE_LEASE_TTL_MS, maxConcurrentSessions: wrappedSlots.length,
-      backfillSeedConfigFor: (identity) => requireEntry(identity).runtime!.seedConfig,
+      backfillSeedConfigFor: (identity) => requireEntry(identity).runtime!.seedConfig, deferBridgeFailureExhaustion: true,
       adapters: { bridgeSlots: wrappedSlots, bridgeIdFor: (identity) => requireEntry(identity).bridgeId, runtimeFor: (identity) => requireEntry(identity).runtime!.port },
       ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
     });
@@ -566,6 +603,12 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
         occurrenceIsLive: (occurrenceId) => { const entry = entries.get(occurrenceId); return entry !== undefined && entry.phase !== "settled"; },
         holdsFinalizedRecording: () => [...entries.values()].some((entry) => entry.phase !== "settled" && entry.session !== null && entry.session.state().recording !== null),
         anyOccurrenceLive: () => [...entries.values()].some((entry) => entry.phase !== "settled"),
+        publishInterrupted: (occurrenceId, nowMs) => {
+          const occurrence = store.getInviteOccurrence(occurrenceId);
+          if (occurrence === null) return false;
+          return store.publishStoredGenerations({ occurrenceId, nowMs, reason: "capture_interrupted",
+            seed: { ...interruptedSeedConfig(version), identity: identityOf(occurrence) } }) !== null;
+        },
       },
       ...(options.maintenance ? { options: options.maintenance } : {}),
     }); } catch (error) {
@@ -591,7 +634,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
   function outcomeOf(entry: OccurrenceEntry): OccurrenceOutcome {
     return { occurrenceId: entry.occurrenceId, bridgeId: entry.bridgeId, organizer: entry.identity.organizer, phase: entry.phase,
       controlSessionId: entry.runtime?.controlSessionId ?? null, failure: entry.failure, finalization: entry.finalization, custody: entry.custody,
-      runtimeClose: entry.runtime?.closeOutcome() ?? "pending", runtimeCleanup: entry.runtime?.cleanupOutcome() ?? null };
+      runtimeClose: entry.runtime?.closeOutcome() ?? "pending", runtimeCleanup: entry.runtime?.cleanupOutcome() ?? null, generations: entry.generations };
   }
 
   /** Explicit unknown-end classification of a stopped recording (D002/D007);
@@ -614,6 +657,11 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     }
     if (source === null) { entry.finalization = "transaction_failed"; entry.custody = "unpersisted"; log("occurrence_recording_unpersisted"); return; }
     entry.finalization = "recorded";
+    if (source.kind === "bridge_failure") { entry.failedRecordings.push({ attempt: source.attempt, recording }); return; }
+    assignCustody(entry, source, recording);
+  }
+
+  function assignCustody(entry: OccurrenceEntry, source: UnknownEndCustodySource, recording: RecordingSummary): void {
     try {
       const assignment = store.assignUnknownEndCustody(source, clock.now(),
         { recordingHandle: recording.recordingHandle, encryptedPath: recording.encryptedPath, sha256: recording.sha256, keyId: recording.keyId });
@@ -622,14 +670,88 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     } catch { entry.custody = "refused"; log("occurrence_custody_refused"); }
   }
 
+  /** Abortable by shutdown; resolves either way. */
+  function backoff(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (shutdown.signal.aborted || ms <= 0) { resolve(); return; }
+      const done = () => { clearTimeout(timer); shutdown.signal.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, ms);
+      shutdown.signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  /** Runs generations on the entry's slot until one ends without a recoverable
+   * bridge failure. A recoverable failure (the store allowed the retry and left
+   * the row listening) is relaunched after a backoff with a fresh Runtime owner
+   * and bridge session; the store's retry limit bounds the attempts. */
   async function runOccurrence(entry: OccurrenceEntry): Promise<OccurrenceOutcome> {
+    let recovery: CreateMeetingSessionOptions["recovery"];
+    let outages: readonly RecognitionOutage[] = [];
+    let gaveUp: PublishStoredGenerationsInput["reason"] | null = null;
+    let relaunches = 0;
+    for (let attempt = 1; ; attempt += 1) {
+      await runGeneration(entry, recovery);
+      const state = entry.session?.state() ?? null;
+      if (state !== null) outages = state.recognitionOutages;
+      const listening = storeOpen && store.getSession(entry.occurrenceId)?.state === "listening";
+      if (!listening) break;
+      // Only a recovery that could not continue gives up; a first generation
+      // that ended otherwise keeps its own outcome (e.g. a rolled-back finalize).
+      if (state?.terminalReason !== "bridge_failure") {
+        if (recovery === undefined) break;
+        // A relaunch that could not start (the Runtime refused the voice
+        // session, startup or join failed) is retried within the same bound;
+        // the earlier generation's capture loss stays open and is the gap. A
+        // quarantined physical client is never retried.
+        if (closing || entry.failure === "physical_client_quarantined" || relaunches >= MAX_BRIDGE_RELAUNCHES) {
+          gaveUp = closing ? "application_closed" : "bridge_recovery_failed";
+          break;
+        }
+        log("occurrence_bridge_relaunch_refused");
+      } else {
+        if (state.bridgeRetryAllowed !== true) { gaveUp = "bridge_failure_exhausted"; break; }
+        if (closing) { gaveUp = "application_closed"; break; }
+        if (relaunches >= MAX_BRIDGE_RELAUNCHES) { gaveUp = "bridge_recovery_failed"; break; }
+        recovery = { uncoveredSince: state.captureLostAt ?? state.generationStartedAt, priorOutages: outages };
+      }
+      relaunches += 1;
+      log("occurrence_bridge_recovery_scheduled");
+      await backoff((options.bridgeRecoveryDelayMs ?? defaultBridgeRecoveryDelayMs)(attempt));
+      entry.runtime = null; entry.session = null; entry.failure = null; entry.finalization = "none"; entry.custody = "not_applicable";
+      entry.childLaunched = false; entry.childCleanup = new Deferred<void>(); entry.noise = null;
+      if (closing) { entry.failure = "application_closed"; gaveUp = "application_closed"; break; }
+    }
+    // No generation can continue and none observed the end: publish what the
+    // stored generations recorded, or fail visibly when nothing was recorded.
+    let shipped: number | null = null;
+    if (gaveUp !== null && storeOpen && store.getSession(entry.occurrenceId)?.state === "listening") {
+      try {
+        const published = entry.seedConfig === null ? null : store.publishStoredGenerations({ occurrenceId: entry.occurrenceId, nowMs: clock.now(), reason: gaveUp,
+          seed: { ...entry.seedConfig, identity: entry.identity,
+            processingWarnings: [...entry.seedConfig.processingWarnings, ...recognitionOutageWarnings(outages, new Date(clock.now()).toISOString())] } });
+        if (published === null) { application.coordinator.fail(entry.occurrenceId, gaveUp); log("occurrence_bridge_recovery_failed"); }
+        else { shipped = published.attempt; entry.finalization = "seeded"; log("occurrence_published_from_stored_generations"); }
+      } catch { failures.add("bridge_recovery_record_failed"); }
+    }
+    for (const failed of entry.failedRecordings) {
+      if (failed.attempt === shipped) continue;
+      assignCustody(entry, { kind: "bridge_failure", occurrenceId: entry.occurrenceId, attempt: failed.attempt }, failed.recording);
+    }
+    occupied.delete(entry.bridgeId);
+    entry.phase = "settled";
+    return outcomeOf(entry);
+  }
+
+  async function runGeneration(entry: OccurrenceEntry, recovery: { readonly uncoveredSince: string } | undefined): Promise<void> {
     let joined = false;
+    entry.generations += 1;
     try {
       entry.runtime = await startRuntimeOwner({ occurrenceId: entry.occurrenceId, shutdown: shutdown.signal, budgetMs, version, startTransport });
+      entry.seedConfig ??= entry.runtime.seedConfig;
       if (closing) throw new OccurrenceStartupFailure("application_closed");
       log("occurrence_runtime_connected");
       markJoinTiming(options.joinTiming, "runtime_connected");
-      try { entry.session = await application.createSession(entry.identity); }
+      try { entry.session = await application.createSession(entry.identity, recovery); }
       catch (error) {
         const message = error instanceof Error ? error.message : "";
         throw new OccurrenceStartupFailure(/closed/.test(message) ? "application_closed" : /quarantined/.test(message) ? "physical_client_quarantined" : "launch_failed");
@@ -655,15 +777,14 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       log("occurrence_runtime_closed");
       if (entry.runtime.closeOutcome() === "failed") failures.add("runtime_close_failed");
     }
-    occupied.delete(entry.bridgeId);
-    entry.phase = "settled";
-    return outcomeOf(entry);
+    const noise = entry.noise?.();
+    if (noise !== undefined && (noise.invalidLines > 0 || noise.stderrBytes > 0)) log("bridge_control_noise_tolerated");
   }
 
   function launchOccurrence(occurrence: InviteOccurrence, slot: BridgeProcessSlot): void {
     const identity = identityOf(occurrence);
     const entry: OccurrenceEntry = { occurrenceId: occurrence.occurrenceId, identity, bridgeId: slot.bridgeId, runtime: null, session: null,
-      childLaunched: false, childCleanup: new Deferred<void>(), phase: "starting", failure: null, finalization: "none", custody: "not_applicable" };
+      childLaunched: false, childCleanup: new Deferred<void>(), noise: null, generations: 0, failedRecordings: [], seedConfig: null, phase: "starting", failure: null, finalization: "none", custody: "not_applicable" };
     entries.set(entry.occurrenceId, entry);
     occupied.set(slot.bridgeId, entry.occurrenceId);
     entry.settled = runOccurrence(entry);

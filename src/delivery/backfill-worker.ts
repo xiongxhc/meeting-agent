@@ -11,6 +11,7 @@ import {
 
 import { connectPostmeetingRuntime, type PostmeetingRuntime } from "../adapters/conversation-runtime-client.ts";
 import type { MeetingIdentity } from "../domain/meeting.ts";
+import { RECOGNITION_OUTAGE_WARNING } from "../domain/transcript.ts";
 import type { OperatorWarningSink } from "../ports/operator-warning.ts";
 import type {
   AlignmentAttempt,
@@ -27,6 +28,7 @@ import {
   reconcilePersistedTimedSpeakers,
 } from "../sessions/speaker-reconciler.ts";
 import { buildTimedTeamMemMeetingArtifactV2 } from "./artifact-builder.ts";
+import { PARTIAL_AUDIO_WARNING, mergeGenerationAttendance, mergeGenerationTranscripts, publishedGaps } from "./generation-merge.ts";
 import type { OutboxWorker } from "./outbox-worker.ts";
 
 const DEFAULT_OPERATION_BUDGET_MS = 900_000;
@@ -230,7 +232,39 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
         recordingHandle: claim.seed.capability.recordingHandle, store: options.store,
         nowMs: () => options.clock.now(), signal: abort.signal };
       const attendance = await readClosedTimedAttendance(closed);
-      const transcript = await reconcilePersistedTimedSpeakers({ ...closed, runtime: connected });
+      const shippedTranscript = await reconcilePersistedTimedSpeakers({ ...closed, runtime: connected });
+      // Every other generation of the occurrence, each reconciled with its own
+      // stored recovery capability, joins the one transcript and attendance.
+      const generations = options.store.listRecordingGenerations(claim.seed.occurrenceId);
+      const others: { ordinal: number; transcript: Awaited<ReturnType<typeof reconcilePersistedTimedSpeakers>> }[] = [];
+      const intervals = [...attendance.attendance];
+      const otherGaps: { direction: "capture" | "playback"; startedAt: string; endedAt: string | null; closeAtEnd: boolean }[] = [];
+      // A failed generation's gaps; the last one's open gaps run to the end
+      // when no generation observed it (no successor closes them).
+      const failedGaps = (attempt: number, last: boolean) => (options.store.getBridgeFailureRecording(claim.seed.occurrenceId, attempt)?.gaps ?? [])
+        .map((gap) => ({ direction: gap.direction, startedAt: gap.startedAt, endedAt: gap.endedAt, closeAtEnd: last }));
+      for (const [index, generation] of generations.entries()) {
+        const last = index === generations.length - 1;
+        if (generation.generationId === recovery.generationId) {
+          if (claim.seed.bridgeGaps.length === 0 && generation.failureAttempt !== null) otherGaps.push(...failedGaps(generation.failureAttempt, last));
+          continue;
+        }
+        if (options.proveExclusiveOwnership) await alignment.recover(generation.generationId);
+        await alignment.stage(generation);
+        const own = { ...closed, bridgeSessionId: generation.bridgeSessionId, recordingHandle: generation.recordingHandle };
+        intervals.push(...(await readClosedTimedAttendance(own)).attendance);
+        others.push({ ordinal: index + 1, transcript: await reconcilePersistedTimedSpeakers({ ...own, runtime: connected }) });
+        if (generation.failureAttempt !== null) otherGaps.push(...failedGaps(generation.failureAttempt, last));
+      }
+      const reconciled = mergeGenerationTranscripts(shippedTranscript, others);
+      const shippedOrdinal = generations.findIndex((generation) => generation.generationId === recovery.generationId) + 1;
+      const generationWarnings = generations.length > 1
+        ? [{ code: PARTIAL_AUDIO_WARNING, detail: `shipped_generation=${shippedOrdinal};generations=${generations.length}` }] : [];
+      // A live recognition outage is covered only by final (recording) wording;
+      // with none, the transcript is incomplete for that span. Publication proceeds.
+      const outage = claim.seed.processingWarnings.some(({ code }) => code === RECOGNITION_OUTAGE_WARNING);
+      const finalWords = reconciled.segments.some((segment) => segment.wording === "reconciled" && segment.text.trim() !== "");
+      const transcript = outage && !finalWords ? { ...reconciled, transcriptComplete: false } : reconciled;
       phase = "build_failed";
       built = await buildTimedTeamMemMeetingArtifactV2({
         identity: { occurrenceId: claim.seed.occurrenceId as MeetingIdentity["occurrenceId"], providerMeetingId: claim.seed.providerMeetingId,
@@ -239,15 +273,15 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
         provider: claim.seed.provider,
         revision: claim.targetRevision,
         endedAt: claim.seed.endedAt,
-        attendance: attendance.attendance,
+        attendance: mergeGenerationAttendance(intervals),
         transcript,
         selectedAlignment: selected,
         sessionId: connected.currentSessionId,
         runtime: connected,
         meetingEnded: true,
-        recordingGaps: claim.seed.bridgeGaps.map((gap) => ({ startedAt: gap.startedAt,
-          endedAt: gap.endedAt ?? claim.seed.endedAt, reason: `bridge_${gap.direction}_gap` })),
-        processingWarnings: claim.seed.processingWarnings,
+        recordingGaps: publishedGaps({ seedGaps: claim.seed.bridgeGaps, otherGaps,
+          occurrenceStartedAt: claim.seed.occurrenceStartedAt, endedAt: claim.seed.endedAt }),
+        processingWarnings: [...claim.seed.processingWarnings, ...generationWarnings],
         provenance: { ...claim.seed.provenance, runtimeProfile: connected.runtimeProfile,
           processedAt: new Date(validClock(options.clock.now())).toISOString() },
         knownProjects: options.readKnownProjects(),

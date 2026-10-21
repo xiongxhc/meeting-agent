@@ -261,3 +261,85 @@ test("v2 slot keeps the fd 3 outcome, environment allowlist and reap behaviour",
     }
   }
 });
+
+// ---- live capture is not killed for control-plane noise; death is reported ----
+
+async function noiseChild(mode: "noisy" | "garbage" | "crash" | "dense" | "spread", invalidLineWindowMs?: number) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "bridge-v2-noise-"));
+  const configPath = path.join(dir, "static.json");
+  writeFileSync(configPath, JSON.stringify(staticFields({ evidenceRoot: dir, audio, bundleVersion: mode })), { mode: 0o600 });
+  const child = await createChildBridgeSlot({ physicalClientId: binding.physicalClientId, bridgeId: "bridge", executable: process.execPath,
+    argv: [v2Child], staticConfigPath: configPath, cooperativeGraceMs: 1000, protocol: "bridge-session/v2",
+    ...(invalidLineWindowMs === undefined ? {} : { invalidLineWindowMs }) }).launch(binding);
+  let closed = 0, eventsAtClose = -1;
+  const events: unknown[] = [];
+  const closedOnce = new Promise<void>((resolve) => {
+    child.bridge.onClosed!(() => { closed += 1; eventsAtClose = events.length; resolve(); });
+  });
+  return { dir, child, events, closedOnce, closed: () => closed, eventsAtClose: () => eventsAtClose };
+}
+
+test("malformed, oversized and replayed control lines and stderr volume are dropped and counted; the capturing bridge keeps running", async () => {
+  const c = await noiseChild("noisy");
+  try {
+    const first = collect(c.child.bridge, 3, c.events);
+    await c.child.bridge.send(v2Join("c1"));
+    await first;
+    assert.deepEqual(c.events.map((raw) => parseEventV2(raw).type), ["joined", "ui_snapshot", "command_result"], "only valid lines are forwarded");
+    const second = collect(c.child.bridge, 4, c.events);
+    await c.child.bridge.send({ schema: "bridge-session/v2", sessionId: binding.bridgeSessionId, commandId: "c2", type: "connect_media", mediaLease: v2Lease } as unknown as BridgeCommandMessage);
+    await second;
+    assert.equal(c.closed(), 0, "the child was not killed");
+    const noise = c.child.controlNoise!();
+    assert.equal(noise.invalidLines, 3);
+    assert.ok(noise.stderrBytes >= 65_536);
+    const result = await c.child.shutdown();
+    assert.equal(result.reaped, true);
+    assert.equal(result.failure, "protocol_failed", "an invalid control line still blocks custody clearing");
+  } finally { rmSync(c.dir, { recursive: true, force: true }); }
+});
+
+test("sustained protocol violation still ends the bridge, and the closure is reported", async () => {
+  const c = await noiseChild("garbage");
+  try {
+    await c.child.bridge.send(v2Join("c1"));
+    await c.closedOnce;
+    assert.equal(c.closed(), 1);
+    const result = await c.child.shutdown();
+    assert.equal(result.reaped, true);
+    assert.equal(result.failure, "protocol_failed");
+  } finally { rmSync(c.dir, { recursive: true, force: true }); }
+});
+
+test("a bridge child that exits on its own reports closure once, after every event it wrote", async () => {
+  const c = await noiseChild("crash");
+  try {
+    c.child.bridge.subscribe((raw) => { c.events.push(raw); });
+    await c.child.bridge.send(v2Join("c1"));
+    await c.closedOnce;
+    assert.equal(c.eventsAtClose(), 3, "joined, ui_snapshot and command_result arrive before the closure");
+    const result = await c.child.shutdown();
+    assert.equal(result.reaped, true);
+    assert.notEqual(result.failure, null, "no outcome, so custody stays quarantined");
+    assert.equal(c.closed(), 1);
+  } finally { rmSync(c.dir, { recursive: true, force: true }); }
+});
+
+test("invalid lines are limited by rate, not by a whole-meeting total: a spread-out trickle never ends capture, a dense burst does", async () => {
+  const spread = await noiseChild("spread", 200);
+  try {
+    const all = collect(spread.child.bridge, 24, spread.events);
+    await spread.child.bridge.send(v2Join("c1"));
+    await all;
+    assert.equal(spread.closed(), 0, "20 invalid lines, at most 10 per window, never end the bridge");
+    assert.equal(spread.child.controlNoise!().invalidLines, 20);
+    await spread.child.shutdown();
+  } finally { rmSync(spread.dir, { recursive: true, force: true }); }
+  const dense = await noiseChild("dense", 60_000);
+  try {
+    await dense.child.bridge.send(v2Join("c1"));
+    await dense.closedOnce;
+    assert.equal(dense.child.controlNoise!().invalidLines, 17, "the 17th invalid line inside one window ends it");
+    assert.equal((await dense.child.shutdown()).failure, "protocol_failed");
+  } finally { rmSync(dense.dir, { recursive: true, force: true }); }
+});

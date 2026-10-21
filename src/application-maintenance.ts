@@ -81,6 +81,9 @@ export type MaintenanceSupervisor = {
   /** Any live or starting entry exists; its Runtime may be writing a recording
    * whose handle nothing in the store names yet. */
   anyOccurrenceLive(): boolean;
+  /** Publishes what the stored generations of an occurrence a previous process
+   * left listening recorded; false when there is nothing to publish. */
+  publishInterrupted?(occurrenceId: string, nowMs: number): boolean;
 };
 
 export type LaneStatus = {
@@ -314,15 +317,22 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
       input.supervisor.assertOwnership();
       const now = clock.now();
       const open = input.store.listOpenCaptureRows();
-      for (const row of open.sessions) {
-        if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
-        input.store.transition({ occurrenceId: row.occurrenceId, fromState: row.state, toState: "failed", reason: "fail", terminalReason: "capture_interrupted", nowMs: now });
-        log("retention_capture_adopted");
-      }
+      // Generations first: a publication needs every generation's terminal.
       for (const row of open.generations) {
         if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
         input.store.completeReconciliationGeneration(row.occurrenceId, row.bridgeSessionId, now, "local_clock");
         log("retention_generation_adopted");
+      }
+      for (const row of open.sessions) {
+        if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
+        // A meeting interrupted after bridge failures publishes what its stored
+        // generations recorded; only an occurrence with nothing stored fails.
+        if (row.state === "listening" && input.supervisor.publishInterrupted?.(row.occurrenceId, now) === true) {
+          log("retention_capture_published");
+          continue;
+        }
+        input.store.transition({ occurrenceId: row.occurrenceId, fromState: row.state, toState: "failed", reason: "fail", terminalReason: "capture_interrupted", nowMs: now });
+        log("retention_capture_adopted");
       }
       let graced = 0;
       for (const file of listRecordingSources(input.dataPaths.recordingsDir)) {

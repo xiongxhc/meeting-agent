@@ -538,6 +538,22 @@ export type BridgeRecoveryResult = {
 };
 export type BridgeFailureRecordingRow = RecordingRow & { readonly attempt: number };
 
+/** One finalized bridge generation with its private recovery binding. */
+export type StoredRecordingGeneration = RecordingRecovery & {
+  readonly recordingHandle: string;
+  readonly startedAtMs: number;
+  readonly terminalAtMs: number | null;
+};
+
+export type PublishStoredGenerationsInput = {
+  readonly occurrenceId: string;
+  readonly nowMs: number;
+  readonly seed: BackfillSeedConfig & { readonly identity: MeetingIdentity };
+  /** Why no generation observed the meeting's end. */
+  readonly reason: "bridge_failure_exhausted" | "bridge_recovery_failed" | "application_closed" | "capture_interrupted";
+};
+export type PublishStoredGenerationsResult = { readonly attempt: number; readonly endedAt: string; readonly generations: number };
+
 export type MigrationRow = {
   readonly version: number;
   readonly name: string;
@@ -840,8 +856,12 @@ export type SessionStore = {
     readonly maxRetries: number;
     readonly gaps: RecordingInput["gaps"];
     readonly recording: RecordingInput | null;
+    /** Leave the row listening when the retries are used up (see publishStoredGenerations). */
+    readonly deferExhaustion?: boolean;
   }): BridgeRecoveryResult;
   getBridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
+  listRecordingGenerations(occurrenceId: string): readonly StoredRecordingGeneration[];
+  publishStoredGenerations(input: PublishStoredGenerationsInput): PublishStoredGenerationsResult | null;
 
   savePending(row: DeliveryRow, authority?: BackfillDeliveryAuthority): SavePendingDeliveryResult;
   pending(): readonly DeliveryRow[];

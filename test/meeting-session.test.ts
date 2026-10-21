@@ -675,7 +675,7 @@ test("media_connected and command_result are both consumed and correlated", asyn
   }
 });
 
-test("a rejected connect_media command aborts speaking but not capture", async () => {
+test("a rejected connect_media command aborts speaking and ends the generation for a bounded retry, with the uncaptured span as a gap", async () => {
   const h = harness();
   try {
     await joined(h);
@@ -692,7 +692,12 @@ test("a rejected connect_media command aborts speaking but not capture", async (
 
     assert.equal(h.session.state().speaking, "aborted");
     assert.equal(h.session.state().speakingAbortReason, "media_command_rejected");
-    assert.equal(h.session.state().phase, "listening");
+    // The bridge accepts one connect_media per bridge session, so the retry is
+    // the next generation: leave, finalize what exists, record the gap.
+    assert.equal(h.session.state().terminalReason, "bridge_failure");
+    assert.equal(h.session.state().recoveryCause, "media_connect_failed");
+    assert.equal(sentTypes(h.bridge).at(-1), "leave");
+    assert.deepEqual(h.session.state().observedGaps, [{ direction: "capture", startedAt: h.session.state().generationStartedAt, endedAt: null }]);
   } finally {
     await h.cleanup();
   }
@@ -1121,7 +1126,9 @@ for (const reason of LEFT_REASONS) {
 
       assert.equal(h.session.state().ignoredAfterTerminal, 3);
       assert.equal(h.session.state().mediaConnected, false);
-      assert.deepEqual(h.session.state().observedGaps, []);
+      // Only the session's own record of the capture loss a bridge failure causes.
+      assert.deepEqual(h.session.state().observedGaps, reason === "bridge_failure"
+        ? [{ direction: "capture", startedAt: h.session.state().generationStartedAt, endedAt: null }] : []);
       assert.equal(h.runtime.callsOf("authorizeVoiceResponse").length, 0);
     } finally {
       await h.cleanup();
@@ -2239,6 +2246,12 @@ test("maxRetries zero persists terminal bridge failure evidence and refuses ever
           direction: "capture",
           startedAt: "2026-09-02T14:10:00Z",
           endedAt: "2026-09-02T14:10:02Z",
+        }, {
+          // The capture loss the bridge failure itself causes, open until the meeting ends.
+          ordinal: 1,
+          direction: "capture",
+          startedAt: new Date(BASE_MS).toISOString(),
+          endedAt: null,
         }],
         runtimeGaps: [{ ordinal: 0, ...runtimeGaps[0] }],
       });

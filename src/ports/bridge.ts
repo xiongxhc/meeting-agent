@@ -58,6 +58,9 @@ export type BridgeTransport = {
   send(message: BridgeCommandMessage): Promise<void>;
   /** Returns an unsubscribe function. Calling it must stop delivery. */
   subscribe(listener: (raw: unknown) => void): () => void;
+  /** Called once when the bridge can no longer deliver anything (its process
+   * ended), after every message it did deliver. Returns an unsubscribe. */
+  onClosed?(listener: () => void): () => void;
 };
 
 /** Raised when a message the coordinator was about to send, or a message the

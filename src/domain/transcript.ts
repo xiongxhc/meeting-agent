@@ -207,3 +207,18 @@ export type ReconciledTranscript = {
    * attribution and is deliberately separate from silence. */
   readonly spokeButUnattributed: readonly string[];
 };
+
+/** Processing-warning code for a span in which live speech recognition was
+ * down while the recording continued. The transcript is incomplete for it
+ * unless final wording from the recording covers it. */
+export const RECOGNITION_OUTAGE_WARNING = "live_recognition_outage";
+
+/** A span in which live recognition was down; local clock instants. */
+export type RecognitionOutage = { readonly startedAt: string; readonly endedAt: string | null; readonly reason: string };
+
+/** The persisted form: one processing warning per outage, an open one ending
+ * at `endedAt`. */
+export function recognitionOutageWarnings(outages: readonly RecognitionOutage[], endedAt: string): { readonly code: string; readonly detail: string }[] {
+  return outages.map((outage) => ({ code: RECOGNITION_OUTAGE_WARNING,
+    detail: `started_at=${outage.startedAt};ended_at=${outage.endedAt ?? endedAt};reason=${outage.reason}` }));
+}

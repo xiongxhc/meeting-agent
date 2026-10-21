@@ -193,6 +193,7 @@ export type SessionCoordinator = {
     maxRetries: number,
     gaps: RecordingInput["gaps"],
     recording: RecordingInput | null,
+    deferExhaustion?: boolean,
   ): BridgeRecoveryResult;
   bridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null;
 
@@ -382,11 +383,12 @@ export function createCoordinator(options: CreateCoordinatorOptions): SessionCoo
       maxRetries: number,
       gaps: RecordingInput["gaps"],
       recording: RecordingInput | null,
+      deferExhaustion = false,
     ): BridgeRecoveryResult {
       if (!Number.isInteger(maxRetries) || maxRetries < 0) {
         throw new OrchestrationError("invalid_configuration", "max bridge retries must be a non-negative integer");
       }
-      return store.recordBridgeFailure({ occurrenceId, nowMs: clock.now(), maxRetries, gaps, recording });
+      return store.recordBridgeFailure({ occurrenceId, nowMs: clock.now(), maxRetries, gaps, recording, deferExhaustion });
     },
 
     bridgeFailureRecording(occurrenceId: string, attempt: number): BridgeFailureRecordingRow | null {

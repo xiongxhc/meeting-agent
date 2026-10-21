@@ -4,4 +4,5 @@ export type { BridgeCommandV2, BridgeEventV2, BridgeCommandMessageV2, BridgeEven
 export type BridgeTransportV2 = {
   send(message: BridgeCommandMessageV2): Promise<void>;
   subscribe(listener: (raw: unknown) => void): () => void;
+  onClosed?(listener: () => void): () => void;
 };

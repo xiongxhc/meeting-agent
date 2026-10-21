@@ -66,7 +66,7 @@ import { createJoinFailureDiagnostic } from "./join-failure-diagnostic.ts";
 import { markJoinTiming, type JoinTimingObserver } from "./join-timing.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import type { MeetingIdentity } from "../domain/meeting.ts";
-import type { ActiveSpeakerObservation } from "../domain/transcript.ts";
+import { recognitionOutageWarnings, type ActiveSpeakerObservation, type RecognitionOutage } from "../domain/transcript.ts";
 import {
   BridgeContractError,
   createDisclosurePublisher,
@@ -117,6 +117,7 @@ export { BridgeContractError } from "../ports/bridge.ts";
 /** Meeting Agent v1 pins these two per session, explicitly, every time. A
  * runtime that answers with anything else is a mismatch, never a fallback. */
 const PINNED_PROFILE = "online";
+
 const PINNED_RESPONSE_MODE = "external_gate";
 
 /**
@@ -141,6 +142,8 @@ const PINNED_RESPONSE_MODE = "external_gate";
  * an observable `audio_gap` rather than vanishing.
  */
 const DEFAULT_MAX_QUEUED_EVENTS = 256;
+/** Bound on recognition outages kept (and published) per occurrence. */
+const MAX_RECOGNITION_OUTAGES = 64;
 
 export type MeetingSessionPhase = "created" | "joining" | "listening" | "ended";
 export type SpeakingState = "enabled" | "aborted";
@@ -191,6 +194,13 @@ export type RoutingFailure = {
  * independently and are never rewritten through an invented SDK method. */
 export type GapReconciliation = "not_needed";
 
+export type { RecognitionOutage } from "../domain/transcript.ts";
+
+/** A bounded token naming the failing Runtime stage, never provider wording. */
+function outageReason(stage: unknown): string {
+  return typeof stage === "string" && /^[a-z][a-z0-9_]{0,39}$/.test(stage) ? stage : "runtime";
+}
+
 export type MeetingSessionState = {
   readonly phase: MeetingSessionPhase;
   readonly speaking: SpeakingState;
@@ -238,6 +248,26 @@ export type MeetingSessionState = {
    * (ruling R55). The same final segments are durably retained in the local
    * reconciliation ledger only; they never enter Team Vault or output paths. */
   readonly liveTranscript: readonly TranscriptSegment[];
+  /** Live speech recognition as this session last saw it. "interrupted" after a
+   * recoverable Runtime recognition failure, "healthy" again once a final
+   * transcript arrives, "failed" once re-arming is exhausted. Recording is
+   * independent of all three. */
+  readonly recognition: "healthy" | "interrupted" | "failed";
+  readonly recognitionFailures: number;
+  /** Spans in which live recognition was down, local clock, in order. Persisted
+   * as processing warnings with the seed the publication is built from: the
+   * recording is complete for them, the live transcript is not. */
+  readonly recognitionOutages: readonly RecognitionOutage[];
+  /** Start of the capture loss this generation recorded when it ended for
+   * recovery (the next generation's gap starts here); null otherwise. */
+  readonly captureLostAt: string | null;
+  /** The store's answer when this generation ended in a bridge failure:
+   * whether another generation may be started. Null otherwise. */
+  readonly bridgeRetryAllowed: boolean | null;
+  /** Why this generation was ended for recovery, when it was; null otherwise. */
+  readonly recoveryCause: "bridge_closed" | "media_connect_failed" | "runtime_voice_terminal" | null;
+  /** Local-clock instant this generation started joining. */
+  readonly generationStartedAt: string;
 };
 
 export type MeetingSession = {
@@ -295,6 +325,21 @@ export type CreateMeetingSessionOptions = {
    * cleanup has finished, so applications can stop retaining sensitive
    * session state without reopening shutdown races. */
   readonly onInactive?: () => void;
+  /** Present on a recovery generation: the instant from which the meeting is not
+   * covered by the recording this generation will finalize. Recorded as a capture
+   * gap ending at this generation's first media connection. */
+  readonly recovery?: {
+    readonly uncoveredSince: string;
+    /** Recognition outages of earlier generations, carried into this one's seed. */
+    readonly priorOutages?: readonly RecognitionOutage[];
+  };
+  /** Composition only: an exhausted bridge-failure retry budget leaves the
+   * occurrence listening so the caller can publish what was recorded. */
+  readonly deferBridgeFailureExhaustion?: boolean;
+  /** Recognition failures in a row, with no recognition output between them,
+   * after which the state reports recognition as failed. Speaking still
+   * re-arms on the next output. Default 3. */
+  readonly recognitionRecoveryLimit?: number;
   /** PRIVATE test-entry observer of join-path phase boundaries (see
    * join-timing.ts). Production composition never sets it. */
   readonly joinTiming?: JoinTimingObserver;
@@ -307,7 +352,8 @@ export type CreateMeetingSessionOptions = {
 
 type QueueItem =
   | { readonly source: "bridge"; readonly raw: unknown }
-  | { readonly source: "runtime"; readonly event: RuntimeEvent };
+  | { readonly source: "runtime"; readonly event: RuntimeEvent }
+  | { readonly source: "bridge_closed" };
 
 export function createMeetingSession(options: CreateMeetingSessionOptions): MeetingSession {
   const {
@@ -323,6 +369,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   } = options;
   const maxQueuedEvents = options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS;
   const bridgeFailureRetryLimit = options.bridgeFailureRetryLimit ?? 2;
+  const recognitionRecoveryLimit = options.recognitionRecoveryLimit ?? 3;
   // A freshly constructed session is either the occurrence's first bridge
   // generation (discovered) or a recovery generation after bridge_failure.
   // This is captured before join so a duplicate `joined` on one generation is
@@ -345,6 +392,38 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   let phase: MeetingSessionPhase = "created";
   let speaking: SpeakingState = "enabled";
   let speakingAbortReason: string | null = null;
+  /** True while the current abort is a recoverable suspension (recognition). */
+  let speakingSuspended = false;
+  let recognition: MeetingSessionState["recognition"] = "healthy";
+  let recognitionFailures = 0;
+  let consecutiveRecognitionFailures = 0;
+  /** Any recognition output is the Runtime showing recognition works again. */
+  function recognitionRecovered(): void {
+    consecutiveRecognitionFailures = 0;
+    if (recognition !== "healthy") { recognition = "healthy"; resumeSpeaking(); }
+    closeRecognitionOutage(clock.now());
+  }
+  const recognitionOutages: Array<{ startedAt: string; endedAt: string | null; reason: string }> =
+    (options.recovery?.priorOutages ?? []).slice(0, MAX_RECOGNITION_OUTAGES).map((outage) => ({ ...outage }));
+  function closeRecognitionOutage(atMs: number): void {
+    const open = recognitionOutages.at(-1);
+    if (open !== undefined && open.endedAt === null) open.endedAt = new Date(atMs).toISOString();
+  }
+  let recoveryCause: MeetingSessionState["recoveryCause"] = null;
+  let generationStartedAt = new Date(clock.now()).toISOString();
+  let uncoveredGapOpen = options.recovery !== undefined;
+  let mediaEverConnected = false;
+  let captureLostAt: string | null = null;
+  let recordedCaptureLossAt: string | null = null;
+  let bridgeRetryAllowed: boolean | null = null;
+  /** The transition gap a recovery generation owns, clamped to the meeting
+   * window: from the previous generation's capture loss (never before the
+   * occurrence start) to this generation's first media connection. */
+  function transitionGapStart(): string | null {
+    if (options.recovery === undefined) return null;
+    const since = options.recovery.uncoveredSince, start = identity.occurrenceStartedAt;
+    return Date.parse(since) < Date.parse(start) ? start : since;
+  }
   let runtimeSessionId: bigint | null = null;
   let evidenceControlId: bigint | null = null;
   let provisional: LiveProvisionalCorrelator | null = null;
@@ -393,6 +472,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   let unsubscribeBridge: (() => void) | null = null;
   let unsubscribeRuntime: (() => void) | null = null;
+  let unsubscribeClosed: (() => void) | null = null;
 
   // What the agent knows when it answers: current-meeting memory first,
   // this session's Team Vault index second -- see
@@ -546,11 +626,56 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     turns.push({ segmentId, outcome, detail, atMs: clock.now() });
   }
 
+  /** Permanent for this generation. The first permanent reason is the true one;
+   * it replaces a recoverable suspension. */
   function abortSpeaking(reason: string): void {
-    if (speaking === "aborted") return; // The first reason is the true one.
+    if (speaking === "aborted" && !speakingSuspended) return;
+    if (speaking !== "aborted") cancellationGeneration += 1;
     speaking = "aborted";
     speakingAbortReason = reason;
+    speakingSuspended = false;
+  }
+
+  /** Recoverable: only resumeSpeaking() undoes it, and only if nothing
+   * permanent happened meanwhile. */
+  function suspendSpeaking(reason: string): void {
+    if (speaking === "aborted") return;
+    speaking = "aborted";
+    speakingAbortReason = reason;
+    speakingSuspended = true;
     cancellationGeneration += 1;
+  }
+
+  function resumeSpeaking(): void {
+    if (!speakingSuspended) return;
+    speaking = "enabled";
+    speakingAbortReason = null;
+    speakingSuspended = false;
+  }
+
+  /** Lets a handler that ends the generation wait for an in-flight join, so the
+   * join is never cancelled half-way by an event it caused. The join never
+   * waits on the event queue, so this cannot deadlock. */
+  async function afterJoin(): Promise<void> {
+    await Promise.resolve();
+    const join = activeJoinPromise;
+    if (join !== null) await Promise.allSettled([join]);
+  }
+
+  /** Ends this generation so the composition can start the next one: what was
+   * captured is finalized and persisted with a capture gap, the lease is
+   * released. A live bridge is asked to leave first so the next generation can
+   * claim the physical client with a confirmed departure. */
+  async function endGenerationForRecovery(cause: NonNullable<MeetingSessionState["recoveryCause"]>, tellBridge: boolean): Promise<void> {
+    await afterJoin();
+    if (terminalReason !== null || disposed) return;
+    recoveryCause = cause;
+    abortSpeaking(cause === "runtime_voice_terminal" ? "provider_unavailable" : cause);
+    if (tellBridge && joinCommandSent) {
+      try { await issue({ type: "leave", reason: "coordinator_stop" }); }
+      catch (error) { routingErrors.push({ source: "join_cleanup", error }); }
+    }
+    await terminate("bridge_failure", clock.now(), "local_clock");
   }
 
   function requireRuntimeSessionId(): bigint {
@@ -571,6 +696,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   const queue: QueueItem[] = [];
   let terminalLeftAdmitted = false;
+  let closedAdmitted = false;
   let pumping = false;
   let idleWaiters: Array<() => void> = [];
 
@@ -599,10 +725,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // session is terminal after the first, and bridge-session/v1 has no
       // re-open, so every later `left` is redundant by the contract's own
       // rule. The rest fall through to the ordinary drop path below.
-      if (item.source === "bridge" && !terminalLeftAdmitted && looksLikeTerminalLeft(item.raw)) {
-        terminalLeftAdmitted = true;
+      // Each once per session, independently: a forged `left`-shaped line
+      // cannot use up the closure notice's admission.
+      const closure = item.source === "bridge_closed" && !closedAdmitted;
+      if (closure || item.source === "bridge" && !terminalLeftAdmitted && looksLikeTerminalLeft(item.raw)) {
+        if (closure) closedAdmitted = true; else terminalLeftAdmitted = true;
         overflows.push({
-          source: item.source,
+          source: "bridge",
           queueDepth: queue.length,
           atMs: clock.now(),
           disposition: "admitted",
@@ -613,17 +742,17 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       }
 
       overflows.push({
-        source: item.source,
+        source: item.source === "runtime" ? "runtime" : "bridge",
         queueDepth: queue.length,
         atMs: clock.now(),
         disposition: "dropped",
       });
       if (options.timedEvidence) {
         try {
-          if (item.source === "bridge") provisional?.invalidateCoverage("ui_sequence_gap");
+          if (item.source !== "runtime") provisional?.invalidateCoverage("ui_sequence_gap");
           else if (item.event.type === "timed_voice_event" && item.event.bridgeSessionId === bridgeSessionId &&
             item.event.event.sessionId === evidenceControlId && item.event.event.type === "voice_transcript_final") provisional?.noteWordingDrop();
-        } catch (error) { routingErrors.push({ source: item.source, error }); }
+        } catch (error) { routingErrors.push({ source: item.source === "runtime" ? "runtime" : "bridge", error }); }
       }
       abortSpeaking("queue_overflow");
       return;
@@ -665,7 +794,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           await handle(item);
         } catch (error) {
           // One event's failure costs that event, never the drain.
-          routingErrors.push({ source: item.source, error });
+          routingErrors.push({ source: item.source === "runtime" ? "runtime" : "bridge", error });
         }
       }
     } finally {
@@ -677,6 +806,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   }
 
   async function handle(item: QueueItem): Promise<void> {
+    if (item.source === "bridge_closed") {
+      await endGenerationForRecovery("bridge_closed", false);
+      return;
+    }
     if (item.source === "bridge") {
       await handleBridgeMessage(item.raw);
       return;
@@ -768,6 +901,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
       case "media_connected":
         mediaConnected = true;
+        mediaEverConnected = true;
+        if (uncoveredGapOpen) {
+          uncoveredGapOpen = false;
+          const startedAt = transitionGapStart()!;
+          if (Date.parse(event.observedAt) > Date.parse(startedAt)) observedGaps.push({ direction: "capture", startedAt, endedAt: event.observedAt });
+        }
         return;
 
       case "media_disconnected":
@@ -802,8 +941,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         if (commandType === "connect_media" && event.outcome !== "ok") {
           // No media path means nothing to speak over. Capture stays as it is;
           // only speaking stops.
+          // The shipped bridge accepts one connect_media per bridge session, so
+          // the bounded retry is the next generation.
           mediaConnected = false;
           abortSpeaking(`media_command_${event.outcome}`);
+          if (!mediaEverConnected) captureLostAt ??= generationStartedAt;
+          await endGenerationForRecovery("media_connect_failed", true);
         }
         return;
       }
@@ -871,6 +1014,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       switch (value.type) {
         case "voice_transcript_final":
           if (settledTurns.has(value.segmentId) || openTurns.has(value.segmentId)) return;
+          recognitionRecovered();
           try { provisional?.finalize(value); } catch (error) { routingErrors.push({ source: "runtime", error }); }
           try { options.timedEvidence.onTranscript?.(value); } catch (error) { routingErrors.push({ source: "runtime", error }); }
           event = { type: "timed_transcript_final", segment: { segmentId: value.segmentId, text: value.text, final: true } }; break;
@@ -881,7 +1025,39 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         case "voice_barge_in":
           if (lastAuthorizedTurn?.turnId !== value.turnId) return;
           event = { type: "barge_in", segmentId: lastAuthorizedTurn.segmentId }; break;
-        case "voice_session_failed": event = { type: "provider_unavailable", detail: "runtime_voice_failed" }; break;
+        case "voice_session_failed":
+          if (value.recovery === "new_session") {
+            // Terminal for this voice session: no capture can be assumed after
+            // it. A new generation brings a new voice session and media lease.
+            for (const segmentId of [...openTurns]) settle(segmentId, "failed", "provider_unavailable");
+            await endGenerationForRecovery("runtime_voice_terminal", true);
+            return;
+          }
+          // continue_session: the Runtime keeps the voice session and the
+          // recording. Ending the generation here would stop native capture
+          // because of a provider failure, so it never does. Only a recognizer
+          // failure is a recognition outage; a language-model or synthesis
+          // failure costs the open turns and nothing else.
+          if (value.error.stage !== "speech_recognizer") {
+            for (const segmentId of [...openTurns]) settle(segmentId, "failed", "provider_unavailable");
+            return;
+          }
+          recognitionFailures += 1;
+          consecutiveRecognitionFailures += 1;
+          if (recognitionOutages.at(-1)?.endedAt !== null && recognitionOutages.length < MAX_RECOGNITION_OUTAGES) {
+            recognitionOutages.push({ startedAt: new Date(clock.now()).toISOString(), endedAt: null, reason: outageReason(value.error.stage) });
+          }
+          for (const segmentId of [...openTurns]) settle(segmentId, "failed", "provider_unavailable");
+          // Always a suspension: the Runtime reconnects recognition inside the
+          // session, and any recognition output re-arms speaking. Past the
+          // limit of failures with no output between them the state says so.
+          recognition = consecutiveRecognitionFailures > recognitionRecoveryLimit ? "failed" : "interrupted";
+          suspendSpeaking("provider_unavailable");
+          return;
+        case "voice_transcript_partial":
+          // Recognition output, so recognition works again; nothing else is used.
+          recognitionRecovered();
+          return;
         default: return;
       }
     } else {
@@ -991,6 +1167,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     if (terminalReason !== null) return;
     terminalReason = reason;
     phase = "ended";
+    closeRecognitionOutage(terminalAtMs ?? clock.now());
     sessionEnded.abort();
 
     try {
@@ -1002,14 +1179,28 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       // recording handle does not exist until the runtime returns it, and the
       // two have to be written together. See applyTerminalTransition.
       await finalizeRecording();
+      const uncaptured = uncoveredGapOpen;
+      if (uncoveredGapOpen) {
+        uncoveredGapOpen = false;
+        // Nothing was captured in this generation before it, so it is the earliest gap.
+        observedGaps.unshift({ direction: "capture", startedAt: transitionGapStart()!, endedAt: null });
+      }
       if (reason === "bridge_failure") {
+        // A generation that never captured passes the earlier loss on unchanged.
+        recordedCaptureLossAt = uncaptured ? transitionGapStart()
+          : captureLostAt ?? (mediaEverConnected ? new Date(terminalAtMs ?? clock.now()).toISOString() : generationStartedAt);
+        const last = observedGaps.at(-1);
+        if (!(last?.direction === "capture" && last.endedAt === null)) {
+          observedGaps.push({ direction: "capture", startedAt: recordedCaptureLossAt!, endedAt: null });
+        }
         const persistedRecording = recording === null ? null : recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId, captureDrain);
-        coordinator.recordBridgeFailure(
+        bridgeRetryAllowed = coordinator.recordBridgeFailure(
           identity.occurrenceId,
           bridgeFailureRetryLimit,
           observedGaps.map((gap) => ({ ...gap })),
           persistedRecording,
-        );
+          options.deferBridgeFailureExhaustion === true,
+        ).retryAllowed;
         // This bridge generation is over even when recovery will create a
         // fresh one; its local wording must not remain a live generation.
         coordinator.completeReconciliationGeneration(identity.occurrenceId, bridgeSessionId, terminalAtMs, terminalSource, terminalSource === "bridge_observed" ? reason : undefined);
@@ -1070,7 +1261,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         const backfillSeed = outcome.kind === "advance" && outcome.toState === "finalizing" &&
           reason === "ended" && terminalSource === "bridge_observed" && terminalObservedAt !== undefined && options.backfillSeedConfig !== undefined
           ? { ...options.backfillSeedConfig, terminalReason: "ended" as const, terminalSource: "bridge_observed" as const,
-              endedAt: terminalObservedAt, identity }
+              endedAt: terminalObservedAt, identity,
+              processingWarnings: [...options.backfillSeedConfig.processingWarnings, ...recognitionOutageWarnings(recognitionOutages, terminalObservedAt)] }
           : undefined;
         coordinator.finalizeWithRecording(identity.occurrenceId, outcome, recordingInput(recording, observedGaps, recoveryCapability, bridgeSessionId, captureDrain),
           bridgeSessionId, terminalAtMs, terminalSource, backfillSeed);
@@ -1174,7 +1366,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       await closeRuntime();
       releaseLease("bridge_failure");
       const state = coordinator.get(identity.occurrenceId)?.state ?? null;
-      if (state !== null && state !== "notified" && state !== "failed") {
+      // A recovery generation that cannot join leaves the row to the caller,
+      // which publishes what the earlier generations recorded.
+      const deferred = options.deferBridgeFailureExhaustion === true && isRecoveryGeneration;
+      if (state !== null && state !== "notified" && state !== "failed" && !deferred) {
         coordinator.fail(identity.occurrenceId, reason);
       }
     } catch (error) {
@@ -1202,9 +1397,11 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   function unsubscribe(): void {
     const bridgeUnsubscribe = unsubscribeBridge;
     const runtimeUnsubscribe = unsubscribeRuntime;
+    const closedUnsubscribe = unsubscribeClosed;
     unsubscribeBridge = null;
     unsubscribeRuntime = null;
-    for (const cleanup of [bridgeUnsubscribe, runtimeUnsubscribe]) {
+    unsubscribeClosed = null;
+    for (const cleanup of [bridgeUnsubscribe, runtimeUnsubscribe, closedUnsubscribe]) {
       if (cleanup === null) continue;
       try {
         cleanup();
@@ -1240,6 +1437,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     }
 
     phase = "joining";
+    generationStartedAt = new Date(clock.now()).toISOString();
     const existing = coordinator.get(identity.occurrenceId);
     if (existing?.state === "discovered") coordinator.advance(identity.occurrenceId, "joining");
     else if (existing?.state !== "listening") {
@@ -1277,6 +1475,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       unsubscribeRuntime = runtime.subscribe((event) => {
         enqueue({ source: "runtime", event });
       });
+      unsubscribeClosed = bridge.onClosed?.(() => { enqueue({ source: "bridge_closed" }); }) ?? null;
 
       markJoinTiming(options.joinTiming, "subscriptions_ready");
       joinDiagnostic?.phase("join_send");
@@ -1404,6 +1603,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         routingErrors: [...routingErrors],
         speakerEvidence: [...speakerEvidence],
         liveTranscript: [...liveTranscript],
+        recognition,
+        recognitionFailures,
+        recognitionOutages: recognitionOutages.map((outage) => ({ ...outage })),
+        captureLostAt: recordedCaptureLossAt,
+        bridgeRetryAllowed,
+        recoveryCause,
+        generationStartedAt,
       };
     },
 

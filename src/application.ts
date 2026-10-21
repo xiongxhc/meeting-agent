@@ -15,7 +15,7 @@ import type { ConversationRuntimePort } from "./ports/conversation-runtime.ts";
 import type { BridgeTransportV2 } from "./ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "./ports/session-store.ts";
 import { createCoordinator, type Clock, type SessionCoordinator } from "./sessions/coordinator.ts";
-import { createMeetingSession, type MeetingSession } from "./sessions/meeting-session.ts";
+import { createMeetingSession, type CreateMeetingSessionOptions, type MeetingSession } from "./sessions/meeting-session.ts";
 import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
 
 // Keep the original public configuration surface available from the package
@@ -70,13 +70,18 @@ export type CreateMeetingAgentApplicationOptions = {
   /** Exact immutable seed inputs for one session, resolved at creation time
    * from that occurrence's connected Runtime; undefined means no seed. */
   readonly backfillSeedConfigFor?: (identity: MeetingIdentity) => BackfillSeedConfig | undefined;
+  /** The caller publishes an occurrence whose bridge generations all failed
+   * (see CreateMeetingSessionOptions.deferBridgeFailureExhaustion). */
+  readonly deferBridgeFailureExhaustion?: boolean;
   /** PRIVATE test-entry join-latency observer (sessions/join-timing.ts). */
   readonly joinTiming?: JoinTimingObserver;
 };
 
 export type MeetingAgentApplication = {
   readonly coordinator: SessionCoordinator;
-  createSession(identity: MeetingIdentity): Promise<MeetingSession>;
+  /** `recovery` starts a recovery generation for an occurrence whose previous
+   * bridge generation failed; see CreateMeetingSessionOptions.recovery. */
+  createSession(identity: MeetingIdentity, recovery?: CreateMeetingSessionOptions["recovery"]): Promise<MeetingSession>;
   liveSessionCount(): number;
   close(): Promise<void>;
 };
@@ -125,7 +130,7 @@ export function createMeetingAgentApplication(
 
   return {
     coordinator,
-    async createSession(identity: MeetingIdentity): Promise<MeetingSession> {
+    async createSession(identity: MeetingIdentity, recovery?: CreateMeetingSessionOptions["recovery"]): Promise<MeetingSession> {
       markJoinTiming(options.joinTiming, "create_session_entered");
       if (closed) return Promise.reject(new Error("meeting-agent application is closed"));
       const slot = slots.get(options.adapters.bridgeIdFor(identity));
@@ -153,6 +158,8 @@ export function createMeetingAgentApplication(
             bridgeSessionId: binding.bridgeSessionId,
             disclosureText: "A meeting agent is listening and will create meeting notes.",
             teamVaultDir: options.config.dataPaths.teamVaultDir,
+            ...(recovery === undefined ? {} : { recovery }),
+            ...(options.deferBridgeFailureExhaustion === true ? { deferBridgeFailureExhaustion: true } : {}),
           };
           const backfillSeedConfig = options.backfillSeedConfigFor?.(identity);
           // The process port is typed for the v1 control plane; a timed slot
