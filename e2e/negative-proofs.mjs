@@ -48,6 +48,9 @@ export function negativeProofs({ staged, live, teammem, outDir, probe }) {
     ...walkFiles(staged.directories.outboxDir, scanErrors),
     ...walkFiles(staged.directories.receiptsDir, scanErrors),
     ...walkFiles(staged.directories.control, scanErrors),
+    ...walkFiles(staged.directories.stateRoot, scanErrors),
+    // The staged key file is the one place the key belongs.
+    ...walkFiles(staged.directories.runtimeRoot, scanErrors, [staged.directories.runtimeKeyDir]),
     ...walkFiles(outDir, scanErrors),
     ...walkFiles(staged.directories.teammem, scanErrors, [path.join(staged.directories.teammem, "src"), path.join(staged.directories.teammem, "wheel-venv"), path.join(staged.directories.teammem, "wheelhouse")]),
     ...[staged.launcherLog, teammem?.paths.envFile].filter((file) => file && existsSync(file)),
@@ -55,12 +58,14 @@ export function negativeProofs({ staged, live, teammem, outDir, probe }) {
   const leaks = { key: [], secret: [], credential: [] };
   const needles = [
     ["key", key], ["secret", secret], ["credential", PROVIDER_CREDENTIAL],
-  ].filter(([, value]) => typeof value === "string" && value.length >= 16);
+  ].filter(([, value]) => typeof value === "string" && value.length >= 16).map(([name, value]) => [name, Buffer.from(value, "utf8")]);
+  // The key is staged as hex text; its raw 32 bytes must not appear either.
+  if (typeof key === "string" && /^[0-9a-f]{64}$/.test(key)) needles.push(["key", Buffer.from(key, "hex")]);
   for (const file of scanned) {
     let bytes;
     try { bytes = readFileSync(file); } catch { scanErrors.push(`${file}: file scan failed`); continue; }
     for (const [name, needle] of needles) {
-      if (bytes.includes(Buffer.from(needle, "utf8"))) leaks[name].push(file);
+      if (bytes.includes(needle) && !leaks[name].includes(file)) leaks[name].push(file);
     }
   }
   // The harness's own evidence copies are scanned too, after they are written.
@@ -99,13 +104,20 @@ export function negativeProofs({ staged, live, teammem, outDir, probe }) {
     if (bytes.includes(zeroRun)) pcmMarkers.push(`${file}: 960-byte silent PCM run`);
     if (bytes.includes(speechMarker) || bytes.includes(voicedMarker)) pcmMarkers.push(`${file}: scripted speech/capture PCM marker`);
   }
+  // Meeting's own store may hold zero-filled pages, so only the scripted
+  // speech/capture markers apply there, not the silent-frame run.
+  for (const file of walkFiles(staged.directories.stateRoot, scanErrors)) {
+    let bytes;
+    try { bytes = readFileSync(file); } catch { scanErrors.push(`${file}: file scan failed`); continue; }
+    if (bytes.includes(speechMarker) || bytes.includes(voicedMarker)) pcmMarkers.push(`${file}: scripted speech/capture PCM marker`);
+  }
 
   const processCleanup = recordedProcessProof({ staged, live, probe });
   const { pids, orphans } = processCleanup;
 
   const trace = live.summary?.trace ?? [];
   const storeClosedAt = trace.lastIndexOf("shutdown_store_closed");
-  const afterStoreClose = storeClosedAt === -1 ? [] : trace.slice(storeClosedAt + 1);
+  const afterStoreClose = storeClosedAt === -1 ? ["shutdown_store_closed_absent"] : trace.slice(storeClosedAt + 1);
 
   const identities = new Set();
   for (const row of live.reopen?.rows.sessions ?? []) if (row.occurrence_id) identities.add(row.occurrence_id);

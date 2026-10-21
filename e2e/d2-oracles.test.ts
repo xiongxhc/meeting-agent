@@ -137,3 +137,36 @@ test("completion requires same-session Runtime late speech rather than only prov
     assert.ok(failures(f).length > 0, `completion accepted ${fault}`);
   }
 });
+
+function failedCheck(value: ReturnType<typeof fixture>, name: string) {
+  const row = d2OrderingOracles(value).find((entry: { name: string }) => entry.name === name);
+  assert.ok(row, name); return row as { status: string; detail: string };
+}
+test("the only held terminal must be the cut's winner, not merely exclusive", () => {
+  for (const [cut, name, wrong] of [["cancel-wins", "cancellation_wins_terminal", "turn_completed"], ["cancel-wins", "cancellation_wins_terminal", "turn_failed"],
+    ["complete-wins", "completion_wins_terminal", "turn_cancelled"]] as const) {
+    const f = fixture(cut); f.runtimeEvents.find(row => row.event)!.event!.type = wrong;
+    const row = failedCheck(f, name);
+    assert.equal(row.status, "fail", `${cut} accepted sole ${wrong}`); assert.match(row.detail, /wrong actual terminal winner/);
+  }
+});
+test("cancellation requires exactly one flush of the held generation", () => {
+  const f = fixture("cancel-wins"); f.childState.flushes.push({ generation: "4", monotonicNs: "25" });
+  const row = failedCheck(f, "cancellation_wins_terminal");
+  assert.equal(row.status, "fail"); assert.match(row.detail, /barge\/flush\/terminal chain/);
+});
+test("repeated close binds the entry exit code to the close disposition and requires three results", () => {
+  const fulfilled = () => Array.from({ length: 3 }, () => ({ status: "fulfilled", reason: "" }));
+  for (const [results, code, pass] of [["refused", 70, true], ["refused", 0, false], ["fulfilled", 0, true], ["fulfilled", 70, false]] as const) {
+    const f = fixture("repeated-close"); f.outcome.code = code;
+    if (results === "fulfilled") f.closed.results = fulfilled();
+    const row = failedCheck(f, "repeated_owner_close");
+    assert.equal(row.status, pass ? "pass" : "fail", `${results} close with exit ${code}: ${row.detail}`);
+    if (!pass) assert.match(row.detail, /entry exit does not match/);
+  }
+  for (const length of [2, 4]) {
+    const f = fixture("repeated-close"); f.closed.results = f.closed.results.slice(0, 1).concat(Array.from({ length: length - 1 }, () => ({ ...f.closed.results[0]! })));
+    const row = failedCheck(f, "repeated_owner_close");
+    assert.equal(row.status, "fail", `${length} results`); assert.match(row.detail, /did not settle the same actual owner/);
+  }
+});

@@ -31,7 +31,7 @@ import { createProcessEvidence, observeProcessSnapshot } from "./process-evidenc
 import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-proofs.mjs";
 import { preflightLauncher } from "./launcher-preflight.mjs";
 import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOracles, mediaTimingMetadata, mediaTimingOracles, tailOmissionMetadata, tailOmissionOracles, longTailOmissionMetadata, longTailOmissionOracles, longTailReport, readDurableEvidence, readRuntimeTrace } from "./durable-oracles.mjs";
-import { d2OrderingOracles } from "./d2-oracles.mjs";
+import { SHUTDOWN_ORDER, d2OrderingOracles } from "./d2-oracles.mjs";
 import { PROVIDER_FAULT_CUTS, providerFaultMetadata, providerFaultOracles, providerFaultPlan } from "./provider-fault-oracles.mjs";
 import { LIFECYCLE_FILE, readVoiceEndRows, voiceEndFromControl } from "./voice-end-evidence.mjs";
 import { joinLatencyFromControl } from "./join-latency-evidence.mjs";
@@ -671,12 +671,13 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
   return { meeting, plan, events, summary, childState, outcome, peakTree, processEvidence, teammemResult, receipt, artifact, stdout, stderr, ...(l6ReceiptGate ? { l6, l6Preparation } : {}) };
 }
 
-function interactiveOracles(live) {
+/** Records the interactive spine oracles through `record` (the runner's own check by default). */
+export function interactiveOracles(live, record = check) {
   const events = live.summary?.runtimeEvents ?? [], calls = live.summary?.interactiveCalls ?? [];
   const language = calls.filter((entry) => entry.route === "language"), speech = calls.filter((entry) => entry.route === "speech");
   const silence = live.events.find((entry) => entry.name === "silent_capture");
   const negative = live.events.find((entry) => entry.name === "name_gate_negative");
-  check("silent_name_gate", silence?.frames >= 51 && silence?.disclosure === "failed" && silence?.languageCalls === 0 && silence?.playback === 0 && silence?.authorizations === 0 &&
+  record("silent_name_gate", silence?.frames >= 51 && silence?.disclosure === "failed" && silence?.languageCalls === 0 && silence?.playback === 0 && silence?.authorizations === 0 &&
     negative?.languageCalls === 0 && negative?.playback === 0 &&
     events.filter((entry) => entry.type === "response_skipped").length >= 3,
     "background, incidental alias and near-name produced three actual skips, no language or playback before invocation");
@@ -689,22 +690,22 @@ function interactiveOracles(live) {
       terminals.length === 1 && terminals[0].event.type === "turn_completed" && live.childState?.playback.some((entry) => entry.turn === question.turn && !entry.held);
   };
   const indexed = (live.summary?.vaultReads ?? []).some((entry) => entry.type === "vault_index_source" && entry.source === `${live.plan.vaultRevision}:orion.md`);
-  check("current_meeting_grounding", completed(current) && current?.vaultReadsBefore === current?.vaultReadsAfter && language[0]?.grounded === "current" && language[0]?.currentFact && !language[0]?.vaultFact &&
+  record("current_meeting_grounding", completed(current) && current?.vaultReadsBefore === current?.vaultReadsAfter && language[0]?.grounded === "current" && language[0]?.currentFact && !language[0]?.vaultFact &&
     speech[0]?.text === "Copper budget is seven.", "first actual provider request carries prior current-meeting fact and no vault fact; matching speech request");
-  check("vault_grounding", completed(vault) && indexed && vault?.vaultReadsAfter === vault?.vaultReadsBefore + 1 && language[1]?.grounded === "vault" && language[1]?.vaultFact &&
+  record("vault_grounding", completed(vault) && indexed && vault?.vaultReadsAfter === vault?.vaultReadsBefore + 1 && language[1]?.grounded === "vault" && language[1]?.vaultFact &&
     speech[1]?.text === "Orion launch code is violet.", "second actual request carries indexed fixture-vault fact; matching speech request");
-  check("vault_unavailable", completed(live.events.find((entry) => entry.name === "unavailable_question_answered")) && language[2]?.unavailable && speech[2]?.text === "Historical team memory is unavailable.",
+  record("vault_unavailable", completed(live.events.find((entry) => entry.name === "unavailable_question_answered")) && language[2]?.unavailable && speech[2]?.text === "Historical team memory is unavailable.",
     "removing fixture checkout produces the shipped unavailable-history instruction and a matching spoken disclosure");
   if (["complete-wins", "repeated-close"].includes(live.plan.d2Cut)) return;
   const interruption = live.events.find((entry) => entry.name === "interruption_acknowledged");
   const terminals = events.filter((entry) => ["turn_completed", "turn_cancelled", "turn_failed"].includes(entry.event?.type) && entry.event.turn_id === interruption?.turn);
-  check("acknowledged_interruption", Boolean(interruption) && terminals.length === 1 && terminals[0].event.type === "turn_cancelled" &&
+  record("acknowledged_interruption", Boolean(interruption) && terminals.length === 1 && terminals[0].event.type === "turn_cancelled" &&
     events.some((entry) => entry.type === "voice_barge_in" && entry.generation_id === interruption.generation && entry.turn_id === interruption.turn) &&
     events.some((entry) => entry.type === "voice_timing" && entry.turn_id === interruption.turn && entry.milestone === "playback_flush_acknowledged") &&
     live.childState?.flushes.some((entry) => entry.generation === interruption.generation) &&
     !live.childState?.playback.some((entry) => entry.generation === interruption.generation && entry.afterFlush),
     "held playable frame, matching actual barge and Runtime flush-acknowledged timing, same-generation peer ACK, one cancellation terminal, no post-flush output; scripted only");
-  check("capture_after_interrupt", interruption?.captureAfter >= interruption?.captureBefore + 10,
+  record("capture_after_interrupt", interruption?.captureAfter >= interruption?.captureBefore + 10,
     "ten actual captured frames continue after the acknowledged interruption");
 }
 
@@ -727,6 +728,49 @@ function readArtifact(bundleDir) {
 // Durable oracles: reopen the state database the application closed
 // ---------------------------------------------------------------------------
 
+const STATE_QUERIES = {
+  sessions: "SELECT occurrence_id, state, terminal_reason FROM sessions",
+  invites: "SELECT occurrence_id, state FROM feishu_invite_occurrences",
+  seeds: "SELECT occurrence_id, ended_at FROM backfill_seeds",
+  custody: "SELECT physical_client_id, occurrence_id, state FROM physical_client_custody",
+  delivery: "SELECT occurrence_id, revision, retry_reason, published_at_ms IS NOT NULL AS published, publication_url IS NOT NULL AS hasUrl FROM delivery_journal",
+  notifications: "SELECT occurrence_id, revision, state, attempt_count, request_uuid, provider_message_id IS NOT NULL AS sent FROM notification_intents",
+  seedLifecycle: "SELECT occurrence_id, state, initial_build_attempts, initial_build_last_reason FROM backfill_seed_lifecycle",
+  alignment: "SELECT generation_id, attempt_id FROM recording_alignment_selected",
+  alignmentPages: "SELECT page_index, entry_count, length(payload) AS storedBytes FROM recording_alignment_pages ORDER BY page_index",
+};
+
+/** A failed query yields no rows and a recorded error, never a row that a
+ * count-based oracle could mistake for evidence. */
+export function readStateRows(database) {
+  const rows = {}, queryErrors = {};
+  for (const [name, sql] of Object.entries(STATE_QUERIES)) {
+    try { rows[name] = database.prepare(sql).all(); } catch (error) { rows[name] = []; queryErrors[name] = String(error?.message ?? error); }
+  }
+  return { rows, queryErrors };
+}
+
+/** custody_claimed, finalized_seed and alignment_stored over the reopened store. */
+export function storeSpineChecks(reopen, occurrenceId) {
+  const rows = reopen?.rows ?? {}, errors = reopen?.queryErrors ?? {};
+  const entry = (name, table, pass, detail) => errors[table] !== undefined || reopen === null || reopen === undefined
+    ? { name, pass: false, detail: reopen ? `${table} query failed: ${errors[table]}` : "no reopened state database" }
+    : { name, pass, detail };
+  const custody = rows.custody ?? [], seeds = rows.seeds ?? [], pages = rows.alignmentPages ?? [];
+  return [
+    entry("custody_claimed", "custody", custody.length === 1 && custody[0].occurrence_id === occurrenceId && custody[0].state === "cleared",
+      JSON.stringify(custody)),
+    entry("finalized_seed", "seeds", seeds.length === 1 && seeds[0].occurrence_id === occurrenceId, JSON.stringify(seeds)),
+    entry("alignment_stored", "alignmentPages", pages.length > 0, `stored pages ${JSON.stringify(pages)}`),
+  ];
+}
+
+export function shutdownCleanCheck({ code, trace }) {
+  const codes = (trace ?? []).filter((entry) => entry.startsWith("shutdown_"));
+  return { pass: code === 0 && JSON.stringify(codes) === JSON.stringify(SHUTDOWN_ORDER),
+    detail: `entry exit ${code}; shipped close order ${JSON.stringify(codes)}` };
+}
+
 function reopenOracles(staged) {
   const filename = path.join(staged.directories.stateRoot, "orchestration.db");
   if (!existsSync(filename)) { oracle("state_database", "fail", "the application left no state database"); return null; }
@@ -734,19 +778,7 @@ function reopenOracles(staged) {
   try {
     database.pragma("foreign_keys = ON");
     const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
-    const query = (sql) => { try { return database.prepare(sql).all(); } catch (error) { return [{ error: String(error?.message ?? error) }]; } };
-    const rows = {
-      sessions: query("SELECT occurrence_id, state, terminal_reason FROM sessions"),
-      invites: query("SELECT occurrence_id, state FROM feishu_invite_occurrences"),
-      seeds: query("SELECT occurrence_id, ended_at FROM backfill_seeds"),
-      custody: query("SELECT physical_client_id, occurrence_id, state FROM physical_client_custody"),
-      delivery: query("SELECT occurrence_id, revision, retry_reason, published_at_ms IS NOT NULL AS published, publication_url IS NOT NULL AS hasUrl FROM delivery_journal"),
-      notifications: query("SELECT occurrence_id, revision, state, attempt_count, request_uuid, provider_message_id IS NOT NULL AS sent FROM notification_intents"),
-      seedLifecycle: query("SELECT occurrence_id, state, initial_build_attempts, initial_build_last_reason FROM backfill_seed_lifecycle"),
-      alignment: query("SELECT generation_id, attempt_id FROM recording_alignment_selected"),
-      alignmentPages: query("SELECT page_index, entry_count, length(payload) AS storedBytes FROM recording_alignment_pages ORDER BY page_index"),
-    };
-    return { filename, tables: [...tables].sort(), rows };
+    return { filename, tables: [...tables].sort(), ...readStateRows(database) };
   } finally {
     database.close();
   }
@@ -935,8 +967,9 @@ async function main() {
         "the scripted long connection was acknowledged only after the durable commit");
       check("discovery_tick", logged("discovery_tick"), "the shipped discovery tick ran");
       check("runtime_connected", logged("occurrence_runtime_connected"), "the real SDK connected over the packaged gateway");
-      check("custody_claimed", (live.reopen?.rows.custody ?? []).length > 0,
-        JSON.stringify(live.reopen?.rows.custody ?? []));
+      const occurrenceId = live.meeting ? `${live.meeting.providerMeetingId}@${new Date(live.meeting.startSeconds * 1000).toISOString().replace(".000Z", "Z")}` : null;
+      const storeChecks = Object.fromEntries(storeSpineChecks(live.reopen, occurrenceId).map((row) => [row.name, row]));
+      check("custody_claimed", storeChecks.custody_claimed.pass, storeChecks.custody_claimed.detail);
       check("child_launched", live.childState?.pid !== undefined && live.childState?.joined === true,
         `child pid ${live.childState?.pid}, joined ${live.childState?.joined}`);
       check("media_connected", live.childState?.mediaConnected === true,
@@ -945,10 +978,9 @@ async function main() {
         `${live.childState?.framesSent} produced capture frames; recordings ${JSON.stringify(readdirSync(staged.directories.recordingsDir))}`);
       if (options.d2Cut !== "repeated-close") {
       check("meeting_ended", live.childState?.left === "ended", `bridge-observed terminal ${live.childState?.left}`);
-      check("finalized_seed", (live.reopen?.rows.seeds ?? []).length === 1, JSON.stringify(live.reopen?.rows.seeds ?? []));
+      check("finalized_seed", storeChecks.finalized_seed.pass, storeChecks.finalized_seed.detail);
       const alignmentPages = live.reopen?.rows.alignmentPages ?? [];
-      check("alignment_stored", alignmentPages.length > 0,
-        `stored pages ${JSON.stringify(alignmentPages)}`);
+      check("alignment_stored", storeChecks.alignment_stored.pass, storeChecks.alignment_stored.detail);
       oracle("alignment_page_budget", "pass",
         `largest stored page ${Math.max(0, ...alignmentPages.map((page) => page.storedBytes))} bytes against the private re-encoding bound of 2x the SDK's MAX_ALIGNMENT_PAGE_BYTES (D032 §1); this run produced ${live.childState?.framesSent} capture frames; the historical ${CAPTURE_FRAME_LIMIT}-frame fixture refused every page before the fix`);
 
@@ -1003,8 +1035,8 @@ async function main() {
           oracle(name, options.l4Case !== undefined && name === "artifact_bundle" ? (live.l4 ? "pass" : "fail") : "skipped",
             options.l4Case !== undefined ? "selected L4 requires actual READY; L6/L7 publication not exercised" : "not exercised by this command: recording media timing conformance only");
       }
-      check("shutdown_clean", live.outcome.code === 0 && logged("shutdown_store_closed"),
-        `entry exit ${live.outcome.code}; shipped close order ${JSON.stringify((live.summary?.trace ?? []).filter((code) => code.startsWith("shutdown_")))}`);
+      const shutdown = shutdownCleanCheck({ code: live.outcome.code, trace: live.summary?.trace });
+      check("shutdown_clean", shutdown.pass, shutdown.detail);
       } else {
         oracle("publication_not_exercised", "skipped", "active-owner repeated-close fault cut; ordinary publication is separately proven by the accepted baseline");
       }

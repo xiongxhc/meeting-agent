@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,7 +10,7 @@ import { keyPresent, negativeProofs } from "./negative-proofs.mjs";
 test("security scanner refuses emitted key leaks, unsafe key permissions, plaintext PCM and missing environment evidence", () => {
   const root = mkdtempSync(path.join(tmpdir(), "meeting-security-test-"));
   chmodSync(root, 0o700);
-  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir"].map((name) => {
+  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir", "stateRoot", "runtimeRoot"].map((name) => {
     const directory = path.join(root, name); mkdirSync(directory, { mode: 0o700 }); return [name, directory];
   }));
   const outDir = path.join(root, "emitted"); mkdirSync(outDir);
@@ -36,11 +37,57 @@ test("security scanner refuses emitted key leaks, unsafe key permissions, plaint
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("security scanner covers Meeting's state database and the raw key bytes", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "meeting-security-state-"));
+  chmodSync(root, 0o700);
+  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir", "stateRoot", "runtimeRoot"].map((name) => {
+    const directory = path.join(root, name); mkdirSync(directory, { mode: 0o700 }); return [name, directory];
+  }));
+  const outDir = path.join(root, "emitted"); mkdirSync(outDir);
+  const keyPath = path.join(directories.runtimeKeyDir!, "key"), appSecretFile = path.join(root, "secret");
+  const key = "c4".repeat(32);
+  writeFileSync(keyPath, `${key}\n`, { mode: 0o600 }); writeFileSync(appSecretFile, "synthetic-feishu-secret");
+  const staged = { root, directories, keyPath, appSecretFile, gatewayPidsPath: path.join(root, "pids") };
+  const live = { childState: { envKeys: [] }, summary: { entryEnvKeys: [], trace: ["shutdown_store_closed"] } };
+  const teammem = { env: {}, paths: { audioStore: directories.recordingsDir } };
+  const scan = () => negativeProofs({ staged, live, teammem, outDir });
+  try {
+    const database = path.join(directories.stateRoot!, "orchestration.db"), wal = `${database}-wal`;
+    writeFileSync(database, "synthetic store"); writeFileSync(wal, "synthetic wal");
+    assert.deepEqual(scan().leaks.key, []); assert.deepEqual(scan().scanErrors, []);
+    writeFileSync(database, `row ${key} row`);
+    assert.deepEqual(scan().leaks.key, [database]);
+    writeFileSync(database, "synthetic store");
+    writeFileSync(wal, Buffer.concat([Buffer.from("page"), Buffer.from(key, "hex"), Buffer.from("page")]));
+    assert.deepEqual(scan().leaks.key, [wal]);
+    assert.ok(negativeProofs({ staged: { ...staged, directories: { ...directories, stateRoot: undefined } }, live, teammem, outDir })
+      .scanErrors.length > 0, "an unscannable state root cannot establish absence");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("no_closed_store_callback evidence fails when the store-close code is absent", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "meeting-store-close-"));
+  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir", "stateRoot", "runtimeRoot"].map((name) => {
+    const directory = path.join(root, name); mkdirSync(directory, { mode: 0o700 }); return [name, directory];
+  }));
+  const keyPath = path.join(directories.runtimeKeyDir!, "key"), appSecretFile = path.join(root, "secret");
+  writeFileSync(keyPath, "d".repeat(64), { mode: 0o600 }); writeFileSync(appSecretFile, "synthetic-feishu-secret");
+  const staged = { root, directories, keyPath, appSecretFile, gatewayPidsPath: path.join(root, "pids") };
+  const teammem = { env: {}, paths: { audioStore: directories.recordingsDir } };
+  const after = (trace: string[]) => negativeProofs({ staged, live: { childState: { envKeys: [] }, summary: { entryEnvKeys: [], trace } }, teammem, outDir: path.join(root, "control") }).afterStoreClose;
+  try {
+    assert.deepEqual(after(["shutdown_fenced", "shutdown_store_closed"]), []);
+    assert.deepEqual(after(["shutdown_store_closed", "late_callback"]), ["late_callback"]);
+    assert.notDeepEqual(after(["shutdown_fenced"]), []);
+    assert.notDeepEqual(after([]), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // Exercises the real scanner: omitting observed helpers or ignoring inventory
 // failure must not turn an empty gateway file into a no-orphan certificate.
 function withProcessScanner(run: (scan: (evidence: object, probe: (pid: number) => void, bridgePid?: unknown) => ReturnType<typeof negativeProofs>) => void) {
   const root = mkdtempSync(path.join(tmpdir(), "meeting-process-scanner-"));
-  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir"].map(name => {
+  const directories = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "runtimeKeyDir", "stateRoot", "runtimeRoot"].map(name => {
     const directory = path.join(root, name); mkdirSync(directory, { mode: 0o700 }); return [name, directory];
   }));
   const outDir = path.join(root, "emitted"); mkdirSync(outDir);
@@ -86,4 +133,35 @@ test("actual negative proof distinguishes complete absent evidence from denied p
     assert.equal(scan({ ...evidence, inventory: { samples: 0, failures: [] } }, observedAbsent).processCleanup.cleanupConfirmed, false);
     assert.equal(scan(evidence, observedAbsent, -1).processCleanup.cleanupConfirmed, false);
   });
+});
+
+test("security scanner covers runtime/ apart from the key directory, and scripted PCM markers in state/", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "meeting-security-runtime-"));
+  chmodSync(root, 0o700);
+  const directories: Record<string, string> = Object.fromEntries(["recordingsDir", "outboxDir", "receiptsDir", "control", "teammem", "stateRoot", "runtimeRoot"].map((name) => {
+    const directory = path.join(root, name); mkdirSync(directory, { mode: 0o700 }); return [name, directory];
+  }));
+  directories.runtimeKeyDir = path.join(directories.runtimeRoot!, "key"); mkdirSync(directories.runtimeKeyDir, { mode: 0o700 });
+  const outDir = path.join(root, "emitted"); mkdirSync(outDir);
+  const keyPath = path.join(directories.runtimeKeyDir, "recording.key"), appSecretFile = path.join(root, "secret");
+  const key = "e5".repeat(32);
+  writeFileSync(keyPath, `${key}\n`, { mode: 0o600 }); writeFileSync(appSecretFile, "synthetic-feishu-secret");
+  const staged = { root, directories, keyPath, appSecretFile, gatewayPidsPath: path.join(root, "pids") };
+  const live = { childState: { envKeys: [] }, summary: { entryEnvKeys: [], trace: ["shutdown_store_closed"] } };
+  const teammem = { env: {}, paths: { audioStore: directories.recordingsDir } };
+  const scan = () => negativeProofs({ staged, live, teammem, outDir });
+  try {
+    const runtimeLog = path.join(directories.runtimeRoot!, "gateway.log"), wal = path.join(directories.stateRoot!, "orchestration.db-wal");
+    writeFileSync(runtimeLog, "synthetic runtime log"); writeFileSync(wal, Buffer.alloc(4096));
+    let proofs = scan();
+    assert.deepEqual(proofs.leaks.key, [], "the staged key file itself is not a leak"); assert.deepEqual(proofs.pcmMarkers, [], "zero-filled pages are not PCM evidence");
+    assert.deepEqual(proofs.scanErrors, []);
+    writeFileSync(runtimeLog, `log ${key} log`);
+    assert.deepEqual(scan().leaks.key, [runtimeLog]);
+    writeFileSync(runtimeLog, "synthetic runtime log");
+    const speech = Buffer.alloc(64); for (let i = 0; i < 32; i += 1) speech.writeInt16LE(0x1234, i * 2);
+    writeFileSync(wal, Buffer.concat([Buffer.alloc(100), speech, Buffer.alloc(100)]));
+    proofs = scan();
+    assert.equal(proofs.pcmMarkers.length, 1); assert.match(proofs.pcmMarkers[0], /scripted speech\/capture PCM marker/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

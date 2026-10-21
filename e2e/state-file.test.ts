@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -91,5 +91,45 @@ test("a permanently invalid state file returns null at the deadline without spin
     const cpuMs = (used.user + used.system) / 1000;
     assert.ok(elapsed >= 245 && elapsed < 1000, `gave up after ${elapsed} ms`);
     assert.ok(cpuMs < elapsed / 2, `cpu ${cpuMs} ms over ${elapsed} ms`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// A caller's bounded reader keeps its own refusals; a tear is still retried.
+test("a caller-supplied byte reader is retried across a tear and its null means absent", () => {
+  const texts = ['{"capturePosition":', '{"capturePosition":{"sequence":"2"}}'];
+  let calls = 0;
+  assert.deepEqual(readStateFile("ignored", { read: () => texts[Math.min(calls++, 1)] }), { capturePosition: { sequence: "2" } });
+  assert.equal(calls, 2);
+  assert.equal(readStateFile("ignored", { read: () => null }), null);
+});
+
+// Every reader of the live bridge state goes through readStateFile: a raw
+// JSON.parse or boundedJson of state.json fails its phase on one torn write.
+test("no harness module parses the live bridge state.json without the retrying reader", () => {
+  const dir = import.meta.dirname, offenders: string[] = [];
+  for (const name of readdirSync(dir).filter((file) => file.endsWith(".mjs"))) {
+    readFileSync(path.join(dir, name), "utf8").split("\n").forEach((line, index) => {
+      if (/"state\.json"|\.statePath\b/.test(line) && /JSON\.parse\(|boundedJson\(|capacityPrivateJson\(/.test(line)) offenders.push(`${name}:${index + 1}`);
+    });
+  }
+  assert.deepEqual(offenders, []);
+});
+
+// Only an absent file is "absent". A bounded reader's refusal (symlink, extent)
+// must surface, or a caller would silently report no bridge.
+test("a reader refusal surfaces as an error; only ENOENT or a null read means absent", async () => {
+  assert.throws(() => readStateFile("ignored", { read: () => { throw new Error("file_extent"); } }), /file_extent/);
+  assert.equal(readStateFile("ignored", { read: () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } }), null);
+  // @ts-expect-error Test-only harness module has no public declaration.
+  const { boundedBytes } = await import("./ingress-run.mjs");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "state-file-"));
+  try {
+    const target = path.join(dir, "target.json"), link = path.join(dir, "state.json");
+    writeFileSync(target, JSON.stringify({ capturePosition: { sequence: "1" } }));
+    symlinkSync(target, link);
+    const bounded = { read: (file: string) => boundedBytes(file, true)?.toString("utf8") ?? null };
+    assert.throws(() => readStateFile(link, bounded));
+    assert.equal(readStateFile(path.join(dir, "missing.json"), bounded), null);
+    assert.deepEqual(readStateFile(target, bounded), { capturePosition: { sequence: "1" } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

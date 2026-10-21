@@ -24,6 +24,7 @@ import { acquireApplicationOwnerLock, type ApplicationOwnerLock } from "../src/a
 import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
 import { createFeishuSocketOwner } from "../src/adapters/feishu-sdk-connection.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { MAINTENANCE_LANES } from "../src/application-maintenance.ts";
 import { composeApplication, stateDatabasePath, RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST, type ComposeApplicationOptions, type ComposedApplication } from "../src/application-composition.ts";
 import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
 import type { BridgeProcessSlot, BridgeShutdownResult, OwnedBridgeProcess } from "../src/ports/bridge-process.ts";
@@ -36,6 +37,7 @@ import { RuntimeTestTransport } from "./lib/runtime-sdk.ts";
 import { envelope, scope, httpPeer, eventFrame, framePayload } from "./lib/feishu-fixtures.ts";
 // @ts-expect-error Test-only JavaScript setup helper has no public declaration.
 import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
+import { pinnedRuntimeGateway } from "./lib/runtime-gateway.ts";
 
 const NODE24 = "/opt/homebrew/opt/node@24/bin/node";
 const CHILD_FIXTURE = path.resolve("test/fixtures/composition-bridge-child.mjs");
@@ -728,8 +730,7 @@ test("a Runtime close rejection swallowed by the session is still visible as a s
 
 // Only the overall case adds the 60s launcher assessment setup budget.
 test("actual gateway: the private launcher env is the allowlist, no provider or recording key reaches Meeting, and the offline gateway's refusal of the pinned online admission reaps the Runtime owner and the child", { timeout: 40_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, async () => {
-  const binary = process.env.MEETING_TEST_RUNTIME_GATEWAY;
-  assert.ok(binary && path.isAbsolute(binary), "Prebuild the immutable Runtime gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
+  const binary = pinnedRuntimeGateway();
   const f = fixture();
   const runtimeRoot = path.join(f.dir, "runtime");
   mkdirSync(runtimeRoot, { mode: 0o700 }); mkdirSync(path.join(runtimeRoot, "models"), { mode: 0o700 });
@@ -1092,7 +1093,9 @@ for (const count of [1, 2, 4, 8]) {
     const ids = await admitted(f, count + 1);
     const log: string[] = [];
     try {
-      const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots, metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 } });
+      // Lanes are driven explicitly here; no cadence tick may depend on how long the run takes.
+      const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots, metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+        maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) } });
       await app.start();
       const tick = await app.discover();
       assert.equal(tick.launched, count); assert.equal(tick.deferred, 1);

@@ -762,3 +762,50 @@ for (const column of ["capture_drain_epoch", "capture_drain_last_frame_sequence"
     const m = await import("./durable-oracles.mjs"), f = omissionFixture(); f.recording[column] = "1";
     assert.equal(m.tailOmissionOracles(f.snapshot, f.child)[0].status, "fail");
   });
+
+// One fixture mutant per predicate the review found unpinned; each asserts the
+// intended predicate's detail so an earlier unrelated refusal cannot stand in.
+function detailOf(rows: Array<{ name: string; status: string; detail: string }>, name: string) {
+  const row = rows.find(entry => entry.name === name)!; assert.ok(row, name); return row;
+}
+test("durable live evidence refuses a persisted live segment no tested segment names", () => {
+  const f = fixture();
+  f.snapshot.live.push({ ...f.snapshot.live[0]!, generation_id: "g2", segment_id: "2" });
+  const row = detailOf(durableOracles(f.snapshot, f.options), "durable_live_evidence");
+  assert.equal(row.status, "fail"); assert.match(row.detail, /untested persisted live segment/);
+});
+test("a negative decision requires exactly one skip", () => {
+  const f = fixture(); f.options.tested[0]!.authorized = false;
+  const skip = { type: "response_skipped", session_id: "42", segment_id: "1" };
+  f.options.runtimeEvents = [f.options.runtimeEvents[0]!, skip, { ...skip }];
+  const row = detailOf(durableOracles(f.snapshot, f.options), "durable_turn_terminals");
+  assert.equal(row.status, "fail"); assert.match(row.detail, /negative segment admitted or skip missing/);
+});
+test("post-flush recorded coverage requires at least ten producer frames", () => {
+  for (const [sequence, outputEndSample, pass] of [["11", "5280", true], ["10", "4800", false], ["2", "960", false]] as const) {
+    const f = fixture(); Object.assign(f.options.interval.captureAfterFlush, { sequence, outputEndSample });
+    const row = detailOf(durableOracles(f.snapshot, f.options), "recorded_capture_after_flush");
+    assert.equal(row.status, pass ? "pass" : "fail", `${sequence}: ${row.detail}`);
+    if (!pass) assert.match(row.detail, /post-flush producer interval mismatch/);
+  }
+});
+test("a persisted bridge capture gap fails post-flush coverage and the confirmed tail", async () => {
+  // @ts-expect-error Test-only reopened evidence has no public declaration.
+  const { captureTailOracles } = await import("./durable-oracles.mjs");
+  const gap = { ordinal: 0, direction: "capture", started_at: "2026-10-01T10:00:00.100Z", ended_at: "2026-10-01T10:00:00.120Z" };
+  const f = fixture(); (f.snapshot.gaps as unknown[]).push(gap);
+  const row = detailOf(durableOracles(f.snapshot, f.options), "recorded_capture_after_flush");
+  assert.equal(row.status, "fail"); assert.match(row.detail, /bridge capture gap/);
+  const t = tailFixture(); (t.snapshot.gaps as unknown[]).push(gap);
+  const tail = captureTailOracles(t.snapshot, t.child)[0];
+  assert.equal(tail.status, "fail"); assert.match(tail.detail, /unaccounted recorded capture tail or audio loss/);
+});
+test("the confirmed tail requires the peer's sent-frame count to equal the acknowledged last frame", async () => {
+  // @ts-expect-error Test-only reopened evidence has no public declaration.
+  const { captureTailOracles } = await import("./durable-oracles.mjs");
+  for (const framesSent of [10, 12]) {
+    const f = tailFixture(); f.child.framesSent = framesSent;
+    const row = captureTailOracles(f.snapshot, f.child)[0];
+    assert.equal(row.status, "fail"); assert.match(row.detail, /peer final producer position mismatch/);
+  }
+});

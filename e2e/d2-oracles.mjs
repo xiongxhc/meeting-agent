@@ -1,4 +1,8 @@
 // Pure test evidence checks; synthetic helper tests are not integration proof.
+/** The shipped close order: each step exactly once, in this order. */
+export const SHUTDOWN_ORDER = Object.freeze(["shutdown_fenced", "shutdown_owned_work_settled", "shutdown_application_closed",
+  "shutdown_runtime_owners_closed", "shutdown_transports_closed", "shutdown_store_closed"]);
+
 export function d2OrderingOracles(live) {
   const { cut, events, runtimeEvents, childState } = live, checks = [];
   const requireFact = (value, reason) => { if (!value) throw new Error(reason); };
@@ -60,8 +64,7 @@ export function d2OrderingOracles(live) {
         closed.results.length === 3 && closed.outcomes.length > 0 && closed.outcomes.every(row => row.phase === "settled" && row.runtimeClose === "closed"),
       "repeated close did not settle the same actual owner Promise/runtime");
       const codes = live.summary.trace.filter(code => code.startsWith("shutdown_"));
-      requireFact(JSON.stringify(codes) === JSON.stringify(["shutdown_fenced", "shutdown_owned_work_settled", "shutdown_application_closed",
-        "shutdown_runtime_owners_closed", "shutdown_transports_closed", "shutdown_store_closed"]) && released?.released && released.afterStoreClosed,
+      requireFact(JSON.stringify(codes) === JSON.stringify(SHUTDOWN_ORDER) && released?.released && released.afterStoreClosed,
       "shutdown close order, single store close or lock release missing");
       const fulfilled = closed.results.every(row => row.status === "fulfilled");
       const refused = closed.results.every(row => row.status === "rejected" && /^composition_close_failed:/.test(row.reason) && row.reason === closed.results[0].reason);

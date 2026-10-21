@@ -67,7 +67,12 @@ if (config.observationPlan !== undefined) {
   } catch { throw new Error("invalid_bridge_observation_plan"); }
 }
 mkdirSync(control, { recursive: true, mode: 0o700 });
+// Command protocol as the real bridge answers it (BridgeProcess.swift): each
+// command ID is reserved before side effects and replays its result.
+const commandResults = new Map();
+let ownerLeaseId = null, joinedNow = false, departed = false, released = false;
 function result(command, outcome, detail) {
+  commandResults.get(command.commandId).answer = { outcome, detail };
   emit({ type: "command_result", commandId: command.commandId, outcome, detail });
 }
 function persist() {
@@ -178,6 +183,9 @@ function watchForEnd() {
     const before = process.hrtime.bigint(), observedAt = new Date().toISOString(), after = process.hrtime.bigint();
     const observation = { reason, observedAt, observationTiming: { clockDomainId: "e2e-clock",
       hostBeforeNs: before.toString(), hostAfterNs: after.toString() }, observationTimingReason: null };
+    // As the real bridge does on an observed left: no longer joined; departure
+    // is confirmed unless the bridge itself failed.
+    joinedNow = false; departed = reason !== "bridge_failure";
     state.left = reason; state.endObservation = observation; persist();
     void captureLifecycle.observeEnd(observation).catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(11); });
   }, 25);
@@ -193,10 +201,44 @@ lines.on("line", (line) => {
     state.commands.push(command.type);
     if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
     if (command.type === "leave" && state.leave === null) state.leave = bridgeLeaveFact(command.reason, process.hrtime.bigint());
+    const previous = commandResults.get(command.commandId);
+    if (previous) {
+      if (previous.line !== line) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
+      const { outcome, detail } = previous.answer ?? { outcome: "failed", detail: "command_incomplete" };
+      emit({ type: "command_result", commandId: command.commandId, outcome, detail });
+      return;
+    }
+    // A first command other than join, or any command after release, is a protocol failure.
+    if (released || (ownerLeaseId === null && command.type !== "join")) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
+    commandResults.set(command.commandId, { line, answer: null });
+    if (command.type === "join" && ownerLeaseId !== null) { result(command, "rejected", "session_already_owned"); persist(); return; }
+    if (command.type === "connect_media" && !joinedNow) { result(command, "rejected", "not_joined"); persist(); return; }
+    if (command.type === "leave") {
+      if (!joinedNow) { result(command, "rejected", "not_joined"); persist(); return; }
+      // Stop media, then report the removal, then answer ok.
+      const before = process.hrtime.bigint(), observedAt = new Date().toISOString(), after = process.hrtime.bigint();
+      const observation = { reason: "removed", observedAt, observationTiming: { clockDomainId: "e2e-clock",
+        hostBeforeNs: before.toString(), hostAfterNs: after.toString() }, observationTimingReason: null };
+      if (state.left === null) { state.left = "removed"; state.endObservation = observation; }
+      persist();
+      await captureLifecycle.observeEnd(observation);
+      joinedNow = false; departed = true;
+      result(command, "ok", null);
+      persist();
+      return;
+    }
+    if (command.type === "release_lease") {
+      if (command.leaseId !== ownerLeaseId || joinedNow || !departed) { result(command, "rejected", "lease_not_releasable"); persist(); return; }
+      released = true;
+      result(command, "ok", null);
+      persist();
+      return;
+    }
     if (command.type === "join") {
+      ownerLeaseId = command.leaseId;
       const joinTiming = timing();
       observations?.prepareJoin(joinTiming);
-      state.joined = true;
+      state.joined = true; joinedNow = true;
       emit({ type: "joined", meetingOccurrenceId: command.meetingOccurrenceId, observationTiming: joinTiming, observationTimingReason: null });
       if (observations === null) {
         snapshotSequence += 1;

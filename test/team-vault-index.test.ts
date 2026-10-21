@@ -188,14 +188,32 @@ test("a revision-read failure makes an existing index unavailable, never falsely
   });
 });
 
-test("constructing the index over a directory that is not a git working tree throws", () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "team-vault-not-git-"));
+// A subdirectory of a repository is a valid vault path (it indexes that
+// checkout), so a "not a git working tree" fixture must be one Git cannot
+// resolve at all, whatever encloses the temp root: discovery is bounded at
+// its parent for the adapter's own git calls, then restored.
+const NOT_A_WORKING_TREE = /not a (clean )?readable git working tree/;
+
+function withNonGitDirectory(prefix: string, run: (dir: string) => void, base = os.tmpdir()): void {
+  const dir = realpathSync(mkdtempSync(path.join(base, prefix)));
+  const previous = process.env["GIT_CEILING_DIRECTORIES"];
+  process.env["GIT_CEILING_DIRECTORIES"] = path.dirname(dir);
   try {
     writeFileSync(path.join(dir, "roadmap.md"), "content\n");
-    assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }));
+    assert.throws(() => execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"],
+      { stdio: "ignore", env: { ...FIXTURE_ENV, GIT_CEILING_DIRECTORIES: path.dirname(dir) } }), "fixture must not resolve to any repository");
+    run(dir);
   } finally {
+    if (previous === undefined) delete process.env["GIT_CEILING_DIRECTORIES"];
+    else process.env["GIT_CEILING_DIRECTORIES"] = previous;
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test("constructing the index over a directory that is not a git working tree throws", () => {
+  withNonGitDirectory("team-vault-not-git-", (dir) => {
+    assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }), NOT_A_WORKING_TREE);
+  });
 });
 
 test("constructing the index over a missing directory throws", () => {
@@ -218,16 +236,26 @@ test("createTeamVaultIndexOrDegraded never throws for a missing checkout, and it
 });
 
 test("createTeamVaultIndexOrDegraded never throws for a non-git checkout, and its search() rethrows the original failure", () => {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "team-vault-degraded-not-git-"));
-  try {
-    writeFileSync(path.join(dir, "roadmap.md"), "content\n");
-
+  withNonGitDirectory("team-vault-degraded-not-git-", (dir) => {
     const index = createTeamVaultIndexOrDegraded({ teamVaultDir: dir });
 
-    assert.throws(() => index.search("anything"));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    assert.throws(() => index.search("anything"), NOT_A_WORKING_TREE);
+  });
+});
+
+test("the non-git fixture stays non-git when the temp root sits inside a clean committed repository", () => {
+  withTempRoot((root) => {
+    const parent = path.join(root, "parent");
+    initRepo(parent);
+    writeFileSync(path.join(parent, ".gitignore"), "scratch/\n");
+    writeFileSync(path.join(parent, "README.md"), "Parent.\n");
+    commitAllAt(parent, "publish");
+    mkdirSync(path.join(parent, "scratch"));
+    withNonGitDirectory("team-vault-enclosed-not-git-", (dir) => {
+      assert.throws(() => createTeamVaultIndex({ teamVaultDir: dir }), NOT_A_WORKING_TREE);
+      assert.throws(() => createTeamVaultIndexOrDegraded({ teamVaultDir: dir }).search("Parent"), NOT_A_WORKING_TREE);
+    }, path.join(parent, "scratch"));
+  });
 });
 
 test("createTeamVaultIndexOrDegraded returns a fully working index for a healthy checkout", () => {

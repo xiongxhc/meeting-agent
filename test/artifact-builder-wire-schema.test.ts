@@ -18,6 +18,7 @@ import path from "node:path";
 import process from "node:process";
 import { Buffer } from "node:buffer";
 import { RuntimeClient, StdioGatewayTransport, validateClientCommand } from "@conversation/runtime";
+import { pinnedRuntimeGateway } from "./lib/runtime-gateway.ts";
 
 import {
   MAX_PROCESSED_OUTPUT_BYTES,
@@ -181,8 +182,7 @@ test("the artifact build asks for exactly the largest output the SDK admits", ()
 // ---------------------------------------------------------------------------
 
 async function offlineGateway() {
-  const binary = process.env["MEETING_TEST_RUNTIME_GATEWAY"];
-  assert.ok(binary && path.isAbsolute(binary), "Prebuild the Runtime gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
+  const binary = pinnedRuntimeGateway();
   const root = mkdtempSync(path.join(os.tmpdir(), "meeting-wire-schema-"));
   const runtimeRoot = path.join(root, "runtime");
   mkdirSync(runtimeRoot, { mode: 0o700 });

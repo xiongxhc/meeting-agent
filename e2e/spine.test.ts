@@ -65,7 +65,7 @@ test("one full run drives the shipped spine and records every oracle", { timeout
       "single_occurrence_identity"]) {
       const oracle = bundle.oracles.find((entry) => entry.name === required);
       assert.ok(oracle, `bundle records the ${required} oracle`);
-      assert.notEqual(oracle.status, "fail", `${required}: ${oracle.detail}`);
+      assert.equal(oracle.status, "pass", `${required}: ${oracle.detail}`);
     }
     assert.ok(existsSync(path.join(run.out, "NEGATIVE-PROOFS.md")));
     assert.ok(bundle.steps.every((step) => step.loadAverage.length === 3), "every timing records the load average");

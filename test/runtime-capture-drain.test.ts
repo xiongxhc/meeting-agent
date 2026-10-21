@@ -15,6 +15,7 @@ import { createCoordinator } from "../src/sessions/coordinator.ts";
 import type { CaptureDrain } from "../src/contracts/bridge-session-v1.ts";
 // @ts-expect-error Test-only JavaScript setup helper has no public declaration.
 import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
+import { pinnedRuntimeGateway } from "./lib/runtime-gateway.ts";
 
 const DEADLINE_MS = 15_000;
 // Only the overall case adds the 60s launcher assessment setup budget.
@@ -79,8 +80,7 @@ function encryptedChunks(filename: string): number {
  * else reachable.
  */
 async function gateway(label: string) {
-  const binary = process.env["MEETING_TEST_RUNTIME_GATEWAY"];
-  assert.ok(binary && path.isAbsolute(binary), "Prebuild the Runtime14 gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
+  const binary = pinnedRuntimeGateway();
   const root = mkdtempSync(path.join(os.tmpdir(), `meeting-capture-drain-${label}-`));
   const runtimeRoot = path.join(root, "runtime"), stateRoot = path.join(root, "meeting");
   mkdirSync(runtimeRoot, { mode: 0o700 }); mkdirSync(stateRoot, { mode: 0o700 });

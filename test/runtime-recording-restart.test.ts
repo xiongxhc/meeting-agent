@@ -15,6 +15,7 @@ import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { RecordingAlignmentOwner } from "../src/sessions/recording-alignment.ts";
 // @ts-expect-error Test-only JavaScript setup helper has no public declaration.
 import { LAUNCHER_PREFLIGHT_TIMEOUT_MS, preflightLauncher } from "../e2e/launcher-preflight.mjs";
+import { pinnedRuntimeGateway } from "./lib/runtime-gateway.ts";
 
 const DEADLINE_MS = 5_000;
 async function bounded<T>(work: Promise<T>): Promise<T> {
@@ -55,8 +56,7 @@ function encryptedChunks(filename: string): number {
 
 // Only the overall case adds the 60s launcher assessment setup budget.
 test("actual encrypted Runtime recording restarts with private authority and stages SDK pages into SQLite", { timeout: 30_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, async () => {
-  const binary = process.env.MEETING_TEST_RUNTIME_GATEWAY;
-  assert.ok(binary && path.isAbsolute(binary), "Prebuild immutable Runtime4c97 gateway and set MEETING_TEST_RUNTIME_GATEWAY; do not skip this proof");
+  const binary = pinnedRuntimeGateway();
   const root = mkdtempSync(path.join(os.tmpdir(), "meeting-authenticated-alignment-"));
   const runtimeRoot = path.join(root, "runtime"), stateRoot = path.join(root, "meeting");
   mkdirSync(runtimeRoot, { mode: 0o700 }); mkdirSync(stateRoot, { mode: 0o700 });

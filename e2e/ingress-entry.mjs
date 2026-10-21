@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { assertIngressAck, assertIngressAudit, assertIngressClose, assertIngressFinalReceiver, assertIngressIsolation, assertIngressLaunch, assertIngressRetry, assertIngressReceiver,
   assertIngressConflict, assertIngressSelection, assertIngressClosedGeneration, assertIngressReopenActivity, assertIngressReopenDiscovery, ingressReopenState, ingressRemovalFact, ingressHistoryFact, readIngressHistory, ingressReopenPhaseFact, ingressData, ingressFact, ingressCloseFact, ingressFailure, ingressReceiverFact, boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
+import { readStateFile } from "./state-file.mjs";
 
 /** Only the selected rejected replay has an already-admitted durable baseline. */
 export function readIngressConflictBaseline(send, read) {
@@ -210,6 +211,8 @@ async function runRealEntry(plan) {
   }
   const outcomes = () => (app?.occurrenceOutcomes() ?? []).map(row => ({ ...row, controlSessionId: row.controlSessionId?.toString() ?? null }));
   function fileCount(directory) { return readdirSync(directory).length; }
+  // The scripted child rewrites state.json in place while it runs.
+  const bridgeState = () => readStateFile(path.join(plan.controlDir, "state.json"), { read: file => boundedBytes(file, true)?.toString("utf8") ?? null });
   let liveBridge = null;
   const files = () => ({ recording: fileCount(plan.directories.recordingsDir), outbox: fileCount(plan.directories.outboxDir), receipt: fileCount(plan.directories.receiptsDir), key: ingressPathExists(plan.keyPath) });
   function activity() {
@@ -220,7 +223,7 @@ async function runRealEntry(plan) {
     }
     const runtimePids = ingressPathExists(plan.runtimePidsPath) ? readPrivateText(plan.runtimePidsPath).trim().split("\n").filter(Boolean).map(Number) : [];
     requireIngress(runtimePids.length <= 1 && runtimePids.every(n => Number.isSafeInteger(n) && n > 0), "runtime_pid_extent");
-    const child = boundedJson(path.join(plan.controlDir, "state.json"), true), state = read();
+    const child = bridgeState(), state = read();
     let bridge = null;
     if (child) {
       const config = plan.closedGenerationReopen && liveBridge ? null : boundedJson(child.configPath), binding = config?.custody ?? liveBridge.binding, generation = state.generations[0], custody = state.custody[0];
@@ -309,7 +312,7 @@ async function runRealEntry(plan) {
     },
     async settled(phaseSignal) {
       return wait(() => {
-        const row = outcomes()[0], child = boundedJson(path.join(plan.controlDir, "state.json"));
+        const row = outcomes()[0], child = bridgeState(); requireIngress(child !== null, "bridge_state_unreadable");
         if (row?.phase !== "settled" || child.left !== "removed" || child.endObservation?.reason !== "removed" || !child.captureFinish || child.captureDrain?.drain !== "confirmed") return null;
         const finish = child.captureFinish, boundary = finish.acknowledgedBoundary;
         requireIngress(finish.authenticated === true && boundary && JSON.stringify(finish.requestedBoundary) === JSON.stringify(boundary) &&

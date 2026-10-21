@@ -8,6 +8,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { assertIngressAck, assertIngressClose, assertIngressFinalReceiver, assertIngressReceiver, ingressPathExists } from './ingress-run.mjs';
+import { readStateFile } from './state-file.mjs';
 import { requireCapacity, validateCapacityPlan, capacityPrivateBytes, capacityPrivateJson, noCapacitySymlinks, readCapacityState, createCapacityCaptureObserver, assertCapacityLive, assertCapacityDeferred, assertCapacityUnchanged, assertCapacityFailureIsolation, assertCapacityStopped } from './capacity-run.mjs';
 
 export async function runCapacityOwner(plan, effects, { signal, budgetMs = 300000, cleanupMs = 45000 } = {}) {
@@ -109,7 +110,7 @@ async function realEntry(plan) {
     const runtimePids = ingressPathExists(plan.runtimePidsPath) ? capacityPrivateBytes(plan.runtimePidsPath).toString('utf8').trim().split('\n').filter(Boolean).map(Number) : [];
     requireCapacity(runtimePids.length <= plan.count && runtimePids.every(pid => Number.isSafeInteger(pid) && pid > 0), 'runtime_pid_extent');
     for (const slot of plan.slots) {
-      if (!ingressPathExists(slot.statePath)) continue; const raw = capacityPrivateJson(slot.statePath); let provenance = observed.get(slot.physicalClientId);
+      if (!ingressPathExists(slot.statePath)) continue; const raw = readStateFile(slot.statePath, { read: file => capacityPrivateBytes(file).toString('utf8') }); requireCapacity(raw !== null, 'bridge_state_unreadable'); let provenance = observed.get(slot.physicalClientId);
       if (!provenance) { const bytes = capacityPrivateBytes(raw.configPath, { mode: 0o600 }), config = JSON.parse(bytes.toString('utf8')), b = config.custody;
         requireCapacity(config.controlDir === slot.controlDir && b.physicalClientId === slot.physicalClientId && config.schema === 'feishu-bridge-config/v3' && typeof b.physicalGenerationId === 'string', 'generated_config');
         provenance = { configPath: raw.configPath, configSha256: createHash('sha256').update(bytes).digest('hex'), binding: { physicalClientId: b.physicalClientId, physicalGenerationId: b.physicalGenerationId, occurrenceId: b.occurrenceId, bridgeSessionId: b.bridgeSessionId } }; observed.set(slot.physicalClientId, provenance);

@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { RUNTIME_PIN, sha256File, verifyPins } from "./pins.mjs";
 import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, run, stage } from "./stage.mjs";
+import { readStateFile } from "./state-file.mjs";
 import { readKnownEndRecoveryState } from "./recovery-state.mjs";
 import { measureWarningFile } from "./warning-commit-cut.mjs";
 import { WARNING_STORE_FAULT_TRIGGER, warningSqlReplayBoundary } from "./warning-store-fault.mjs";
@@ -273,7 +274,8 @@ export async function runRecovery(options) {
     active = childOwner(staged, staged.entryPath, initialPath, "initial", evidence);
     const eventPath = path.join(staged.directories.control, "events.ndjson");
     await waitEvent(active, eventPath, "media_capture", 180000);
-    evidence.bridgeState = JSON.parse(readFileSync(path.join(staged.directories.control, "state.json"), "utf8"));
+    evidence.bridgeState = readStateFile(path.join(staged.directories.control, "state.json"));
+    assert.ok(evidence.bridgeState, "bridge state unreadable");
     assert.ok([...active.record.trees.flat(), ...processTree(active.child.pid)].some(row => row.pid === evidence.bridgeState.pid),
       "capture child not observed beneath admitted app");
     await waitEvent(active, eventPath, "meeting_ended_signalled", 60000);
