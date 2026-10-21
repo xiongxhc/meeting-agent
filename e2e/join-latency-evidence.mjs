@@ -28,7 +28,7 @@ const isObject = value => value !== null && typeof value === "object" && !Array.
 /** The entry-side observer: timestamp first, buffer in memory, write once when the join settles (or on flush). */
 export function createJoinTimingRecorder({ filename, clock = () => process.hrtime.bigint(), wall = () => Date.now(), write = appendFileSync, limit = 256 }) {
   const rows = [];
-  let open = true, recorded = 0;
+  let open = true, recorded = 0, settled = false;
   function flush() {
     if (!open || rows.length === 0) return;
     const text = rows.map(row => `${JSON.stringify(row)}\n`).join("");
@@ -41,7 +41,9 @@ export function createJoinTimingRecorder({ filename, clock = () => process.hrtim
     if (recorded >= limit) { open = false; rows.length = 0; return; }
     recorded += 1;
     rows.push({ event: "meeting_phase", phase: RANK.has(phase) ? phase : "unrecognized", pid: process.pid, at: wall(), monotonicNs: String(monotonicNs) });
-    if (phase === "join_settled") flush();
+    // The vault mark can land after the join settles; write it then too, so a
+    // later signal kill cannot lose it. Before the join settles, never write.
+    if (phase === "join_settled") { settled = true; flush(); } else if (phase === "vault_index_built" && settled) flush();
   }
   return { observe, flush };
 }
@@ -65,13 +67,17 @@ const clock = value => typeof value === "string" && DECIMAL.test(value) ? BigInt
 const ms = (from, to) => from === null || to === null ? null : Math.round(Number(to - from) / 1000) / 1000;
 
 /** Bundle projection: one row per Meeting phase of the first join attempt, in
- * milliseconds after `runtime_connected`, plus the child and wire anchors. */
+ * milliseconds after `runtime_connected`, plus the child and wire anchors.
+ * `vault_index_built` marks an asynchronous build settling; it may land at any
+ * point (even after the join settles), so it is kept out of the ordered chain. */
 export function joinLatencyEvidence({ meeting = { status: "absent", rows: [] }, child = null, lifecycleRows = [], runtimeEvents = [] } = {}) {
   const all = (Array.isArray(meeting.rows) ? meeting.rows : []).filter(row => isObject(row) && row.event === "meeting_phase");
   const startIndex = all.findIndex(row => row.phase === "runtime_connected");
   const after = startIndex < 0 ? [] : all.slice(startIndex);
   const settledIndex = after.findIndex(row => row.phase === "join_settled");
-  const attempt = settledIndex < 0 ? after : after.slice(0, settledIndex + 1);
+  const attempt = (settledIndex < 0 ? after : after.slice(0, settledIndex + 1)).filter(row => row.phase !== "vault_index_built");
+  const vaultBuilt = attempt.some(row => row.phase === "vault_index_started")
+    ? after.find(row => row.phase === "vault_index_built" && row.pid === attempt[0]?.pid) ?? null : null;
   const origin = clock(attempt[0]?.monotonicNs);
   const phases = attempt.map(row => ({ phase: row.phase, ms: ms(origin, clock(row.monotonicNs)) }));
   const seen = attempt.map(row => row.phase);
@@ -81,9 +87,9 @@ export function joinLatencyEvidence({ meeting = { status: "absent", rows: [] }, 
     const a = clock(previous.monotonicNs), b = clock(current.monotonicNs);
     if (a === null || b === null || b < a || !RANK.has(current.phase) || RANK.get(current.phase) <= RANK.get(previous.phase)) ordered = false;
   }
-  const vault = seen.filter(phase => phase.startsWith("vault_")).length;
-  const complete = ordered && REQUIRED.every(phase => seen.includes(phase)) && (vault === 0 || vault === 2);
-  const at = phase => phases.find(row => row.phase === phase)?.ms ?? null;
+  const complete = ordered && REQUIRED.every(phase => seen.includes(phase));
+  const builtMs = vaultBuilt === null ? null : ms(origin, clock(vaultBuilt.monotonicNs));
+  const at = phase => phase === "vault_index_built" ? builtMs : phases.find(row => row.phase === phase)?.ms ?? null;
   const between = (from, to) => { const a = at(from), b = at(to); return a === null || b === null ? null : Math.round((b - a) * 1000) / 1000; };
 
   const timing = isObject(child) && isObject(child.joinTiming) ? child.joinTiming : null;
@@ -95,6 +101,7 @@ export function joinLatencyEvidence({ meeting = { status: "absent", rows: [] }, 
     status: meeting.status, rows: all.length, attempts: all.filter(row => row.phase === "join_entered").length,
     complete, ordered, settled: settledIndex >= 0,
     phases,
+    vault: seen.includes("vault_index_started") ? { builtMs, settledBeforeJoinSend: builtMs !== null && at("join_send_started") !== null ? builtMs <= at("join_send_started") : null } : null,
     segments: {
       createSession: between("runtime_connected", "session_created"),
       custodyClaim: between("create_session_entered", "custody_claimed"),

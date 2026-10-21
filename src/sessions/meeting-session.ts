@@ -57,7 +57,7 @@ import {
   type BridgeEventMessage,
   type CaptureDrain,
 } from "../contracts/bridge-session-v1.ts";
-import { createTeamVaultIndexOrDegraded } from "../adapters/team-vault-index.ts";
+import { createTeamVaultIndexOrDegradedAsync } from "../adapters/team-vault-index.ts";
 import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2 } from "../contracts/bridge-session-v2.ts";
 import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "../ports/session-store.ts";
@@ -102,7 +102,7 @@ import {
  * meeting alone, and states plainly that historical team memory is
  * unavailable for anything the current meeting alone cannot cover -- the
  * same degraded path a broken checkout takes (see
- * createTeamVaultIndexOrDegraded), never a silently-empty vault. */
+ * createTeamVaultIndexOrDegradedAsync), never a silently-empty vault. */
 const UNCONFIGURED_VAULT: TeamVaultIndexPort = {
   search(): TeamVaultSearchResult {
     throw new Error(
@@ -279,8 +279,8 @@ export type CreateMeetingSessionOptions = {
   readonly nextCommandId?: () => string;
   /** The published Team Vault checkout this session's retrieval router
    * reads (`config.dataPaths.teamVaultDir`). The session never opens it
-   * directly -- it builds a read-only index once via
-   * `createTeamVaultIndexOrDegraded`, which never throws: a missing or
+   * directly -- it starts a read-only index build once, at construction, via
+   * `createTeamVaultIndexOrDegradedAsync`, which never rejects: a missing or
    * broken checkout degrades to an always-"vault unavailable" index rather
    * than failing the session (see src/adapters/team-vault-index.ts).
    * Ignored when `retrieval` is provided. Omitting both leaves retrieval
@@ -400,7 +400,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // (tests, advanced callers) wins outright; otherwise a router is built
   // from `options.teamVaultDir` via the non-throwing constructor, so a
   // missing or broken checkout degrades retrieval instead of failing the
-  // session (see createTeamVaultIndexOrDegraded and UNCONFIGURED_VAULT
+  // session (see createTeamVaultIndexOrDegradedAsync and UNCONFIGURED_VAULT
   // above).
   const runtimeContextSink = {
     get sessionId(): bigint {
@@ -419,10 +419,13 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   const retrievalRouter: RetrievalRouter =
     options.retrieval ??
     createRetrievalRouter({
+      // Built off the join path: started now (so the index binds the checkout
+      // as it is at session start), awaited by the first vault question.
       vault: options.teamVaultDir === undefined ? UNCONFIGURED_VAULT : (() => {
         markJoinTiming(options.joinTiming, "vault_index_started");
-        const vault = createTeamVaultIndexOrDegraded({ teamVaultDir: options.teamVaultDir });
-        markJoinTiming(options.joinTiming, "vault_index_built");
+        const vault = createTeamVaultIndexOrDegradedAsync({ teamVaultDir: options.teamVaultDir });
+        // Never rejects; the mark lands when the build settles, after the join may already be under way.
+        void vault.then(() => { markJoinTiming(options.joinTiming, "vault_index_built"); });
         return vault;
       })(),
       sink: runtimeContextSink,
@@ -443,6 +446,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // runtime actually received seedContext/authorizeVoiceResponse, since
   // seeding context adds a real await the runtime call alone did not have.
   const pendingSinkWork = new Set<Promise<void>>();
+  // Aborted when the session ends (dispose or terminal): a question waiting
+  // for the Team Vault index stops waiting, so shutdown never waits on git.
+  const sessionEnded = new AbortController();
 
   // The gate's sink and dispatcher. The dispatcher owns "one decision applied
   // per segmentId"; this module never re-derives a decision. The retrieval
@@ -475,6 +481,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             phase === "listening" &&
             speaking === "enabled" &&
             openTurns.has(segmentId),
+          signal: sessionEnded.signal,
         })
         .then(() => {})
         .catch((error: unknown) => {
@@ -984,6 +991,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
     if (terminalReason !== null) return;
     terminalReason = reason;
     phase = "ended";
+    sessionEnded.abort();
 
     try {
       for (const segmentId of [...openTurns]) {
@@ -1413,6 +1421,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       disposed = true;
       cancellationGeneration += 1;
       queue.length = 0;
+      sessionEnded.abort();
       disposePromise = (async () => {
         try {
           const join = activeJoinPromise;

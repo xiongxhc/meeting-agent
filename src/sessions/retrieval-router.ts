@@ -121,7 +121,9 @@ export function createCurrentMeetingMemory(): CurrentMeetingMemory {
 // ---------------------------------------------------------------------------
 
 export type CreateRetrievalRouterOptions = {
-  readonly vault: TeamVaultIndexPort;
+  /** An index, or one still being built (awaited only when a question
+   * actually needs the vault; current-meeting answers never wait for it). */
+  readonly vault: TeamVaultIndexPort | Promise<TeamVaultIndexPort>;
   readonly sink: RuntimeContextSink;
   /** Defaults to a fresh createCurrentMeetingMemory(). Injectable so a
    * caller (or a test) can hold and inspect the same memory instance
@@ -139,7 +141,13 @@ export type RetrievalRouter = {
   answer(
     invocation: AuthorizedInvocation,
     queryText: string,
-    options?: { readonly mayAuthorize?: () => boolean },
+    options?: {
+      readonly mayAuthorize?: () => boolean;
+      /** Aborted when the session ends: a question still waiting for an
+       * index that is being built stops waiting and is cancelled, so session
+       * shutdown (and its recording finalization) never waits on git. */
+      readonly signal?: AbortSignal;
+    },
   ): Promise<SeededContext>;
 };
 
@@ -151,6 +159,21 @@ export class RetrievalAuthorizationCancelled extends Error {
     super("retrieval authorization was cancelled before runtime authorization");
     this.name = "RetrievalAuthorizationCancelled";
   }
+}
+
+/** The pending index, or RetrievalAuthorizationCancelled as soon as `signal`
+ * aborts; the listener is removed either way. */
+function untilAbandoned<T>(pending: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return pending;
+  if (signal.aborted) return Promise.reject(new RetrievalAuthorizationCancelled());
+  return new Promise<T>((resolve, reject) => {
+    const abandon = () => reject(new RetrievalAuthorizationCancelled());
+    signal.addEventListener("abort", abandon, { once: true });
+    pending.then(
+      (value) => { signal.removeEventListener("abort", abandon); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", abandon); reject(error); },
+    );
+  });
 }
 
 export function createRetrievalRouter(options: CreateRetrievalRouterOptions): RetrievalRouter {
@@ -165,7 +188,7 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
     async answer(
       invocation: AuthorizedInvocation,
       queryText: string,
-      answerOptions: { readonly mayAuthorize?: () => boolean } = {},
+      answerOptions: { readonly mayAuthorize?: () => boolean; readonly signal?: AbortSignal } = {},
     ): Promise<SeededContext> {
       const meetingHits = memory.search(queryText);
       const bestMeetingScore = meetingHits[0]?.score ?? 0;
@@ -178,10 +201,12 @@ export function createRetrievalRouter(options: CreateRetrievalRouterOptions): Re
       if (bestMeetingScore < SUFFICIENCY_THRESHOLD) {
         vaultQueried = true;
         try {
-          const result = vault.search(queryText);
+          const index = vault instanceof Promise ? await untilAbandoned(vault, answerOptions.signal) : vault;
+          const result = index.search(queryText);
           vaultStale = result.stale;
           combined = [...meetingHits, ...result.hits].sort((a, b) => b.score - a.score);
-        } catch {
+        } catch (error) {
+          if (error instanceof RetrievalAuthorizationCancelled) throw error;
           vaultUnavailable = true;
           // combined stays meetingHits only -- whatever the current meeting
           // already had is still used.

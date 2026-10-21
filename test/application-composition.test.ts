@@ -700,11 +700,16 @@ for (const startMode of ["accept", "reject"] as const) {
     const phases: string[] = [];
     const plain = await runOnce(undefined);
     const observed = await runOnce((phase) => { phases.push(phase); });
+    // The asynchronous vault build may settle after the occurrence closes; wait for its one mark.
+    for (let waited = 0; !phases.includes("vault_index_built") && waited < 10_000; waited += 20) await pause(20);
     const throwing = await runOnce(() => { throw new Error("PRIVATE-OBSERVER"); });
     assert.deepEqual(observed, plain); assert.deepEqual(throwing, plain);
-    const expected = [...JOIN_TIMING_PHASES];
-    assert.deepEqual(phases, startMode === "accept" ? expected
+    // The vault build is asynchronous: it settles exactly once, after it starts, at no fixed point in the chain.
+    const expected = JOIN_TIMING_PHASES.filter((phase) => phase !== "vault_index_built");
+    assert.deepEqual(phases.filter((phase) => phase !== "vault_index_built"), startMode === "accept" ? expected
       : [...expected.slice(0, expected.indexOf("runtime_admission_started") + 1), "join_settled"]);
+    assert.equal(phases.filter((phase) => phase === "vault_index_built").length, 1);
+    assert.ok(phases.indexOf("vault_index_built") > phases.indexOf("vault_index_started"));
   });
 }
 

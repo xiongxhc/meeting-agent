@@ -13,8 +13,14 @@
 // (test/lib/import-scanner.ts) enforces that structurally across all of
 // src/, and this module satisfies it by never reaching for a write API at
 // all, not by working around the scanner's heuristic.
+//
+// The build is written once, as a generator that yields each git query and
+// receives its stdout, and is driven either synchronously (execFileSync) or
+// asynchronously (execFile). Both drivers run the same queries in the same
+// order with the same checks; the asynchronous one only keeps the event loop
+// free while git runs, so a session can start its join while its index builds.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
 import {
@@ -73,17 +79,65 @@ type CheckoutState = {
  * `config.dataPaths.teamVaultDir` into this factory.
  */
 export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): TeamVaultIndexPort {
-  const { teamVaultDir } = options;
+  return runSync(buildIndex(options.teamVaultDir));
+}
+
+/** The same build as `createTeamVaultIndex` (same git queries, order,
+ * refusals and namespace/revision binding, starting when called), without
+ * blocking the event loop while git runs. Rejects where that one throws. */
+export function createTeamVaultIndexAsync(options: CreateTeamVaultIndexOptions): Promise<TeamVaultIndexPort> {
+  return runAsync(buildIndex(options.teamVaultDir));
+}
+
+/** A git query the build needs: its argv, run as `git <argv>` from PATH. */
+type GitQuery = readonly string[];
+type Build<T> = Generator<GitQuery, T, string>;
+
+function runSync<T>(build: Build<T>): T {
+  let step = build.next();
+  while (!step.done) {
+    let output: string;
+    try {
+      output = execFileSync("git", step.value, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    } catch (error) {
+      step = build.throw(error);
+      continue;
+    }
+    step = build.next(output);
+  }
+  return step.value;
+}
+
+async function runAsync<T>(build: Build<T>): Promise<T> {
+  let step = build.next();
+  while (!step.done) {
+    const query = step.value;
+    let output: string;
+    try {
+      output = await new Promise<string>((resolve, reject) => {
+        const child = execFile("git", query, { encoding: "utf8" }, (error, stdout) => { if (error) reject(error); else resolve(stdout); });
+        child.stdin?.end();
+      });
+    } catch (error) {
+      step = build.throw(error);
+      continue;
+    }
+    step = build.next(output);
+  }
+  return step.value;
+}
+
+function* buildIndex(teamVaultDir: string): Build<TeamVaultIndexPort> {
   // A HEAD revision is provenance only for the bytes committed at that HEAD.
   // Refuse a dirty tree rather than silently attaching untracked/draft text to
   // an unrelated published revision. Verify before and after the read so a
   // checkout advancing during construction cannot create a mixed snapshot.
-  const bound = readCheckoutState(teamVaultDir);
-  assertCleanWorkingTree(teamVaultDir);
+  const bound = yield* readCheckoutState(teamVaultDir);
+  yield* assertCleanWorkingTree(teamVaultDir);
   const indexedRevision = bound.revision;
-  const files = readMarkdownFiles(teamVaultDir, indexedRevision);
-  assertCleanWorkingTree(teamVaultDir);
-  const after = readCheckoutState(teamVaultDir);
+  const files = yield* readMarkdownFiles(teamVaultDir, indexedRevision);
+  yield* assertCleanWorkingTree(teamVaultDir);
+  const after = yield* readCheckoutState(teamVaultDir);
   if (!sameNamespace(after.namespace, bound.namespace)) {
     throw new Error("Team Vault namespace changed while its index was being built");
   }
@@ -109,7 +163,7 @@ export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): Team
 
       // One git invocation reports namespace and HEAD from the same
       // discovery, so the revision compared below belongs to that namespace.
-      const current = tryReadCheckoutState(teamVaultDir);
+      const current = runSync(tryReadCheckoutState(teamVaultDir));
       if (current === null) {
         throw new Error("Team Vault revision is unavailable; refusing stale provenance");
       }
@@ -137,11 +191,8 @@ function bestParagraph(
   return best;
 }
 
-function readMarkdownFiles(rootDir: string, revision: string): readonly IndexedFile[] {
-  const listing = execFileSync("git", ["-C", rootDir, "ls-tree", "-r", "-z", "--full-tree", revision], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
+function* readMarkdownFiles(rootDir: string, revision: string): Build<readonly IndexedFile[]> {
+  const listing = yield ["-C", rootDir, "ls-tree", "-r", "-z", "--full-tree", revision];
   const files: IndexedFile[] = [];
   for (const row of listing.split("\0")) {
     if (row === "") continue;
@@ -152,10 +203,7 @@ function readMarkdownFiles(rootDir: string, revision: string): readonly IndexedF
     if (mode === undefined || relativePath === undefined) throw new Error("Team Vault git tree entry is malformed");
     if (!relativePath.toLowerCase().endsWith(MARKDOWN_EXTENSION)) continue;
     if (mode === "120000") throw new Error(`Team Vault index refuses symlink entry "${relativePath}"`);
-    const content = execFileSync("git", ["-C", rootDir, "show", `${revision}:${relativePath}`], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    const content = yield ["-C", rootDir, "show", `${revision}:${relativePath}`];
     files.push({ relativePath, paragraphs: splitParagraphs(content) });
   }
   return files;
@@ -190,17 +238,29 @@ export function createTeamVaultIndexOrDegraded(
   try {
     return createTeamVaultIndex(options);
   } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    return {
-      search(): TeamVaultSearchResult {
-        throw failure;
-      },
-    };
+    return degraded(error);
   }
 }
 
-function readCheckoutState(dir: string): CheckoutState {
-  const state = tryReadCheckoutState(dir);
+/** `createTeamVaultIndexOrDegraded` over the asynchronous build: never
+ * rejects; a failed build resolves to an index whose search() rethrows it. */
+export function createTeamVaultIndexOrDegradedAsync(
+  options: CreateTeamVaultIndexOptions,
+): Promise<TeamVaultIndexPort> {
+  return createTeamVaultIndexAsync(options).catch(degraded);
+}
+
+function degraded(error: unknown): TeamVaultIndexPort {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  return {
+    search(): TeamVaultSearchResult {
+      throw failure;
+    },
+  };
+}
+
+function* readCheckoutState(dir: string): Build<CheckoutState> {
+  const state = yield* tryReadCheckoutState(dir);
   if (state === null) {
     throw new Error(`Team Vault checkout at "${dir}" is not a readable git working tree`);
   }
@@ -209,13 +269,9 @@ function readCheckoutState(dir: string): CheckoutState {
 
 /** Null when `dir` is not inside a non-bare git working tree with a HEAD
  * commit. `--show-toplevel` refuses a bare repository. */
-function tryReadCheckoutState(dir: string): CheckoutState | null {
+function* tryReadCheckoutState(dir: string): Build<CheckoutState | null> {
   try {
-    const [topLevel, gitDir, revision] = execFileSync(
-      "git",
-      ["-C", dir, "rev-parse", "--show-toplevel", "--absolute-git-dir", "HEAD"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).split("\n");
+    const [topLevel, gitDir, revision] = (yield ["-C", dir, "rev-parse", "--show-toplevel", "--absolute-git-dir", "HEAD"]).split("\n");
     if (!topLevel || !gitDir || !revision) return null;
     return { namespace: { topLevel: realpathSync(topLevel), gitDir: realpathSync(gitDir) }, revision };
   } catch {
@@ -227,12 +283,9 @@ function sameNamespace(a: CheckoutNamespace, b: CheckoutNamespace): boolean {
   return a.topLevel === b.topLevel && a.gitDir === b.gitDir;
 }
 
-function assertCleanWorkingTree(dir: string): void {
+function* assertCleanWorkingTree(dir: string): Build<void> {
   try {
-    const status = execFileSync("git", ["-C", dir, "status", "--porcelain=v1", "--untracked-files=all"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    const status = yield ["-C", dir, "status", "--porcelain=v1", "--untracked-files=all"];
     if (status.trim() !== "") {
       throw new Error("Team Vault checkout is dirty or has untracked files");
     }

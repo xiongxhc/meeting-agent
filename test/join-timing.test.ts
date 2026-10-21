@@ -51,13 +51,15 @@ test("the phase list is fixed and the helper is a no-op without an observer", ()
   assert.equal(calls, 1);
 });
 
-test("a successful timed join reports every session phase once, in order, with the vault build bracketed", async () => {
+test("a successful timed join reports every session phase once, in order, and the vault build settles once, off the join path", async () => {
   const seen: JoinTimingPhase[] = [];
   const vault = mkdtempSync(path.join(os.tmpdir(), "join-timing-vault-"));
   try {
     const result = await probe("success", (phase) => { seen.push(phase); }, vault);
     assert.equal(result.caught, undefined);
-    assert.deepEqual(seen, ["vault_index_started", "vault_index_built", ...SESSION_PHASES]);
+    for (let waited = 0; !seen.includes("vault_index_built") && waited < 5000; waited += 10) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(seen.filter((phase) => phase !== "vault_index_built"), ["vault_index_started", ...SESSION_PHASES]);
+    assert.equal(seen.filter((phase) => phase === "vault_index_built").length, 1);
   } finally { rmSync(vault, { recursive: true }); }
 });
 

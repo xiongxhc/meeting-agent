@@ -3,7 +3,9 @@
 // below is a single undefined check. The observer receives a fixed phase
 // token only: no ids, paths, leases or payloads. It is called synchronously,
 // is never awaited, and anything it throws is swallowed, so it cannot change
-// the join's control flow.
+// the join's control flow. `vault_index_built` is emitted when the
+// asynchronous Team Vault build settles, which may be after the join is sent;
+// every other phase is emitted in the order listed.
 export const JOIN_TIMING_PHASES = [
   "runtime_connected",
   "create_session_entered",

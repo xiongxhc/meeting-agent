@@ -34,6 +34,18 @@ test("the recorder timestamps before anything else, buffers, and writes once whe
   recorder.flush(); assert.equal(writes.length, 1, "nothing left to flush");
 });
 
+test("a vault mark after the join settles is written at once; before it settles, nothing is written", () => {
+  const writes: string[] = [];
+  const recorder = createJoinTimingRecorder({ filename: "/synthetic", write: (_f: string, text: string) => { writes.push(text); } });
+  recorder.observe("vault_index_started"); recorder.observe("vault_index_built");
+  assert.equal(writes.length, 0, "an early vault mark is buffered with the join rows");
+  recorder.observe("join_settled"); assert.equal(writes.length, 1);
+  const late = createJoinTimingRecorder({ filename: "/synthetic", write: (_f: string, text: string) => { writes.push(text); } });
+  late.observe("vault_index_started"); late.observe("join_settled"); late.observe("vault_index_built");
+  assert.equal(writes.length, 3);
+  assert.equal(JSON.parse(writes[2]!.trim()).phase, "vault_index_built");
+});
+
 test("a recorder write failure disables recording once and never throws; the row limit closes it", () => {
   let attempts = 0;
   const failing = createJoinTimingRecorder({ filename: "/synthetic", write: () => { attempts += 1; throw new Error("disk"); } });
@@ -58,7 +70,7 @@ test("a full ordered first attempt is complete and segments are measured from ru
     runtimeEvents: [{ type: "voice_session_started", monotonicNs: "1019500000" }] });
   assert.equal(evidence.complete, true); assert.equal(evidence.ordered, true); assert.equal(evidence.settled, true);
   assert.equal(evidence.attempts, 2);
-  assert.deepEqual(evidence.phases.map((p: { phase: string }) => p.phase), [...MEETING_PHASES]);
+  assert.deepEqual(evidence.phases.map((p: { phase: string }) => p.phase), MEETING_PHASES.filter((phase: string) => phase !== "vault_index_built"));
   assert.equal(evidence.segments.connectedToJoinSend, MEETING_PHASES.indexOf("join_send_started"));
   assert.equal(evidence.segments.vaultIndex, 1);
   assert.equal(evidence.child?.joinSendToReceiptMs, 1.5);
@@ -66,12 +78,19 @@ test("a full ordered first attempt is complete and segments are measured from ru
   assert.deepEqual(evidence.wire, { startCommandMs: 18, voiceStartedMs: 19.5 });
 });
 
-test("a missing required phase, a lone vault mark, a clock regression, a phase regression or a second pid is not complete", () => {
+test("a missing required phase, a clock regression, a phase regression or a second pid is not complete; the async vault mark is outside the chain", () => {
   const full = fullRows();
   const without = (phase: string) => full.filter(r => r.phase !== phase);
   assert.equal(joinLatencyEvidence({ meeting: { status: "present", rows: without("lease_acquired") } }).complete, false);
-  assert.equal(joinLatencyEvidence({ meeting: { status: "present", rows: without("vault_index_built") } }).complete, false);
-  assert.equal(joinLatencyEvidence({ meeting: { status: "present", rows: without("vault_index_built").filter(r => r.phase !== "vault_index_started") } }).complete, true);
+  // The asynchronous build may settle after the join is sent, or after the join settles.
+  const late = [...without("vault_index_built"), row("vault_index_built", 9_000_000_000n)];
+  const lateEvidence = joinLatencyEvidence({ meeting: { status: "present", rows: late } });
+  assert.equal(lateEvidence.complete, true); assert.equal(lateEvidence.ordered, true);
+  assert.equal(lateEvidence.segments.vaultIndex, 8000 - MEETING_PHASES.indexOf("vault_index_started"));
+  assert.deepEqual(lateEvidence.vault, { builtMs: 8000, settledBeforeJoinSend: false });
+  const unbuilt = joinLatencyEvidence({ meeting: { status: "present", rows: without("vault_index_built") } });
+  assert.equal(unbuilt.complete, true); assert.deepEqual(unbuilt.vault, { builtMs: null, settledBeforeJoinSend: null });
+  assert.equal(joinLatencyEvidence({ meeting: { status: "present", rows: without("vault_index_started").filter(r => r.phase !== "vault_index_built") } }).vault, null);
   const clockBack = full.map((r, i) => i === 5 ? { ...r, monotonicNs: "1" } : r);
   assert.equal(joinLatencyEvidence({ meeting: { status: "present", rows: clockBack } }).ordered, false);
   const swapped = [...full]; [swapped[3], swapped[4]] = [swapped[4]!, swapped[3]!];
