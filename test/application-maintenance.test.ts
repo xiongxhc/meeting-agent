@@ -25,6 +25,7 @@ import { composeApplication, RUNTIME_CHILD_ENVIRONMENT_ALLOWLIST, type ComposedA
 import { createApplicationMaintenance, DEFAULT_LANE_INTERVALS_MS, MAINTENANCE_LANES, type CreateMaintenanceInput, type MaintenanceOwner, type MaintenanceSupervisor } from "../src/application-maintenance.ts";
 import type { BackfillGatewayTransport } from "../src/delivery/backfill-worker.ts";
 import { notificationRequestUuid, type NotificationSender } from "../src/delivery/notification-worker.ts";
+import { NO_VERBATIM_INSTRUCTION } from "../src/delivery/artifact-builder.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { occurrencePathSegment } from "../src/domain/occurrence-id.ts";
 import type { PostmeetingRuntime } from "../src/adapters/conversation-runtime-client.ts";
@@ -332,6 +333,124 @@ test("R2: an incomplete revision publishes through the real builder/outbox, noti
     assert.equal(organizer.calls.length, 2, "the complete revision has its own verified-receipt notification");
     await owner.close();
   } finally { store.close(); r.close(); }
+});
+
+/** TeamMem's exact refusal record for one revision (teammem-meeting-refusal/v1). */
+function writeRefusal(r: Roots, occurrenceId: string, revision: number, artifactHash: string): void {
+  const directory = path.join(r.receiptsDir, occurrencePathSegment(occurrenceId as `${string}@${string}`));
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, `${revision}.refused.json`), `${JSON.stringify({ artifact_hash: artifactHash,
+    invariants: ["meeting.leakage.forbidden-content"], occurrence_id: occurrenceId, reason_code: "transcript_text_in_note", revision,
+    schema: "teammem-meeting-refusal/v1", status: "refused" })}\n`);
+}
+
+/** The scripted Runtime, recording every synthesis instruction it receives. */
+function recordingInstructions(runtime: ReturnType<typeof scriptedRuntime>): string[] {
+  const seen: string[] = [];
+  const target = runtime.runtime as unknown as { processText(input: { instructions: string }): Promise<unknown> };
+  const original = target.processText.bind(target);
+  target.processText = async (input) => { seen.push(input.instructions); return original(input); };
+  return seen;
+}
+
+function refusalFixture(finalFailures: number) {
+  const r = roots();
+  const clock = { wall: ENDED_AT_MS + 1 };
+  const store = openSessionStore({ filename: r.filename, nowMs: ENDED_AT_MS });
+  const seeded = seedKnownEnded(store, r, () => clock.wall, true);
+  const runtime = scriptedRuntime(seeded.source, finalFailures);
+  const instructions = recordingInstructions(runtime);
+  const organizer = sender();
+  const logs: string[] = [];
+  const backfill = { operationBudgetMs: 1_000, cleanupTimeouts: { eofGraceMs: 1, termGraceMs: 1, killGraceMs: 1 },
+    startTransport: async () => gracefulTransport(), connectRuntime: async () => runtime.runtime };
+  const owner = maintenance(store, r, () => clock.wall, { notificationSender: organizer, log: (line) => { logs.push(line); }, options: { backfill } });
+  const occurrenceId = seeded.identity.occurrenceId;
+  const revision = (n: number) => store.pending().find((row) => row.revision === n)!;
+  return { r, clock, store, seeded, instructions, organizer, logs, owner, occurrenceId, revision };
+}
+
+test("an incomplete revision TeamMem refuses for good raises one operator alert, its next revision is told not to quote, and publication clears the alert", async () => {
+  const f = refusalFixture(1);
+  try {
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    assert.equal(f.revision(1).transcriptComplete, false);
+    writeRefusal(f.r, f.occurrenceId, 1, f.revision(1).artifactHash);
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(f.revision(1).refusalReason, "transcript_text_in_note");
+    assert.equal(warningFiles(f.r).length, 1, "one durable operator alert");
+    f.clock.wall += 60_000;
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(warningFiles(f.r).length, 1);
+    assert.deepEqual(f.logs.filter((line) => line.startsWith("maintenance_outbox_publication_refused")), ["maintenance_outbox_publication_refused:transcript_text_in_note"]);
+    assert.equal(await f.owner.tick("notification"), "notification_polled");
+    assert.equal(f.organizer.calls.length, 0, "a refused revision sends the organizer nothing");
+    assert.equal(existsSync(f.seeded.recordingPath), true);
+    // The incomplete transcript's own retry builds revision 2, told not to quote.
+    f.clock.wall += 60_000;
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    assert.equal(f.instructions.length, 2);
+    assert.equal(f.instructions[0]!.includes(NO_VERBATIM_INSTRUCTION), false);
+    assert.equal(f.instructions[1]!.endsWith(NO_VERBATIM_INSTRUCTION), true);
+    writeReceipt(f.r, f.occurrenceId, 2, f.revision(2).artifactHash);
+    f.clock.wall += 60_000;
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(existsSync(f.seeded.recordingPath), false);
+    assert.deepEqual(warningFiles(f.r), [], "the publication clears the refusal alert");
+    assert.equal(await f.owner.tick("notification"), "notification_polled");
+    assert.equal(f.organizer.calls.length, 1, "the published higher revision notifies the organizer");
+    await f.owner.close();
+  } finally { f.store.close(); f.r.close(); }
+});
+
+test("a complete revision refused for quoting its own transcript is re-synthesised once without an alert and the new revision publishes", async () => {
+  const f = refusalFixture(0);
+  try {
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    assert.equal(f.revision(1).transcriptComplete, true);
+    assert.equal(await f.owner.tick("backfill"), "backfill_idle", "a complete revision schedules no retry by itself");
+    writeRefusal(f.r, f.occurrenceId, 1, f.revision(1).artifactHash);
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(f.revision(1).refusalReason, "transcript_text_in_note");
+    assert.deepEqual(warningFiles(f.r), [], "self-repair raises no operator alert");
+    assert.equal(f.logs.includes("delivery_resynthesis_scheduled"), true);
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    assert.equal(f.revision(2).transcriptComplete, true);
+    assert.equal(f.instructions.at(-1)!.endsWith(NO_VERBATIM_INSTRUCTION), true, "the re-synthesis is told not to quote");
+    writeReceipt(f.r, f.occurrenceId, 2, f.revision(2).artifactHash);
+    f.clock.wall += 1_000;
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(f.store.getSession(f.occurrenceId)?.state, "published");
+    assert.deepEqual(f.store.pending(), [], "both revisions are cleaned with the complete receipt");
+    assert.equal(await f.owner.tick("notification"), "notification_polled");
+    assert.equal(f.organizer.calls.length, 1);
+    await f.owner.close();
+  } finally { f.store.close(); f.r.close(); }
+});
+
+test("a re-synthesised revision refused again stays refused, alerts the operator once and builds nothing more", async () => {
+  const f = refusalFixture(0);
+  try {
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    writeRefusal(f.r, f.occurrenceId, 1, f.revision(1).artifactHash);
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(await f.owner.tick("backfill"), "backfill_enqueued");
+    writeRefusal(f.r, f.occurrenceId, 2, f.revision(2).artifactHash);
+    f.clock.wall += 1_000;
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(f.revision(2).refusalReason, "transcript_text_in_note");
+    assert.equal(warningFiles(f.r).length, 1, "the refusal that stays reaches the operator");
+    f.clock.wall += 60_000;
+    assert.equal(await f.owner.tick("outbox"), "outbox_reconciled");
+    assert.equal(await f.owner.tick("backfill"), "backfill_idle", "only one automatic re-synthesis");
+    assert.equal(f.revision(3), undefined);
+    assert.equal(warningFiles(f.r).length, 1);
+    assert.equal(f.store.getSession(f.occurrenceId)?.state, "awaiting_teammem");
+    assert.equal(existsSync(f.seeded.recordingPath), true, "custody is unchanged until its deadline");
+    assert.equal(await f.owner.tick("notification"), "notification_polled");
+    assert.equal(f.organizer.calls.length, 0);
+    await f.owner.close();
+  } finally { f.store.close(); f.r.close(); }
 });
 
 /** A committed Team Vault with one published project page, in TeamMem's render shape. */

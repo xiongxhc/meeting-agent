@@ -698,6 +698,39 @@ explicit v2 and supported-version validation; the outbox preserves either versio
 through restart. Manifest and receipt versions remain v1. Consuming v2 requires a
 matching v2-capable TeamMem package; it is never silently downgraded to v1.
 
+When TeamMem refuses a revision for good it writes
+`<receipts>/<segment>/<revision>.refused.json` (`teammem-meeting-refusal/v1`).
+The outbox reads it only for a pending, unpublished row with the exact
+occurrence, revision and artifact hash, and only when no matching receipt
+exists. The row then keeps TeamMem's reason code (migration 031), stops
+counting retries and is rechecked only at the 60 s retry cap. The organizer
+gets nothing, since no URL was published.
+
+A complete revision refused for quoting its own transcript
+(`transcript_text_in_note`) is re-synthesised once: the refusal and a due
+backfill job for the next revision commit together, and that build tells the
+synthesis never to quote the transcript verbatim. This raises no operator
+alert. Every other refusal, and a second own-transcript refusal for the same
+occurrence, stays terminal and raises one operator alert file
+(`meeting-publication-refusal-alert/v1`, identity, hash and reason code only)
+in `outbox/operator-warnings/`; the refusal is recorded only after that file is
+durable. An incomplete revision's own retry also gets the no-quote instruction.
+A higher revision publishes and cleans the refused one only when one is built:
+by that one re-synthesis or by an incomplete transcript's retry. An exact
+receipt for a refused revision (the producer cleared its refusal) is still
+accepted. Any publication of the occurrence removes its refusal alert files.
+Retention still ends at `ended_at + 14 days`.
+
+Before a bundle exists, the builder applies TeamMem's text rules. Names, titles,
+project names and model names admit no control character. Prose keeps tab, LF
+and CR. A stray control character from the summary model or a display name is
+removed (a line break or tab in a name becomes a space). A name that is blank
+or `.`/`..` after that gets a fixed fallback: the title becomes `Meeting
+<meeting number>`, a display name `Participant`, a project `Unnamed project`,
+a model name `unknown`. Each repaired field counts in one `text_normalized`
+processing warning. Person ids get no fallback. `enqueue` refuses any artifact
+that still breaks the rules, so TeamMem never quarantines it unseen.
+
 These library paths are not yet selected by a shipped application lifecycle.
 Application composition and human live checks remain separate gates; no live
 provider/device/TeamMem or whole-application E2E proof is implied here.

@@ -62,6 +62,17 @@ that policy. The same sweep fails `joining`/`listening` sessions and closes
 open capture generations that no live occurrence owns, so their evidence gets
 its normal 14-day expiry.
 
+A revision TeamMem refuses for good (its `<revision>.refused.json` record)
+keeps its custody unchanged: the encrypted recording and bundle stay until
+`ended_at + 14 days` or a later complete publication. The failure behaviour is:
+
+| Failure | Required behaviour |
+|---|---|
+| TeamMem refuses a revision for good | Record the reason code and stop retrying it. A complete revision refused for quoting its own transcript is re-synthesised once into the next revision with a no-quotation instruction. Any other refusal, or a second one, raises one operator alert with the reason code. The organizer is notified only when a later revision publishes. |
+
+Regression evidence for it lives in `test/publication-refusal.test.ts` and the
+refusal cases of `test/application-maintenance.test.ts`.
+
 Regression evidence lives in `test/outbox-worker.test.ts` (D033 cases) and
 `test/backfill-journal-handoff.test.ts` (atomic handoff and legacy repair),
 `test/outbox-retry-gate.test.ts` (retry gate and transient errors) and

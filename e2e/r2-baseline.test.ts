@@ -296,7 +296,7 @@ test("actual runner read helper refuses WAL/header/sidecars before any ordinary 
     };
     await assert.rejects(runner.readRunEvidence({ databasePath: walPath, r2Baseline: true, read: readWal }), /WAL/);
     assert.equal(reads, 1); assert.deepEqual(readdirSync(f.root).sort(), files); assert.deepEqual(readFileSync(walPath), walBefore);
-    f.alter("UPDATE schema_migrations SET version=31 WHERE version=30");
+    f.alter("UPDATE schema_migrations SET version=32 WHERE version=31");
     const schemaBefore = readFileSync(f.databasePath), schemaFiles = readdirSync(f.root).sort();
     await assert.rejects(runner.readRunEvidence({ databasePath: f.databasePath, r2Baseline: true, read }), /schema/);
     assert.equal(reads, 1); assert.deepEqual(readFileSync(f.databasePath), schemaBefore); assert.deepEqual(readdirSync(f.root).sort(), schemaFiles);

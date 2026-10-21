@@ -29,7 +29,7 @@ function snapshot(databasePath, work) {
     requireFact(db.readonly, "recovery database was not opened readonly");
     requireFact(db.pragma("journal_mode", { simple: true }) !== "wal", "recovery reader requires a non-WAL snapshot");
     return db.transaction(() => {
-      requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 30, "unsupported recovery schema");
+      requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 31, "unsupported recovery schema");
       return work(db);
     })();
   } finally { db.close(); }

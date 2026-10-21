@@ -50,8 +50,8 @@ function fixture() {
 test("migration 029 is the schema head and the recordings columns carry D029's outcome", () => {
   const f = fixture();
   try {
-    assert.equal(f.store.schemaVersion, 30);
-    assert.equal(f.store.appliedMigrations().at(-1)?.name, "030_recording_retention.sql");
+    assert.equal(f.store.schemaVersion, 31);
+    assert.equal(f.store.appliedMigrations().at(-1)?.name, "031_delivery_publication_refusal.sql");
 
     const confirmed = f.finalize(CONFIRMED);
     const zeroFrame = f.finalize(ZERO_FRAME);
@@ -103,7 +103,7 @@ test("a pre-028 recording stays unavailable rather than being reinterpreted", ()
     } finally { db.close(); }
     const reopened = openSessionStore({ filename: f.filename });
     try {
-      assert.equal(reopened.schemaVersion, 30);
+      assert.equal(reopened.schemaVersion, 31);
       assert.equal(reopened.getRecording(occurrenceId)?.captureDrain, null);
       assert.equal(reopened.getRecording(occurrenceId)?.captureIntegrity, "unavailable");
     } finally { reopened.close(); }
@@ -134,7 +134,7 @@ test("a store opened against a pre-028 migration set still finalizes, and refuse
   const root = mkdtempSync(path.join(os.tmpdir(), "meeting-capture-drain-legacy-"));
   const legacy = path.join(root, "migrations-027");
   mkdirSync(legacy);
-  cpSync(path.resolve("migrations"), legacy, { recursive: true, filter: (source) => !/^0(?:2[89]|30)_/.test(path.basename(source)) });
+  cpSync(path.resolve("migrations"), legacy, { recursive: true, filter: (source) => !/^0(?:2[89]|3[01])_/.test(path.basename(source)) });
   const store = openSessionStore({ filename: path.join(root, "state.db"), migrationsDir: legacy });
   try {
     assert.equal(store.schemaVersion, 27);

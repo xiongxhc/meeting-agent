@@ -9,9 +9,13 @@ import {
   addMillisecondsToUtcInstant,
   canonicalArtifactHash,
   canonicalArtifactJson,
+  isDotSegment,
   isUnicodeScalarString,
+  mapTeamMemText,
+  normalizeTeamMemText,
   parseTeamMemMeetingArtifact,
   TEAMMEM_MEETING_V1_SCHEMA,
+  teamMemTextViolations,
   type TeamMemMeetingArtifact,
 } from "../contracts/teammem-meeting-v1.ts";
 import {
@@ -26,6 +30,9 @@ import type { MediaTimelineAlignment, ReconciledSegment, ReconciledTranscript, T
 import type { ConversationRuntimePort } from "../ports/conversation-runtime.ts";
 import type { SelectedAlignment } from "../ports/session-store.ts";
 import { resolveProjects, synthesisProjectVocabulary } from "./project-resolution.ts";
+
+/** Added after TeamMem refused a note for quoting its own transcript. */
+export const NO_VERBATIM_INSTRUCTION = " Do not copy any sentence or phrase from the transcript verbatim into any field; restate every point in your own words. A note that quotes the transcript is refused.";
 
 /** The artifact contract's bound on processing warnings. */
 const MAX_PROCESSING_WARNINGS = 500;
@@ -157,6 +164,9 @@ export type ArtifactBuildInput = {
    * be read. Supplied, only these names are published (project-resolution.ts).
    * Omitted, the model's names pass through unchanged. */
   readonly knownProjects?: readonly string[] | null;
+  /** TeamMem refused an earlier revision for quoting its own transcript: the
+   * synthesis is told never to quote it verbatim. */
+  readonly noVerbatimQuotes?: boolean;
 };
 
 export type BuiltTeamMemMeetingArtifact = {
@@ -280,9 +290,9 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
   transcriptWarnings: readonly { readonly code: string; readonly detail: string }[], version: "v1" | "v2"): Promise<BuiltTeamMemMeetingArtifact | BuiltTeamMemMeetingArtifactV2> {
   const processed = await input.runtime.processText({
     sessionId: input.sessionId,
-    instructions: version === "v1"
+    instructions: (version === "v1"
       ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies."
-      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.",
+      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.") + (input.noVerbatimQuotes === true ? NO_VERBATIM_INSTRUCTION : ""),
     input: canonicalSynthesisInput(transcript, version, input.knownProjects),
     outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
     maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES,
@@ -337,16 +347,52 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
       expires_at: input.audio.expiresAt,
     },
   };
+  // A stray control character from a model or a display name would get the
+  // whole bundle quarantined by TeamMem. Normalise it here and say so.
+  let normalized = 0;
+  const sanitized = mapTeamMemText(artifactValue as SupportedTeamMemMeetingArtifact, (path, kind, value) => {
+    let next = normalizeTeamMemText(value, kind);
+    // A name that is blank or a dot path segment once stripped (a Feishu topic
+    // of "." for instance) gets a fixed fallback instead of failing every build.
+    if (kind === "line" && (next.trim() === "" || isDotSegment(next))) next = lineFallback(path, input.identity.meetingNo) ?? next;
+    if (next !== value) normalized += 1;
+    return next;
+  });
+  if (normalized > 0) {
+    if (sanitized.processing_warnings.length + 1 > MAX_PROCESSING_WARNINGS) throw new Error("processing warning limit exceeded");
+    sanitized.processing_warnings.push({ code: "text_normalized", detail: `control characters or unusable names repaired in ${normalized} text field(s)` });
+  }
   if (version === "v1") {
-    const artifact = parseTeamMemMeetingArtifact(artifactValue);
+    const artifact = parseTeamMemMeetingArtifact(sanitized);
+    assertTeamMemText(artifact);
     const artifact_hash = canonicalArtifactHash(artifact);
     input.revisionGuard?.check(artifact, artifact_hash);
     return { artifact, artifact_hash, serialized: canonicalArtifactJson(artifact) };
   }
-  const artifact = parseTeamMemMeetingArtifactV2(artifactValue);
+  const artifact = parseTeamMemMeetingArtifactV2(sanitized);
+  assertTeamMemText(artifact);
   const artifact_hash = canonicalArtifactHash(artifact);
   input.revisionGuard?.check(artifact, artifact_hash);
   return { artifact, artifact_hash, serialized: canonicalArtifactJson(artifact) };
+}
+
+/** Person ids have no fallback: an identity is never invented. */
+function lineFallback(path: string, meetingNo: string): string | null {
+  if (path === "title") {
+    const number = normalizeTeamMemText(meetingNo, "line").trim();
+    return number === "" || isDotSegment(number) ? "Meeting" : `Meeting ${number}`.slice(0, 200);
+  }
+  if (path.endsWith(".display_name")) return "Participant";
+  if (/^projects\[\d+\]\.name$/.test(path)) return "Unnamed project";
+  if (path.startsWith("provenance.") || path.endsWith(".provenance.model")) return "unknown";
+  return null;
+}
+
+/** What normalising cannot repair (a `.` or `..` name) is a visible build
+ * failure naming the fields, never a bundle TeamMem quarantines. */
+function assertTeamMemText(artifact: SupportedTeamMemMeetingArtifact): void {
+  const violations = teamMemTextViolations(artifact);
+  if (violations.length > 0) throw new Error(`artifact text violates TeamMem text rules: ${violations.slice(0, 10).join(",")}`);
 }
 
 /** A deliberately ephemeral reference implementation of TeamMem's revision

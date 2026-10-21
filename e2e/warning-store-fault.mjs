@@ -94,7 +94,7 @@ export function installWarningStoreFault(input) {
       assertIdentity();
       requireFact(db.pragma("journal_mode", { simple: true }) !== "wal", "warning fault requires a non-WAL database");
       db.transaction(() => {
-        requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 30,
+        requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 31,
           "unsupported warning fault schema");
         work(db);
         assertIdentity();

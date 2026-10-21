@@ -359,7 +359,12 @@ export type ClaimBackfillJobInput = {
   readonly operationBudgetMs: number;
 };
 
+export type PublicationRefusalInput = { readonly row: DeliveryRow; readonly reasonCode: string; readonly nowMs: number };
+
 export type BackfillJobClaim = {
+  /** Present when TeamMem refused an earlier revision for quoting its own
+   * transcript: the synthesis must not quote it verbatim. */
+  readonly noVerbatimQuotes?: true;
   readonly seed: BackfillSeed;
   readonly claimToken: string;
   readonly claimExpiresAtMs: number;
@@ -559,6 +564,9 @@ export type DeliveryRow = {
   readonly recoveryArtifact: string | null;
   readonly stageToken: string | null;
   readonly recordingHandle?: string | null;
+  /** TeamMem's reason code once it refused this exact revision for good.
+   * Present only when set; never cleared. */
+  readonly refusalReason?: string;
 };
 
 export type NotificationTerminalReason =
@@ -839,6 +847,12 @@ export type SessionStore = {
   pending(): readonly DeliveryRow[];
   recoverablePublications(): readonly DeliveryRow[];
   update(row: DeliveryRow): void;
+  /** Whether TeamMem's own-transcript refusal of this complete revision may
+   * schedule the one automatic re-synthesis into the next revision. */
+  publicationResynthesisEligible(input: PublicationRefusalInput): boolean;
+  /** Records the terminal refusal and, when `resynthesis`, re-arms the backfill
+   * job for the next revision in the same transaction (throws if it cannot). */
+  recordPublicationRefusal(input: PublicationRefusalInput & { readonly nextRetryAtMs: number; readonly resynthesis: boolean }): void;
   acceptPublication(input: AcceptPublicationInput): void;
   notifications(): readonly NotificationRow[];
   claimNotification(input: ClaimNotificationInput): NotificationRow | null;

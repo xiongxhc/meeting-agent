@@ -281,6 +281,8 @@ const SOURCE_ROLES = [
   "dist/migrations/029_alignment_page_private_bound.sql",
   "migrations/030_recording_retention.sql",
   "dist/migrations/030_recording_retention.sql",
+  "migrations/031_delivery_publication_refusal.sql",
+  "dist/migrations/031_delivery_publication_refusal.sql",
   "node_modules/better-sqlite3/package.json",
   "node_modules/better-sqlite3/lib/binding.js",
   "node_modules/better-sqlite3/lib/darwin-arm64.js",

@@ -112,7 +112,7 @@ export function readTerminalState({ root, databasePath, occurrenceId }) {
     const result = db.transaction(() => {
       const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name);
       requireTerminal(same(tables, TABLES), "schema_tables");
-      requireTerminal(same(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map(row => row.version), Array.from({ length: 30 }, (_, i) => i + 1)), "schema_versions");
+      requireTerminal(same(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map(row => row.version), Array.from({ length: 31 }, (_, i) => i + 1)), "schema_versions");
       const schemaSha256 = hash(JSON.stringify({ definitions: db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all(),
         migrations: db.prepare("SELECT * FROM schema_migrations ORDER BY version").all() }));
       const one = (table, sql) => { requireTerminal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n === 1, "cardinality"); const row = db.prepare(sql).get(occurrenceId); requireTerminal(row, "occurrence_binding"); return row; };

@@ -179,7 +179,7 @@ test("migrations 026 and 027 add per-source custody and the generation terminal 
     } finally { raw025.close(); }
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 30);
+      assert.equal(upgraded.schemaVersion, 31);
       const raw027 = new Database(filename, { readonly: true });
       try {
         const columns = (raw027.pragma("table_info(reconciliation_generations)") as Array<{ name: string }>).map((column) => column.name);

@@ -251,6 +251,7 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
         provenance: { ...claim.seed.provenance, runtimeProfile: connected.runtimeProfile,
           processedAt: new Date(validClock(options.clock.now())).toISOString() },
         knownProjects: options.readKnownProjects(),
+        ...(claim.kind === "retry" && claim.noVerbatimQuotes === true ? { noVerbatimQuotes: true } : {}),
         audio: { format: claim.seed.recordingFormat, encryption: claim.seed.recordingEncryption,
           durationSeconds: claim.seed.recordingDurationMs / 1000, bytes: claim.seed.recordingBytes,
           sha256: `sha256:${claim.seed.recordingSha256}`, expiresAt: new Date(claim.seed.expiresAtMs).toISOString() },

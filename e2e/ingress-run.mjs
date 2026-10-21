@@ -331,7 +331,7 @@ export function readIngressState(input) {
     guard(); db = new Database(databasePath, { readonly: true, fileMustExist: true }); guard();
     requireIngress(db.readonly && db.pragma("journal_mode", { simple: true }) !== "wal", "reader_WAL");
     const state = db.transaction(() => {
-      requireIngress(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 30, "schema29_required");
+      requireIngress(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 31, "schema29_required");
       requireIngress(db.prepare("SELECT count(*) AS n FROM feishu_invite_occurrences").get().n === 1, "occurrence_count");
       const immutable = db.prepare(`SELECT occurrence_id AS occurrenceId,region,tenant_key AS tenantKey,app_id AS appId,
         provider_meeting_id AS providerMeetingId,meeting_no AS meetingNo,occurrence_started_at AS occurrenceStartedAt,

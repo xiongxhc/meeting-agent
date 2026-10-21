@@ -313,7 +313,7 @@ test("one application-owned store opens inside the private root after the lock; 
     assert.equal(f.owner.closed(), 0, "the caller closes the lock last");
     await assert.rejects(app.discover(), /closed/);
     const reopened = f.reopen();
-    try { assert.equal(reopened.schemaVersion, 30); } finally { reopened.close(); }
+    try { assert.equal(reopened.schemaVersion, 31); } finally { reopened.close(); }
   } finally { f.close(); }
 });
 

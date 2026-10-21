@@ -1,18 +1,20 @@
 // Local delivery state machine.  The outbox is the durable handoff; polling a
 // receipt is deliberately the only thing this worker ever does beyond it.
 
-import { readPublicationReceipt } from "../adapters/receipt-inbox.ts";
+import { readPublicationReceipt, readPublicationRefusal } from "../adapters/receipt-inbox.ts";
 import { deleteDeliveredEvidence, deleteSeedRecordingEvidence, meetingBundleReady, verifyConsumedMeetingBundle, writeMeetingBundle } from "../adapters/filesystem-outbox.ts";
-import { canonicalArtifactHash, canonicalArtifactJson } from "../contracts/teammem-meeting-v1.ts";
+import { canonicalArtifactHash, canonicalArtifactJson, teamMemTextViolations } from "../contracts/teammem-meeting-v1.ts";
 import { parseSupportedTeamMemMeetingArtifact, type SupportedTeamMemMeetingArtifact } from "../contracts/teammem-meeting-v2.ts";
 import { occurrencePathSegment } from "../domain/occurrence-id.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { notificationRequestUuid } from "./notification-worker.ts";
-import type { AcceptPublicationInput, BackfillDeliveryAuthority, BackfillSeedCleanupClaim, DeliveryRow as StoreDeliveryRow, SavePendingDeliveryResult } from "../ports/session-store.ts";
+import type { AcceptPublicationInput, BackfillDeliveryAuthority, BackfillSeedCleanupClaim, DeliveryRow as StoreDeliveryRow, SavePendingDeliveryResult, SessionStore } from "../ports/session-store.ts";
 
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_ARTIFACT_BYTES = 16 * 1024 * 1024;
+/** The retry cap: a refused revision is rechecked for a receipt no faster. */
+const REFUSED_RECHECK_MS = 60_000;
 /** Errors a later attempt can outlive. They back off and retry; only parse,
  * path and integrity failures make a delivery terminal. */
 const TRANSIENT_ERRNO = new Set(["EACCES", "EPERM", "EAGAIN", "EBUSY", "EINTR", "EIO", "EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "ETIMEDOUT"]);
@@ -41,6 +43,18 @@ export type DeliveryJournal = {
   claimExpiredBackfillSeedCleanup(input: { readonly nowMs: number; readonly claimToken: string }): BackfillSeedCleanupClaim | null;
   completeBackfillSeedCleanup(input: { readonly occurrenceId: string; readonly claimToken: string; readonly nowMs: number }): void;
   authorizeDeliveryEvidenceCleanup(input: { readonly occurrenceId: string; readonly nowMs: number }): boolean;
+  /** Optional: without them a refusal is recorded with `update` and never re-synthesised. */
+  publicationResynthesisEligible?: SessionStore["publicationResynthesisEligible"];
+  recordPublicationRefusal?: SessionStore["recordPublicationRefusal"];
+};
+
+/** TeamMem refused this exact revision for good: operator metadata only, no
+ * title or meeting text. */
+export type PublicationRefusalAlert = {
+  readonly occurrenceId: string;
+  readonly revision: number;
+  readonly artifactHash: string;
+  readonly reasonCode: string;
 };
 
 export type OutboxWorker = {
@@ -64,7 +78,12 @@ export function createOutboxWorker(options: {
   readonly random: () => number;
   readonly session: { state(occurrenceId: string): string | null; publish(occurrenceId: string): void };
   readonly reconciliationEvidence: { purgeExpiredReconciliationEvidence(nowMs: number): number };
-  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed" | "backfill_seed_cleanup_failed" | "delivery_recovery_unavailable") => void;
+  readonly onMaintenanceFailure?: (reason: "reconciliation_evidence_purge_failed" | "backfill_seed_cleanup_failed" | "delivery_recovery_unavailable" | "publication_refusal_alert_failed" | "publication_refusal_alert_clear_failed") => void;
+  /** Durably raises the operator alert; throws when it could not. The refusal
+   * is recorded only after this returns, so a failed alert is raised again. */
+  readonly onPublicationRefused?: (alert: PublicationRefusalAlert) => void;
+  /** Removes that alert once the occurrence publishes; a missing alert is a no-op. */
+  readonly onPublicationRefusalCleared?: (alert: PublicationRefusalAlert) => void;
   /** Static delivery state-change codes only; never identifiers, paths or content. */
   readonly log?: (code: string) => void;
 }): OutboxWorker {
@@ -81,6 +100,9 @@ export function createOutboxWorker(options: {
           canonicalArtifactHash(requestedArtifact) !== input.artifactHash) {
         throw new Error("delivery artifact bytes or hash are not canonical");
       }
+      // TeamMem quarantines a bundle whose text breaks its rules, and Meeting
+      // never hears of a quarantine. The builder normalises; refuse the rest.
+      if (teamMemTextViolations(requestedArtifact).length > 0) throw new Error("delivery artifact text violates TeamMem text rules");
       const bundlePath = path.join(path.resolve(options.outboxDir), occurrencePathSegment(input.artifact.occurrence_id as `${string}@${string}`), String(input.artifact.revision));
       const owner = recordingOwners.get(path.resolve(input.recordingPath));
       if (owner !== undefined && owner !== input.artifact.occurrence_id) throw new Error("recording is owned by another occurrence");
@@ -207,6 +229,36 @@ export function createOutboxWorker(options: {
           // verified consumed-bundle metadata. Other terminal rows stay inert.
           const consumedOnly = current.retryReason === "recovery_unavailable";
           if (consumedOnly && receipt === null) continue;
+          // A refused revision is terminal: no retry count and no backoff
+          // growth. Its exact receipt is still honoured at the slowest retry
+          // cadence, because the producer may clear the refusal and publish it.
+          if (current.refusalReason !== undefined && receipt === null) {
+            options.journal.update({ ...current, nextRetryAtMs: now + REFUSED_RECHECK_MS });
+            continue;
+          }
+          const refuse = (): boolean => {
+            const refusal = readPublicationRefusal({
+              receiptsDir: options.receiptsDir,
+              occurrenceId: current.occurrenceId,
+              revision: current.revision,
+              artifactHash: current.artifactHash,
+            });
+            if (refusal === null) return false;
+            const reasonCode = refusal.reason_code, nextRetryAtMs = now + REFUSED_RECHECK_MS;
+            // A complete revision refused for quoting its own transcript is
+            // re-synthesised once into the next revision. That is self-repair,
+            // so only a refusal that stays reaches the operator.
+            const resynthesis = options.journal.publicationResynthesisEligible?.({ row: current, reasonCode, nowMs: now }) === true;
+            if (!resynthesis && !raiseRefusalAlert(options, current, reasonCode)) return false;
+            if (options.journal.recordPublicationRefusal === undefined) {
+              options.journal.update({ ...current, refusalReason: reasonCode, nextRetryAtMs });
+              return true;
+            }
+            try { options.journal.recordPublicationRefusal({ row: current, reasonCode, nowMs: now, nextRetryAtMs, resynthesis }); }
+            catch { return false; }
+            if (resynthesis) options.log?.("delivery_resynthesis_scheduled");
+            return true;
+          };
           const waitReceipt = (): void => {
             const retryCount = current.retryCount + 1;
             options.journal.update({
@@ -219,11 +271,11 @@ export function createOutboxWorker(options: {
           };
           // Still waiting: the recording was verified and hashed when the
           // bundle was written; only a missing READY bundle needs that again.
-          if (receipt === null && meetingBundleReady({ outboxDir: options.outboxDir, bundlePath: current.bundlePath })) { waitReceipt(); continue; }
+          if (receipt === null && meetingBundleReady({ outboxDir: options.outboxDir, bundlePath: current.bundlePath })) { if (!refuse()) waitReceipt(); continue; }
           const recovered = recoverBundle(options, current, consumedOnly);
           if (recovered === null) continue;
           const { artifact, consumed } = recovered;
-          if (receipt === null) { waitReceipt(); continue; }
+          if (receipt === null) { if (!refuse()) waitReceipt(); continue; }
           // A receipt is evidence, not authorization to mutate an arbitrary
           // orchestration state. Only the legal edge and an interrupted replay
           // are allowed to record it or release encrypted evidence.
@@ -244,6 +296,12 @@ export function createOutboxWorker(options: {
             ...(consumed ? { consumedInboxAudio: true as const } : {}),
           });
           options.log?.("delivery_published");
+          // A publication ends this occurrence's refusal alerts.
+          for (const row of options.journal.pending()) {
+            if (row.occurrenceId !== current.occurrenceId || row.refusalReason === undefined) continue;
+            try { options.onPublicationRefusalCleared?.({ occurrenceId: row.occurrenceId, revision: row.revision, artifactHash: row.artifactHash, reasonCode: row.refusalReason }); }
+            catch { options.onMaintenanceFailure?.("publication_refusal_alert_clear_failed"); }
+          }
           if (current.transcriptComplete) {
             deleteOccurrenceEvidence(options, published, now, eligibleRows(options, published));
           }
@@ -266,6 +324,16 @@ export function createOutboxWorker(options: {
       }
     },
   };
+}
+
+function raiseRefusalAlert(options: Pick<Parameters<typeof createOutboxWorker>[0], "onPublicationRefused" | "onMaintenanceFailure">, row: DeliveryRow, reasonCode: string): boolean {
+  try {
+    options.onPublicationRefused?.({ occurrenceId: row.occurrenceId, revision: row.revision, artifactHash: row.artifactHash, reasonCode });
+    return true;
+  } catch {
+    options.onMaintenanceFailure?.("publication_refusal_alert_failed");
+    return false;
+  }
 }
 
 function notificationFromRecovery(row: DeliveryRow): AcceptPublicationInput["notification"] {

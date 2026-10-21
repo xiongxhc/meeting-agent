@@ -231,6 +231,97 @@ export function validateRelationships(artifact: SupportedTeamMemMeetingArtifact)
   }
 }
 
+/** The artifact strings TeamMem's bundle validation checks for control
+ * characters. A `line` value becomes a folder name or front matter: it admits
+ * no C0 control, DEL or C1 control, and is never `.` or `..` once trimmed. A
+ * `text` value is prose: tab, LF and CR stay legal, every other control does
+ * not. Paths name fields by index only, never by content. */
+export type TeamMemTextKind = "line" | "text";
+
+/** Returns a copy of `artifact` with every TeamMem-checked string passed
+ * through `map`; every other value is copied unchanged. */
+export function mapTeamMemText<T extends SupportedTeamMemMeetingArtifact>(artifact: T, map: (path: string, kind: TeamMemTextKind, value: string) => string): T {
+  const copy = structuredClone(artifact) as SupportedTeamMemMeetingArtifact;
+  const line = (path: string, value: string) => map(path, "line", value);
+  const text = (path: string, value: string) => map(path, "text", value);
+  copy.title = line("title", copy.title);
+  copy.summary = text("summary", copy.summary);
+  if (copy.organizer !== null) {
+    copy.organizer.person_id = line("organizer.person_id", copy.organizer.person_id);
+    copy.organizer.display_name = line("organizer.display_name", copy.organizer.display_name);
+  }
+  copy.participants.forEach((entry, index) => {
+    entry.person_id = line(`participants[${index}].person_id`, entry.person_id);
+    entry.display_name = line(`participants[${index}].display_name`, entry.display_name);
+  });
+  copy.transcript.forEach((segment, index) => {
+    segment.text = text(`transcript[${index}].text`, segment.text);
+    segment.provenance.model = line(`transcript[${index}].provenance.model`, segment.provenance.model);
+    if (segment.speaker.kind === "person") {
+      segment.speaker.person_id = line(`transcript[${index}].speaker.person_id`, segment.speaker.person_id);
+      segment.speaker.display_name = line(`transcript[${index}].speaker.display_name`, segment.speaker.display_name);
+    }
+  });
+  copy.projects.forEach((entry, index) => { entry.name = line(`projects[${index}].name`, entry.name); });
+  copy.decisions.forEach((entry, index) => { entry.text = text(`decisions[${index}].text`, entry.text); });
+  copy.discussion_points.forEach((entry, index) => { entry.text = text(`discussion_points[${index}].text`, entry.text); });
+  copy.action_items.forEach((entry, index) => {
+    entry.text = text(`action_items[${index}].text`, entry.text);
+    if (entry.owner !== null) {
+      entry.owner.person_id = line(`action_items[${index}].owner.person_id`, entry.owner.person_id);
+      entry.owner.display_name = line(`action_items[${index}].owner.display_name`, entry.owner.display_name);
+    }
+  });
+  copy.person_summaries.forEach((entry, index) => {
+    entry.person_id = line(`person_summaries[${index}].person_id`, entry.person_id);
+    entry.display_name = line(`person_summaries[${index}].display_name`, entry.display_name);
+    entry.text = text(`person_summaries[${index}].text`, entry.text);
+  });
+  for (const key of ["stt_provider", "stt_model", "text_provider", "text_model", "agent_version"] as const) {
+    copy.provenance[key] = line(`provenance.${key}`, copy.provenance[key]);
+  }
+  return copy as T;
+}
+
+/** Field paths TeamMem would quarantine the whole bundle for. */
+export function teamMemTextViolations(artifact: SupportedTeamMemMeetingArtifact): string[] {
+  const violations: string[] = [];
+  mapTeamMemText(artifact, (path, kind, value) => {
+    if (hasTeamMemControl(value, kind) || (kind === "line" && isDotSegment(value))) violations.push(path);
+    return value;
+  });
+  return violations;
+}
+
+/** Line breaks and tabs become a space where a value admits none; every other
+ * control character is removed. A dot segment cannot be repaired this way and
+ * stays a violation. */
+export function normalizeTeamMemText(value: string, kind: TeamMemTextKind): string {
+  let result = "";
+  for (const char of value) {
+    const code = char.codePointAt(0)!;
+    if (!isTeamMemControl(code, kind)) result += char;
+    else if (code === 0x09 || code === 0x0a || code === 0x0b || code === 0x0c || code === 0x0d || code === 0x85) result += " ";
+  }
+  return result;
+}
+
+function isTeamMemControl(code: number, kind: TeamMemTextKind): boolean {
+  if (kind === "text" && (code === 0x09 || code === 0x0a || code === 0x0d)) return false;
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+}
+
+function hasTeamMemControl(value: string, kind: TeamMemTextKind): boolean {
+  for (const char of value) if (isTeamMemControl(char.codePointAt(0)!, kind)) return true;
+  return false;
+}
+
+/** `.` or `..` once trimmed: TeamMem refuses it as a folder name. */
+export function isDotSegment(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed === "." || trimmed === "..";
+}
+
 function validateEvidence(ids: readonly string[], segments: ReadonlySet<string>): void {
   for (const id of ids) issue(segments.has(id), "evidence_segment_ids must refer to stored transcript segments");
 }

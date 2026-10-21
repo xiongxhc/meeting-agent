@@ -28,12 +28,12 @@ import { lstatSync } from "node:fs";
 import path from "node:path";
 import type { StdioGatewayCleanupTimeouts } from "@conversation/runtime";
 
-import { createFilesystemOperatorWarningSink } from "./adapters/filesystem-operator-warning.ts";
+import { createFilesystemOperatorWarningSink, createFilesystemPublicationRefusalAlert } from "./adapters/filesystem-operator-warning.ts";
 import { deleteSeedRecordingEvidence, listRecordingSources } from "./adapters/filesystem-outbox.ts";
 import { readTeamVaultProjects } from "./adapters/team-vault-projects.ts";
 import { createBackfillWarningWorker, createBackfillWorker, type BackfillWorkerOptions } from "./delivery/backfill-worker.ts";
 import { createNotificationWorker, type NotificationSender } from "./delivery/notification-worker.ts";
-import { createOutboxWorker } from "./delivery/outbox-worker.ts";
+import { createOutboxWorker, type PublicationRefusalAlert } from "./delivery/outbox-worker.ts";
 import type { OperatorWarningSink } from "./ports/operator-warning.ts";
 import type { AlignmentAttempt, SessionStore, UnknownEndCustodyCleanupClaim, UnknownEndCustodyFailureReason, UnknownEndCustodySource } from "./ports/session-store.ts";
 import type { Clock } from "./sessions/coordinator.ts";
@@ -65,6 +65,8 @@ export type MaintenanceOptions = {
   readonly backfill?: Pick<BackfillWorkerOptions, "operationBudgetMs" | "cleanupTimeouts" | "startTransport" | "connectRuntime">;
   /** Test seams only; production composes the accepted Feishu sender and file sink. */
   readonly warningSink?: OperatorWarningSink;
+  /** Test seam for the refused-publication operator alert. */
+  readonly publicationRefusalAlert?: { raise(alert: PublicationRefusalAlert): void; clear(alert: PublicationRefusalAlert): void };
 };
 
 /** The application supervisor's own facts. These are the ONLY quiescence and
@@ -211,6 +213,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
   }
 
   // --- accepted owners ------------------------------------------------------
+  const refusalAlert = options.publicationRefusalAlert ?? createFilesystemPublicationRefusalAlert({ outboxDir: input.dataPaths.outboxDir });
   const outbox = createOutboxWorker({
     recordingsDir: input.dataPaths.recordingsDir, outboxDir: input.dataPaths.outboxDir, receiptsDir: input.dataPaths.receiptsDir,
     journal: input.store, clock, random,
@@ -219,6 +222,13 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
     reconciliationEvidence: input.store,
     onMaintenanceFailure: (reason) => { lanes.outbox.failures.add(`outbox_${reason}`); log(`maintenance_outbox_${reason}`); },
     log,
+    // The spec sends the organizer only a confirmed published URL; a refused
+    // revision has none, so the operator gets the reason code instead.
+    onPublicationRefused: (alert) => {
+      refusalAlert.raise(alert);
+      log(`maintenance_outbox_publication_refused:${alert.reasonCode}`);
+    },
+    onPublicationRefusalCleared: (alert) => { refusalAlert.clear(alert); },
   });
   /** The composition's own trusted proof for a stale alignment attempt: this
    * process holds the exclusive owner lock (so the attempt's previous owner

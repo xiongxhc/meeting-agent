@@ -86,6 +86,7 @@ import {
   type BridgeRecoveryResult,
   type BridgeFailureRecordingRow,
   type DeliveryRow,
+  type PublicationRefusalInput,
   type AcceptPublicationInput,
   type ClaimNotificationInput,
   type CompleteNotificationInput,
@@ -281,6 +282,8 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     pending: () => deliveryRows(db, "active"),
     recoverablePublications: () => deliveryRows(db, "deleted_with_recovery"),
     update: (row) => updateDelivery(db, row),
+    publicationResynthesisEligible: (input) => publicationResynthesisEligible(db, input),
+    recordPublicationRefusal: (input) => recordPublicationRefusal(db, input),
     acceptPublication: (input) => acceptPublication(db, input),
     notifications: () => notifications(db),
     claimNotification: (input) => claimNotification(db, input),
@@ -1325,7 +1328,9 @@ function claimBackfillJob(db: Database.Database, input: ClaimBackfillJobInput): 
       .get(candidate.occurrence_id) as { attempt_count: number; stop_at_ms: number };
     const seed = getBackfillSeed(db, candidate.occurrence_id);
     if (seed === null) throw new Error("claimed backfill job seed is missing");
-    return { seed, claimToken: input.claimToken, claimExpiresAtMs, attempt: row.attempt_count,
+    const noVerbatimQuotes = refusalColumn(db) === "refusal_reason" && db.prepare(`SELECT 1 FROM delivery_journal
+      WHERE occurrence_id=? AND refusal_reason='${OWN_TRANSCRIPT_REFUSAL}' LIMIT 1`).get(candidate.occurrence_id) !== undefined;
+    return { ...(noVerbatimQuotes ? { noVerbatimQuotes: true as const } : {}), seed, claimToken: input.claimToken, claimExpiresAtMs, attempt: row.attempt_count,
       targetRevision: next, stopAtMs: row.stop_at_ms, observedAtMs: candidate.observed_at_ms };
   }).immediate();
 }
@@ -2054,20 +2059,34 @@ function advanceSeededDeliveryState(db: Database.Database, occurrenceId: string,
     reason: "delivery_handoff", terminalReason: null, nowMs: Math.max(nowMs, session.updated_at_ms) });
 }
 
+// Migration 031's column. A store opened on an older schema (a test seam for
+// legacy upgrades) reads no refusal and never writes one.
+const refusalColumns = new WeakMap<Database.Database, "refusal_reason" | "NULL AS refusal_reason">();
+function refusalColumn(db: Database.Database): "refusal_reason" | "NULL AS refusal_reason" {
+  let column = refusalColumns.get(db);
+  if (column === undefined) {
+    const present = (db.prepare("PRAGMA table_info(delivery_journal)").all() as Array<{ name: string }>).some((entry) => entry.name === "refusal_reason");
+    column = present ? "refusal_reason" : "NULL AS refusal_reason";
+    refusalColumns.set(db, column);
+  }
+  return column;
+}
+
 function selectDeliveryRow(db: Database.Database, occurrenceId: string, revision: number): DeliveryRow | null {
   const row = db.prepare(
     `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
             transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle
+            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle, ${refusalColumn(db)}
        FROM delivery_journal WHERE occurrence_id=? AND revision=?`,
-  ).get(occurrenceId, revision) as { occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null } | undefined;
+  ).get(occurrenceId, revision) as { occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null; refusal_reason: string | null } | undefined;
   if (!row) return null;
   return { occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
     recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
     transcriptComplete: row.transcript_complete === 1, retryCount: row.retry_count,
     nextRetryAtMs: row.next_retry_at_ms, retryReason: row.retry_reason, publishedAtMs: row.published_at_ms,
     deletedAtMs: row.deleted_at_ms, publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
-    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token, recordingHandle: row.recording_handle };
+    recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token, recordingHandle: row.recording_handle,
+    ...(row.refusal_reason === null ? {} : { refusalReason: row.refusal_reason }) };
 }
 
 function seededArtifact(row: DeliveryRow): SupportedTeamMemMeetingArtifact {
@@ -2237,9 +2256,9 @@ function deliveryRows(db: Database.Database, selection: "active" | "deleted_with
   const rows = db.prepare(
     `SELECT occurrence_id, revision, artifact_hash, recording_path, bundle_path, ended_at_ms,
             transcript_complete, retry_count, next_retry_at_ms, retry_reason, published_at_ms,
-            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle
+            deleted_at_ms, publication_url, vault_commit, recovery_artifact, stage_token, recording_handle, ${refusalColumn(db)}
        FROM delivery_journal WHERE ${predicate} ORDER BY next_retry_at_ms, occurrence_id, revision`,
-  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null }>;
+  ).all() as Array<{ occurrence_id: string; revision: number; artifact_hash: string; recording_path: string; bundle_path: string; ended_at_ms: number; transcript_complete: 0 | 1; retry_count: number; next_retry_at_ms: number; retry_reason: DeliveryRow["retryReason"]; published_at_ms: number | null; deleted_at_ms: number | null; publication_url: string | null; vault_commit: string | null; recovery_artifact: string | null; stage_token: string | null; recording_handle: string | null; refusal_reason: string | null }>;
   return rows.map((row) => ({
     occurrenceId: row.occurrence_id, revision: row.revision, artifactHash: row.artifact_hash,
     recordingPath: row.recording_path, bundlePath: row.bundle_path, endedAtMs: row.ended_at_ms,
@@ -2248,18 +2267,59 @@ function deliveryRows(db: Database.Database, selection: "active" | "deleted_with
     publishedAtMs: row.published_at_ms, deletedAtMs: row.deleted_at_ms,
     publicationUrl: row.publication_url, vaultCommit: row.vault_commit,
     recoveryArtifact: row.recovery_artifact, stageToken: row.stage_token, recordingHandle: row.recording_handle,
+    ...(row.refusal_reason === null ? {} : { refusalReason: row.refusal_reason }),
   }));
+}
+
+// TeamMem's only terminal reason: the note quotes its own stored transcript.
+const OWN_TRANSCRIPT_REFUSAL = "transcript_text_in_note";
+
+/** One automatic re-synthesis per occurrence: the refused revision is complete,
+ * no other revision was refused for its own transcript, no higher revision
+ * exists, and the backfill lifecycle still owns the delivery before its stop. */
+function publicationResynthesisEligible(db: Database.Database, input: PublicationRefusalInput): boolean {
+  const { row } = input;
+  if (input.reasonCode !== OWN_TRANSCRIPT_REFUSAL || !row.transcriptComplete || refusalColumn(db) !== "refusal_reason") return false;
+  if (db.prepare(`SELECT 1 FROM delivery_journal WHERE occurrence_id=? AND ((revision<>? AND refusal_reason='${OWN_TRANSCRIPT_REFUSAL}') OR revision>?) LIMIT 1`)
+    .get(row.occurrenceId, row.revision, row.revision) !== undefined) return false;
+  const lifecycle = db.prepare(`SELECT owner,state,stop_at_ms,deleted_at_ms,process_cleanup_state,last_observed_at_ms
+    FROM backfill_seed_lifecycle WHERE occurrence_id=?`).get(row.occurrenceId) as { owner: string; state: string; stop_at_ms: number;
+      deleted_at_ms: number | null; process_cleanup_state: string | null; last_observed_at_ms: number } | undefined;
+  if (!lifecycle || lifecycle.owner !== "delivery" || lifecycle.state !== "pending" || lifecycle.deleted_at_ms !== null ||
+      lifecycle.process_cleanup_state !== null || Math.max(input.nowMs, lifecycle.last_observed_at_ms) >= lifecycle.stop_at_ms) return false;
+  const job = db.prepare("SELECT state,target_revision FROM backfill_jobs WHERE occurrence_id=?").get(row.occurrenceId) as
+    { state: string; target_revision: number | null } | undefined;
+  return job === undefined || (job.state === "awaiting_complete_receipt" && job.target_revision === row.revision);
+}
+
+function recordPublicationRefusal(db: Database.Database, input: PublicationRefusalInput & { readonly nextRetryAtMs: number; readonly resynthesis: boolean }): void {
+  db.transaction(() => {
+    if (input.resynthesis && !publicationResynthesisEligible(db, input)) throw seedViolation("publication re-synthesis is no longer eligible");
+    updateDelivery(db, { ...input.row, refusalReason: input.reasonCode, nextRetryAtMs: input.nextRetryAtMs });
+    if (!input.resynthesis) return;
+    const lifecycle = db.prepare("SELECT stop_at_ms,last_observed_at_ms FROM backfill_seed_lifecycle WHERE occurrence_id=?")
+      .get(input.row.occurrenceId) as { stop_at_ms: number; last_observed_at_ms: number };
+    const due = Math.max(input.nowMs, lifecycle.last_observed_at_ms);
+    const changed = db.prepare("SELECT 1 FROM backfill_jobs WHERE occurrence_id=?").get(input.row.occurrenceId) === undefined
+      ? withConstraintTranslation(() => db.prepare(`INSERT INTO backfill_jobs
+          (occurrence_id,state,attempt_count,next_attempt_at_ms,claim_token,claim_expires_at_ms,target_revision,last_reason,stop_at_ms,completion_revision,completion_artifact_hash)
+          VALUES (?,'due',0,?,NULL,NULL,NULL,NULL,?,NULL,NULL)`).run(input.row.occurrenceId, due, lifecycle.stop_at_ms).changes)
+      : db.prepare(`UPDATE backfill_jobs SET state='due',next_attempt_at_ms=?,target_revision=NULL,last_reason=NULL
+          WHERE occurrence_id=? AND state='awaiting_complete_receipt' AND target_revision=?`).run(due, input.row.occurrenceId, input.row.revision).changes;
+    if (changed !== 1) throw seedViolation("publication re-synthesis could not re-arm its backfill job");
+  }).immediate();
 }
 
 function updateDelivery(db: Database.Database, row: DeliveryRow): void {
   const changed = withConstraintTranslation(() => db.prepare(
     `UPDATE delivery_journal SET retry_count = ?, next_retry_at_ms = ?, retry_reason = ?,
        published_at_ms = ?, deleted_at_ms = ?, publication_url = ?, vault_commit = ?,
-       recovery_artifact = ?, stage_token = ?, recording_handle = ?
+       recovery_artifact = ?, stage_token = ?, recording_handle = ?${refusalColumn(db) === "refusal_reason" ? ", refusal_reason = COALESCE(refusal_reason, @refusal)" : ""}
      WHERE occurrence_id = ? AND revision = ? AND artifact_hash = ?`,
-  ).run(row.retryCount, row.nextRetryAtMs, row.retryReason, row.publishedAtMs, row.deletedAtMs,
+  ).run(...[row.retryCount, row.nextRetryAtMs, row.retryReason, row.publishedAtMs, row.deletedAtMs,
     row.publicationUrl, row.vaultCommit, row.recoveryArtifact, row.stageToken,
-    row.recordingHandle ?? null, row.occurrenceId, row.revision, row.artifactHash).changes);
+    row.recordingHandle ?? null, row.occurrenceId, row.revision, row.artifactHash],
+    ...(refusalColumn(db) === "refusal_reason" ? [{ refusal: row.refusalReason ?? null }] : [])).changes);
   if (changed !== 1) throw new OrchestrationError("constraint_violation", "delivery journal row is unknown or immutable fields changed");
 }
 

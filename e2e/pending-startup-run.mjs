@@ -307,7 +307,7 @@ export function readStartupEmptyState({ databasePath }) {
     guard(); db = new Database(databasePath, { readonly: true, fileMustExist: true }); guard();
     requireStartup(db.readonly && db.pragma("journal_mode", { simple: true }) !== "wal", "reader_WAL");
     const counts = db.transaction(() => {
-      requireStartup(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 30, "reader_schema29");
+      requireStartup(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 31, "reader_schema29");
       const values = {};
       for (const table of TABLES) { const count = db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n; requireStartup(count === 0, "reader_nonempty"); values[table] = count; }
       return values;
