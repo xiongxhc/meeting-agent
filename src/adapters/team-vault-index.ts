@@ -5,15 +5,17 @@
 // docs task-6-report.md for why that is enough for this product. The only
 // reader this module exists to serve is src/sessions/retrieval-router.ts.
 //
-// READ-ONLY BY CONSTRUCTION: every filesystem call in this file is
-// readdirSync, statSync or readFileSync, and the one shell-out is
-// `git rev-parse HEAD`, itself read-only. There is no write-shaped call
+// READ-ONLY BY CONSTRUCTION: the only filesystem call in this file is
+// realpathSync, and every shell-out is a read-only git query (`rev-parse`,
+// `status`, `ls-tree`, `show`) -- Markdown bytes come from the committed tree
+// via git, never from the working directory. There is no write-shaped call
 // anywhere here -- test/boundaries.test.ts's writable-fs scanner
 // (test/lib/import-scanner.ts) enforces that structurally across all of
 // src/, and this module satisfies it by never reaching for a write API at
 // all, not by working around the scanner's heuristic.
 
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 
 import {
   termCoverageScore,
@@ -37,10 +39,34 @@ export type CreateTeamVaultIndexOptions = {
   readonly teamVaultDir: string;
 };
 
+/** Which checkout a directory resolves to: its canonical worktree top level
+ * and canonical per-worktree git directory (linked worktrees share a common
+ * dir, so that alone would not tell them apart). */
+type CheckoutNamespace = {
+  readonly topLevel: string;
+  readonly gitDir: string;
+};
+
+type CheckoutState = {
+  readonly namespace: CheckoutNamespace;
+  readonly revision: string;
+};
+
 /**
- * Builds a read-only index of every `.md` file under `teamVaultDir`
- * (recursively; `.git` itself is skipped), and records the checkout's git
- * revision at that same instant. Throws if the directory cannot be read or
+ * Builds a read-only index of every committed `.md` file in the checkout that
+ * contains `teamVaultDir` (the WHOLE checkout, even when `teamVaultDir` is a
+ * subdirectory or a symlink alias; sourcePath is relative to the checkout
+ * root), and records the checkout's git revision at that same instant.
+ *
+ * The index is bound to the checkout `teamVaultDir` resolved to at
+ * construction. If the directory later resolves to a different checkout --
+ * e.g. the vault's own `.git` vanished and git's upward discovery now finds an
+ * enclosing repository, or an alias was retargeted -- `search()` throws even
+ * when that checkout's HEAD equals the indexed revision. This binds the
+ * namespace observed at construction; it cannot tell an intended
+ * subdirectory from a nested repository that vanished BEFORE construction.
+ *
+ * Throws if the directory cannot be read or
  * is not inside a readable git working tree -- the retrieval router treats
  * any throw from `search()` as "vault unavailable"; a throw here, at
  * construction, is a startup-time configuration error for whoever wires
@@ -52,11 +78,16 @@ export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): Team
   // Refuse a dirty tree rather than silently attaching untracked/draft text to
   // an unrelated published revision. Verify before and after the read so a
   // checkout advancing during construction cannot create a mixed snapshot.
+  const bound = readCheckoutState(teamVaultDir);
   assertCleanWorkingTree(teamVaultDir);
-  const indexedRevision = readGitRevision(teamVaultDir);
+  const indexedRevision = bound.revision;
   const files = readMarkdownFiles(teamVaultDir, indexedRevision);
   assertCleanWorkingTree(teamVaultDir);
-  if (readGitRevision(teamVaultDir) !== indexedRevision) {
+  const after = readCheckoutState(teamVaultDir);
+  if (!sameNamespace(after.namespace, bound.namespace)) {
+    throw new Error("Team Vault namespace changed while its index was being built");
+  }
+  if (after.revision !== indexedRevision) {
     throw new Error("Team Vault checkout advanced while its index was being built");
   }
 
@@ -76,11 +107,16 @@ export function createTeamVaultIndex(options: CreateTeamVaultIndexOptions): Team
       }
       hits.sort((a, b) => b.score - a.score);
 
-      const currentRevision = tryReadGitRevision(teamVaultDir);
-      if (currentRevision === null) {
+      // One git invocation reports namespace and HEAD from the same
+      // discovery, so the revision compared below belongs to that namespace.
+      const current = tryReadCheckoutState(teamVaultDir);
+      if (current === null) {
         throw new Error("Team Vault revision is unavailable; refusing stale provenance");
       }
-      const stale = currentRevision !== indexedRevision;
+      if (!sameNamespace(current.namespace, bound.namespace)) {
+        throw new Error("Team Vault namespace changed: the directory no longer resolves to the indexed checkout");
+      }
+      const stale = current.revision !== indexedRevision;
 
       return { hits, indexedRevision, stale };
     },
@@ -163,23 +199,32 @@ export function createTeamVaultIndexOrDegraded(
   }
 }
 
-function readGitRevision(dir: string): string {
-  const revision = tryReadGitRevision(dir);
-  if (revision === null) {
+function readCheckoutState(dir: string): CheckoutState {
+  const state = tryReadCheckoutState(dir);
+  if (state === null) {
     throw new Error(`Team Vault checkout at "${dir}" is not a readable git working tree`);
   }
-  return revision;
+  return state;
 }
 
-function tryReadGitRevision(dir: string): string | null {
+/** Null when `dir` is not inside a non-bare git working tree with a HEAD
+ * commit. `--show-toplevel` refuses a bare repository. */
+function tryReadCheckoutState(dir: string): CheckoutState | null {
   try {
-    return execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const [topLevel, gitDir, revision] = execFileSync(
+      "git",
+      ["-C", dir, "rev-parse", "--show-toplevel", "--absolute-git-dir", "HEAD"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).split("\n");
+    if (!topLevel || !gitDir || !revision) return null;
+    return { namespace: { topLevel: realpathSync(topLevel), gitDir: realpathSync(gitDir) }, revision };
   } catch {
     return null;
   }
+}
+
+function sameNamespace(a: CheckoutNamespace, b: CheckoutNamespace): boolean {
+  return a.topLevel === b.topLevel && a.gitDir === b.gitDir;
 }
 
 function assertCleanWorkingTree(dir: string): void {
