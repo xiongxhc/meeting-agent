@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { readTeamVaultProjects } from "../src/adapters/team-vault-projects.ts";
-import { resolveProjects } from "../src/delivery/project-resolution.ts";
+import { MAX_TEAM_VAULT_PAGES, readTeamVaultProjects } from "../src/adapters/team-vault-projects.ts";
+import { resolveProjects, synthesisProjectVocabulary } from "../src/delivery/project-resolution.ts";
 
 test("proposed names differing only by case or whitespace resolve to the exact published name and merge", () => {
   const resolved = resolveProjects([
@@ -88,6 +88,80 @@ test("the published project list is the exact names TeamMem rendered as project 
     git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", "render");
     page("Draft", "project: Draft\n");
     assert.deepEqual(readTeamVaultProjects({ teamVaultDir: dir }), ["Orbit", "Project Atlas", "Q3: Roadmap"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("published area names join the list, hidden labels stay out, and a proposed area resolves to its exact name", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-vault-areas-"));
+  try {
+    const page = (root: string, folder: string, frontmatter: string) => {
+      mkdirSync(path.join(dir, root, folder), { recursive: true });
+      writeFileSync(path.join(dir, root, folder, "README.md"), `---\n${frontmatter}---\n# heading\n`);
+    };
+    git(dir, "init", "-q");
+    // TeamMem's layout: projects under Projects/ keyed `project:`, areas under
+    // Areas/ keyed `area:`; an area known only from meetings gets a quoted name.
+    // A hidden label gets no page and appears only as plain text elsewhere.
+    page("Projects", "Project Atlas", "project: Project Atlas\ngenerated: 2026-10-20\n");
+    page("Areas", "Customer Support", "area: Customer Support\ngenerated: 2026-10-20\n");
+    page("Areas", "Q4- Hiring", "area: Q4: Hiring\ngenerated: 2026-10-20\n");
+    page("Areas", "Night Desk", 'area: "Ops \\"Night\\" Desk"\ngenerated: 2026-10-20\n');
+    writeFileSync(path.join(dir, "Areas", "README.md"), "---\ngenerated: 2026-10-20\n---\n# Areas\n");
+    writeFileSync(path.join(dir, "Areas", "Customer Support", "2026-W40.md"), "---\narea: Support Week\n---\n");
+    page("Areas", "Mislabelled", "project: Not An Area\n");
+    mkdirSync(path.join(dir, "Work Journal"), { recursive: true });
+    writeFileSync(path.join(dir, "Work Journal", "2026-W40.md"), "---\ngenerated: 2026-10-20\n---\n- IdeaProjects: 3 events\n");
+    // A committed symlink's blob is its target text, which can itself look like a page.
+    mkdirSync(path.join(dir, "Areas", "Linked"));
+    symlinkSync("---\narea: Linked Area\n---\n", path.join(dir, "Areas", "Linked", "README.md"));
+    git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", "render");
+    page("Areas", "Draft Area", "area: Draft Area\n");
+    const known = readTeamVaultProjects({ teamVaultDir: dir });
+    assert.deepEqual(known, ["Customer Support", "Ops \"Night\" Desk", "Project Atlas", "Q4: Hiring"]);
+    assert.deepEqual(synthesisProjectVocabulary(known), known);
+    const resolved = resolveProjects([
+      { name: " customer   SUPPORT", evidence_segment_ids: ["seg_001"] },
+      { name: "q4: hiring", evidence_segment_ids: ["seg_002"] },
+      { name: "IdeaProjects", evidence_segment_ids: ["seg_003"] },
+    ], known);
+    assert.deepEqual(resolved.projects, [
+      { name: "Customer Support", evidence_segment_ids: ["seg_001"] },
+      { name: "Q4: Hiring", evidence_segment_ids: ["seg_002"] },
+    ]);
+    assert.deepEqual(resolved.warnings, [{ code: "project_unassigned", detail: "IdeaProjects" }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the published names together stay under the 500-name synthesis cap", () => {
+  const names = Array.from({ length: 600 }, (_, index) => `Name ${String(index).padStart(3, "0")}`);
+  assert.equal(synthesisProjectVocabulary(names).length, 500);
+});
+
+test("a directory that is not itself the Team Vault checkout is not read through an enclosing repository", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-vault-enclosing-"));
+  try {
+    git(dir, "init", "-q");
+    mkdirSync(path.join(dir, "vault", "Areas", "Ops"), { recursive: true });
+    writeFileSync(path.join(dir, "vault", "Areas", "Ops", "README.md"), "---\narea: Ops\n---\n");
+    mkdirSync(path.join(dir, "Projects", "Outer"), { recursive: true });
+    writeFileSync(path.join(dir, "Projects", "Outer", "README.md"), "---\nproject: Outer\n---\n");
+    git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", "outer");
+    assert.equal(readTeamVaultProjects({ teamVaultDir: path.join(dir, "vault") }), null);
+    assert.deepEqual(readTeamVaultProjects({ teamVaultDir: dir }), ["Outer"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a vault with more project and area pages than the read bound yields no list instead of a partial one", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-vault-bound-"));
+  try {
+    git(dir, "init", "-q");
+    for (let index = 0; index <= MAX_TEAM_VAULT_PAGES; index += 1) {
+      const root = index % 2 === 0 ? "Projects" : "Areas";
+      mkdirSync(path.join(dir, root, `P${index}`), { recursive: true });
+      writeFileSync(path.join(dir, root, `P${index}`, "README.md"), "---\nproject: x\n---\n");
+    }
+    git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", "many");
+    assert.equal(readTeamVaultProjects({ teamVaultDir: dir }), null);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
