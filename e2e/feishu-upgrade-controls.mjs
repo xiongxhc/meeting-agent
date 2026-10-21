@@ -127,7 +127,9 @@ export function createFeishuUpgradeControls(websocket) {
         detach(owner);
         settleCleanup();
       };
-      owner.onEnd = () => {}; // FIN alone is not close; preserve allowHalfOpen.
+      // FIN alone is not close. The server socket is allowHalfOpen, so answer
+      // with our own FIN as a real server would; only the actual close settles.
+      owner.onEnd = () => owner.socket.end();
       owner.onData = () => refuse(owner); // Count no bytes and retain none.
       owner.onError = () => refuse(owner); // Error text is never retained.
       owners.set(socket, owner);

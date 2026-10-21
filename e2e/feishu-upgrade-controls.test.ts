@@ -3,9 +3,11 @@ import { Buffer } from "node:buffer";
 import { createServer, IncomingMessage } from "node:http";
 import type { Server } from "node:http";
 import type { WebSocketServer } from "ws";
+import { connect } from "node:net";
 import type { Socket } from "node:net";
+import { once } from "node:events";
 import { Duplex } from "node:stream";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 // Load the private JavaScript boundary by URL, without a compiler suppression.
 const peer: unknown = await import(new URL("./feishu-peer.mjs", import.meta.url).href);
@@ -373,4 +375,58 @@ test("never-closing fifth refusal leaves cleanup sticky unconfirmed without more
   assert.deepEqual(p.controls.readUpgradeObservation(), unconfirmed);
   assert.equal(p.close(), closed);
   await new Promise<void>((resolve) => p.websocket.close(() => resolve()));
+});
+
+// Real loopback TCP: the application owner destroys its socket (FIN, not RST).
+// The server-side upgrade socket is allowHalfOpen, so only a peer reply to FIN
+// lets the actual close arrive before fixture cleanup.
+async function tcpHeld() {
+  const server = createServer(), upgrade = createFeishuUpgradeServer(server);
+  let client: Socket | undefined, closing: Promise<void> | undefined;
+  // Cleanup exists before any assertion, so a failed hold cannot leak the transport.
+  const done = () => closing ??= (async () => {
+    client?.destroy(); await upgrade.close();
+    await new Promise<void>((resolve) => upgrade.websocket.close(() => resolve()));
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  })();
+  try {
+    server.listen(0, "127.0.0.1"); await once(server, "listening");
+    const id = upgrade.controls.armNextUpgrade(), address = server.address();
+    assert.ok(address && typeof address === "object");
+    client = connect(address.port, "127.0.0.1"); await once(client, "connect");
+    client.write("GET /ws?private-query HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+      + "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    for (let i = 0; i < 200 && upgrade.controls.readPendingUpgrade(id) === null; i++) await delay(5);
+    assert.equal(upgrade.controls.readPendingUpgrade(id)?.id, id);
+    return { id, client, controls: upgrade.controls, done };
+  } catch (error) { await done(); throw error; }
+}
+const kinds = (controls: UpgradeControls) => controls.readUpgradeObservation().events.map((event) => event.kind);
+
+// Catch a peer that leaves an actual client FIN half-open until fixture cleanup.
+test("real TCP client destroy of a held upgrade settles remote_closed before fixture cleanup", { timeout: 5000 }, async () => {
+  const t = await tcpHeld();
+  try {
+    t.client.destroy();
+    for (let i = 0; i < 200 && t.controls.readUpgradeObservation().pending !== 0; i++) await delay(5);
+    assert.equal(t.controls.readPendingUpgrade(t.id), null);
+    assert.deepEqual(t.controls.readUpgradeObservation(), { arrivals: 1, accepted: 0, pending: 0,
+      disposed: false, invalid: false, overflow: false,
+      events: [{ ordinal: 1, id: t.id, kind: "held" }, { ordinal: 2, id: t.id, kind: "remote_closed" }] });
+  } finally { await t.done(); }
+  assert.deepEqual(kinds(t.controls), ["held", "remote_closed"]);
+});
+
+// Catch a peer that closes a live held upgrade without any client FIN.
+test("real TCP held upgrade without client FIN stays pending until fixture cleanup", { timeout: 5000 }, async () => {
+  const t = await tcpHeld();
+  try {
+    await delay(200);
+    assert.equal(t.controls.readPendingUpgrade(t.id)?.id, t.id);
+    assert.equal(t.controls.readUpgradeObservation().pending, 1);
+    assert.deepEqual(kinds(t.controls), ["held"]);
+    assert.equal(t.client.readableEnded, false);
+  } finally { await t.done(); }
+  assert.deepEqual(kinds(t.controls), ["held", "fixture_closed"]);
 });
