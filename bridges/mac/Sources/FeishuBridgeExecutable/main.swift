@@ -38,7 +38,8 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
                                   callTimeout: configuration.axCallTimeout)
     let driver = AXAccessibilityDriver(backend: backend, clock: clock, cancellation: cancellation,
                                        maxNodes: inspection ? 128 : 512, maxStringBytes: inspection ? 1024 : 4096,
-                                       readDeadline: min(configuration.actionDeadline, 2))
+                                       readDeadline: min(configuration.actionDeadline, 2),
+                                       measured: configuration.speakerSelectors, labels: configuration.labels)
     if inspection {
         let sink = try FileEvidenceSink(root: configuration.evidenceRoot, filename: "inspection-" + UUID().uuidString + ".jsonl", maxLineBytes: 1_048_576)
         defer { try? sink.close() }
@@ -68,6 +69,7 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     let process = BridgeProcess(driver: driver, labels: configuration.labels, clock: clock, sink: sink,
                                 joinDeadline: configuration.joinDeadline, actionDeadline: configuration.actionDeadline, custody: configuration.custody,
                                 v2Clock: timingClock, timedMedia: timedMedia,
+                                identity: configuration.speakerSelectors.resolver(),
                                 output: writer.write)
     let input = BridgeInputPump(fd: STDIN_FILENO, cancellation: cancellation)
     var failure: Error?

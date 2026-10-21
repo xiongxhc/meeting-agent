@@ -889,6 +889,21 @@ test("a tile held after its participant left cannot name later speech", () => {
   assert.deepEqual(result.spokeButUnattributed, []);
 });
 
+test("exact UI evidence in a different id namespace from attendance stays anonymous, never wrong-named", () => {
+  // The bridge must take roster and tile ids from one source. A tile handle
+  // that is not an attendee id names nobody, even with one attendee left.
+  const result = reconcileTranscript(
+    input({
+      attendance: [attendee(ALPHA, "Alpha Synthetic")],
+      liveSegments: [live("seg_foreign", 10_000, 14_000, "who said this")],
+      evidence: [exact(9_800, "tile_internal_alpha")],
+      reconciliation: { unavailable: "offline" },
+    }),
+  );
+  assert.notEqual(only(result).speaker.kind, "named");
+  assert.deepEqual(result.silentAttendees, [ALPHA]);
+});
+
 test("mixed timestamp precision is ordered by instant, then bridge sequence, never lexical spelling", () => {
   const result = reconcileTranscript(
     input({

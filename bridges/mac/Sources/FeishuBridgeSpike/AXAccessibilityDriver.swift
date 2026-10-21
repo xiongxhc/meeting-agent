@@ -29,6 +29,12 @@ public protocol AXNativeBackend {
     func children(_ handle: String, limit: Int) -> [String]?
     func press(_ handle: String) -> Bool
     func setValue(_ value: String, handle: String) -> Bool
+    /// One named attribute, read only for configured measured selectors.
+    /// A failed read is `.malformed` (unknown), never a guessed value.
+    func attribute(_ name: String, handle: String) -> AXStringRead
+}
+extension AXNativeBackend {
+    public func attribute(_ name: String, handle: String) -> AXStringRead { .absent }
 }
 
 public final class AXAccessibilityDriver: AccessibilityDriver {
@@ -37,15 +43,20 @@ public final class AXAccessibilityDriver: AccessibilityDriver {
     private let cancellation: BridgeCancellation
     private let maxNodes: Int, maxDepth: Int, maxStringBytes: Int
     private let readDeadline: TimeInterval
+    private let measured: MeasuredSpeakerSelectors
+    private let rowPrefix: String, tilePrefix: String
     private var handles: [String: (String, NativeAXAttributes)] = [:]
     private var previous: AccessibilityNode?
 
     public init(backend: any AXNativeBackend, clock: any BridgeDeadlineClock,
                 cancellation: BridgeCancellation, maxNodes: Int = 512, maxDepth: Int = 16,
-                maxStringBytes: Int = 4096, readDeadline: TimeInterval = 2) {
+                maxStringBytes: Int = 4096, readDeadline: TimeInterval = 2,
+                measured: MeasuredSpeakerSelectors = .unmeasured, labels: FeishuUiLabels = .bundled) {
         self.backend = backend; self.clock = clock; self.cancellation = cancellation
         self.maxNodes = maxNodes; self.maxDepth = maxDepth; self.maxStringBytes = maxStringBytes
         self.readDeadline = readDeadline
+        self.measured = measured
+        rowPrefix = labels.identifiers.participantRowPrefix; tilePrefix = labels.identifiers.speakerTilePrefix
     }
 
     public func snapshot(waitingUpTo seconds: TimeInterval) -> AccessibilityNode? {
@@ -78,12 +89,36 @@ public final class AXAccessibilityDriver: AccessibilityDriver {
             guard let node = project(child, depth: depth + 1, visited: &visited, deadline: deadline) else { return nil }
             nodes.append(node)
         }
+        let (identity, highlight) = measuredReads(handle, identifier: fields.identifier)
         guard !cancellation.isCancelled, clock.monotonicSeconds() <= deadline else { return nil }
         let key = UUID().uuidString
         handles[key] = (handle, fields)
         return AccessibilityNode(role: fields.role, identifier: fields.identifier, title: fields.title,
-                                 value: fields.value, isEnabled: fields.enabled, children: nodes, nativeKey: key,
-                                 identifierRead: fields.identifierRead, titleRead: fields.titleRead)
+                                 value: fields.value, isEnabled: fields.enabled, isHighlighted: highlight == true,
+                                 children: nodes, nativeKey: key,
+                                 identifierRead: fields.identifierRead, titleRead: fields.titleRead,
+                                 highlightRead: highlight, measuredIdentity: identity)
+    }
+
+    /// Extra reads happen only for configured selectors on roster rows and
+    /// speaker tiles. An absent, malformed or failed highlight stays nil.
+    private func measuredReads(_ handle: String, identifier: String?) -> (AXStringRead, Bool?) {
+        guard let identifier, measured != .unmeasured else { return (.absent, nil) }
+        func scoped(_ prefix: String) -> Bool { !prefix.isEmpty && identifier.hasPrefix(prefix) && identifier != prefix }
+        func read(_ name: String) -> AXStringRead {
+            let value = backend.attribute(name, handle: handle)
+            return (value.text?.utf8.count ?? 0) > maxStringBytes ? .malformed : value
+        }
+        let tile = scoped(tilePrefix)
+        var identity = AXStringRead.absent
+        if tile || scoped(rowPrefix), let attribute = measured.identity?.attribute, attribute != "AXIdentifier" {
+            identity = read(attribute)
+        }
+        var highlight: Bool?
+        if tile, let selector = measured.highlight, let value = read(selector.attribute).text {
+            highlight = value == selector.speakingValue
+        }
+        return (identity, highlight)
     }
 
     private func actionable(_ node: AccessibilityNode) -> (String, NativeAXAttributes)? {
@@ -187,5 +222,16 @@ public final class SystemAXBackend: AXNativeBackend {
     public func setValue(_ value: String, handle: String) -> Bool {
         guard isApplicationValid(), let element = elements[handle] else { return false }
         return AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString) == .success
+    }
+    public func attribute(_ name: String, handle: String) -> AXStringRead {
+        guard let element = elements[handle] else { return .malformed }
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        if status == .attributeUnsupported || status == .noValue { return .absent }
+        guard status == .success, let value else { return .malformed }
+        if CFGetTypeID(value) == CFBooleanGetTypeID() { return .value(CFBooleanGetValue((value as! CFBoolean)) ? "true" : "false") }
+        if let text = value as? String { return .value(text) }
+        if let number = value as? NSNumber { return .value(number.stringValue) }
+        return .malformed
     }
 }

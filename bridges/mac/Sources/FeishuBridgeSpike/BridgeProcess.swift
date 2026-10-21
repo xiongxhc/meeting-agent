@@ -15,6 +15,7 @@ public final class BridgeProcess {
     private let adapter: FeishuClientAdapter
     private let cleanupAdapter: FeishuClientAdapter
     private let labels: FeishuUiLabels
+    private let identity: any UiIdentityResolver
     private let clock: any BridgeClock
     private let sink: any BridgeEvidenceSink
     private let output: (Data) throws -> Void
@@ -47,8 +48,9 @@ public final class BridgeProcess {
                 joinDeadline: TimeInterval = 60, actionDeadline: TimeInterval = 5, custody: BridgeCustodyBinding? = nil,
                 v2Clock: CaptureClockPairSampler? = nil,
                 timedMedia: (any TimedMediaControl)? = nil,
+                identity: any UiIdentityResolver = UnknownUiIdentity(),
                 output: @escaping (Data) throws -> Void) {
-        self.driver = driver; self.labels = labels; self.clock = clock; self.sink = sink
+        self.driver = driver; self.labels = labels; self.identity = identity; self.clock = clock; self.sink = sink
         self.output = output; self.maxCommands = maxCommands
         self.custody = custody
         self.v2Clock = v2Clock
@@ -97,9 +99,9 @@ public final class BridgeProcess {
             if let custody, custody.bridgeSessionId != message.sessionId || custody.occurrenceId != occurrence { throw BridgeProcessError.ownershipConflict }
             owner = (message.sessionId, occurrence, lease)
             recorder = BridgeRecorder(sessionId: message.sessionId, clock: clock, sink: sink, retainRecords: false)
-            observer = AccessibilityObserver(labels: labels, identity: UnknownUiIdentity())
-            reducer = SessionObservationReducer(sessionId: message.sessionId, identity: UnknownUiIdentity(), chatControl: UnavailableChat())
-            if let v2Clock { snapshots = UiSnapshotProducer(clock: v2Clock, labels: labels, identity: UnknownUiIdentity()) }
+            observer = AccessibilityObserver(labels: labels, identity: identity)
+            reducer = SessionObservationReducer(sessionId: message.sessionId, identity: identity, chatControl: UnavailableChat())
+            if let v2Clock { snapshots = UiSnapshotProducer(clock: v2Clock, labels: labels, identity: identity) }
         }
         guard recordCommand(message, v2: v2) else {
             evidenceFailed = true; stopped = true; throw BridgeProcessError.evidenceUnavailable

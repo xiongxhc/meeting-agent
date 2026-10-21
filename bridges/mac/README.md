@@ -210,7 +210,8 @@ allows that content. Capture bounded snapshots in idle/in-meeting/ended/chat
 states and each supported locale. It neither presses controls nor resolves
 people. A tree exceeding128nodes/depth16/1024bytes per string is unavailable;
 normal control allows512nodes/4096bytes. No selected/focused attribute becomes
-an active-speaker highlight. Production identity remains unknown.
+an active-speaker highlight. Production identity remains unknown unless the
+measured `selectors.identity` below is configured.
 
 For control mode, add `selectors` with exactly `build`, `locale`, `measured:true`,
 `identifiers`, `titles`. Build/locale must equal the outer config. `identifiers`
@@ -225,6 +226,22 @@ Configuration reads continue through short reads/EINTR to EOF, reject a 65,537th
 byte even if the file grew after its size check, and bound retries to one second
 (this does not preempt a filesystem syscall).
 Do not replace the bundled fixture labels with private measurements.
+
+`selectors` may also carry two optional measured channels (HUMAN-CHECKLIST 3.0b).
+`identity` is exactly `{"attribute", "pattern"}`. The attribute must be an
+identifier-type attribute, `AXIdentifier` (the suffix after the row/tile prefix)
+or `AXDOMIdentifier`; text-bearing attributes such as `AXValue`, `AXHelp` and
+`AXTitle` are refused. The pattern must match the whole handle and is limited to
+`^` + literals, `\.`, `\-`, `\d` and simple `[...]` classes + `$`, with any number
+of `{m}` and at most one `?`, `*`, `+` or `{m,n}`, so matching stays linear. Rows
+and tiles share it, so attendance and speaker ids are one namespace. `highlight`
+is exactly `{"attribute", "speakingValue"}`, read only on speaker tiles.
+Placeholders and focus/selection attributes (`AXSelected`, `AXFocused`, ...) are
+refused. A
+handle that is missing, malformed, unmatched or equal to the row title is
+unresolved; an unreadable highlight stays unknown. Without `identity` the bridge
+emits no `participant_joined`; without both, no `ui_exact`. These reads run on the UI
+observation path only; capture and recording do not wait on them.
 
 ```sh
 bridges/mac/.build/debug/FeishuBridgeSpike --config /Users/OPERATOR/meeting-agent-evidence/config.json

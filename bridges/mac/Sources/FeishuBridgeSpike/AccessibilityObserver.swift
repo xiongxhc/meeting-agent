@@ -32,8 +32,11 @@ public struct AccessibilityNode: Equatable, Sendable {
     /// Whether the element carries the client's active-speaking highlight.
     public let isHighlighted: Bool
     /// V2 evidence requires a measured readable highlight channel. Native AX
-    /// projection currently has none: nil is unsupported/unknown, never false.
+    /// projection has none unless `MeasuredSpeakerSelectors.highlight` is
+    /// configured: nil is unsupported/unknown, never false.
     public let highlightRead: Bool?
+    /// The measured identity attribute, read only when configured.
+    public let measuredIdentity: AXStringRead
     public let children: [AccessibilityNode]
 
     public init(
@@ -44,7 +47,8 @@ public struct AccessibilityNode: Equatable, Sendable {
         isEnabled: Bool = true,
         isHighlighted: Bool = false,
         children: [AccessibilityNode] = [], nativeKey: String? = nil,
-        identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil, highlightRead: Bool? = nil
+        identifierRead: AXStringRead? = nil, titleRead: AXStringRead? = nil, highlightRead: Bool? = nil,
+        measuredIdentity: AXStringRead = .absent
     ) {
         self.role = role
         self.identifierRead = identifierRead ?? AXStringRead(rawValue: identifier)
@@ -53,6 +57,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         self.isEnabled = isEnabled
         self.isHighlighted = isHighlighted
         self.highlightRead = highlightRead
+        self.measuredIdentity = measuredIdentity
         self.children = children
         self.nativeKey = nativeKey
     }
@@ -62,7 +67,7 @@ public struct AccessibilityNode: Equatable, Sendable {
         lhs.role == rhs.role && lhs.identifierRead == rhs.identifierRead && lhs.titleRead == rhs.titleRead
             && lhs.value == rhs.value && lhs.isEnabled == rhs.isEnabled
             && lhs.isHighlighted == rhs.isHighlighted && lhs.children == rhs.children
-            && lhs.highlightRead == rhs.highlightRead
+            && lhs.highlightRead == rhs.highlightRead && lhs.measuredIdentity == rhs.measuredIdentity
     }
 
     /// Depth-first, tree order — the order the client lays the UI out in.
@@ -120,6 +125,11 @@ public enum UiObservation: Equatable, Sendable {
 /// never a cue to guess.
 public protocol UiIdentityResolver {
     func identify(uiElementId: String) -> String?
+    /// The element itself, for resolvers that read a measured attribute.
+    func identify(node: AccessibilityNode, uiElementId: String) -> String?
+}
+extension UiIdentityResolver {
+    public func identify(node: AccessibilityNode, uiElementId: String) -> String? { identify(uiElementId: uiElementId) }
 }
 
 /// Attempts to type the disclosure into the meeting chat. A missing or
@@ -184,7 +194,7 @@ public final class AccessibilityObserver {
             let participants = panel.descendants { $0.identifier?.hasPrefix(prefix) == true }
                 .compactMap { row -> RosterEntry? in
                     guard let rowId = row.identifier?.dropFirst(prefix.count),
-                        let userId = identity.identify(uiElementId: String(rowId)),
+                        let userId = identity.identify(node: row, uiElementId: String(rowId)),
                         let displayName = row.title, !displayName.isEmpty
                     else { return nil }
                     return RosterEntry(feishuUserId: userId, displayName: displayName)
@@ -225,7 +235,7 @@ public final class AccessibilityObserver {
         if highlighted.isEmpty { return UiSnapshotState(state: "unknown", feishuUserId: nil, reason: "no_highlight") }
         guard highlighted.count == 1 else { return UiSnapshotState(state: "ambiguous", feishuUserId: nil, reason: nil) }
         let element = String(highlighted[0].identifier!.dropFirst(prefix.count))
-        guard let id = identity.identify(uiElementId: element), !id.isEmpty else {
+        guard let id = identity.identify(node: highlighted[0], uiElementId: element), !id.isEmpty else {
             return UiSnapshotState(state: "ambiguous", feishuUserId: nil, reason: "identity_unavailable")
         }
         guard id.utf8.count <= 1024 else { return UiSnapshotState(state: "unknown", feishuUserId: nil, reason: "identity_unavailable") }

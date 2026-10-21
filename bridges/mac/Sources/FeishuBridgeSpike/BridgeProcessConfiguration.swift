@@ -45,6 +45,8 @@ public struct BridgeProcessConfiguration {
     public let actionDeadline: TimeInterval
     public let axCallTimeout: Float
     public let labels: FeishuUiLabels
+    /// Absent unless the private config carries measured identity/highlight.
+    public let speakerSelectors: MeasuredSpeakerSelectors
     public let custody: BridgeCustodyBinding?
     public let audio: Audio?
 
@@ -99,8 +101,10 @@ public struct BridgeProcessConfiguration {
         let path = try string("bundlePath"), root = try string("evidenceRoot"), build = try string("bundleVersion"), locale = try string("locale")
         guard path.hasPrefix("/"), path.hasSuffix(".app"), root.hasPrefix("/"), root != "/" else { throw BridgeProcessError.invalidInput }
         var labels = FeishuUiLabels.bundled
+        var speakerSelectors = MeasuredSpeakerSelectors.unmeasured
         if let selectors = object["selectors"] as? [String: Any] {
-            guard Set(selectors.keys) == ["build", "locale", "measured", "identifiers", "titles"],
+            let base: Set<String> = ["build", "locale", "measured", "identifiers", "titles"]
+            guard base.isSubset(of: Set(selectors.keys)), Set(selectors.keys).isSubset(of: base.union(["identity", "highlight"])),
                   selectors["build"] as? String == build, selectors["locale"] as? String == locale,
                   let measured = selectors["measured"] as? NSNumber, CFGetTypeID(measured) == CFBooleanGetTypeID(), measured.boolValue,
                   let ids = selectors["identifiers"] as? [String: String], let titles = selectors["titles"] as? [String: [String]] else { throw BridgeProcessError.invalidInput }
@@ -113,12 +117,18 @@ public struct BridgeProcessConfiguration {
             let nonempty = ids.values.filter { !$0.isEmpty }
             guard Set(nonempty).count == nonempty.count else { throw BridgeProcessError.invalidInput }
             labels = FeishuUiLabels(identifiers: try JSONDecoder().decode(FeishuUiLabels.Identifiers.self, from: JSONSerialization.data(withJSONObject: ids)), titlesByIdentifier: titles)
+            speakerSelectors = try MeasuredSpeakerSelectors.decode(identity: selectors["identity"], highlight: selectors["highlight"])
+            // A tile channel needs measured, nonempty grid/tile locators.
+            if speakerSelectors.highlight != nil || speakerSelectors.identity != nil {
+                let rowOrTile = !labels.identifiers.participantRowPrefix.isEmpty || !labels.identifiers.speakerTilePrefix.isEmpty
+                guard rowOrTile, speakerSelectors.highlight == nil || (!labels.identifiers.speakerGrid.isEmpty && !labels.identifiers.speakerTilePrefix.isEmpty) else { throw BridgeProcessError.invalidInput }
+            }
         } else if !inspection || object["selectors"] != nil { throw BridgeProcessError.invalidInput }
         return Self(pid: Int32(try integer("pid", 1...Int(Int32.max))), bundlePath: path,
                     bundleIdentifier: try string("bundleIdentifier"), bundleVersion: build, locale: locale, evidenceRoot: root,
                     observationInterval: Double(try integer("observationIntervalMs", 50...5000)) / 1000,
                     joinDeadline: Double(try integer("joinDeadlineMs", 100...120_000)) / 1000,
                     actionDeadline: Double(try integer("actionDeadlineMs", 100...10_000)) / 1000,
-                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels, custody: custody, audio: audio)
+                    axCallTimeout: Float(try integer("axCallTimeoutMs", 10...250)) / 1000, labels: labels, speakerSelectors: speakerSelectors, custody: custody, audio: audio)
     }
 }

@@ -98,6 +98,11 @@ never reaches `ui_exact` and `participant_joined` cannot be emitted at all — s
 this row gates both halves of the task. Procedure: `docs/HUMAN-CHECKLIST.md`
 section 3.0b. Record attribute names only, never a real handle.
 
+The shipped Swift bridge emits no `participant_joined` until the optional
+`selectors.identity` is measured and configured, and no `ui_exact` until
+`selectors.highlight` is too (`bridges/mac/README.md`). Named speaker attribution is deferred
+until this row has a result.
+
 | What was inspected | Attribute that carries an identity | Stable across a rejoin | Feishu client version | macOS version | Result | Measured on |
 |---|---|---|---|---|---|---|
 | Roster row | | | | | | |
