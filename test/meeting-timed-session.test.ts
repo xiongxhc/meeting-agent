@@ -321,3 +321,90 @@ for (const firstEvent of ["final", "failure"] as const) {
     } finally { await session.dispose(); await runtime.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+// "VAD check gates speech recognition, not encrypted recording. Recording must remain
+// independent of provider failures." The Runtime reports a mid-meeting recognizer failure as a
+// non-terminal `continue_session` voice failure; the meeting must keep its recording running
+// and persist exactly what it would have persisted without the failure.
+async function timedMeetingEndingNormally(recognitionFails: boolean) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-timed-asr-fault-")), store = openSessionStore({ filename: path.join(dir, "state.db") });
+  const identity = buildMeetingIdentity({ providerMeetingId: "asr-fault", meetingNo: "000000000", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "Recognition fault", organizer: null });
+  const coordinator = createCoordinator({ store, clock: { now: () => 1000 }, bridgeLeaseTtlMs: 30000, maxConcurrentSessions: 1 }); coordinator.discover(identity);
+  const { client, transport } = await runtimeTestClient(4), runtime = createConversationRuntimeClient(client);
+  transport.onSend = (command) => {
+    transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+    if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId,
+      media_lease: { media_protocol_version: 3, session_id: "42", connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64),
+        expires_at_ms: String(Date.now() + 60000), reconnect_window_ms: "10000", capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
+    if (command.type === "finalize_recording") transport.push({ ...finalizedWire, request_id: command.requestId, recovery_capability: { ...finalizedWire.recovery_capability, source_session_id: "42" } });
+  };
+  let listener: ((raw: unknown) => void) | undefined, sequence = 0;
+  const bridgeCommands: string[] = [];
+  const emit = (event: Record<string, unknown>) => listener?.({ schema: "bridge-session/v2", sessionId: "bridge-one", sequence: ++sequence, observedAt: "2026-09-02T14:00:00Z", ...event });
+  const bridge = { subscribe(callback: (raw: unknown) => void) { listener = callback; return () => { listener = undefined; }; }, async send(command: BridgeCommandMessageV2) {
+    parseCommandV2(command); bridgeCommands.push(command.type);
+    if (command.type === "join") emit({ type: "joined", meetingOccurrenceId: identity.occurrenceId, observationTiming: { clockDomainId: "domain", hostBeforeNs: "0", hostAfterNs: "1" }, observationTimingReason: null });
+  } };
+  const session = createMeetingSession({ identity, bridge, runtime, coordinator, clock: { now: () => 1000 }, agentIdentity: { aliases: ["Meetbot"] },
+    bridgeId: "mac", bridgeSessionId: "bridge-one", disclosureText: "Disclosure", timedEvidence: { store } });
+  try {
+    await session.join(); await session.settled();
+    transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_started", session_id: "42", privacy: { privacy_mode: "cloud",
+      components: ["speech_recognition", "language_model", "speech_synthesis", "audio_io"].map((kind) => ({ kind, execution_location: "remote", provider_label: "Synthetic" })) } } });
+    transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_transcript_final", session_id: "42", segment_id: "9", turn_id: null,
+      text: "Discussion before the fault", capture_unavailable_reason: "provider_offsets_unavailable" } });
+    await setImmediate(); await session.settled();
+    if (recognitionFails) {
+      // Exactly what the Runtime gateway emits for a recognizer connect failure, provider error,
+      // provider close or stall (scripted_provider_entry.rs, recording_survives_*).
+      transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_failed", session_id: "42", recovery: "continue_session",
+        error: { code: "adapter_failure", kind: "adapter", stage: "speech_recognizer", message: "speech recognition operation failed" } } });
+      await setImmediate(); await session.settled();
+    }
+    const live = session.state();
+    const liveCommands = transport.commands.map((command) => command.type), liveBridgeCommands = [...bridgeCommands];
+    emit({ type: "left", reason: "ended", observationTiming: null, observationTimingReason: "timing_unavailable" });
+    await setImmediate(); await session.settled();
+    const ended = session.state(), storedRow = store.getRecording(identity.occurrenceId);
+    return {
+      live: { phase: live.phase, terminalReason: live.terminalReason, recording: live.recording, speakingAbortReason: live.speakingAbortReason },
+      liveCommands, liveBridgeCommands,
+      ended: { terminalReason: ended.terminalReason, recording: ended.recording, finalizationError: ended.finalizationError ?? null,
+        observedGaps: ended.observedGaps, gapReconciliation: ended.gapReconciliation },
+      finalizeCount: transport.commands.filter((command) => command.type === "finalize_recording").length,
+      row: (({ state, terminalReason }) => ({ state, terminalReason }))(coordinator.get(identity.occurrenceId)!),
+      // The finalization clock is the only field allowed to differ between the two runs.
+      stored: storedRow === null ? null : { ...storedRow, finalizedAtMs: 0 },
+    };
+  } finally { await session.dispose(); await runtime.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+}
+
+test("a mid-meeting recognition failure neither ends nor alters the timed meeting recording", async () => {
+  const control = await timedMeetingEndingNormally(false);
+  const faulted = await timedMeetingEndingNormally(true);
+  // Before the bridge ends the meeting: still listening, still recording, nothing finalized or stopped.
+  assert.equal(faulted.live.phase, "listening");
+  assert.equal(faulted.live.terminalReason, null);
+  assert.equal(faulted.live.recording, null);
+  assert.equal(faulted.liveCommands.includes("finalize_recording"), false, "the recognition failure finalized the recording");
+  assert.equal(faulted.liveCommands.includes("stop_voice_session"), false, "the recognition failure stopped the voice session");
+  // A bridge `leave` ends native capture, so it would stop the recording just as surely.
+  assert.equal(faulted.liveBridgeCommands.includes("leave"), false, "the recognition failure told the bridge to leave");
+  assert.deepEqual(faulted.liveBridgeCommands, control.liveBridgeCommands);
+  // Only speaking reacts: recognition gates the response path, never the recording.
+  assert.equal(faulted.live.speakingAbortReason, "provider_unavailable");
+  assert.equal(control.live.speakingAbortReason, null);
+  // The bridge's own end finalizes once, and the session, coordinator and stored rows match the
+  // control's. The recording content is the fixture in both runs; byte integrity is proven by the
+  // Runtime tests (scripted_provider_entry.rs, recording_survives_*).
+  assert.equal(faulted.finalizeCount, 1);
+  assert.equal(faulted.ended.terminalReason, "ended");
+  assert.equal(faulted.ended.finalizationError, null);
+  assert.deepEqual(faulted.ended.recording?.gaps, []);
+  assert.equal(faulted.stored?.handle, finalizedWire.recording.recording_handle, "the recording was persisted");
+  assert.equal(faulted.stored?.sha256, finalizedWire.recording.sha256);
+  assert.deepEqual(faulted.stored?.runtimeGaps, []);
+  assert.deepEqual(faulted.ended, control.ended);
+  assert.deepEqual(faulted.row, control.row);
+  assert.deepEqual(faulted.stored, control.stored);
+});
