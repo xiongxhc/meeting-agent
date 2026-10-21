@@ -34,6 +34,7 @@ import { captureFinishMetadata, captureTailOracles, durableMetadata, durableOrac
 import { d2OrderingOracles } from "./d2-oracles.mjs";
 import { PROVIDER_FAULT_CUTS, providerFaultMetadata, providerFaultOracles, providerFaultPlan } from "./provider-fault-oracles.mjs";
 import { LIFECYCLE_FILE, readVoiceEndRows, voiceEndFromControl } from "./voice-end-evidence.mjs";
+import { joinLatencyFromControl } from "./join-latency-evidence.mjs";
 import { validateDependencyWheelhouse } from "./python-wheelhouse.mjs";
 import { runPackageRefusalCuts } from "./package-refusal-cuts.mjs";
 import { readStateFile } from "./state-file.mjs";
@@ -1167,6 +1168,7 @@ export function writeBundle(outDir, { options, pins, treeId, staged, teammem, li
     runtimeEvents: live.summary?.runtimeEvents ?? [],
     vaultReads: live.summary?.vaultReads ?? [],
     voiceEnd: voiceEndFromControl(staged?.directories?.control, { childState: live.childState, summary: live.summary }),
+    joinLatency: joinLatencyFromControl(staged?.directories?.control, { childState: live.childState }),
     bridgeChild: live.childState === null ? null : { pid: live.childState.pid, joined: live.childState.joined, mediaConnected: live.childState.mediaConnected, framesSent: live.childState.framesSent, left: live.childState.left, commands: live.childState.commands, playback: live.childState.playback, flushes: live.childState.flushes, ...captureFinishMetadata(live.childState) },
     processTreeAtPeak: live.peakTree,
     processEvidence: live.processEvidence,

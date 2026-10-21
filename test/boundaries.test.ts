@@ -24,10 +24,11 @@
 // see into it at all.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import ts from "typescript";
 
 import {
   collectImports,
@@ -760,4 +761,64 @@ test("better-sqlite3 imported from the sanctioned adapter file is never flagged"
   ];
   const violations = findUnconfinedSqliteImports(records, repoRoot);
   assert.deepEqual(violations, []);
+});
+
+// The private join-latency observer (src/sessions/join-timing.ts) is a public
+// option, so its production non-use is pinned structurally: only the three
+// plumbing sites may name it, each only passes `options.joinTiming` through
+// or hands it to markJoinTiming, and src/main.ts never names it at all.
+const JOIN_TIMING_SITES = ["src/application-composition.ts", "src/application.ts", "src/sessions/meeting-session.ts"];
+const JOIN_TIMING_NAMES = new Set(["joinTiming", "markJoinTiming", "JoinTimingObserver", "JoinTimingPhase", "JOIN_TIMING_PHASES"]);
+function findJoinTimingUses(repoRoot: string): string[] {
+  const violations: string[] = [];
+  const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? walk(path.join(dir, entry.name)) : entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts") ? [path.join(dir, entry.name)] : []);
+  const isOptionsJoinTiming = (node: ts.Node): boolean => ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) &&
+    node.expression.text === "options" && node.name.text === "joinTiming";
+  for (const file of walk(path.join(repoRoot, "src"))) {
+    const relative = path.relative(repoRoot, file).split(path.sep).join("/");
+    if (relative === "src/sessions/join-timing.ts") continue; // the helper itself
+    const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (node: ts.Node): void => {
+      if (ts.isStringLiteral(node) && /join-timing/.test(node.text) && !JOIN_TIMING_SITES.includes(relative)) violations.push(`${relative}: imports join-timing`);
+      if (ts.isIdentifier(node) && JOIN_TIMING_NAMES.has(node.text)) {
+        const parent = node.parent;
+        const allowed = JOIN_TIMING_SITES.includes(relative) && (
+          ts.isImportSpecifier(parent) ||
+          ts.isTypeReferenceNode(parent) ||
+          (ts.isPropertySignature(parent) && parent.name === node && node.text === "joinTiming") ||
+          (ts.isPropertyAccessExpression(parent) && isOptionsJoinTiming(parent) && (
+            (ts.isCallExpression(parent.parent) && ts.isIdentifier(parent.parent.expression) && parent.parent.expression.text === "markJoinTiming" && parent.parent.arguments[0] === parent) ||
+            (ts.isPropertyAssignment(parent.parent) && parent.parent.initializer === parent) ||
+            (ts.isBinaryExpression(parent.parent) && parent.parent.left === parent && ts.isIdentifier(parent.parent.right) && parent.parent.right.text === "undefined"))) ||
+          (ts.isPropertyAssignment(parent) && parent.name === node && isOptionsJoinTiming(parent.initializer)) ||
+          (ts.isCallExpression(parent) && parent.expression === node && parent.arguments.length === 2 && isOptionsJoinTiming(parent.arguments[0]!) && ts.isStringLiteral(parent.arguments[1]!)));
+        if (!allowed) violations.push(`${relative}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: ${node.text}`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return violations;
+}
+
+test("the private join-timing observer is only plumbed through its three sites and never set by production entry code", () => {
+  assert.deepEqual(findJoinTimingUses(REPO_ROOT), []);
+  assert.doesNotMatch(readFileSync(path.join(SRC_ROOT, "main.ts"), "utf8"), /joinTiming|JoinTiming|join-timing/);
+  withTempDir((root) => {
+    mkdirSync(path.join(root, "src", "sessions"), { recursive: true });
+    writeFileSync(path.join(root, "src", "main.ts"), 'import { markJoinTiming } from "./sessions/join-timing.ts";\nrunStandaloneComposition(config, owner, { joinTiming: () => {} });\n');
+    writeFileSync(path.join(root, "src", "application.ts"), [
+      'import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";',
+      "type O = { readonly joinTiming?: JoinTimingObserver };",
+      'function ok(options: O) { markJoinTiming(options.joinTiming, "join_entered"); return { ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }) }; }',
+      'function bad(options: O, other: O) { options.joinTiming?.("join_entered"); markJoinTiming(other.joinTiming, "join_entered"); const alias = options.joinTiming; return { joinTiming: () => {} }; }',
+    ].join("\n"));
+    const found = findJoinTimingUses(root);
+    // main.ts: import string, import name, joinTiming property. application.ts bad(): direct call,
+    // markJoinTiming on another object (call + property), alias, invented observer; ok() adds nothing.
+    assert.equal(found.filter((v) => v.startsWith("src/main.ts")).length, 3, found.join("\n"));
+    assert.equal(found.filter((v) => v.startsWith("src/application.ts")).length, 5, found.join("\n"));
+    assert.ok(found.every((v) => !v.includes(":3:")), "the pass-through line is clean");
+  });
 });

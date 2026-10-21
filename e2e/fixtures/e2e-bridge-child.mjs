@@ -24,7 +24,9 @@ import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge
 
 import { compileL4Plan, l4Configuration, l4PlanHash } from "../l4-campaign.mjs";
 import { bridgeLeaveFact } from "../voice-end-evidence.mjs";
+import { childStartClocks } from "../join-latency-evidence.mjs";
 
+const joinClocks = childStartClocks(); // Clocks only; read by the join-latency projection.
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 if ((statSync(configPath).mode & 0o777) !== 0o600) process.exit(8);
@@ -47,7 +49,7 @@ const state = {
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
   mediaClosedReason: null, left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
-  capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [],
+  capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [], joinTiming: joinClocks,
 };
 const FRAME_MS = 20;
 const CLOCK_PAIR_EVERY = 50; // one second at 20 ms frames
@@ -184,8 +186,10 @@ function watchForEnd() {
 
 const lines = createInterface({ input: process.stdin });
 lines.on("line", (line) => {
+  const receivedNs = process.hrtime.bigint();
   void (async () => {
     const command = JSON.parse(line);
+    if (command.type === "join" && joinClocks.joinReceivedNs === null) joinClocks.joinReceivedNs = String(receivedNs);
     state.commands.push(command.type);
     if (command.schema !== "bridge-session/v2" || command.sessionId !== sessionId) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
     if (command.type === "leave" && state.leave === null) state.leave = bridgeLeaveFact(command.reason, process.hrtime.bigint());
@@ -274,3 +278,4 @@ lines.on("close", () => {
     }
   })().catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(11); });
 });
+joinClocks.linesReadyNs = String(process.hrtime.bigint()); // stdin handlers are live from here

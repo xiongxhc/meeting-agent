@@ -31,6 +31,7 @@ import type { FeishuOrganizerLookup } from "../src/ports/feishu.ts";
 import type { BridgeProcessOutcome, CustodyBinding } from "../src/contracts/bridge-process-outcome-v1.ts";
 import type { BridgeCommandMessageV2 } from "../src/contracts/bridge-session-v2.ts";
 import { STANDALONE_SCHEMA, type StandaloneConfigV1 } from "../src/standalone-config.ts";
+import { JOIN_TIMING_PHASES } from "../src/sessions/join-timing.ts";
 import { RuntimeTestTransport } from "./lib/runtime-sdk.ts";
 import { envelope, scope, httpPeer, eventFrame, framePayload } from "./lib/feishu-fixtures.ts";
 // @ts-expect-error Test-only JavaScript setup helper has no public declaration.
@@ -675,6 +676,35 @@ test("a rejected timed start during join reaps the late child, closes the Runtim
     } finally { store.close(); }
   } finally { f.close(); }
 });
+
+for (const startMode of ["accept", "reject"] as const) {
+  test(`the private join-timing observer sees every phase of ${startMode === "accept" ? "an accepted" : "a rejected"} join once, in order, and changes no outcome or command`, async () => {
+    const runOnce = async (joinTiming: ComposeApplicationOptions["joinTiming"]) => {
+      const f = fixture();
+      const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, ...(startMode === "reject" ? { startMode: "reject" as const } : {}) });
+      const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+      const [id] = await admitted(f, 1);
+      try {
+        const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+          ...(joinTiming === undefined ? {} : { joinTiming }) });
+        await app.start();
+        assert.equal((await app.discover()).launched, 1);
+        if (startMode === "accept") { await until(() => slot.sent().some((command) => command.type === "connect_media")); slot.left("ended"); }
+        const outcome = await app.awaitOccurrence(id!);
+        await app.close();
+        return { failure: outcome.failure, commands: slot.sent().map((command) => command.type) };
+      } finally { f.close(); }
+    };
+    const phases: string[] = [];
+    const plain = await runOnce(undefined);
+    const observed = await runOnce((phase) => { phases.push(phase); });
+    const throwing = await runOnce(() => { throw new Error("PRIVATE-OBSERVER"); });
+    assert.deepEqual(observed, plain); assert.deepEqual(throwing, plain);
+    const expected = [...JOIN_TIMING_PHASES];
+    assert.deepEqual(phases, startMode === "accept" ? expected
+      : [...expected.slice(0, expected.indexOf("runtime_admission_started") + 1), "join_settled"]);
+  });
+}
 
 test("a Runtime close rejection swallowed by the session is still visible as a static aggregate at application close", async () => {
   const f = fixture();

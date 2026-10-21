@@ -52,6 +52,7 @@ import type { BackfillSeedConfig, SessionStore, UnknownEndCustodySource } from "
 import type { Clock } from "./sessions/coordinator.ts";
 import { createInviteDiscovery } from "./sessions/invite-discovery.ts";
 import type { MeetingSession } from "./sessions/meeting-session.ts";
+import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
 import type { StandaloneConfigV1 } from "./standalone-config.ts";
 
 export const STATE_DATABASE_NAME = "orchestration.db";
@@ -103,6 +104,8 @@ export type ComposeApplicationOptions = {
   readonly maintenance?: MaintenanceOptions & { readonly notificationSender?: NotificationSender };
   /** Static lifecycle codes only; never paths, identities or secrets. */
   readonly log?: (code: string) => void;
+  /** PRIVATE test-entry join-latency observer (sessions/join-timing.ts); production never sets it. */
+  readonly joinTiming?: JoinTimingObserver;
 };
 
 export type OccurrenceFailure =
@@ -509,6 +512,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       config: legacyConfig, store, clock, liveEvidence: "timed", bridgeLeaseTtlMs: BRIDGE_LEASE_TTL_MS, maxConcurrentSessions: wrappedSlots.length,
       backfillSeedConfigFor: (identity) => requireEntry(identity).runtime!.seedConfig,
       adapters: { bridgeSlots: wrappedSlots, bridgeIdFor: (identity) => requireEntry(identity).bridgeId, runtimeFor: (identity) => requireEntry(identity).runtime!.port },
+      ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
     });
   } catch (error) { store.close(); storeOpen = false; throw error instanceof Error && /duplicate slot/.test(error.message) ? new Error("bridge_slot_invalid") : error; }
 
@@ -624,18 +628,22 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       entry.runtime = await startRuntimeOwner({ occurrenceId: entry.occurrenceId, shutdown: shutdown.signal, budgetMs, version, startTransport });
       if (closing) throw new OccurrenceStartupFailure("application_closed");
       log("occurrence_runtime_connected");
+      markJoinTiming(options.joinTiming, "runtime_connected");
       try { entry.session = await application.createSession(entry.identity); }
       catch (error) {
         const message = error instanceof Error ? error.message : "";
         throw new OccurrenceStartupFailure(/closed/.test(message) ? "application_closed" : /quarantined/.test(message) ? "physical_client_quarantined" : "launch_failed");
       }
+      markJoinTiming(options.joinTiming, "session_created");
       if (closing) throw new OccurrenceStartupFailure("application_closed");
       entry.phase = "live";
+      markJoinTiming(options.joinTiming, "join_called");
       try { await entry.session.join(); joined = true; }
       catch {
         const reason = entry.session.state().terminalReason;
         entry.failure = reason === "join_failed" || reason === "media_format_rejected" ? reason : "join_cancelled";
       }
+      markJoinTiming(options.joinTiming, "join_settled");
     } catch (error) {
       entry.failure = error instanceof OccurrenceStartupFailure ? error.code : "launch_failed";
     }

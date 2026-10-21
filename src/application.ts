@@ -16,6 +16,7 @@ import type { BridgeTransportV2 } from "./ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "./ports/session-store.ts";
 import { createCoordinator, type Clock, type SessionCoordinator } from "./sessions/coordinator.ts";
 import { createMeetingSession, type MeetingSession } from "./sessions/meeting-session.ts";
+import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
 
 // Keep the original public configuration surface available from the package
 // root while adding composition. Existing deployment overlays import these
@@ -69,6 +70,8 @@ export type CreateMeetingAgentApplicationOptions = {
   /** Exact immutable seed inputs for one session, resolved at creation time
    * from that occurrence's connected Runtime; undefined means no seed. */
   readonly backfillSeedConfigFor?: (identity: MeetingIdentity) => BackfillSeedConfig | undefined;
+  /** PRIVATE test-entry join-latency observer (sessions/join-timing.ts). */
+  readonly joinTiming?: JoinTimingObserver;
 };
 
 export type MeetingAgentApplication = {
@@ -123,18 +126,22 @@ export function createMeetingAgentApplication(
   return {
     coordinator,
     async createSession(identity: MeetingIdentity): Promise<MeetingSession> {
+      markJoinTiming(options.joinTiming, "create_session_entered");
       if (closed) return Promise.reject(new Error("meeting-agent application is closed"));
       const slot = slots.get(options.adapters.bridgeIdFor(identity));
       if (!slot) return Promise.reject(new Error("physical_client_slot_unknown"));
       const binding = validateCustodyBinding({ physicalClientId: slot.physicalClientId, physicalGenerationId: randomBytes(16).toString("hex"), occurrenceId: identity.occurrenceId, bridgeSessionId: randomBytes(16).toString("hex") });
       try { store.claimPhysicalClient(binding, clock.now()); }
       catch (error) { return Promise.reject(error); }
+      markJoinTiming(options.joinTiming, "custody_claimed");
       const owner: Ownership = { binding };
       owners.add(owner);
       const creation = (async () => {
         try {
           if (coordinator.get(identity.occurrenceId) === null) coordinator.discover(identity);
+          markJoinTiming(options.joinTiming, "bridge_launch_started");
           owner.child = await slot.launch(binding);
+          markJoinTiming(options.joinTiming, "bridge_launch_returned");
           if (closed) throw new Error("meeting-agent application is closed");
           const common = {
             identity,
@@ -158,14 +165,17 @@ export function createMeetingAgentApplication(
           const tracked: { session?: MeetingSession } = {};
           const lifecycleOptions = {
             ...sessionOptions,
+            ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
             onInactive: () => {
               if (tracked.session !== undefined) sessions.delete(tracked.session);
               void cleanup(owner);
             },
           };
+          markJoinTiming(options.joinTiming, "session_construct_started");
           const session = createMeetingSession(options.bridgeFailureRetryLimit === undefined
             ? lifecycleOptions
             : { ...lifecycleOptions, bridgeFailureRetryLimit: options.bridgeFailureRetryLimit });
+          markJoinTiming(options.joinTiming, "session_constructed");
           tracked.session = session;
           sessions.add(session);
           return session;

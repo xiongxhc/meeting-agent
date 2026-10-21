@@ -63,6 +63,7 @@ import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "../ports/session-store.ts";
 import { LiveProvisionalCorrelator, type LiveCatchupClock, type ProvisionalResolution } from "./live-provisional.ts";
 import { createJoinFailureDiagnostic } from "./join-failure-diagnostic.ts";
+import { markJoinTiming, type JoinTimingObserver } from "./join-timing.ts";
 import type { VersionFourVoiceTranscriptFinalEvent } from "@conversation/runtime";
 import type { MeetingIdentity } from "../domain/meeting.ts";
 import type { ActiveSpeakerObservation } from "../domain/transcript.ts";
@@ -294,6 +295,9 @@ export type CreateMeetingSessionOptions = {
    * cleanup has finished, so applications can stop retaining sensitive
    * session state without reopening shutdown races. */
   readonly onInactive?: () => void;
+  /** PRIVATE test-entry observer of join-path phase boundaries (see
+   * join-timing.ts). Production composition never sets it. */
+  readonly joinTiming?: JoinTimingObserver;
 } & ({ readonly bridge: BridgeTransport; readonly timedEvidence?: undefined } | {
   readonly bridge: BridgeTransportV2;
   readonly timedEvidence: { readonly store: SessionStore; readonly catchupClock?: LiveCatchupClock;
@@ -415,10 +419,12 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   const retrievalRouter: RetrievalRouter =
     options.retrieval ??
     createRetrievalRouter({
-      vault:
-        options.teamVaultDir === undefined
-          ? UNCONFIGURED_VAULT
-          : createTeamVaultIndexOrDegraded({ teamVaultDir: options.teamVaultDir }),
+      vault: options.teamVaultDir === undefined ? UNCONFIGURED_VAULT : (() => {
+        markJoinTiming(options.joinTiming, "vault_index_started");
+        const vault = createTeamVaultIndexOrDegraded({ teamVaultDir: options.teamVaultDir });
+        markJoinTiming(options.joinTiming, "vault_index_built");
+        return vault;
+      })(),
       sink: runtimeContextSink,
     });
 
@@ -1214,6 +1220,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   }
 
   async function performJoin(): Promise<void> {
+    markJoinTiming(options.joinTiming, "join_entered");
     if (disposed) throw new Error("meeting session was disposed and cannot join");
     if (terminalReason !== null) {
       throw new Error(
@@ -1237,8 +1244,10 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         bridgeSessionId,
       });
       leaseId = lease.leaseId;
+      markJoinTiming(options.joinTiming, "lease_acquired");
       coordinator.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId);
       reconciliationGenerationStarted = true;
+      markJoinTiming(options.joinTiming, "reconciliation_started");
 
       joinDiagnostic?.phase("timed_control");
       if (options.timedEvidence) {
@@ -1252,6 +1261,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           ...(options.timedEvidence.onResult ? { onResult: options.timedEvidence.onResult } : {}) });
       }
 
+      markJoinTiming(options.joinTiming, "timed_control_ready");
       joinDiagnostic?.phase("subscriptions");
       unsubscribeBridge = bridge.subscribe((raw) => {
         enqueue({ source: "bridge", raw });
@@ -1260,22 +1270,27 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         enqueue({ source: "runtime", event });
       });
 
+      markJoinTiming(options.joinTiming, "subscriptions_ready");
       joinDiagnostic?.phase("join_send");
+      markJoinTiming(options.joinTiming, "join_send_started");
       await issue({
         type: "join",
         meetingOccurrenceId: identity.occurrenceId,
         meetingNo: identity.meetingNo,
         leaseId: lease.leaseId,
       });
+      markJoinTiming(options.joinTiming, "join_send_resolved");
       joinDiagnostic?.phase("join_cancel_check");
       assertJoinCanContinue();
 
       joinDiagnostic?.phase("runtime_admission");
       runtimeStartAttempted = true;
+      markJoinTiming(options.joinTiming, "runtime_admission_started");
       const runtimeAdmission = runtime.startVoiceSession(options.timedEvidence
         ? { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE, timingContract: "capture-clock/v1", bridgeSessionId }
         : { profile: PINNED_PROFILE, responseMode: PINNED_RESPONSE_MODE });
       const handle = await runtimeAdmission;
+      markJoinTiming(options.joinTiming, "runtime_admission_resolved");
       joinDiagnostic?.phase("admitted_binding");
       if (options.timedEvidence && (handle.timingContract !== "capture-clock/v1" || handle.sessionId !== evidenceControlId ||
         handle.bridgeSessionId !== bridgeSessionId || handle.mediaLease.sessionId !== evidenceControlId ||
@@ -1292,6 +1307,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           handle.mediaLease.captureFormat !== "pcm_s16le/24000/1/20ms") throw new Error("timed media lease changed admitted binding or format");
         timedVoiceAdmitted = true;
         joinDiagnostic?.phase("connect_media_send");
+        markJoinTiming(options.joinTiming, "connect_media_send_started");
         await issue({ type: "connect_media", mediaLease: { sessionId: handle.sessionId.toString(), bridgeSessionId,
           connectEndpoint: handle.mediaLease.connectEndpoint, credential: handle.mediaLease.credential,
           expiresAtMs: handle.mediaLease.expiresAtMs.toString(), reconnectWindowMs: handle.mediaLease.reconnectWindowMs.toString(),

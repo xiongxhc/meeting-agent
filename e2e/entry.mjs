@@ -45,6 +45,7 @@ import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-c
 
 import { startFixtureProvider } from "./fixture-provider.mjs";
 import { readStateFile } from "./state-file.mjs";
+import { JOIN_TIMING_FILE, createJoinTimingRecorder } from "./join-latency-evidence.mjs";
 import { interactiveGatewayToml, liveGatewayToml, postmeetingOnlineGatewayToml } from "./gateway-config.mjs";
 import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { RESERVE_ID, SCOPE, inviteEnvelope, startFeishuPeer } from "./feishu-peer.mjs";
@@ -95,6 +96,9 @@ export async function settleLongTailDrive({ drive, getApplication, controller })
 const plan = isMain ? JSON.parse(readFileSync(process.argv[process.argv.indexOf("--plan") + 1], "utf8")) : {};
 const eventsPath = isMain ? path.join(plan.controlDir, "events.ndjson") : null;
 const trace = [];
+// Join-latency phases (clocks only), buffered and written once the first join settles.
+const joinTiming = isMain ? createJoinTimingRecorder({ filename: path.join(plan.controlDir, JOIN_TIMING_FILE) }) : null;
+if (joinTiming) process.once("exit", joinTiming.flush);
 
 function event(name, detail = {}) {
   const line = { at: new Date().toISOString(), monotonicNs: process.hrtime.bigint().toString(), name, ...detail };
@@ -430,6 +434,7 @@ async function driveApplication({ interactive, provider, unusedVoice, peer }) {
     organizerReferences: [{ ...SCOPE, meetingNo: plan.meeting.meetingNo, reference: { kind: "reservation", reserveId: RESERVE_ID } }],
     maintenance: { intervalsMs: plan.laneIntervalsMs, random: () => 0 },
     log: (code) => { trace.push(code); event("log", { code }); },
+    joinTiming: joinTiming.observe,
   };
   const dependencies = {
     readConfig: readStandaloneConfig,
