@@ -6,19 +6,44 @@ export class RuntimeTestTransport implements RuntimeTransport {
   readonly messages = new Readable({ objectMode: true, read() {} });
   readonly commands: ClientCommand[] = [];
   onSend: ((command: ClientCommand) => void) | undefined;
-  async send(command: ClientCommand): Promise<void> { this.commands.push(command); this.onSend?.(command); }
+  /** When set, a `status` command is answered here (accepted, then this
+   * status) and not passed to onSend, so a status probe can never hang a test. */
+  statusReply: { readonly version: number; readonly status: Record<string, unknown> } | undefined;
+  async send(command: ClientCommand): Promise<void> {
+    this.commands.push(command);
+    if (command.type === "status" && this.statusReply !== undefined) {
+      this.push({ type: "command_accepted", protocol_version: this.statusReply.version, request_id: command.requestId });
+      this.push({ type: "status", protocol_version: this.statusReply.version, request_id: command.requestId, status: this.statusReply.status });
+      return;
+    }
+    this.onSend?.(command);
+  }
   push(message: unknown): void { this.messages.push(message); }
   async close(): Promise<void> { this.messages.push(null); }
 }
 
-export async function runtimeTestClient<V extends ClientProtocolVersion>(version: V, currentSessionId = 42n) {
+/** The gateway capabilities a test Runtime advertises unless a test names others. */
+export const TEST_RUNTIME_CAPABILITIES: readonly string[] = ["text", "conversation_context_seed"];
+
+/** A connected pinned SDK client over a fake transport. `capabilities` is what
+ * the gateway's ready (and every status answer) advertises. */
+export async function runtimeTestClient<V extends ClientProtocolVersion>(version: V, currentSessionId = 42n,
+  options: { readonly capabilities?: readonly string[] } = {}) {
   const transport = new RuntimeTestTransport();
-  transport.push({ type: "ready", protocol_version: version, ...(version === 4 ? { current_session_id: currentSessionId.toString() } : {}),
-    status: { profile: "offline", transport: "stdio", privacy_mode: "local_only", language_location: "local",
-      model_id: "synthetic", memory_enabled: false, memory_location: null, telemetry_enabled: false,
-      capabilities: ["text", "conversation_context_seed"], components: [{ kind: "language_model", execution_location: "local", provider_label: "Synthetic" }],
-      last_context_seed_operation_id: null } });
+  const status = { profile: "offline", transport: "stdio", privacy_mode: "local_only", language_location: "local",
+    model_id: "synthetic", memory_enabled: false, memory_location: null, telemetry_enabled: false,
+    capabilities: [...(options.capabilities ?? TEST_RUNTIME_CAPABILITIES)], components: [{ kind: "language_model", execution_location: "local", provider_label: "Synthetic" }],
+    last_context_seed_operation_id: null };
+  transport.statusReply = { version, status };
+  transport.push({ type: "ready", protocol_version: version, ...(version === 4 ? { current_session_id: currentSessionId.toString() } : {}), status });
   return { client: await RuntimeClient.connect(transport, version), transport };
+}
+
+/** Stands in for an SDK that has no `renewMediaLease` (one built before
+ * lease renewal), whatever the pinned SDK has. */
+export function withoutMediaLeaseRenewal<T extends object>(client: T): T {
+  Object.defineProperty(client, "renewMediaLease", { value: undefined, configurable: true });
+  return client;
 }
 
 /** Parser/SQLite fixture, NOT evidence of capability authentication. */

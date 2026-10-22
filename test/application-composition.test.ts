@@ -18,7 +18,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { WebSocketServer, type WebSocket } from "ws";
-import { RuntimeClient, type ClientCommand } from "@conversation/runtime";
+import type { ClientCommand } from "@conversation/runtime";
 
 import { acquireApplicationOwnerLock, type ApplicationOwnerLock } from "../src/adapters/application-owner-lock.ts";
 import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
@@ -106,6 +106,8 @@ type RuntimeScript = {
   recordingsDir: string;
   /** A media lease lifetime other than 60 s. */
   leaseMs?: number;
+  /** The gateway advertises media_lease_renewal in ready and status, and refuses every renewal. */
+  refusesLeaseRenewal?: boolean;
 };
 
 type ScriptedRuntime = {
@@ -179,11 +181,13 @@ function scriptedRuntimes(script: RuntimeScript) {
             recovery_capability: { source_session_id: id, recording_handle: handle, sha256: "b".repeat(64), key_id: "c".repeat(16), authorization: "d".repeat(64) } });
           return;
         case "authorize_voice_response": accept({ turn_id: "99" }); return;
+        case "renew_media_lease":
+          transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "scripted renewal refusal" } }); return;
         default: accept(); return;
       }
     };
     const readyStatus = { profile: "online", transport: "stdio", privacy_mode: "hybrid", language_location: "remote", model_id: "scripted-text-model",
-      memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ["text", "conversation_context_seed", "voice_session"],
+      memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ["text", "conversation_context_seed", "voice_session", ...(script.refusesLeaseRenewal ? ["media_lease_renewal"] : [])],
       components: [{ kind: "speech_recognition", execution_location: "remote", provider_label: "scripted-stt" }, { kind: "language_model", execution_location: "remote", provider_label: "scripted-text" },
         { kind: "speech_synthesis", execution_location: "local", provider_label: "scripted-tts" }, { kind: "audio_io", execution_location: "local", provider_label: "scripted-audio" }],
       last_context_seed_operation_id: null };
@@ -1010,17 +1014,12 @@ test("real v2 children: the timed join reaches joined, the owner lock descriptor
 // 4. Runtime owner
 // ---------------------------------------------------------------------------
 
-test("the operator view reports a degraded and lapsed media-lease renewal while recording continues, and the log names it", async () => {
-  // The pinned SDK has neither renewMediaLease nor the capability flag (its
-  // ready parser refuses it); a refusing method and a status that advertises
-  // the flag stand in for a renewal-capable SDK and gateway.
-  const proto = RuntimeClient.prototype as unknown as { renewMediaLease?: () => Promise<bigint>; status(): Promise<{ capabilities: readonly string[] }> };
-  const status = proto.status;
-  proto.renewMediaLease = () => Promise.reject(new Error("scripted renewal refusal"));
-  proto.status = async function (this: unknown) { const value = await status.call(this); return { ...value, capabilities: [...value.capabilities, "media_lease_renewal"] }; };
+test("the operator view reports a degraded and lapsed media-lease renewal while recording continues, and the log names it", { timeout: 30_000 }, async () => {
+  // The real pinned SDK against a scripted gateway that advertises
+  // media_lease_renewal and refuses every renewal.
   const f = fixture();
   try {
-    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, leaseMs: 1500 });
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, leaseMs: 1500, refusesLeaseRenewal: true });
     const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
     // Admitted on the real clock: the lease expiry the SDK checks is wall time, so the session's clock must be too.
     const id = await (async () => { const store = f.reopen(); try { const value = invite(1); store.acceptInvite(value, Date.now()); store.admitInviteJoin(value.occurrenceId, Date.now()); return value.occurrenceId; } finally { store.close(); } })();
@@ -1046,7 +1045,7 @@ test("the operator view reports a degraded and lapsed media-lease renewal while 
     assert.equal(settled.leaseRenewal, "lapsed");
     assert.ok(log.includes("occurrence_media_lease_renewal_lapsed"), "the lapse is never silent");
     } finally { await app.close(); }
-  } finally { delete proto.renewMediaLease; proto.status = status; f.close(); }
+  } finally { f.close(); }
 });
 
 test("the connected v4 control identity is awaited before spawn and join, and timed UI evidence binds to it", async () => {

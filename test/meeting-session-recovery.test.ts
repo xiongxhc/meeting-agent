@@ -20,7 +20,7 @@ import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { createMeetingSession } from "../src/sessions/meeting-session.ts";
 import { createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
 import { parseCommandV2, type BridgeCommandMessageV2 } from "../src/contracts/bridge-session-v2.ts";
-import { runtimeTestClient, finalizedWire } from "./lib/runtime-sdk.ts";
+import { runtimeTestClient, finalizedWire, TEST_RUNTIME_CAPABILITIES, withoutMediaLeaseRenewal } from "./lib/runtime-sdk.ts";
 import type { RuntimeEvent } from "../src/ports/conversation-runtime.ts";
 
 const NOW_MS = Date.parse("2026-09-02T14:05:00.000Z");
@@ -36,6 +36,10 @@ async function harness(options: { connectOutcome?: "ok" | "failed"; recovery?: {
   supported?: boolean;
   /** Whether the bridge's connected answer advertises renewal (default true). */
   bridgeAdvertises?: boolean;
+  /** What the fake gateway's ready and status advertise (default: no media_lease_renewal). */
+  runtimeCapabilities?: readonly string[];
+  /** The real adapter over an SDK that has no renewMediaLease, whatever the pin has. */
+  sdkWithoutRenewal?: boolean;
   renewalOutcome?: "ok" | "rejected" } = {}) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-session-recovery-"));
   const store = openSessionStore({ filename: path.join(dir, "state.db") });
@@ -44,13 +48,13 @@ async function harness(options: { connectOutcome?: "ok" | "failed"; recovery?: {
   const coordinator = createCoordinator({ store, clock, bridgeLeaseTtlMs: 30000, maxConcurrentSessions: 1 });
   coordinator.discover(identity);
   if (options.recoveryGeneration) { coordinator.advance(identity.occurrenceId, "joining"); coordinator.advance(identity.occurrenceId, "listening"); }
-  const { client, transport } = await runtimeTestClient(4);
-  const runtime = createConversationRuntimeClient(client);
+  const { client, transport } = await runtimeTestClient(4, 42n, options.runtimeCapabilities === undefined ? {} : { capabilities: options.runtimeCapabilities });
+  const runtime = createConversationRuntimeClient(options.sdkWithoutRenewal ? withoutMediaLeaseRenewal(client) : client);
   const runtimeListeners = new Set<(event: RuntimeEvent) => void>();
   const base = options.renew === undefined ? runtime
     : { ...runtime, renewMediaLease: options.renew, supportsMediaLeaseRenewal: async () => options.supported ?? true };
-  // Records the session's Runtime listener, so a test can deliver an event the
-  // pinned SDK cannot parse yet (round-2 codes) at the port boundary.
+  // Records the session's Runtime listener, so a test can deliver an event at
+  // the port boundary, independent of what the pinned SDK parses.
   const port = { ...base,
     subscribe(listener: (event: RuntimeEvent) => void) {
       runtimeListeners.add(listener);
@@ -65,6 +69,9 @@ async function harness(options: { connectOutcome?: "ok" | "failed"; recovery?: {
         expires_at_ms: String(Date.now() + (options.leaseMs ?? 60000)), reconnect_window_ms: options.leaseMs === undefined ? "10000" : String(Math.floor(options.leaseMs / 2)), capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
     if (command.type === "start_drainable_timed_voice_session") transport.push({ type: "voice_event", protocol_version: 4, event: { type: "voice_session_started", session_id: "42",
       privacy: { privacy_mode: "cloud", components: ["speech_recognition", "language_model", "speech_synthesis", "audio_io"].map((kind) => ({ kind, execution_location: "remote", provider_label: "Synthetic" })) } } });
+    // The fake gateway renews for one more lease lifetime.
+    if (command.type === "renew_media_lease") transport.push({ type: "media_lease_renewed", protocol_version: 4, request_id: command.requestId,
+      expires_at_ms: String(Date.now() + (options.leaseMs ?? 60000)) });
     if (command.type === "finalize_recording") transport.push({ ...finalizedWire, request_id: command.requestId, recovery_capability: { ...finalizedWire.recovery_capability, source_session_id: "42" } });
   };
   let listener: ((raw: unknown) => void) | undefined, closedListener: (() => void) | undefined, sequence = 0;
@@ -306,7 +313,7 @@ test("the live session renews at a third of the remaining lifetime and forwards 
   } finally { await h.cleanup(); }
 });
 
-test("without the Runtime capability, or a bridge that does not advertise renewal, nothing is renewed and nothing relaunches", async () => {
+test("without the Runtime capability, or a bridge that does not advertise renewal, nothing is renewed and nothing relaunches", { timeout: 20_000 }, async () => {
   for (const options of [{}, { supported: false }, { bridgeAdvertises: false }]) {
     const calls: bigint[] = [];
     const h = await harness({ leaseMs: 300, ...("supported" in options || "bridgeAdvertises" in options ? { renew: async ({ sessionId }: { readonly sessionId: bigint }) => { calls.push(sessionId); return BigInt(Date.now() + 300); } } : {}), ...options });
@@ -315,21 +322,43 @@ test("without the Runtime capability, or a bridge that does not advertise renewa
       await wait(450); await h.settle();
       assert.equal(calls.length, 0, JSON.stringify(options));
       assert.equal(h.bridgeCommands.includes("renew_media_lease"), false);
-      // The actual adapter on the pinned SDK, and a Runtime without the flag, report unsupported;
-      // a bridge that did not advertise renewal never gets as far as asking.
+      // The real SDK on a gateway that does not advertise the flag (`{}`), and a
+      // port reporting unsupported, are unsupported; a bridge that did not
+      // advertise renewal never gets as far as asking.
+      if (!("supported" in options) && !("bridgeAdvertises" in options)) {
+        assert.equal(h.runtimeCommands().filter((type) => type === "status").length, 1, "one status probe, answered");
+        assert.equal(h.runtimeCommands().includes("renew_media_lease"), false);
+      }
       assert.equal(h.session.state().leaseRenewal, "bridgeAdvertises" in options ? "inactive" : "unsupported");
       assertStillRecording(h);
     } finally { await h.cleanup(); }
   }
 });
 
-test("on today's pinned SDK the actual adapter reports no renewal support: no status probe, no renewal, no relaunch", async () => {
-  const h = await harness({ leaseMs: 300 });
+test("the actual adapter over an SDK without renewMediaLease reports no renewal support: no status probe, no renewal, no relaunch", { timeout: 20_000 }, async () => {
+  const h = await harness({ leaseMs: 300, sdkWithoutRenewal: true });
   try {
     await h.session.join(); await h.settle();
     await wait(450); await h.settle();
     assert.equal(h.bridgeCommands.includes("renew_media_lease"), false);
     assert.equal(h.runtimeCommands().includes("status"), false);
+    assert.equal(h.session.state().leaseRenewal, "unsupported");
+    assertStillRecording(h);
+  } finally { await h.cleanup(); }
+});
+
+test("the real pinned SDK renews once the gateway's ready advertises media_lease_renewal, and forwards each expiry to the bridge", { timeout: 20_000 }, async () => {
+  const h = await harness({ leaseMs: 900, runtimeCapabilities: [...TEST_RUNTIME_CAPABILITIES, "media_lease_renewal"] });
+  try {
+    await h.session.join(); await h.settle();
+    await wait(200); await h.settle();
+    assert.equal(h.runtimeCommands().includes("renew_media_lease"), false, "nothing before a third of the lifetime");
+    await wait(500); await h.settle();
+    assert.equal(h.runtimeCommands().filter((type) => type === "status").length, 1, "one capability probe, answered");
+    assert.ok(h.runtimeCommands().includes("renew_media_lease"), "the SDK sent the renewal");
+    assert.ok(h.renewals.length >= 1, "the renewed expiry reached the bridge");
+    assert.equal(h.session.state().leaseRenewal, "renewing");
+    assert.equal(h.session.state().leaseRenewalFailures, 0);
     assertStillRecording(h);
   } finally { await h.cleanup(); }
 });

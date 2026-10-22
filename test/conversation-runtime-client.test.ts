@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import type { RuntimeEvent } from "../src/ports/conversation-runtime.ts";
 import { connectPostmeetingRuntime, createConversationRuntimeClient } from "../src/adapters/conversation-runtime-client.ts";
 import { CommandRejectedError, type ClientCommand, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
-import { finalizedWire, RuntimeTestTransport, runtimeTestClient, testCapability } from "./lib/runtime-sdk.ts";
+import { finalizedWire, RuntimeTestTransport, runtimeTestClient, testCapability, TEST_RUNTIME_CAPABILITIES, withoutMediaLeaseRenewal } from "./lib/runtime-sdk.ts";
 
 test("public connected postmeeting runtime retains its actual finalized recovery surface", async () => {
   const transport = new RuntimeTestTransport();
@@ -287,27 +287,31 @@ test("the adapter hands out the SDK's own timed session handle and its stopIfAct
   }
 });
 
-test("lease renewal is reported only when the SDK has it and the connected Runtime advertises media_lease_renewal", async () => {
-  // Today's pinned SDK: no method, so no status probe and nothing to renew.
-  const pinned = await runtimeTestClient(4);
-  const pinnedPort = createConversationRuntimeClient(pinned.client);
-  assert.equal(await pinnedPort.supportsMediaLeaseRenewal!(), false);
-  await assert.rejects(pinnedPort.renewMediaLease!({ sessionId: 42n }), /not supported/);
-  assert.equal(pinned.transport.commands.some((command) => command.type === "status"), false);
-  await pinnedPort.close();
+test("lease renewal is reported only when the SDK has it and the connected Runtime advertises media_lease_renewal", { timeout: 10_000 }, async () => {
+  // An SDK without renewMediaLease (a stub, whatever the pin has): no status probe and nothing to renew.
+  const bare = await runtimeTestClient(4);
+  const barePort = createConversationRuntimeClient(withoutMediaLeaseRenewal(bare.client));
+  assert.equal(await barePort.supportsMediaLeaseRenewal!(), false);
+  await assert.rejects(barePort.renewMediaLease!({ sessionId: 42n }), /not supported/);
+  assert.equal(bare.transport.commands.some((command) => command.type === "status"), false);
+  await barePort.close();
 
-  // A renewal-capable SDK: the gateway's status (the one its ready carried) decides.
+  // The real pinned SDK: the capability the gateway's ready (and status) advertises decides.
   for (const advertised of [false, true]) {
-    const { client } = await runtimeTestClient(4);
-    let renewed = 0;
-    const renewing = client as unknown as { renewMediaLease(): Promise<bigint>; status(): Promise<{ capabilities: readonly string[] }> };
-    renewing.renewMediaLease = async () => { renewed += 1; return 2_000n; };
-    renewing.status = async () => ({ capabilities: advertised ? ["text", "voice_session", "media_lease_renewal"] : ["text", "voice_session"] });
+    const { client, transport } = await runtimeTestClient(4, 42n,
+      { capabilities: advertised ? [...TEST_RUNTIME_CAPABILITIES, "media_lease_renewal"] : TEST_RUNTIME_CAPABILITIES });
+    transport.onSend = (command) => {
+      if (command.type !== "renew_media_lease") return;
+      transport.push({ type: "command_accepted", protocol_version: 4, request_id: command.requestId });
+      transport.push({ type: "media_lease_renewed", protocol_version: 4, request_id: command.requestId, expires_at_ms: "2000" });
+    };
     const port = createConversationRuntimeClient(client);
-    assert.equal(await port.supportsMediaLeaseRenewal!(), advertised);
-    assert.equal(await port.renewMediaLease!({ sessionId: 42n }), 2_000n);
+    assert.equal(await port.supportsMediaLeaseRenewal!(), advertised, `advertised=${advertised}`);
+    assert.equal(transport.commands.filter((command) => command.type === "status").length, 1, "one status probe, answered");
+    if (advertised) assert.equal(await port.renewMediaLease!({ sessionId: 42n }), 2_000n);
+    else await assert.rejects(port.renewMediaLease!({ sessionId: 42n }), /does not support media lease renewal/, "the SDK refuses locally");
     await assert.rejects(port.renewMediaLease!({ sessionId: 7n }), /session/);
-    assert.equal(renewed, 1);
+    assert.equal(transport.commands.filter((command) => command.type === "renew_media_lease").length, advertised ? 1 : 0);
     await port.close();
   }
 });
