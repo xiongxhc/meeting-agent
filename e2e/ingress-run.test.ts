@@ -5,6 +5,7 @@ import { test } from "node:test";
 import Database from "better-sqlite3";
 import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
+import { replayNeedsJoinDecision } from "../src/ports/session-store.ts";
 
 // Listener-free component facts. No SDK, application, stage or process inventory.
 async function helpers() {
@@ -19,29 +20,33 @@ const identity = { occurrenceId: "synthetic@2026-10-06T10:00:00Z", region: "feis
 const events = ["A", "B", "C"].map((eventId, index) => ({ eventId, hash: String(index + 1).repeat(64),
   title: [identity.title, "Later observed title", "Earlier event delivered late"][index],
   createTime: String([100, 200, 50][index]), inviteSeconds: String([10, 20, 5][index]), startSeconds: "1791280800" }));
+// Owner 2's later invite for the same meeting, from the allowlisted inviter.
+const allowedEvent = { eventId: "D", hash: "4".repeat(64), title: "Allowed inviter title", createTime: "300", inviteSeconds: "30", startSeconds: "1791280800" };
 type State = { fileIdentity: string; immutable: typeof identity; events: typeof events; sessions: { occurrenceId: string; providerMeetingId: string; occurrenceStartedAt: string; state: string }[];
-  metadata: { state: string; reason: string; claimed: number; claimExpiresAtMs: number | null; organizerId: string | null; organizerSource: string | null;
+  metadata: { state: string; reason: string; lastBlockedAtMs: number | null; claimed: number; claimExpiresAtMs: number | null; organizerId: string | null; organizerSource: string | null;
     reference: { kind: string; reserveId: string } | null; admittedAtMs: number | null; totalAttempts: number; generationAttempts: number;
-    generationStartedAtMs: number | null; firstAttemptAtMs: number; lastAttemptAtMs: number; retryGeneration: number; operatorRetryCount: number;
+    generationStartedAtMs: number | null; firstAttemptAtMs: number | null; lastAttemptAtMs: number | null; retryGeneration: number; operatorRetryCount: number;
     lastOperator: string | null; lastOperatorRetryAtMs: number | null; nextAttemptAtMs: number };
   counts: { custody: number; recording: number; seed: number; delivery: number; notification: number } };
+/** Phase 1's invites come from an inviter the allowlist does not name: refused on the row, no organizer lookup. */
 function blocked(): State {
   return { fileIdentity: "synthetic-file", immutable: copy(identity), events: copy(events), sessions: [],
-    metadata: { state: "metadata_blocked", reason: "metadata_unavailable", claimed: 0, claimExpiresAtMs: null,
-      organizerId: null, organizerSource: null, reference: null, admittedAtMs: null, totalAttempts: 1,
-      generationAttempts: 1, generationStartedAtMs: 101, firstAttemptAtMs: 101, lastAttemptAtMs: 101,
+    metadata: { state: "metadata_blocked", reason: "inviter_not_allowed", lastBlockedAtMs: 100, claimed: 0, claimExpiresAtMs: null,
+      organizerId: null, organizerSource: null, reference: null, admittedAtMs: null, totalAttempts: 0,
+      generationAttempts: 0, generationStartedAtMs: null, firstAttemptAtMs: null, lastAttemptAtMs: null,
       retryGeneration: 0, operatorRetryCount: 0, lastOperator: null, lastOperatorRetryAtMs: null, nextAttemptAtMs: 100 },
     counts: { custody: 0, recording: 0, seed: 0, delivery: 0, notification: 0 } };
 }
 const emptyActivity = () => ({ trace: ["composition_lock_verified", "composition_store_opened", "composition_started"],
-  requests: [{ route: "unmatched", status: 404 }], messages: [], runtimePids: [], bridge: null,
+  requests: [{ route: "ws_endpoint", status: 200 }], messages: [], runtimePids: [], bridge: null,
   files: { recording: 0, outbox: 0, receipt: 0, key: false }, outcomes: [], envKeys: ["PATH"],
   receiver: { invalid: false, overflow: false, observations: [] as { ordinal: number; kind: string; messageId: string; payload: { code: number } }[] } });
 type Mutation = (name: string, fact: Record<string, unknown>) => void;
 function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}, conflictingReplay = false) {
-  const calls: string[] = [], plans: { occurrenceId: string; expected: typeof events; sends: (typeof events[number] & { wireMessageId: string; occurrenceId: string; expectedCode?: number })[] } = { occurrenceId: identity.occurrenceId, expected: events, sends: [0, 1, 2, 0].map((index, send) =>
-    ({ ...events[index]!, wireMessageId: `phase1-${send}`, occurrenceId: identity.occurrenceId })) };
-  let current = blocked(), activity = emptyActivity(), phase = 0, sends = 0;
+  const calls: string[] = [], plans: { occurrenceId: string; expected: typeof events; sends: (typeof events[number] & { wireMessageId: string; occurrenceId: string; expectedCode?: number })[];
+    allowedSend: typeof allowedEvent & { wireMessageId: string; occurrenceId: string } } = { occurrenceId: identity.occurrenceId, expected: events, sends: [0, 1, 2, 0].map((index, send) =>
+    ({ ...events[index]!, wireMessageId: `phase1-${send}`, occurrenceId: identity.occurrenceId })), allowedSend: { ...allowedEvent, wireMessageId: "phase2-d", occurrenceId: identity.occurrenceId } };
+  let current = blocked(), activity = emptyActivity(), phase = 0, sends = 0, retried = false; const refused = new Set<string>();
   const commits: { ordinal: number; ackFloor: number; wireMessageId: string; eventId: string; expectedHash: string; persistedHash: string; immutable: typeof identity }[] = [];
   const fact = <T extends object>(name: string, value: T): T => { calls.push(name); const result = copy(value); mutate(name, result as Record<string, unknown>); return result; };
   const owner = {
@@ -52,8 +57,15 @@ function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}, 
         activity.receiver.observations.push({ ordinal: sends, kind: "ack", messageId: send.wireMessageId, payload: { code: 500 } });
         return fact("deliver", { receiver: { invalid: false, overflow: false, observations: [activity.receiver.observations.at(-1)!] }, state: current });
       }
-      const index = events.findIndex(e => e.eventId === send.eventId);
-      current.events = copy(events.slice(0, Math.max(current.events.length === 3 && sends === 1 ? 0 : current.events.length, index + 1)));
+      if (send.eventId === allowedEvent.eventId) {
+        // The allowed invite is admitted at once: one discovered session, no organizer yet.
+        current.events = [...current.events, copy(allowedEvent)];
+        current.sessions = [{ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId, occurrenceStartedAt: identity.occurrenceStartedAt, state: "discovered" }];
+      } else {
+        const index = events.findIndex(e => e.eventId === send.eventId);
+        current.events = copy(events.slice(0, Math.max(current.events.length === 3 && sends === 1 ? 0 : current.events.length, index + 1)));
+        if (!refused.has(send.eventId)) { refused.add(send.eventId); activity.trace.push("invite_admission_inviter_not_allowed"); }
+      }
       activity.receiver.observations.push({ ordinal: sends, kind: "ack", messageId: send.wireMessageId, payload: { code: 200 } });
       commits.push({ ordinal: commits.length + 1, ackFloor: sends - 1, wireMessageId: send.wireMessageId, eventId: send.eventId,
         expectedHash: send.hash, persistedHash: send.hash, immutable: copy(identity) });
@@ -63,18 +75,25 @@ function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}, 
     },
     async blocked() { return fact("blocked", { state: current, activity }); },
     async read() { return fact("read", current); },
-    async discover() { return fact("discover", { launched: 0, resolved: 0, deferred: 0 }); },
+    async discover() {
+      // After an operator retry the tick no longer knows the inviter: it refuses the row again.
+      if (retried && current.metadata.state === "pending_metadata") {
+        current.metadata = { ...current.metadata, state: "metadata_blocked", reason: "inviter_unverified", lastBlockedAtMs: 201 };
+        activity.trace.push("invite_admission_inviter_unverified");
+      }
+      return fact("discover", { launched: 0, resolved: 0, deferred: 0 });
+    },
     async retry() {
+      retried = true;
       current.metadata = { ...current.metadata, state: "pending_metadata", generationAttempts: 0, generationStartedAtMs: null,
         retryGeneration: 1, operatorRetryCount: 1, lastOperator: "e2e-ingress-operator", lastOperatorRetryAtMs: 200, nextAttemptAtMs: 200 };
       return fact("retry", { result: "pending", state: current });
     },
     async launched() {
-      current.metadata = { ...current.metadata, state: "admitted", totalAttempts: 2, generationAttempts: 1,
-        organizerId: "ou_e2e_organizer", organizerSource: "reservation", reference: { kind: "reservation", reserveId: "reserve-e2e-1" }, admittedAtMs: 201 };
-      current.sessions = [{ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId,
-        occurrenceStartedAt: identity.occurrenceStartedAt, state: "discovered" }];
-      const outcome = { occurrenceId: identity.occurrenceId, phase: missingLauncher ? "settled" : "live",
+      // The allowed invite reopened the organizer lane (retry generation 2); its lookup resolves after the launch.
+      current.metadata = { ...current.metadata, state: "admitted", totalAttempts: 1, generationAttempts: 1, generationStartedAtMs: 203, firstAttemptAtMs: 203, lastAttemptAtMs: 203,
+        retryGeneration: 2, organizerId: "ou_e2e_organizer", organizerSource: "reservation", reference: { kind: "reservation", reserveId: "reserve-e2e-1" }, admittedAtMs: 204 };
+      const outcome = { occurrenceId: identity.occurrenceId, organizer: null, phase: missingLauncher ? "settled" : "live",
         failure: missingLauncher ? "runtime_startup_failed" : null, controlSessionId: missingLauncher ? null : "41",
         custody: "not_applicable", finalization: "none", runtimeClose: "closed", runtimeCleanup: "graceful" };
       activity = { ...activity, requests: ["reserve_active_meeting", "reserve_get", "contact_user_get"].map(route => ({ route, status: 200 })),
@@ -95,7 +114,7 @@ function syntheticEffects(missingLauncher = false, mutate: Mutation = () => {}, 
     effects: {
       async prepare() { calls.push("prepare"); },
       async runOwner(p: Record<string, unknown>, signal: AbortSignal) {
-        phase++; current = blocked(); activity = emptyActivity(); commits.length = 0;
+        phase++; current = blocked(); activity = emptyActivity(); commits.length = 0; retried = false; refused.clear();
         const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
         const result = await runIngressPhase(p, owner, { signal });
         return fact(`owner${phase}`, { ...result, ownerProcessProof: { cleanupConfirmed: true },
@@ -204,11 +223,12 @@ test("inventory adapter retains signal and bounded sticky overflow without arbit
   assert.equal(JSON.stringify(evidence).includes("private-value"), false);
 });
 
-test("synthetic two-owner campaign uses shared transitions, exact replay and one public retry", async () => {
+test("synthetic two-owner campaign uses shared transitions, exact replay, one refused public retry and one allowed later invite", async () => {
   const { runIngressCampaign } = await helpers();
   const fixture = syntheticEffects(); const result = await runIngressCampaign(fixture.plan, fixture.effects);
   assert.equal(result.success, true); assert.equal(result.label, "component-facts");
-  assert.equal(fixture.calls.filter(name => name === "deliver").length, 4);
+  assert.equal(fixture.calls.filter(name => name === "deliver").length, 5);
+  assert.ok(fixture.calls.lastIndexOf("retry") < fixture.calls.lastIndexOf("deliver") && fixture.calls.lastIndexOf("deliver") < fixture.calls.indexOf("launched"));
   assert.equal(fixture.calls.filter(name => name === "retry").length, 1);
   assert.ok(fixture.calls.indexOf("owner1") < fixture.calls.indexOf("between"));
   assert.ok(fixture.calls.indexOf("between") < fixture.calls.lastIndexOf("ready"));
@@ -279,7 +299,8 @@ for (const bad of ["staleReopen", "lateDuplicate", "lateInvalid", "lateOverflow"
   });
 }
 for (const bad of ["audit", "extraAudit", "503", "reference_missing", "session", "organizer", "custody", "runtime", "seed", "artifact", "dm",
-  "dbIdentity", "root", "noClose", "signal", "stdio", "lingering", "autoRetry", "extraRetry", "falseReady", "crossWire", "secondLaunch", "cleanup"]) {
+  "dbIdentity", "root", "noClose", "signal", "stdio", "lingering", "autoRetry", "extraRetry", "falseReady", "crossWire", "secondLaunch", "cleanup",
+  "refusalUnlogged", "lookupOnRefusal", "retryJoins", "retryLookup", "retryUnlogged", "retryReason", "retryPending", "organizerFirst", "allowedAudit", "earlyLaunch", "operatorOnly"]) {
   test(`synthetic recovery/launch ${bad} cannot pass`, async () => {
     const { runIngressCampaign } = await helpers(); const f = syntheticEffects(false, (name, v) => {
       if (name === "blocked") {
@@ -293,7 +314,17 @@ for (const bad of ["audit", "extraAudit", "503", "reference_missing", "session",
         if (bad === "runtime") a.runtimePids = [99] as unknown as [];
         if (bad === "artifact") a.files.outbox = 1;
         if (bad === "dm") a.messages = [{}] as unknown as [];
+        if (bad === "refusalUnlogged") a.trace = a.trace.filter(code => code !== "invite_admission_inviter_not_allowed");
+        if (bad === "lookupOnRefusal") { s.metadata.totalAttempts = 1; a.requests = [{ route: "reserve_get", status: 200 }]; }
       }
+      // The read after the operator retry: the row must be refused again, never joined or looked up.
+      if (name === "read" && (v.metadata as Record<string, unknown>).reason === "inviter_unverified" && (v.metadata as Record<string, unknown>).state === "metadata_blocked") {
+        if (bad === "retryJoins") (v as unknown as State).sessions = [{ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId, occurrenceStartedAt: identity.occurrenceStartedAt, state: "discovered" }];
+        if (bad === "retryLookup") (v.metadata as Record<string, unknown>).totalAttempts = 1;
+        if (bad === "retryReason") (v.metadata as Record<string, unknown>).reason = "inviter_not_allowed";
+        if (bad === "retryPending") (v.metadata as Record<string, unknown>).state = "pending_metadata";
+      }
+      if (name === "activity" && bad === "retryUnlogged") (v as unknown as ReturnType<typeof emptyActivity>).trace = (v as unknown as ReturnType<typeof emptyActivity>).trace.filter(code => code !== "invite_admission_inviter_unverified");
       if (name === "owner1") {
         const child = v.child as Record<string, unknown>;
         if (bad === "noClose") child.closeObserved = false;
@@ -309,6 +340,10 @@ for (const bad of ["audit", "extraAudit", "503", "reference_missing", "session",
         if (bad === "falseReady") a.bridge = null;
         if (bad === "crossWire") (a.bridge as unknown as Record<string, unknown>).occurrenceId = "other";
         if (bad === "secondLaunch") a.trace.push("occurrence_launched");
+        if (bad === "organizerFirst") (a.outcomes[0] as unknown as Record<string, unknown>).organizer = { feishuUserId: "ou_e2e_organizer", displayName: "Organizer", source: "reservation" };
+        if (bad === "allowedAudit") (v.state as State).events = (v.state as State).events.filter(e => e.eventId !== allowedEvent.eventId);
+        if (bad === "earlyLaunch") { a.trace = a.trace.filter(code => code !== "occurrence_launched"); a.trace.splice(a.trace.indexOf("invite_admission_inviter_unverified"), 0, "occurrence_launched"); }
+        if (bad === "operatorOnly") (v.state as State).metadata.retryGeneration = 1;
       }
       if (name === "cleanup" && ["lingering", "cleanup"].includes(bad)) v.cleanupConfirmed = false;
     });
@@ -370,8 +405,10 @@ test("synthetic schema29 SQLite SELECT projection is bounded and omits claim sec
       .run(identity.region, identity.tenantKey, identity.appId, e.eventId, occurrenceId, e.createTime,
         identity.providerMeetingId, identity.meetingNo, e.title, e.startSeconds, e.inviteSeconds, e.hash);
     assert.equal(read().events.length, 3);
-    db.exec("INSERT INTO feishu_invite_events SELECT region,tenant_key,app_id,'extra',occurrence_id,envelope_schema,event_type,create_time,provider_meeting_id,meeting_no,topic,start_seconds,end_seconds,invite_seconds,call_id,normalized_sha256,normalized_bytes,accepted_at_ms FROM feishu_invite_events LIMIT 1");
+    // Owner 2's allowed invite is the fourth audited event; a fifth exceeds the bound.
+    for (const extra of ["extra", "extra2"]) db.exec(`INSERT INTO feishu_invite_events SELECT region,tenant_key,app_id,'${extra}',occurrence_id,envelope_schema,event_type,create_time,provider_meeting_id,meeting_no,topic,start_seconds,end_seconds,invite_seconds,call_id,normalized_sha256,normalized_bytes,accepted_at_ms FROM feishu_invite_events LIMIT 1`);
     assert.throws(read, /audit_count/);
+    db.exec("DELETE FROM feishu_invite_events WHERE event_id='extra2'"); assert.equal(read().events.length, 4);
     db.exec("DELETE FROM feishu_invite_events WHERE event_id='extra'; PRAGMA journal_mode=WAL");
     assert.throws(read, /WAL/);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
@@ -403,7 +440,8 @@ for (const bad of ["falseAdmission", "rootRefusal", "connected", "bridge", "repe
       const a = v.activity as { trace: string[]; bridge: object | null; outcomes: { failure: string }[] };
       if (bad === "connected") a.trace.push("occurrence_runtime_connected");
       if (bad === "bridge") a.bridge = { pid: 99 };
-      if (bad === "repeatLaunch") a.trace.push("occurrence_launched");
+      // A missing launcher may be retried once in the same tick; a third launch is never allowed.
+      if (bad === "repeatLaunch") a.trace.push("occurrence_launched", "occurrence_launched");
       if (bad === "wrongFailure") { const outcome = a.outcomes[0]; assert.ok(outcome); outcome.failure = "runtime_startup_timeout"; }
     }); assert.equal((await runIngressCampaign(f.plan, f.effects)).success, false);
   });
@@ -462,28 +500,33 @@ for (const missingLauncher of [false, true]) test(`C selected conflict retains o
   f.plan.sends = h.selectIngressSends(f.plan.sends, { ...f.plan.sends[0], title: "Conflicting title", hash: "f".repeat(64) });
   const result = await h.runIngressCampaign(f.plan, f.effects);
   assert.equal(result.success, true); assert.equal(result.label, "component-facts");
-  assert.equal(f.calls.filter(n => n === "deliver").length, 6); assert.equal(f.calls.filter(n => n === "retry").length, 1);
+  assert.equal(f.calls.filter(n => n === "deliver").length, 7); assert.equal(f.calls.filter(n => n === "retry").length, 1);
   assert.deepEqual(result.phases[0].close.receiver.observations.map((r: { payload: { code: number } }) => r.payload.code), [200, 500, 200, 200, 200, 200]);
   assert.equal(result.phases[0].close.commitObservations.length, 5);
 });
 
-async function transactionConflictFixture(mutate: Mutation = () => {}) {
+// Store-level model of accept() (application-composition.ts), which decides the join right after each durable
+// commit. With no session, a stranger's invite is refused on the row; whether an exact replay is decided again is
+// production's replayNeedsJoinDecision. accept() itself is pinned by the composition replay tests.
+// `decisions: "each"` uses each delivery's own clock, as production does.
+async function transactionConflictFixture(mutate: Mutation = () => {}, decisions: "single" | "each" = "single") {
   const h = await helpers(), peer = await import(path.join(import.meta.dirname, "feishu-peer.mjs"));
   const root = mkdtempSync("/private/tmp/ingress-conflict-transaction-"); chmodSync(root, 0o700);
   const databasePath = path.join(root, "actual.db"), store = openSessionStore({ filename: databasePath });
   const meeting = { eventId: "ingress-a", providerMeetingId: "meeting-component", meetingNo: "987654321", title: "First accepted title",
     startSeconds: 1791280800, inviteSeconds: 1791280800, createTimeMs: 1791280800000 };
-  const envelopes = [peer.inviteEnvelope(meeting), peer.inviteEnvelope({ ...meeting, eventId: "ingress-b", title: "Later observed title" }),
-    peer.inviteEnvelope({ ...meeting, eventId: "ingress-c", title: "Earlier event delivered late" })];
+  const stranger = { ...meeting, inviterId: peer.E2E_STRANGER };
+  const envelopes = [peer.inviteEnvelope(stranger), peer.inviteEnvelope({ ...stranger, eventId: "ingress-b", title: "Later observed title" }),
+    peer.inviteEnvelope({ ...stranger, eventId: "ingress-c", title: "Earlier event delivered late" })];
   const normalized = envelopes.map(e => normalizeInvite(e, peer.SCOPE)), first = normalized[0]!;
   const expected = normalized.map(n => ({ eventId: n.eventId, hash: n.normalizedSha256, title: n.title, createTime: n.createTime,
     inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds }));
   const base = [0, 1, 2, 0].map((i, at) => ({ ...expected[i], occurrenceId: first.occurrenceId, wireMessageId: `phase1-${at}`, envelope: envelopes[i] }));
-  const conflictEnvelope = peer.inviteEnvelope({ ...meeting, title: "Conflicting title" }), conflict = normalizeInvite(conflictEnvelope, peer.SCOPE);
+  const conflictEnvelope = peer.inviteEnvelope({ ...stranger, title: "Conflicting title" }), conflict = normalizeInvite(conflictEnvelope, peer.SCOPE);
   const sends = h.selectIngressSends(base, { ...expected[0], title: conflict.title, hash: conflict.normalizedSha256, occurrenceId: first.occurrenceId, envelope: conflictEnvelope });
-  const decoder = peer.createFeishuFrameReceiver(), commits: Record<string, unknown>[] = [], calls: string[] = [];
+  const decoder = peer.createFeishuFrameReceiver(), commits: Record<string, unknown>[] = [], calls: string[] = [], trace = [...emptyActivity().trace];
   const state = () => h.readIngressState({ databasePath, occurrenceId: first.occurrenceId });
-  const activity = () => ({ ...emptyActivity(), receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: copy(decoder.observations) } });
+  const activity = () => ({ ...emptyActivity(), trace: [...trace], receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: copy(decoder.observations) } });
   const fact = <T extends object>(name: string, value: T): T => { calls.push(name); mutate(name, value as Record<string, unknown>); return value; };
   let deliveries = 0;
   const effects = {
@@ -493,7 +536,10 @@ async function transactionConflictFixture(mutate: Mutation = () => {}) {
       // Admission/rollback are real. Reply bytes below are explicit C inputs, never an SDK result.
       if (deliveries === 2) assert.throws(() => store.acceptInvite(n, 100 + deliveries), /invite_conflict/);
       else {
-        store.acceptInvite(n, 100 + deliveries); const projection = state();
+        const status = store.acceptInvite(n, 100 + deliveries);
+        if ((status !== "replay" || replayNeedsJoinDecision(store.inviteJoinStatus(n.occurrenceId))) && store.getSession(n.occurrenceId) === null &&
+          store.admitInviteJoin(n.occurrenceId, decisions === "each" ? 100 + deliveries : 101, "inviter_not_allowed") === "inviter_not_allowed") trace.push("invite_admission_inviter_not_allowed");
+        const projection = state();
         commits.push({ ordinal: commits.length + 1, ackFloor: floor, wireMessageId: send.wireMessageId, eventId: n.eventId,
           expectedHash: n.normalizedSha256, persistedHash: projection.events.find((e: { eventId: string }) => e.eventId === n.eventId).hash, immutable: projection.immutable });
       }
@@ -501,13 +547,8 @@ async function transactionConflictFixture(mutate: Mutation = () => {}) {
       return fact("deliver", { ...(deliveries === 2 ? {} : { commit: copy(commits.at(-1)) }),
         receiver: { invalid: decoder.invalid, overflow: decoder.overflow, observations: [copy(decoder.observations.at(-1))] }, state: state() });
     },
-    async blocked() {
-      if (deliveries === 1) {
-        const claim = store.claimInviteMetadata(110)!;
-        store.failInviteClaim(claim, { status: "blocked", reason: "metadata_unavailable", retryable: false }, 111, 1000);
-      }
-      return fact("blocked", { state: state(), activity: activity() });
-    },
+    // A refused row parks its organizer lane: it is never claimed for a lookup.
+    async blocked() { assert.equal(store.claimInviteMetadata(110), null); return fact("blocked", { state: state(), activity: activity() }); },
     async activity() { return fact("activity", activity()); }, async discover() { return fact("discover", { launched: 0 }); },
     async read() { return fact("read", state()); },
     async close() { return fact("close", { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true,
@@ -518,11 +559,12 @@ async function transactionConflictFixture(mutate: Mutation = () => {}) {
     immutableExpected: Object.fromEntries(["occurrenceId", "region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt", "title"].map(k => [k, first[k as keyof typeof first]])) };
   return { plan, effects, calls, dispose() { store.close(); rmSync(root, { recursive: true, force: true }); } };
 }
-test("C real normalization/SQLite transaction/decoder feed shared selected phase with unchanged conflict and original replay", async () => {
-  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")), f = await transactionConflictFixture();
+for (const decisions of ["single", "each"] as const) test(`C real normalization/SQLite transaction/allowlist refusal/decoder feed shared selected phase with unchanged conflict and original replay (${decisions === "single" ? "decisions at one clock reading" : "each decision at its delivery's clock"})`, async () => {
+  const { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs")), f = await transactionConflictFixture(undefined, decisions);
   try {
     const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, true, JSON.stringify(result.failures));
     assert.equal(result.state.events.length, 3); assert.equal(result.state.immutable.title, "First accepted title");
+    assert.equal(result.state.metadata.reason, "inviter_not_allowed"); assert.equal(result.state.metadata.totalAttempts, 0); assert.deepEqual(result.state.sessions, []);
     assert.equal(result.state.immutable.acceptedAtMs, 101); assert.equal(result.close.commitObservations.length, 5);
     assert.deepEqual(result.close.receiver.observations.map((r: { payload: { code: number } }) => r.payload.code), [200, 500, 200, 200, 200, 200]);
   } finally { f.dispose(); }
@@ -639,7 +681,7 @@ for (const branch of ["default", "missing", "conflict", "conflict-missing"]) {
     assert.equal(result.success, true, JSON.stringify(result.failures)); assert.equal(result.phases.length, 2);
     assert.equal(result.phases[0].root, "/synthetic"); assert.equal(result.phases[1].databasePath, "/synthetic/db");
     assert.equal(f.calls.filter(n => n === "retry").length, 1);
-    assert.equal(f.calls.filter(n => n === "deliver").length, selected ? 6 : 4);
+    assert.equal(f.calls.filter(n => n === "deliver").length, selected ? 7 : 5);
     assert.equal(result.selectedCase, selected ? "conflicting-replay" : undefined);
     assert.equal(result.branch, missingLauncher ? "missing-launcher" : "live");
   });
@@ -676,8 +718,7 @@ test("C real empty store adapter baseline waits until selected rejection, never 
     assert.throws(read, /ingress_occurrence_count/);
     assert.doesNotThrow(() => assert.equal(readIngressConflictBaseline({ expectedCode: 200 }, adapterRead), undefined));
     assert.doesNotThrow(() => assert.equal(readIngressConflictBaseline({}, adapterRead), undefined)); assert.equal(reads, 0);
-    store.acceptInvite(invite, 100); const claim = store.claimInviteMetadata(101)!;
-    store.failInviteClaim(claim, { status: "blocked", reason: "metadata_unavailable", retryable: false }, 102, 1000);
+    store.acceptInvite(invite, 100); assert.equal(store.admitInviteJoin(invite.occurrenceId, 100, "inviter_not_allowed"), "inviter_not_allowed");
     const before = readIngressConflictBaseline({ expectedCode: 500 }, adapterRead);
     assert.equal(reads, 1); assert.equal(before.metadata.state, "metadata_blocked");
     assert.equal(readIngressConflictBaseline({ expectedCode: 200 }, adapterRead), undefined); assert.equal(reads, 1);
@@ -756,9 +797,10 @@ test("closed generation selection is finite and rejects conflicting branches bef
 
 // Synthetic lifecycle input only; these rows are never authored by the executable.
 function closedState() {
-  const s = blocked(); s.metadata = { ...s.metadata, state: "admitted", totalAttempts: 2, generationAttempts: 1,
-    organizerId: "ou_e2e_organizer", organizerSource: "reservation", reference: { kind: "reservation", reserveId: "reserve-e2e-1" }, admittedAtMs: 201,
-    retryGeneration: 1, operatorRetryCount: 1, lastOperator: "e2e-ingress-operator", lastOperatorRetryAtMs: 200 };
+  const s = blocked(); s.metadata = { ...s.metadata, state: "admitted", totalAttempts: 1, generationAttempts: 1,
+    organizerId: "ou_e2e_organizer", organizerSource: "reservation", reference: { kind: "reservation", reserveId: "reserve-e2e-1" }, admittedAtMs: 204,
+    retryGeneration: 2, operatorRetryCount: 1, lastOperator: "e2e-ingress-operator", lastOperatorRetryAtMs: 200 };
+  s.events = [...s.events, copy(allowedEvent)];
   return { ...s, sessions: [{ occurrenceId: identity.occurrenceId, providerMeetingId: identity.providerMeetingId,
     occurrenceStartedAt: identity.occurrenceStartedAt, state: "finalizing", terminalReason: null }],
     counts: { ...s.counts, custody: 1, recording: 1 },
@@ -797,7 +839,10 @@ async function reopenFixture(mutate: Mutation = () => {}) {
   const acceptedAudit = (state: Record<string, unknown>) => { if (Array.isArray(state.events)) for (const [i, e] of state.events.entries()) Object.assign(e, { acceptedAtMs: 100 + i }); };
   acceptedAudit(current);
   const emptyEvidence = () => ({ generation: [], timedOwner: [], recording: [], recovery: [], physical: [], unknownEnd: [], counts: { failedRecording: 0, alignmentAttempt: 0 } });
+  // Owner 2's allowed invite: its decoded ACK and commit stay in that owner's settled activity and close.
+  const allowedAck: ReturnType<typeof emptyActivity>["receiver"]["observations"] = [], allowedCommits: Record<string, unknown>[] = [];
   const f = syntheticEffects(false, (name, value) => {
+    if (phase === 2 && name === "deliver") { allowedAck.push(...copy((value.receiver as ReturnType<typeof emptyActivity>["receiver"]).observations)); allowedCommits.push(copy(value.commit as Record<string, unknown>)); }
     // Existing owners receive selected reader shape even before generation creation.
     if (["deliver", "blocked", "launched", "retry"].includes(name)) (value.state as Record<string, unknown>).reopenEvidence = emptyEvidence();
     if (name === "read" || name === "between") value.reopenEvidence = emptyEvidence();
@@ -812,7 +857,8 @@ async function reopenFixture(mutate: Mutation = () => {}) {
   Object.assign(f.plan, { closedGenerationReopen: true });
   const ordinaryRun = f.effects.runOwner, ordinaryClose = f.owner.close;
   const fact = <T extends object>(name: string, value: T) => { f.calls.push(name); const result = copy(value); mutate(name, result as Record<string, unknown>); return result; };
-  let settled = false; const live = () => ({ ...emptyActivity(), files: historyFact().files, runtimePids: [43], bridge: { pid: 44, bridgeSessionId: "synthetic-bridge", envKeys: ["PATH"] },
+  const allowedReceiver = () => ({ invalid: false, overflow: false, observations: copy(allowedAck) });
+  let settled = false; const live = () => ({ ...emptyActivity(), receiver: allowedReceiver(), files: historyFact().files, runtimePids: [43], bridge: { pid: 44, bridgeSessionId: "synthetic-bridge", envKeys: ["PATH"] },
     outcomes: [{ occurrenceId: identity.occurrenceId, phase: "settled", controlSessionId: "41", failure: null, finalization: "recorded", custody: "assigned", runtimeClose: "closed", runtimeCleanup: "graceful" }] });
   const receiver = emptyActivity().receiver; const commits: Record<string, unknown>[] = [];
   const reopenedActivity = () => ({ ...emptyActivity(), requests: [{ route: "ws_endpoint", status: 200 }], files: historyFact().files, history: historyFact(), receiver });
@@ -823,7 +869,9 @@ async function reopenFixture(mutate: Mutation = () => {}) {
       if (phase === 1 || !settled) return ordinaryClose();
       return fact("close", { standaloneExit: 0, compositionClosed: true, peerClosed: true, lockClosedLast: true, cleanupFailures: [], finalState: current,
         keyCustody: "private_runtime_file", outcomes: phase === 2 ? live().outcomes : [], trace: [], environmentKeys: ["PATH"],
-        receiver, observerFailure: false, overflow: false, commitObservations: commits, ackObservations: receiver.observations, history: historyFact() });
+        ...(phase === 2 ? { receiver: allowedReceiver(), commitObservations: copy(allowedCommits), ackObservations: copy(allowedAck) }
+          : { receiver, commitObservations: commits, ackObservations: receiver.observations }),
+        observerFailure: false, overflow: false, history: historyFact() });
     },
   });
   f.effects.runOwner = async (p, signal) => {

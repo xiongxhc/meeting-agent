@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { assertIngressAck, assertIngressAudit, assertIngressClose, assertIngressFinalReceiver, assertIngressIsolation, assertIngressLaunch, assertIngressRetry, assertIngressReceiver,
+import { assertIngressAck, assertIngressAudit, assertIngressClose, assertIngressFinalReceiver, assertIngressIsolation, assertIngressLaunch, assertIngressRetry, assertIngressRetryRefused, assertIngressReceiver,
   assertIngressConflict, assertIngressSelection, assertIngressClosedGeneration, assertIngressReopenActivity, assertIngressReopenDiscovery, ingressReopenState, ingressRemovalFact, ingressHistoryFact, readIngressHistory, ingressReopenPhaseFact, ingressData, ingressFact, ingressCloseFact, ingressFailure, ingressReceiverFact, boundedBytes, boundedJson, ingressPathExists, readIngressState, requireIngress } from "./ingress-run.mjs";
 import { readStateFile } from "./state-file.mjs";
 
@@ -79,10 +79,13 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
           const actual = delivered.state.events.find(row => row.eventId === event.eventId);
           requireIngress(JSON.stringify(actual) === JSON.stringify(event), "audit_replay_mutation");
         }
+        // Every invite here comes from an inviter the allowlist does not name: refused on the row, never joined.
         const fact = await step("blocked"); state = fact.state; activity = fact.activity;
         assertIngressReceiver(activity.receiver, wireIds);
         assertIngressAudit(state, audits, immutable); assertIngressIsolation(state, activity);
-        requireIngress(activity.requests.some(row => row.route === "unmatched" && row.status === 404), "actual_404");
+        const refusals = activity.trace.filter(code => code === "invite_admission_inviter_not_allowed").length;
+        // One refusal per distinct invite; an exact replay is not decided or logged again.
+        requireIngress(refusals === audits.length, "refusal_logged");
       }
       const before = state; await step("discover"); state = await step("read");
       requireIngress(JSON.stringify(state) === JSON.stringify(before), "blocked_discovery_mutation");
@@ -104,21 +107,29 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
       state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(baseline), "reopen_projection");
       activity = await step("activity"); assertIngressReopenActivity(activity, plan.history); assertIngressReceiver(activity.receiver, [send]);
     } else {
-      requireIngress(plan.phase === 2 && plan.original, "reopen_plan");
+      requireIngress(plan.phase === 2 && plan.original && plan.allowedSend, "reopen_plan");
       state = await step("read"); requireIngress(JSON.stringify(state) === JSON.stringify(plan.original), "reopen_projection");
       activity = await step("activity"); assertIngressReceiver(activity.receiver, []);
+      // The recorded refusal survives the reopen; the tick never re-decides it.
       await step("discover"); state = await step("read"); activity = await step("activity");
       requireIngress(JSON.stringify(state) === JSON.stringify(plan.original), "automatic_retry"); assertIngressIsolation(state, activity);
       assertIngressReceiver(activity.receiver, []);
+      // An operator retry reopens only the organizer lane; the next tick refuses the row again (fails closed).
       const retried = await step("retry", plan.occurrenceId); assertIngressRetry(plan.original, retried);
-      await step("discover"); const launched = await step("launched"); assertIngressLaunch(plan.original, launched, plan.missingLauncher);
+      await step("discover"); state = await step("read"); activity = await step("activity");
+      assertIngressRetryRefused(retried, state, activity); assertIngressReceiver(activity.receiver, []);
+      // A later invite for the same meeting from the allowlisted inviter joins it without waiting on the organizer.
+      const allowed = { ...plan.allowedSend, expectedCode: 200 };
+      const delivered = await step("deliver", allowed); assertIngressAck(allowed, delivered, plan.original.immutable);
+      acceptedSends.push(allowed); acceptedCommits.push(delivered.commit);
+      const launched = await step("launched"); assertIngressLaunch(plan.original, launched, plan.missingLauncher, plan.allowedSend);
       state = launched.state; activity = launched.activity;
-      assertIngressReceiver(activity.receiver, []);
+      assertIngressReceiver(activity.receiver, [allowed]);
       if (!plan.missingLauncher) {
         const idle = await step("discover"); requireIngress(idle.launched === 0, "second_launch");
         const next = { state: await step("read"), activity: await step("activity") };
-        assertIngressLaunch(plan.original, next, false);
-        assertIngressReceiver(next.activity.receiver, []);
+        assertIngressLaunch(plan.original, next, false, plan.allowedSend);
+        assertIngressReceiver(next.activity.receiver, [allowed]);
         requireIngress(next.activity.outcomes[0].controlSessionId === activity.outcomes[0].controlSessionId &&
           next.activity.bridge.pid === activity.bridge.pid && next.activity.bridge.bridgeSessionId === activity.bridge.bridgeSessionId, "live_binding_changed");
         state = next.state; activity = next.activity;
@@ -134,7 +145,7 @@ export async function runIngressPhase(plan, effects, { signal, budgetMs = 120000
           requireIngress(a.outcomes.length === 1 && row.phase === "settled" && row.failure === null && row.finalization === "recorded" && row.custody === "assigned" &&
             row.runtimeClose === "closed" && row.runtimeCleanup === "graceful" && row.controlSessionId === before.outcomes[0].controlSessionId &&
             a.bridge.pid === before.bridge.pid && a.bridge.bridgeSessionId === before.bridge.bridgeSessionId, "reopen_settlement");
-          assertIngressIsolation(settled.state, a, false); assertIngressReceiver(a.receiver, []);
+          assertIngressIsolation(settled.state, a, false); assertIngressReceiver(a.receiver, [allowed]);
           state = settled.state; activity = a;
         }
       }
@@ -298,6 +309,8 @@ async function runRealEntry(plan) {
         const rows = outcomes(), row = rows[0];
         if (plan.missingLauncher ? row?.phase === "settled" : row?.phase === "live") {
           const fact = { state: read(), activity: activity() };
+          // The join does not wait on the organizer; the separate lookup still settles before the oracle.
+          if (fact.state.metadata.state !== "admitted") return null;
           if (plan.missingLauncher || fact.activity.bridge?.mediaConnected && fact.activity.bridge.framesSent > 0 &&
             (!plan.closedGenerationReopen || fact.state.sessions[0]?.state === "listening")) return fact;
         }
@@ -306,7 +319,7 @@ async function runRealEntry(plan) {
     },
     async remove() {
       check(); requireIngress(plan.closedGenerationReopen && plan.phase === 2 && !ingressPathExists(path.join(plan.controlDir, "end")), "removal_control");
-      const fact = { state: read(), activity: activity() }; assertIngressLaunch(plan.original, fact, false);
+      const fact = { state: read(), activity: activity() }; assertIngressLaunch(plan.original, fact, false, plan.allowedSend);
       requireIngress(fact.state.sessions[0].state === "listening", "reopen_listening");
       writeFileSync(path.join(plan.controlDir, "end"), "removed", { mode: 0o600, flag: "wx" }); return { requested: "removed" };
     },

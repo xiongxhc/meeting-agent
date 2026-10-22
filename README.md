@@ -157,10 +157,15 @@ The raw development checkout includes an
 excluded partial implementation and is not the packaged source for these commands.
 
 The prepared ingress recovery campaign uses two sequential application owners
-against the same preserved private root. An unavailable reservation first leaves
-one durable metadata-blocked invite; duplicate and reordered events keep its
-first title and identity. A corrected resolver on reopen leaves it blocked until
-one public operator retry, then verifies one Runtime/bridge launch:
+against the same preserved private root. The first owner receives invites only
+from an inviter the allowlist does not name: each is refused and recorded on the
+invite row (`inviter_not_allowed`), with no session and no organizer lookup, and
+duplicate and reordered events keep its first title and identity. On reopen the
+refusal stands. One public operator retry reopens only the organizer lane, and the
+next tick refuses the row again (`inviter_unverified`). A later invite for the same
+meeting from the allowlisted inviter then joins at once, without organizer details,
+and the reopened organizer lookup resolves separately. The campaign verifies one
+Runtime/bridge launch:
 
 ```sh
 /opt/homebrew/opt/node@24/bin/node e2e/ingress-run.mjs --out /absolute/private/evidence/ingress
@@ -169,7 +174,8 @@ one public operator retry, then verifies one Runtime/bridge launch:
 
 Use a fresh output directory for each sequential invocation on a permitted host.
 The missing-launcher branch requires admitted metadata and the actual lazy
-Runtime startup failure before any bridge launch. Inventory or root refusal
+Runtime startup failure before any bridge launch; the same tick may retry that
+failed start once. Inventory or root refusal
 leaves that branch unexecuted. Exact commit-before-ACK observations, final ACK
 history, direct-child and descendant cleanup must all pass; both roots are
 preserved. The listener-free source checks do not establish R5/R7 application
@@ -184,8 +190,9 @@ under the original event identity, then replays the original content:
 
 It requires an actual decoded SDK 500 for the conflict, no commit observation and
 an unchanged durable invitation. The subsequent original replay must receive 200
-and preserve the first title, hash and acceptance time. The existing two-owner
-reopen, public metadata retry and one-launch checks still apply. This option can
+and preserve the first title, hash and acceptance time, and leave the durable
+invitation unchanged. The existing two-owner reopen, refused retry, allowed
+later invite and one-launch checks still apply. This option can
 also combine with `--missing-launcher` in a separate fresh output directory.
 Reviewed listener-free tests cover the normalizer, store transaction, decoder and
 campaign controls; actual SDK/application execution remains unverified. This
@@ -219,13 +226,17 @@ names a new evidence file under an existing canonical parent directory:
 The first valid invite must receive 500 without a commit or partial occurrence.
 After exact trigger removal, the original invite must receive 200 as its first
 durable acceptance. A fresh ordinary application/store owner must then replay
-it unchanged. Missing metadata references keep the case blocked without launch.
-Both owners must close cleanly and the trigger must be absent. This is ordinary
+it unchanged. The staged config has an empty allowlist: each start logs
+`invite_admission_no_inviters_configured`, and the accepted invite is refused and
+recorded on its row with no session, launch or organizer lookup. Both owners must
+close cleanly and the trigger must be absent. This is ordinary
 same-process reopen after a nonfatal transaction abort. Real-store components
 do not establish actual SDK ACKs, admitted ownership or crash recovery.
 
 The separate durable-backlog selection fills the production 256-invitation
-backlog without launching meetings. For this command, `--out` names a new
+backlog with allowlisted invites. Each is admitted at once with no organizer.
+The first occupies the single bridge slot with its Runtime start held, so no
+Runtime, bridge or recording starts, and the rest are deferred. For this command, `--out` names a new
 JSON evidence file under an existing canonical private parent directory:
 
 ```sh
@@ -233,11 +244,13 @@ JSON evidence file under an existing canonical private parent directory:
 ```
 
 All 256 distinct invitations must commit before receiving 200, then settle
-with missing metadata references. Invitation 257 must receive 500 without a commit or partial row.
+with missing metadata references, each with one discovered session admitted by
+the allowlist. Their Feishu invite times are years old but their arrivals are
+fresh, so none is stale. Invitation 257 must receive 500 without a commit or partial row.
 After clean ordinary application/store reopen, each original invitation must
 receive 200 as an unchanged replay; the same overflow invitation must still
-receive 500. The full invitation, audit and metadata state must remain intact,
-with no downstream meeting work. Each application must close with zero owned transport work before fixture
+receive 500. The full invitation, audit, metadata and admitted-session state must
+remain intact, with no other downstream meeting work. Each application must close with zero owned transport work before fixture
 cleanup; the peer then closes before admitted return and owner release. The
 first owner must fully settle before the second begins. This is ordinary same-process reopen, not
 process restart. Real-store and decoded-frame components do not establish actual

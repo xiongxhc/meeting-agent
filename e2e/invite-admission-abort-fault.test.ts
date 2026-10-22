@@ -34,11 +34,14 @@ test("actual event INSERT abort rolls back the first new occurrence and all thir
     assert.deepEqual(rawProjection(f.databasePath), before); assert.equal(store.getInviteOccurrence(f.invite.occurrenceId), null); assert.throws(() => fault.install());
   } finally { store.close(); f.cleanup(); }
 });
-test("explicit clear permits first acceptance, component reference_missing discovery, and ordinary store reopen replay with full equality", async () => {
+test("explicit clear permits first acceptance, its allowlist refusal without any organizer lookup, and ordinary store reopen replay with full equality", async () => {
   const f = componentFixture(); let store = f.open();
   try { const fault = await controller(f); fault.install(); assert.throws(() => store.acceptInvite(f.invite, 1700000000001)); fault.clear(); assert.equal(store.acceptInvite(f.invite, 1700000000002), "accepted");
-    const discovery = createInviteDiscovery({ store, metadata: { async resolve() { return { status: "blocked", reason: "reference_missing", retryable: false }; } }, now: () => 1700000000003 });
-    assert.equal(await discovery.runOnce(), true); assert.equal(await discovery.close(), true); const before = rawProjection(f.databasePath); store.close(); store = f.open();
+    // The composition's join decision right after the commit: an empty allowlist refuses on the row, no session.
+    assert.equal(store.admitInviteJoin(f.invite.occurrenceId, 1700000000002, "inviter_not_allowed"), "inviter_not_allowed"); assert.equal(store.getSession(f.invite.occurrenceId), null);
+    let lookups = 0; const discovery = createInviteDiscovery({ store, metadata: { async resolve() { lookups++; return { status: "blocked", reason: "reference_missing", retryable: false }; } }, now: () => 1700000000003 });
+    assert.equal(await discovery.runOnce(), false); assert.equal(lookups, 0); assert.equal(await discovery.close(), true);
+    assert.equal(store.getInviteOccurrence(f.invite.occurrenceId)?.lastBlockedReason, "inviter_not_allowed"); const before = rawProjection(f.databasePath); store.close(); store = f.open();
     assert.equal(store.acceptInvite(f.invite, 1700000001000), "replay"); assert.deepEqual(rawProjection(f.databasePath), before); assert.equal(fault.inspect().phase, "cleared"); assert.throws(() => fault.clear());
   } finally { store.close(); f.cleanup(); }
 });

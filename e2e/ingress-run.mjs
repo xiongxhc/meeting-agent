@@ -348,8 +348,8 @@ export function readIngressState(input) {
       metadata.reference = metadata.reference === null ? null : JSON.parse(metadata.reference);
       const events = db.prepare(`SELECT event_id AS eventId,normalized_sha256 AS hash,topic AS title,
         create_time AS createTime,invite_seconds AS inviteSeconds,start_seconds AS startSeconds,accepted_at_ms AS acceptedAtMs
-        FROM feishu_invite_events WHERE occurrence_id=? ORDER BY event_id LIMIT 4`).all(occurrenceId);
-      requireIngress(events.length <= 3 && db.prepare("SELECT count(*) AS n FROM feishu_invite_events").get().n === events.length, "audit_count");
+        FROM feishu_invite_events WHERE occurrence_id=? ORDER BY event_id LIMIT 5`).all(occurrenceId);
+      requireIngress(events.length <= 4 && db.prepare("SELECT count(*) AS n FROM feishu_invite_events").get().n === events.length, "audit_count");
       const sessions = db.prepare(`SELECT occurrence_id AS occurrenceId,provider_meeting_id AS providerMeetingId,
         occurrence_started_at AS occurrenceStartedAt,state,terminal_reason AS terminalReason FROM sessions LIMIT 2`).all();
       requireIngress(sessions.length <= 1 && sessions.every(row => row.occurrenceId === occurrenceId), "session_count");
@@ -454,16 +454,33 @@ export function assertIngressReceiver(receiver, expected) {
   }
 }
 const forbiddenKeys = ["E2E_RUNTIME_RECORDING_KEY", "E2E_RECORDING_KEY", "E2E_PROVIDER_CREDENTIAL", "FEISHU_APP_SECRET", "RUNTIME_SECRET", "NODE_OPTIONS"];
-export function assertIngressIsolation(state, activity, blocked = true) {
+/** `refusal` names the join refusal recorded on the invite row (false: not refused). A refused
+ * invite is never joined and never triggers an organizer lookup. */
+export function assertIngressIsolation(state, activity, refusal = "inviter_not_allowed") {
   requireIngress(state.counts.seed === 0 && state.counts.delivery === 0 && state.counts.notification === 0 && activity.messages.length === 0 &&
     activity.files.outbox === 0 && activity.files.receipt === 0, "publication_isolation");
   requireIngress(forbiddenKeys.every(key => !activity.envKeys.includes(key)), "environment_boundary");
-  if (!blocked) return;
+  if (refusal === false) return;
+  requireIngress(["inviter_not_allowed", "inviter_unverified"].includes(refusal), "refusal_selection");
   const m = state.metadata;
-  requireIngress(m.state === "metadata_blocked" && m.reason === "metadata_unavailable" && m.claimed === 0 && m.claimExpiresAtMs === null &&
+  requireIngress(m.totalAttempts === 0 && m.generationAttempts === 0 && m.firstAttemptAtMs === null && m.lastAttemptAtMs === null &&
+    activity.requests.every(row => ["ws_endpoint", "tenant_access_token"].includes(row.route) && row.status === 200), "refused_lookup");
+  requireIngress(m.state === "metadata_blocked" && m.reason === refusal && m.claimed === 0 && m.claimExpiresAtMs === null &&
     m.organizerId === null && m.organizerSource === null && m.reference === null && m.admittedAtMs === null && state.sessions.length === 0 &&
     Object.values(state.counts).every(n => n === 0) && activity.runtimePids.length === 0 && activity.bridge === null && activity.outcomes.length === 0 &&
     !activity.trace.some(code => code.startsWith("occurrence_")) && activity.files.recording === 0 && activity.files.key === false, "blocked_isolation");
+}
+/** Operator retry reopens only the organizer lane. The next tick no longer knows the inviter, so it
+ * refuses the row as inviter_unverified: a retry can never join a refused invite. */
+export function assertIngressRetryRefused(retried, state, activity) {
+  const m = state.metadata, r = retried.state.metadata;
+  assertIngressAudit(state, retried.state.events, retried.state.immutable); assert.deepEqual(state.events, retried.state.events);
+  requireIngress(state.fileIdentity === retried.state.fileIdentity && m.state === "metadata_blocked" && m.reason === "inviter_unverified" &&
+    m.retryGeneration === r.retryGeneration && m.operatorRetryCount === r.operatorRetryCount && m.lastOperator === r.lastOperator &&
+    m.lastOperatorRetryAtMs === r.lastOperatorRetryAtMs && m.totalAttempts === r.totalAttempts && Number.isSafeInteger(m.lastBlockedAtMs) &&
+    m.lastBlockedAtMs >= r.lastOperatorRetryAtMs, "retry_cannot_admit");
+  assertIngressIsolation(state, activity, "inviter_unverified");
+  requireIngress(activity.trace.includes("invite_admission_inviter_unverified"), "retry_refusal_logged");
 }
 export function assertIngressRetry(before, result) {
   requireIngress(result.result === "pending", "public_retry");
@@ -476,18 +493,30 @@ export function assertIngressRetry(before, result) {
     m.nextAttemptAtMs === m.lastOperatorRetryAtMs && m.organizerId === null && m.reference === null && m.admittedAtMs === null, "retry_projection");
   assert.deepEqual(state.counts, before.counts);
 }
-export function assertIngressLaunch(before, fact, missingLauncher) {
+/** A later invite from the allowlisted inviter for the refused meeting joins it at once: the launch
+ * carries no organizer, and the reopened organizer lane resolves separately. `allowed` is its audit row. */
+export function assertIngressLaunch(before, fact, missingLauncher, allowed) {
   const { state, activity: a } = fact, m = state.metadata;
-  assertIngressAudit(state, before.events, before.immutable); assert.deepEqual(state.events, before.events);
+  requireIngress(allowed && !before.events.some(row => row.eventId === allowed.eventId), "allowed_selection");
+  assertIngressAudit(state, [...before.events, allowed], before.immutable);
+  for (const event of before.events) requireIngress(JSON.stringify(state.events.find(row => row.eventId === event.eventId)) === JSON.stringify(event), "audit_replay_mutation");
+  // Retry generation: the operator retry, then the allowed invite reopening the parked organizer lane.
   requireIngress(state.fileIdentity === before.fileIdentity && m.state === "admitted" && m.organizerId === "ou_e2e_organizer" && m.organizerSource === "reservation" &&
     m.reference?.kind === "reservation" && m.reference.reserveId === "reserve-e2e-1" && m.admittedAtMs !== null && m.claimed === 0 &&
-    m.retryGeneration === before.metadata.retryGeneration + 1 && m.operatorRetryCount === before.metadata.operatorRetryCount + 1 &&
+    m.retryGeneration === before.metadata.retryGeneration + 2 && m.operatorRetryCount === before.metadata.operatorRetryCount + 1 &&
     m.totalAttempts === before.metadata.totalAttempts + 1 && m.generationAttempts === 1 && state.sessions.length === 1 &&
     state.sessions[0].occurrenceId === before.immutable.occurrenceId && state.sessions[0].providerMeetingId === before.immutable.providerMeetingId &&
     state.sessions[0].occurrenceStartedAt === before.immutable.occurrenceStartedAt, "admitted_projection");
   requireIngress(["reserve_active_meeting", "reserve_get", "contact_user_get"].every(route => a.requests.some(r => r.route === route && r.status === 200)), "metadata_requests");
-  requireIngress(a.trace.filter(code => code === "occurrence_launched").length === 1 && a.outcomes.length === 1, "one_launch");
+  // Missing launcher: the startup failure settles without a session, so the same tick's post-lookup pass may
+  // retry it once; a live launch is never repeated.
+  const launches = a.trace.filter(code => code === "occurrence_launched").length;
+  requireIngress((missingLauncher ? launches >= 1 && launches <= 2 : launches === 1) && a.outcomes.length === 1, "one_launch");
   const outcome = a.outcomes[0]; requireIngress(outcome.occurrenceId === before.immutable.occurrenceId, "launch_occurrence");
+  // The join never waited on the organizer: the launched identity has none (a missing-launcher retry may
+  // be launched after the lookup resolved, so only a single attempt is held to that).
+  requireIngress((missingLauncher && launches === 2 || outcome.organizer === null) &&
+    a.trace.indexOf("occurrence_launched") > a.trace.lastIndexOf("invite_admission_inviter_unverified"), "launch_without_organizer");
   assertIngressIsolation(state, a, false);
   if (missingLauncher) {
     requireIngress(outcome.phase === "settled" && outcome.failure === "runtime_startup_failed" && outcome.controlSessionId === null &&
@@ -778,12 +807,18 @@ async function realMain(argv) {
       staged = stage({ repository: path.resolve(import.meta.dirname, "..") });
       const meeting = { providerMeetingId: "meeting-ingress-e2e", meetingNo: "987654321", title: "First accepted title", startSeconds: Math.floor(Date.now() / 1000),
         eventId: "ingress-a", inviteSeconds: Math.floor(Date.now() / 1000), createTimeMs: Date.now() };
-      const { inviteEnvelope, SCOPE } = await import("./feishu-peer.mjs");
+      const { inviteEnvelope, SCOPE, E2E_STRANGER } = await import("./feishu-peer.mjs");
       const { normalizeInvite } = await import("../dist/src/ports/feishu-ingress.js");
-      const envelopes = [inviteEnvelope(meeting), inviteEnvelope({ ...meeting, eventId: "ingress-b", title: "Later observed title", inviteSeconds: meeting.inviteSeconds + 1, createTimeMs: meeting.createTimeMs + 1000 }),
-        inviteEnvelope({ ...meeting, eventId: "ingress-c", title: "Earlier event delivered late", inviteSeconds: meeting.inviteSeconds - 1, createTimeMs: meeting.createTimeMs - 1000 })];
-      const normalized = envelopes.map(raw => normalizeInvite(raw, SCOPE));
-      const expected = normalized.map(n => ({ eventId: n.eventId, hash: n.normalizedSha256, title: n.title, createTime: n.createTime, inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds }));
+      // Owner 1 sees only invites from an inviter the allowlist does not name: each is refused and recorded.
+      // Owner 2 receives one later invite for the same meeting from the allowlisted inviter: it joins.
+      const stranger = { ...meeting, inviterId: E2E_STRANGER };
+      const envelopes = [inviteEnvelope(stranger), inviteEnvelope({ ...stranger, eventId: "ingress-b", title: "Later observed title", inviteSeconds: meeting.inviteSeconds + 1, createTimeMs: meeting.createTimeMs + 1000 }),
+        inviteEnvelope({ ...stranger, eventId: "ingress-c", title: "Earlier event delivered late", inviteSeconds: meeting.inviteSeconds - 1, createTimeMs: meeting.createTimeMs - 1000 })];
+      const allowedEnvelope = inviteEnvelope({ ...meeting, eventId: "ingress-d", title: "Allowed inviter title", inviteSeconds: meeting.inviteSeconds + 2, createTimeMs: meeting.createTimeMs + 2000 });
+      const normalized = envelopes.map(raw => normalizeInvite(raw, SCOPE)), allowedNormalized = normalizeInvite(allowedEnvelope, SCOPE);
+      const expectedRow = n => ({ eventId: n.eventId, hash: n.normalizedSha256, title: n.title, createTime: n.createTime, inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds });
+      const expected = normalized.map(expectedRow);
+      requireIngress(normalized.every(n => n.inviterId === E2E_STRANGER) && allowedNormalized.inviterId !== E2E_STRANGER && allowedNormalized.occurrenceId === normalized[0].occurrenceId, "allowed_selection");
       if (options.missingLauncher) {
         staged.standaloneConfig.runtime.launcherPath = path.join(staged.root, "unavailable-runtime-launcher");
         writeFileSync(staged.standaloneConfigPath, JSON.stringify(staged.standaloneConfig), { mode: 0o600 });
@@ -793,10 +828,11 @@ async function realMain(argv) {
         immutableExpected: Object.fromEntries(["occurrenceId", "region", "tenantKey", "appId", "providerMeetingId", "meetingNo", "occurrenceStartedAt", "title"].map(key => [key, normalized[0][key]])),
         occurrenceId: normalized[0].occurrenceId, sends: [0, 1, 2, 0].map((index, at) => ({ ...expected[index], occurrenceId: normalized[0].occurrenceId,
           wireMessageId: `phase1-${["a-1", "b-1", "c-1", "a-2"][at]}`, envelope: envelopes[index] })),
+        allowedSend: { ...expectedRow(allowedNormalized), occurrenceId: allowedNormalized.occurrenceId, wireMessageId: "phase2-d-1", envelope: allowedEnvelope },
         standaloneConfigPath: staged.standaloneConfigPath, controlDir: staged.directories.control, runtimePidsPath: staged.gatewayPidsPath,
         keyPath: staged.keyPath, directories: staged.directories });
       if (options.conflictingReplay) {
-        const envelope = inviteEnvelope({ ...meeting, title: "Conflicting replay title" }), n = normalizeInvite(envelope, SCOPE);
+        const envelope = inviteEnvelope({ ...stranger, title: "Conflicting replay title" }), n = normalizeInvite(envelope, SCOPE);
         plan.sends = selectIngressSends(plan.sends, { eventId: n.eventId, hash: n.normalizedSha256, title: n.title,
           createTime: n.createTime, inviteSeconds: n.inviteSeconds, startSeconds: n.startSeconds, occurrenceId: n.occurrenceId, envelope });
       }

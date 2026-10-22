@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
+import { replayNeedsJoinDecision } from "../src/ports/session-store.ts";
 const modulePath = path.resolve(import.meta.dirname, "invite-admission-abort-run.mjs");
 async function runner() { assert.ok(existsSync(modulePath), "the selected finite rollback campaign must exist"); return import(modulePath); }
 const H = "a".repeat(64);
@@ -14,17 +15,17 @@ export function goodFacts() {
   const fault = (phase: string) => ({ phase, trigger: "e2e_invite_admission_abort", templateSha256: H, targetHash: H, ownerCurrent: true, databaseBound: true, schemaExact: true, helperHandles: 0, installOrdinal: 1, clearOrdinal: phase === "cleared" ? 2 : null, invalid: false });
   const counts = Object.fromEntries(["feishu_invite_occurrences", "feishu_invite_events", "sessions", "bridge_leases", "physical_client_custody", "reconciliation_generations", "recordings", "bridge_failure_recordings", "recording_recovery_bindings", "unknown_end_custody", "backfill_seeds", "delivery_journal", "notification_intents"].map(t => [t, 0]));
   const empty = { databaseIdentitySame: true, counts, filesEmpty: true };
-  const durable = { databaseIdentitySame: true, immutableSame: true, eventHash: H, eventRows: 1, occurrenceRows: 1, acceptedAtMs: 1700000000002, state: "metadata_blocked", reason: "reference_missing", claimed: false, claimExpiresAtMs: null, organizerNull: true, referenceNull: true, admittedAtMs: null, totalAttempts: 1, generationAttempts: 1, retryGeneration: 0, operatorRetryCount: 0, metadataSame: true, downstreamZero: true, triggerAbsent: true, schemaRestored: true };
-  const delivery = (owner: number, wireId: string, code: number, ordinal: number) => ({ owner, wireId, expectedHash: H, ack: { code, receiverOrdinal: ordinal, matchingWire: true }, commit: code === 500 ? null : { ordinal: 1, persistedHash: H, ackFloor: ordinal - 1 }, auditRows: code === 500 ? 0 : 1, occurrenceRows: code === 500 ? 0 : 1, fault: fault(code === 500 ? "installed" : "cleared"), receiverInvalid: false, receiverOverflow: false });
+  const durable = { databaseIdentitySame: true, immutableSame: true, eventHash: H, eventRows: 1, occurrenceRows: 1, acceptedAtMs: 1700000000002, state: "metadata_blocked", reason: "inviter_not_allowed", claimed: false, claimExpiresAtMs: null, organizerNull: true, referenceNull: true, admittedAtMs: null, totalAttempts: 0, generationAttempts: 0, retryGeneration: 0, operatorRetryCount: 0, metadataSame: true, downstreamZero: true, triggerAbsent: true, schemaRestored: true };
+  const delivery = (owner: number, wireId: string, code: number, ordinal: number) => ({ owner, wireId, expectedHash: H, ack: { code, receiverOrdinal: ordinal, matchingWire: true }, commit: code === 500 ? null : { ordinal: 1, persistedHash: H, ackFloor: ordinal - 1 }, auditRows: code === 500 ? 0 : 1, occurrenceRows: code === 500 ? 0 : 1, refusalLogs: wireId === "abort-recover" ? 1 : 0, fault: fault(code === 500 ? "installed" : "cleared"), receiverInvalid: false, receiverOverflow: false });
   const deliveries = [delivery(1, "abort-first", 500, 1), delivery(1, "abort-recover", 200, 2), delivery(2, "abort-reopened", 200, 1)];
   const close = (owner: number) => ({ owner, firstSecondSame: true, thirdSame: true, fulfilled: true, repeatUnchanged: true, clean: true, httpActive: 0, httpSockets: { active: 0, pending: 0 }, wsSockets: { active: 0, pending: 0 }, peerConnections: 0, preFixtureObserved: true, fixtureCleanupStarted: true, publicCloseOrdinal: 1, storeClosedOrdinal: 9, preFixtureOrdinal: 10, peerClosedOrdinal: 11, admittedReturnOrdinal: 12, ownerCloseBeginOrdinal: 13, ownerCloseEndOrdinal: 14, standaloneExit: 0, invalid: false, overflow: false, cleanupFailures: [] });
   const history = (owner: number) => ({ owner, acks: deliveries.filter(d => d.owner === owner).map(d => ({ wireId: d.wireId, code: d.ack.code, receiverOrdinal: d.ack.receiverOrdinal })), commits: deliveries.filter(d => d.owner === owner && d.commit).map(d => ({ wireId: d.wireId, ...d.commit! })), lifecycle: shutdownCodes.map((code, i) => ({ ordinal: i + 1, code })), invalid: false, overflow: false });
-  return { fault, empty, durable, deliveries, close, history };
+  return { fault, empty, durable, deliveries, close, history, warned: true };
 }
 export function syntheticEffects(f = goodFacts()) {
   const calls: string[] = [];
   const effects = { async beginOwner(owner: number) { calls.push(`owner${owner}`); return {
-    async ready() { return { admitted: true, started: true, endpoint200: true, connections: 1, receiverEmpty: true, commitEmpty: true, discoveryEmpty: true, sideEffectsZero: true }; },
+    async ready() { return { admitted: true, started: true, endpoint200: true, connections: 1, receiverEmpty: true, commitEmpty: true, discoveryEmpty: true, sideEffectsZero: true, admissionWarned: f.warned }; },
     empty() { return f.empty; }, install() { calls.push("install"); return f.fault("installed"); }, inspectFault() { return f.fault("installed"); }, clear() { calls.push("clear"); return f.fault("cleared"); },
     async deliver(wireId: string) { calls.push(wireId); return f.deliveries.find(d => d.wireId === wireId); }, async blocked() { return f.durable; }, durable() { return f.durable; },
     async close() { calls.push(`close${owner}`); return { close: f.close(owner), history: f.history(owner), durable: f.durable }; },
@@ -35,7 +36,8 @@ test("finite campaign requires rollback then first acceptance then replay, with 
   const r = await runner(), f = syntheticEffects(); const result = await r.runInviteAdmissionAbortCampaign(f.effects, { expectedHash: H, sources: r.componentSourceIds() });
   assert.equal(result.success, true); assert.equal(result.label, "component-facts"); assert.deepEqual(f.calls, ["owner1", "install", "abort-first", "clear", "abort-recover", "close1", "owner2", "abort-reopened", "close2"]); assert.equal(result.deliveries.length, 3); assert.equal(result.closes.length, 2);
 });
-const negatives = ["partial_occurrence", "partial_event", "first200", "reject_commit", "early_clear", "changed_hash", "recover500", "missing_commit", "commit_ack_order", "wrong_wire", "reused_wire", "durable_identity", "metadata_admitted", "metadata_attempt", "trigger_survives", "extra_row", "close_rejected", "memoized_identity", "cleanup_before_snapshot", "stale_socket", "close_order", "duplicate_ack", "late_commit", "history_overflow"] as const;
+const negatives = ["partial_occurrence", "partial_event", "first200", "reject_commit", "early_clear", "changed_hash", "recover500", "missing_commit", "commit_ack_order", "wrong_wire", "reused_wire", "durable_identity", "metadata_admitted", "metadata_attempt", "trigger_survives", "extra_row",
+  "organizer_reason", "organizer_lookup", "joined", "unwarned", "recover_unrefused", "rollback_refused", "replay_relogged", "close_rejected", "memoized_identity", "cleanup_before_snapshot", "stale_socket", "close_order", "duplicate_ack", "late_commit", "history_overflow"] as const;
 for (const kind of negatives) test(`coherent campaign refuses ${kind}`, async () => {
   const r = await runner(), f = goodFacts();
   if (kind === "partial_occurrence") f.deliveries[0]!.occurrenceRows = 1;
@@ -54,10 +56,18 @@ for (const kind of negatives) test(`coherent campaign refuses ${kind}`, async ()
   if (kind === "metadata_attempt") f.durable.totalAttempts = 2;
   if (kind === "trigger_survives") f.durable.triggerAbsent = false;
   if (kind === "extra_row") f.durable.eventRows = 2;
+  // Allowlist admission: refusal on the row, no lookup, no session, start warning, one refusal per accepted invite.
+  if (kind === "organizer_reason") f.durable.reason = "reference_missing";
+  if (kind === "organizer_lookup") { f.durable.totalAttempts = 1; f.durable.generationAttempts = 1; }
+  if (kind === "joined") f.durable.downstreamZero = false;
+  if (kind === "unwarned") f.warned = false;
+  if (kind === "recover_unrefused") f.deliveries[1]!.refusalLogs = 0;
+  if (kind === "rollback_refused") f.deliveries[0]!.refusalLogs = 1;
+  if (kind === "replay_relogged") f.deliveries[2]!.refusalLogs = 1;
   const originalClose = f.close, originalHistory = f.history;
   f.close = owner => { const c = originalClose(owner); if (kind === "close_rejected") c.fulfilled = false; if (kind === "memoized_identity") c.thirdSame = false; if (kind === "cleanup_before_snapshot") c.preFixtureObserved = false; if (kind === "stale_socket") c.wsSockets.active = 1; if (kind === "close_order") { c.ownerCloseBeginOrdinal = 11; c.ownerCloseEndOrdinal = 12; c.peerClosedOrdinal = 13; c.admittedReturnOrdinal = 14; } return c; };
   f.history = owner => { const h = originalHistory(owner); if (kind === "duplicate_ack") h.acks.push({ ...h.acks[0]! }); if (kind === "late_commit") h.commits.push({ wireId: "abort-first", ordinal: 2, persistedHash: H, ackFloor: 2 }); if (kind === "history_overflow") h.overflow = true; if (kind === "close_order") h.lifecycle = [...shutdownCodes.slice(0, 10), "owner_close_begin", "owner_close_end", "peer_closed", "admitted_return"].map((code, i) => ({ ordinal: i + 1, code })); return h; };
-  const component = syntheticEffects(f), result = await r.runInviteAdmissionAbortCampaign(component.effects, { expectedHash: H, sources: r.componentSourceIds() }); assert.equal(result.success, false); assert.ok(result.failures.length > 0); if (kind !== "wrong_wire" && kind !== "reused_wire" && kind !== "history_overflow") assert.ok(component.calls.includes("close1")); assert.ok(!component.calls.includes("owner2"));
+  const component = syntheticEffects(f), result = await r.runInviteAdmissionAbortCampaign(component.effects, { expectedHash: H, sources: r.componentSourceIds() }); assert.equal(result.success, false); assert.ok(result.failures.length > 0); if (kind !== "wrong_wire" && kind !== "reused_wire" && kind !== "history_overflow") assert.ok(component.calls.includes("close1")); if (kind !== "replay_relogged") assert.ok(!component.calls.includes("owner2"));
 });
 test("getter/private diagnostics, custom arrays and component provenance cannot pass output validation", async () => {
   const r = await runner(), c = syntheticEffects(), result = await r.runInviteAdmissionAbortCampaign(c.effects, { expectedHash: H, sources: r.componentSourceIds() }); let calls = 0;
@@ -85,12 +95,16 @@ test("deadline refuses before invoking an expired effect and preserves synchrono
   await assert.rejects(r.inviteAbortDeadline(() => { now = 6; calls++; return {}; }, 5, 5, () => now)); assert.equal(calls, 1);
   now = 0; await assert.rejects(r.inviteAbortDeadline(() => { now = 6; throw new Error("private"); }, 5, 5, () => now), /invite_abort_deadline/);
 });
-test("real first-empty store/controller and real shared ACK decoder feed the finite consumer with explicitly synthetic wire status", async () => {
+// Store-level model of accept() (application-composition.ts), which decides the join right after each durable
+// commit: with no session, an empty allowlist records inviter_not_allowed on the row. Whether an exact replay is
+// decided again is production's replayNeedsJoinDecision, so a replay at a later clock leaves the row byte-identical.
+// accept() itself is pinned by the composition replay tests.
+for (const replayAtMs of [1700000000002, 1700000000004]) test(`real first-empty store/controller and real shared ACK decoder feed the finite consumer with explicitly synthetic wire status (replay at ${replayAtMs === 1700000000002 ? "the same" : "a later"} clock)`, async () => {
   const r = await runner(), faultApi = await import(path.resolve(import.meta.dirname, "invite-admission-abort-fault.mjs")), entry = await import(path.resolve(import.meta.dirname, "invite-admission-abort-entry.mjs")), peers = await import(path.resolve(import.meta.dirname, "feishu-peer.mjs"));
   const root = realpathSync(mkdtempSync(path.join(realpathSync(tmpdir()), "meeting-abort-wire-component-"))); chmodSync(root, 0o700); mkdirSync(path.join(root, "state"), { mode: 0o700 }); const databasePath = path.join(root, "state", "orchestration.db");
   const envelope = peers.inviteEnvelope({ eventId: "abort-original", providerMeetingId: "meeting-abort", meetingNo: "987654321", title: "Original title", startSeconds: 1700000000, inviteSeconds: 1700000000, createTimeMs: 1700000000000 }), n = normalizeInvite(envelope, peers.SCOPE), expectedHash = n.normalizedSha256;
   const open = () => openSessionStore({ filename: databasePath, migrationsDir: path.resolve(import.meta.dirname, "../migrations"), nowMs: 1700000000000 }); let store = open(), baseline: unknown, fault: ReturnType<typeof faultApi.createInviteAdmissionAbortFault>;
-  const owners: number[] = [], statuses: string[] = [], facts = goodFacts();
+  const owners: number[] = [], statuses: string[] = [], decisions: string[] = [], facts = goodFacts();
   function durable() {
     const projection = entry.readInviteAbortProjection(databasePath, n.occurrenceId), row = projection.occurrences[0]; if (!baseline) baseline = projection;
     return { ...facts.durable, eventHash: n.normalizedSha256, acceptedAtMs: row.accepted_at_ms, state: row.state, reason: row.last_blocked_reason, totalAttempts: row.total_attempts, generationAttempts: row.generation_attempts, immutableSame: JSON.stringify(projection) === JSON.stringify(baseline), metadataSame: JSON.stringify(projection) === JSON.stringify(baseline) };
@@ -99,21 +113,32 @@ test("real first-empty store/controller and real shared ACK decoder feed the fin
     fault = faultApi.createInviteAdmissionAbortFault({ root, databasePath, appDatabasePath: databasePath, configDatabasePath: databasePath, freshRoot: faultApi.registerInviteAbortFixture(root), owner: { assertCurrentOwnership() { /* finite synthetic ownership only */ } }, envelope, scope: peers.SCOPE });
     const effects = { async beginOwner(owner: number) {
       owners.push(owner); if (owner === 2) store = open(); const receiver = peers.createFeishuFrameReceiver(), deliveries: ReturnType<typeof facts.deliveries.slice> = [];
-      return { async ready() { return { admitted: true, started: true, endpoint200: true, connections: 1, receiverEmpty: true, commitEmpty: true, discoveryEmpty: true, sideEffectsZero: true }; }, empty() { return facts.empty; }, install() { return fault.install(); }, inspectFault() { return fault.inspect(); }, clear() { return fault.clear(); },
+      // The start warning is a composition fact; this store-level consumer states it explicitly.
+      return { async ready() { return { admitted: true, started: true, endpoint200: true, connections: 1, receiverEmpty: true, commitEmpty: true, discoveryEmpty: true, sideEffectsZero: true, admissionWarned: true }; }, empty() { return facts.empty; }, install() { return fault.install(); }, inspectFault() { return fault.inspect(); }, clear() { return fault.clear(); },
         async deliver(wireId: string) {
           const armed = fault.inspect(); let status: string;
+          let refusalLogs = 0;
+          // A rolled-back commit throws before the join decision, so nothing is refused or joined.
           if (wireId === "abort-first") { assert.throws(() => store.acceptInvite(n, 1700000000001), { code: "SQLITE_CONSTRAINT_TRIGGER", message: "e2e_invite_admission_abort" }); assert.equal(store.getInviteOccurrence(n.occurrenceId), null); status = "rollback"; }
-          else { status = store.acceptInvite(n, 1700000000002); assert.equal(status, wireId === "abort-recover" ? "accepted" : "replay"); }
+          else {
+            status = store.acceptInvite(n, 1700000000002); assert.equal(status, wireId === "abort-recover" ? "accepted" : "replay");
+            assert.equal(store.getSession(n.occurrenceId), null, "a refused invite never creates a session");
+            if (status !== "replay" || replayNeedsJoinDecision(store.inviteJoinStatus(n.occurrenceId))) {
+              const decision = store.admitInviteJoin(n.occurrenceId, wireId === "abort-recover" ? 1700000000002 : replayAtMs, "inviter_not_allowed");
+              decisions.push(decision); refusalLogs = decision === "inviter_not_allowed" ? 1 : 0;
+            }
+          }
           statuses.push(status);
           // Synthetic wire input is explicit and independent of the store throw.
           receiver.receive(peers.eventFrame({ code: wireId === "abort-first" ? 500 : 200 }, wireId)); const projected = entry.projectInviteAbortReceiver(receiver), observed = projected.observations.at(-1); assert.equal(observed.kind, "ack"); assert.equal(projected.invalid, false); assert.equal(projected.overflow, false);
-          const fact = { owner, wireId, expectedHash, ack: { code: observed.payload.code, receiverOrdinal: observed.ordinal, matchingWire: observed.messageId === wireId }, commit: wireId === "abort-first" ? null : { ordinal: 1, persistedHash: n.normalizedSha256, ackFloor: observed.ordinal - 1 }, auditRows: wireId === "abort-first" ? 0 : entry.readInviteAbortProjection(databasePath, n.occurrenceId).counts.feishu_invite_events, occurrenceRows: store.listInviteOccurrences().length, fault: armed, receiverInvalid: receiver.invalid, receiverOverflow: receiver.overflow }; deliveries.push(fact); return fact;
+          const fact = { owner, wireId, expectedHash, ack: { code: observed.payload.code, receiverOrdinal: observed.ordinal, matchingWire: observed.messageId === wireId }, commit: wireId === "abort-first" ? null : { ordinal: 1, persistedHash: n.normalizedSha256, ackFloor: observed.ordinal - 1 }, auditRows: wireId === "abort-first" ? 0 : entry.readInviteAbortProjection(databasePath, n.occurrenceId).counts.feishu_invite_events, occurrenceRows: store.listInviteOccurrences().length, refusalLogs, fault: armed, receiverInvalid: receiver.invalid, receiverOverflow: receiver.overflow }; deliveries.push(fact); return fact;
         },
-        async blocked() { const claim = store.claimInviteMetadata(1700000000003); if (claim) store.failInviteClaim(claim, { status: "blocked", reason: "reference_missing", retryable: false }, 1700000000003, 1000); return durable(); }, durable,
+        // A refused row parks its organizer lane: it is never claimed for a lookup.
+        async blocked() { assert.equal(store.claimInviteMetadata(1700000000003), null); assert.equal(store.inviteJoinStatus(n.occurrenceId)?.refusal, "inviter_not_allowed"); return durable(); }, durable,
         async close() { store.close(); const history = facts.history(owner); history.acks = deliveries.map(d => ({ wireId: d.wireId, code: d.ack.code, receiverOrdinal: d.ack.receiverOrdinal })); history.commits = deliveries.filter(d => d.commit).map(d => ({ wireId: d.wireId, ...d.commit! })); return { close: facts.close(owner), history, durable: durable() }; },
       };
     } };
-    const result = await r.runInviteAdmissionAbortCampaign(effects, { expectedHash, sources: r.componentSourceIds() }); assert.equal(result.success, true, JSON.stringify(result.failures)); assert.deepEqual(owners, [1, 2]); assert.deepEqual(statuses, ["rollback", "accepted", "replay"]); assert.equal(result.label, "component-facts");
+    const result = await r.runInviteAdmissionAbortCampaign(effects, { expectedHash, sources: r.componentSourceIds() }); assert.equal(result.success, true, JSON.stringify(result.failures)); assert.deepEqual(owners, [1, 2]); assert.deepEqual(statuses, ["rollback", "accepted", "replay"]); assert.deepEqual(decisions, ["inviter_not_allowed"]); assert.equal(result.label, "component-facts");
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 test("opaque thrown diagnostic getters are never evaluated or retained", async () => {
