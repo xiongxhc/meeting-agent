@@ -1303,12 +1303,37 @@ for (const [name, result, extraRows] of [
     assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result }), false);
   });
 }
-test("phase 2 bridge binding keeps the sampled path without a registration and accepts sampled plus registered", async () => {
+test("bridge binding has no sampled-only path: a sampled but unregistered bridge is refused; sampled plus registered binds", async () => {
   const { h, createProcessEvidence } = await bridgeBindingApis(), evidence = createProcessEvidence();
   sampledWithoutBridge(h, evidence, OWNER, `${BRIDGE} ${OWNER} node\n`);
-  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: ownerResult(BRIDGE) }), true);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: ownerResult(BRIDGE) }), false);
   assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE)])) }), true);
+  // An owner without a bridge (refusal phase, missing launcher, reopen phase 3) needs no registration.
   assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: { activity: { runtimePids: [], bridge: null } } }), true);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: { activity: { runtimePids: [], bridge: null }, bridgeSpawns: bridgeRecord(OWNER, []) } }), true);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: { activity: { runtimePids: [], bridge: null }, bridgeSpawns: bridgeRecord(OWNER, [settledBridge(BRIDGE)]) } }), false, "a registered bridge the activity never reported");
+});
+test("every owner that can spawn a bridge registers it; only the reopen admission owner (phase 3) does not", async () => {
+  const { provenance } = await bridgeBindingApis(), module = { spawn: () => ({}) };
+  const active = (plan: object) => "bridgeSpawns" in provenance.createOwnerBridgeSpawns(plan, { childProcessModule: module, ownerPid: OWNER, sync: () => {} }).attach({});
+  assert.deepEqual([{ phase: 1 }, { phase: 2 }, { phase: 1, missingLauncher: true }, { phase: 2, missingLauncher: true }, { phase: 2, conflictingReplay: true }].map(active), [true, true, true, true, true]);
+  assert.deepEqual([1, 2, 3].map(phase => active({ phase, closedGenerationReopen: true })), [false, true, false]);
+});
+test("ingress campaign phase 2 binds a real bridge that exits before any sample through the owner seam", async () => {
+  const { h, createProcessEvidence, provenance } = await bridgeBindingApis();
+  const { spawn } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(process.env.TMPDIR ?? "/private/tmp", "campaign-binding-")); chmodSync(dir, 0o700);
+  const script = path.join(dir, "e2e-bridge-child.mjs"); writeFileSync(script, "process.exit(0);\n", { mode: 0o600 });
+  const module = { spawn } as { spawn: typeof spawn };
+  const seam = provenance.createOwnerBridgeSpawns({ phase: 2, missingLauncher: false }, { childProcessModule: module, ownerPid: process.pid, sync: () => {} });
+  try {
+    seam.start();
+    const bridge = module.spawn(process.execPath, [script, "--config", path.join(dir, "config.json")], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: {}, shell: false, detached: false });
+    await new Promise(r => bridge.once("close", r)); seam.stop(); assert.equal(module.spawn, spawn);
+    const result = seam.attach(ownerResult(bridge.pid!)), evidence = createProcessEvidence(); sampledWithoutBridge(h, evidence, process.pid);
+    assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: process.pid, result }), true);
+    assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: process.pid, result: ownerResult(bridge.pid!) }), false, "forced miss without registration stays unbound");
+  } finally { seam.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 test("bridge spawn observer marks a bridge-shaped spawn that returns the owner PID or no PID invalid", async () => {
   const { provenance } = await bridgeBindingApis(), { EventEmitter } = await import("node:events");

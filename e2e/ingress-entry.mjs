@@ -189,8 +189,8 @@ async function runRealEntry(plan) {
   ]);
   // Reopen owner only: record the lock's own helper children for parent origin attribution.
   const admission = provenance.createReopenAdmission(plan, { childProcessModule: childProcess.default, ownerPid: process.pid });
-  // Reopen bridge owner only: register the bridge child so the parent binds its PID without a lucky sample.
-  const bridgeSpawns = provenance.createReopenBridgeSpawns(plan, { childProcessModule: childProcess.default, ownerPid: process.pid, sync: syncBuiltinESMExports });
+  // Bridge-capable owners register the bridge child so the parent binds its PID without a lucky sample.
+  const bridgeSpawns = provenance.createOwnerBridgeSpawns(plan, { childProcessModule: childProcess.default, ownerPid: process.pid, sync: syncBuiltinESMExports });
   const shutdown = new globalThis.AbortController();
   const signal = () => shutdown.abort(); for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(name, signal);
   let peer, app, run, http, connection, standaloneExit, compositionResult, ownerClosed = false, admitted = false, observerFailure = false, overflow = false;

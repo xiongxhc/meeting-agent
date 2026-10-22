@@ -624,15 +624,15 @@ export function ingressBridgeSpawnFact(value) {
     (row.signal === null || /^SIG[A-Z0-9]{1,12}$/.test(row.signal)), "bridge_spawn_record");
   return value;
 }
-/** Phase owned-PID binding. The Runtime PID must be sampled under the owner. The bridge PID is bound by
- * the owner's spawn registration when one exists (exactly one registered bridge, that PID, spawned by this
- * owner, exited 0 and closed), else by sampling as before. A registration never relaxes the sampled cleanup proof. */
+/** Phase owned-PID binding. The Runtime PID must be sampled under the owner. A reported bridge PID is bound only by
+ * the owner's spawn registration (exactly one registered bridge, that PID, spawned by this owner, exited 0 and closed);
+ * sampling alone never binds it. A registration never relaxes the sampled cleanup proof. */
 export function ingressOwnedPidsBound(evidence, { role, ownerPid, result }) {
   try {
     const sampled = pid => evidence.observed.some(row => row.pid === pid && row.origins.includes(role));
     const runtime = result?.activity?.runtimePids ?? [], bridge = result?.activity?.bridge ?? null;
     if (!Array.isArray(runtime) || !runtime.every(sampled)) return false;
-    if (result?.bridgeSpawns === undefined) return bridge === null || sampled(bridge.pid);
+    if (result?.bridgeSpawns === undefined) return bridge === null;
     const record = ingressBridgeSpawnFact(result.bridgeSpawns);
     if (record.invalid || record.ownerPid !== ownerPid) return false;
     if (bridge === null) return record.bridges.length === 0;

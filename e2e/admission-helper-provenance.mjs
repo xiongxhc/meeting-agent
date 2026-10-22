@@ -139,9 +139,11 @@ export function createBridgeSpawnObserver(childProcessModule, { ownerPid, sync }
     },
   };
 }
-/** Entry seam: register the bridge spawn only for the closed-generation reopen's bridge owner (phase 2). */
-export function createReopenBridgeSpawns(plan, { childProcessModule, ownerPid, sync }) {
-  const observer = plan.closedGenerationReopen === true && plan.phase === 2 ? createBridgeSpawnObserver(childProcessModule, { ownerPid, sync }) : null;
+/** Entry seam: every owner that can spawn a bridge registers it (both ingress campaign owners and the reopen's
+ * phase-2 owner). The reopen's phase-1 owner and phase-3 admission owner never launch one and record their lock helpers instead. */
+export function createOwnerBridgeSpawns(plan, { childProcessModule, ownerPid, sync }) {
+  const active = plan.closedGenerationReopen === true ? plan.phase === 2 : true;
+  const observer = active ? createBridgeSpawnObserver(childProcessModule, { ownerPid, sync }) : null;
   return {
     start() { observer?.start(); },
     stop() { observer?.stop(); },
