@@ -89,6 +89,11 @@ for (const code of shutdownCodes.slice(1, 9)) for (const variant of ["omitted", 
   f.close = owner => { const value = originalClose(owner), list = codes(); for (const [key, name] of [["publicCloseOrdinal", "public_close"], ["storeClosedOrdinal", "shutdown_store_closed"], ["preFixtureOrdinal", "pre_fixture"], ["peerClosedOrdinal", "peer_closed"], ["admittedReturnOrdinal", "admitted_return"], ["ownerCloseBeginOrdinal", "owner_close_begin"], ["ownerCloseEndOrdinal", "owner_close_end"]] as const) value[key] = list.indexOf(name) + 1; return value; };
   const c = syntheticEffects(f), result = await r.runInviteAdmissionAbortCampaign(c.effects, { expectedHash: H, sources: r.componentSourceIds() }); assert.equal(result.success, false); assert.ok(!c.calls.includes("owner2"));
 });
+test("invite-abort lifecycle allowlist names the startup retention sweep and no other sweep outcome", async () => {
+  const { INVITE_ABORT_LIFECYCLE_CODES } = await runner() as { INVITE_ABORT_LIFECYCLE_CODES: readonly string[] };
+  assert.ok(Object.isFrozen(INVITE_ABORT_LIFECYCLE_CODES) && INVITE_ABORT_LIFECYCLE_CODES.includes("retention_swept"));
+  assert.deepEqual(INVITE_ABORT_LIFECYCLE_CODES.filter(code => code.includes("retention")), ["retention_swept"]);
+});
 test("deadline refuses before invoking an expired effect and preserves synchronous overrun and rejected-effect overrun", async () => {
   const r = await runner(); let now = 0, calls = 0;
   await assert.rejects(r.inviteAbortDeadline(() => { calls++; }, 0, 5, () => now)); assert.equal(calls, 0);

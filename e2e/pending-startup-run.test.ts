@@ -186,6 +186,14 @@ test("shared finite log and diagnostics retain no secret input and keep overflow
   assert.deepEqual(api("observeStartupDiagnostic")("stderr", "meeting-agent: composition_closed"), { channel: "stderr", code: "composition_closed" });
   for (const line of ["private-token", "meeting-agent: application_owner_lock_private_secret", "meeting-agent: composition_unavailable private_secret", "x".repeat(10000)]) assert.throws(() => api("observeStartupDiagnostic")("stderr", line), /pending_startup_diagnostic_invalid/);
 });
+test("startup log accepts the retention sweep outcome a fresh state root logs and still refuses every other sweep outcome", () => {
+  const log = api("createStartupLog")();
+  for (const code of ["composition_lock_verified", "composition_store_opened", "retention_swept", "maintenance_started", "composition_started"]) log.log(code);
+  assert.equal(log.snapshot().invalid, false); assert.deepEqual(log.snapshot().observations.map((row: { code: string }) => row.code).slice(2, 3), ["retention_swept"]);
+  for (const code of ["retention_sweep_failed", "retention_deferred_live", "retention_delete_failed", "maintenance_retention_sweep_failed", "retention_swept_extra"]) {
+    const refused = api("createStartupLog")(); refused.log(code); assert.equal(refused.snapshot().invalid, true, code);
+  }
+});
 test("entry import exposes callable adapter without application or SDK startup", async () => {
   // @ts-expect-error Private adapter has no declaration.
   const entry = await import("./pending-startup-entry.mjs"); assert.equal(typeof entry.runRealPendingStartup, "function");

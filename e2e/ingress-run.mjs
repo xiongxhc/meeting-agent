@@ -138,14 +138,18 @@ export function ingressCloseFact(value) {
   requireIngress(value.keyCustody === undefined || ["not_created", "private_runtime_file"].includes(value.keyCustody), "close_fields");
   if (value.finalState !== undefined && value.finalState !== null) { ingressCloseState(value.finalState); if (value.finalState.reopenEvidence) ingressReopenState(value.finalState); }
   if (value.history !== undefined) ingressHistoryFact(value.history);
-  ingressCloseRows(value.outcomes, ["occurrenceId", "bridgeId", "organizer", "phase", "controlSessionId", "failure", "finalization", "custody", "runtimeClose", "runtimeCleanup"], ["organizer"]);
+  ingressCloseRows(value.outcomes, ["occurrenceId", "bridgeId", "organizer", "phase", "controlSessionId", "failure", "finalization", "custody", "runtimeClose", "runtimeCleanup",
+    "generations", "leaseRenewal", "leaseRenewalFailures"], ["organizer"]);
   for (const row of value.outcomes) {
     const choices = { phase: ["starting", "live", "settled"], failure: [null, "runtime_startup_aborted", "runtime_startup_timeout", "runtime_startup_failed",
       "application_closed", "physical_client_quarantined", "launch_failed", "join_failed", "media_format_rejected", "join_cancelled"],
     finalization: ["none", "seeded", "recorded", "stop_failed", "finalize_failed", "transaction_failed"],
     custody: ["not_applicable", "assigned", "existing", "refused", "unpersisted"], runtimeClose: ["pending", "closed", "failed"],
-    runtimeCleanup: [null, "graceful", "forced", "failed", "unconfirmed"] };
+    runtimeCleanup: [null, "graceful", "forced", "failed", "unconfirmed"], leaseRenewal: [null, "inactive", "unsupported", "renewing", "degraded", "lapsed"] };
     for (const [key, allowed] of Object.entries(choices)) requireIngress(row[key] === undefined || allowed.includes(row[key]), "close_fields");
+    // A launched occurrence has started at least one bridge generation; renewal failures only count.
+    requireIngress(row.generations === undefined || Number.isSafeInteger(row.generations) && row.generations >= 1, "close_fields");
+    requireIngress(row.leaseRenewalFailures === undefined || Number.isSafeInteger(row.leaseRenewalFailures) && row.leaseRenewalFailures >= 0, "close_fields");
     if (row.organizer !== undefined && row.organizer !== null) ingressCloseRecord(row.organizer, ["feishuUserId", "displayName", "source"]);
   }
   ingressCloseRows(value.commitObservations, ["ordinal", "wireMessageId", "eventId", "expectedHash", "persistedHash", "immutable", "ackFloor"], ["immutable"]);
@@ -575,7 +579,8 @@ export function observeIngressInventory(evidence, { result, rootPid, owner, stag
     // the owner's direct child with the role's fixed executable basename; raw comm is not retained.
     if (!baseline) for (const row of rows) {
       if (row.pid === rootPid) continue;
-      const edges = evidence.directChildren ??= [], base = row.comm.slice(row.comm.lastIndexOf("/") + 1);
+      // An exiting process shows as its kernel short name in parentheses, "(diskutil)"; that is the same executable.
+      const edges = evidence.directChildren ??= [], base = /^\(([^()/]{1,16})\)$/.exec(row.comm)?.[1] ?? row.comm.slice(row.comm.lastIndexOf("/") + 1);
       const helper = ADMISSION_HELPER_BASENAMES.includes(base) ? base : null;
       if (edges.some(e => e.owner === owner && e.parentPid === row.ppid && e.pid === row.pid && e.helper === helper)) continue;
       if (edges.length < 256) edges.push({ owner, parentPid: row.ppid, pid: row.pid, helper });

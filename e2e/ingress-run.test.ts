@@ -784,6 +784,26 @@ test("C closed report keeps the actual optional outcome/organizer DTO and sparse
   } finally { f.dispose(); }
 });
 
+test("C closed report accepts the composition outcome's generations and lease-renewal fields, typed, and still refuses unknown keys", async () => {
+  const h = await helpers(), { runIngressPhase } = await import(path.join(import.meta.dirname, "ingress-entry.mjs"));
+  const f = await transactionConflictFixture();
+  try {
+    const result = await runIngressPhase(f.plan, f.effects); assert.equal(result.success, true);
+    const close = copy(result.close);
+    const outcome = { occurrenceId: f.plan.occurrenceId, bridgeId: "component-bridge", organizer: null, phase: "settled", controlSessionId: "41", failure: null,
+      finalization: "recorded", custody: "assigned", runtimeClose: "closed", runtimeCleanup: "graceful", generations: 1, leaseRenewal: "renewing", leaseRenewalFailures: 0 };
+    for (const accepted of [{}, { generations: 5 }, { leaseRenewal: null }, ...["inactive", "unsupported", "degraded", "lapsed"].map(leaseRenewal => ({ leaseRenewal })), { leaseRenewalFailures: 3 }]) {
+      close.outcomes = [{ ...outcome, ...accepted }];
+      assert.deepEqual(h.ingressCloseFact(close), close);
+    }
+    for (const refused of [{ generations: 0 }, { generations: -1 }, { generations: 1.5 }, { generations: "1" }, { generations: null }, { generations: [{ bridgeSessionId: "b", controlSessionId: "41" }] },
+      { leaseRenewal: "renewed" }, { leaseRenewal: 1 }, { leaseRenewalFailures: -1 }, { leaseRenewalFailures: 0.5 }, { leaseRenewalFailures: null }, { privateGeneration: 1 }]) {
+      close.outcomes = [{ ...outcome, ...refused }];
+      assert.throws(() => h.ingressCloseFact(close), /ingress_close_fields/, JSON.stringify(refused));
+    }
+  } finally { f.dispose(); }
+});
+
 test("closed generation selection is finite and rejects conflicting branches before effects", async () => {
   const h = await helpers(), out = "/private/tmp/meeting-closed-selector-unused";
   assert.deepEqual(h.parseIngressArguments(["--closed-generation-reopen", "--out", out]), { out, missingLauncher: false, closedGenerationReopen: true });

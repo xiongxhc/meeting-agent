@@ -274,3 +274,22 @@ test("observer helper shapes match the real application owner lock source", asyn
   assert.notDeepEqual(lockShapes(source.replace('const PLUTIL = "/usr/bin/plutil"', 'const PLUTIL = "/opt/plutil"')), p.ADMISSION_HELPER_SHAPES);
   assert.notDeepEqual(lockShapes(source.replace('stdio: ["ignore", "ignore", "ignore", state.lockFd]', 'stdio: ["ignore", "ignore", "pipe", state.lockFd]')), p.ADMISSION_HELPER_SHAPES);
 });
+// macOS ps prints an exiting process's kernel short name in parentheses, e.g. "(diskutil)"; real reopen runs sample
+// short-lived helpers in that state. It names the same executable; every other comm form stays refused.
+test("attribution accepts an exiting helper sighted only by its parenthesised short name", async () => {
+  const { h, evidence } = await phase3(`${PARENT} 1 node\n${OWNER} ${PARENT} node\n${HELPER} ${OWNER} (diskutil)\n`);
+  assert.equal(h.attributeIngressAdmissionHelpers(evidence, { role: ROLE, ownerPid: OWNER, helpers: record() }), 1);
+  h.assertIngressReopenOrigins(h.ingressProcessProof(evidence, ROLE, absent), OWNER, record());
+});
+test("attribution accepts a helper sighted live and then exiting", async () => {
+  const { h, evidence } = await sightings(`${HELPER} ${OWNER} (diskutil)\n`);
+  assert.equal(h.attributeIngressAdmissionHelpers(evidence, { role: ROLE, ownerPid: OWNER, helpers: record() }), 1);
+  h.assertIngressReopenOrigins(h.ingressProcessProof(evidence, ROLE, absent), OWNER, record());
+});
+for (const comm of ["<defunct>", "(lockf)", "(python3)", "((diskutil))", "(diskutil", "diskutil)", "(/usr/sbin/diskutil)", "()"]) {
+  test(`attribution still refuses helper comm ${comm}`, async () => {
+    const { h, evidence } = await phase3(`${PARENT} 1 node\n${OWNER} ${PARENT} node\n${HELPER} ${OWNER} ${comm}\n`);
+    assert.equal(h.attributeIngressAdmissionHelpers(evidence, { role: ROLE, ownerPid: OWNER, helpers: record() }), 0);
+    assert.throws(() => h.assertIngressReopenOrigins(h.ingressProcessProof(evidence, ROLE, absent), OWNER, record()), /reopen_process_origins/);
+  });
+}

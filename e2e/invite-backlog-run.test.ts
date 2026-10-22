@@ -52,6 +52,11 @@ test("refused invites are recorded per invite and never fill the cap: 256 strang
   } finally { store.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("backlog lifecycle allowlist names the startup retention sweep and no other sweep outcome", async () => {
+  const { BACKLOG_LOG_CODES } = await import(modulePath) as { BACKLOG_LOG_CODES: readonly string[] };
+  assert.ok(Object.isFrozen(BACKLOG_LOG_CODES) && BACKLOG_LOG_CODES.includes("retention_swept"));
+  assert.deepEqual(BACKLOG_LOG_CODES.filter(code => code.includes("retention")), ["retention_swept"]);
+});
 test("stale is judged on the later of Feishu invite_time and arrival", async () => {
   const f = fixture(), store = openSessionStore({ filename: f.databasePath, nowMs: ARRIVAL }); chmodSync(f.databasePath, 0o600);
   const invite = (eventId: string, id: string, inviteSeconds: number) => normalizeInvite(peer.inviteEnvelope({ eventId, providerMeetingId: id, meetingNo: "987654320", title: "Stale rule", startSeconds: 1700000000, inviteSeconds, createTimeMs: 1700000000000 }), peer.SCOPE);

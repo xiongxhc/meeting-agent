@@ -12,7 +12,7 @@ import { assertPendingStartupEnvironment, parsePendingStartupArguments, validate
 export const TENANT_FAMILY = "tenant-token-timeout-close";
 const BASE = "ae4316ed2bc7a5c652ea44f32c16b3fdc260a5bb93f933bf45e63b49a5c0ad01";
 const SHUTDOWN = ["shutdown_fenced", "maintenance_fenced", "maintenance_closed", "shutdown_owned_work_settled", "shutdown_application_closed", "shutdown_runtime_owners_closed", "shutdown_transports_closed", "shutdown_store_closed"];
-const LOGS = ["composition_lock_verified", "composition_store_opened", "maintenance_started", "composition_started", "discovery_tick", "invite_committed", "occurrence_launched", ...SHUTDOWN, "feishu_sdk_error", "feishu_sdk_warning", "feishu_sdk_info", "feishu_sdk_debug", "feishu_sdk_trace"];
+const LOGS = ["composition_lock_verified", "composition_store_opened", "retention_swept", "maintenance_started", "composition_started", "discovery_tick", "invite_committed", "occurrence_launched", ...SHUTDOWN, "feishu_sdk_error", "feishu_sdk_warning", "feishu_sdk_info", "feishu_sdk_debug", "feishu_sdk_trace"];
 const MARKS = ["admitted", "handle", "started", "initialDiscovery", "commit", "ack", "tokenStart", "tokenSettlement", "closeRequested", "closeSettled", "lifecycleSettled", "fixtureStarted", "peerClosed", "admittedReturned", "ownerCloseBegin", "ownerCloseEnd"];
 const CLOCKS = ["acceptedAtMs", "claimExpiresAtMs", "generationStartedAtMs", "firstAttemptAtMs", "lastAttemptAtMs", "lastBlockedAtMs", "lastObservedAtMs", "nextAttemptAtMs"];
 const COUNTERS = ["occurrences", "events", "sessions", "custody", "generations", "claimed", "totalAttempts", "generationAttempts", "retryGeneration", "operatorRetryCount"];

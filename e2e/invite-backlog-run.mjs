@@ -12,7 +12,7 @@ import { inviteEnvelope, SCOPE } from "./feishu-peer.mjs";
 export const BACKLOG_DESIGN = "323abf4269e9764b99c4f42a563408733703875f2337b7ea613922804a4f88d1";
 export const BACKLOG_BASE = "eec0a149f61a495bb17235b23ccbc3e8053cd6e736886612c2dffd9aed0c9867";
 export const BACKLOG_CLOSE_CODES = Object.freeze(["public_close", "shutdown_fenced", "maintenance_fenced", "maintenance_closed", "shutdown_owned_work_settled", "shutdown_application_closed", "shutdown_runtime_owners_closed", "shutdown_transports_closed", "shutdown_store_closed", "pre_fixture", "peer_closed", "admitted_return", "owner_close_begin", "owner_close_end"]);
-export const BACKLOG_LOG_CODES = Object.freeze(["owner_acquired", "composition_lock_verified", "composition_store_opened", "maintenance_started", "composition_started", "discovery_tick", "invite_committed", "occurrence_launched", ...BACKLOG_CLOSE_CODES, "feishu_sdk_error", "feishu_sdk_warning", "feishu_sdk_info", "feishu_sdk_debug", "feishu_sdk_trace"]);
+export const BACKLOG_LOG_CODES = Object.freeze(["owner_acquired", "composition_lock_verified", "composition_store_opened", "retention_swept", "maintenance_started", "composition_started", "discovery_tick", "invite_committed", "occurrence_launched", ...BACKLOG_CLOSE_CODES, "feishu_sdk_error", "feishu_sdk_warning", "feishu_sdk_info", "feishu_sdk_debug", "feishu_sdk_trace"]);
 const REASONS = new Set(["fact", "reader", "schema", "durable", "delivery", "history", "ready", "close", "deadline", "effect", "sources", "provenance", "output"]);
 export const demandBacklog = (v, reason) => { if (!v) throw new Error(`backlog_${reason}`); };
 export const backlogHash = bytes => createHash("sha256").update(bytes).digest("hex");
