@@ -25,7 +25,7 @@ import Database from "better-sqlite3";
 
 import { RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
 import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, mediaTimingConfiguration, run, stage } from "./stage.mjs";
-import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
+import { publicationReceiptPasses, publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 
 import { createProcessEvidence, observeProcessSnapshot } from "./process-evidence.mjs";
 import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-proofs.mjs";
@@ -1007,9 +1007,7 @@ async function main() {
         check("teammem_publish", live.teammemResult.publishRun.exit === 0,
           options.l6ReceiptGate ? `exit ${live.teammemResult.publishRun.exit}; consumer output discarded` : `exit ${live.teammemResult.publishRun.exit}: ${live.teammemResult.publishRun.stdout.trim().slice(0, 400)} ${live.teammemResult.publishRun.stderr.trim().slice(0, 400)}`);
         const checks = live.receipt?.checks ?? [];
-        check("publication_receipt", checks.length === 1 && checks.every((entry) => entry.commitExists && entry.commitIsAncestorOfRef && entry.noteBytes > 0
-          && entry.occurrenceMatchesArtifact && entry.revisionMatchesArtifact && entry.artifactHashMatches && entry.noteNamesOccurrence && entry.urlNamesCommit),
-          JSON.stringify(checks));
+        check("publication_receipt", publicationReceiptPasses(checks), JSON.stringify(checks));
         const messages = live.summary?.feishuMessages ?? [];
         const intents = live.reopen?.rows.notifications ?? [];
         const intent = intents[0], message = messages[0];

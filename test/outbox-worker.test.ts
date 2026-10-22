@@ -11,7 +11,7 @@ import { parseTeamMemMeetingArtifact, canonicalArtifactHash, canonicalArtifactJs
 import { parseSupportedTeamMemMeetingArtifact } from "../src/contracts/teammem-meeting-v2.ts";
 import type { SupportedTeamMemMeetingArtifact } from "../src/contracts/teammem-meeting-v2.ts";
 import { deleteDeliveredEvidence, writeMeetingBundle } from "../src/adapters/filesystem-outbox.ts";
-import { readPublicationReceipt } from "../src/adapters/receipt-inbox.ts";
+import { readPublicationReceipt, readPublicationRefusal } from "../src/adapters/receipt-inbox.ts";
 import { occurrencePathSegment, type OccurrenceId } from "../src/domain/occurrence-id.ts";
 import { createOutboxWorker, type DeliveryJournal, type DeliveryRow } from "../src/delivery/outbox-worker.ts";
 import { createNotificationWorker } from "../src/delivery/notification-worker.ts";
@@ -1753,3 +1753,86 @@ for (const interruption of [
     } finally { h.cleanup(); }
   });
 }
+
+// TeamMem writes each publication twice: `<segment>/<revision>.json` first,
+// then `<segment>.json`, the latest, which a newer revision replaces.
+function writeTwinReceipt(receipts: string, artifact: SupportedTeamMemMeetingArtifact, hash: string, commit: string): string {
+  const segment = occurrencePathSegment(artifact.occurrence_id as OccurrenceId);
+  const receipt = { ...publishedReceipt(artifact, hash), vault_commit: commit,
+    markdown_url: `https://example.test/group/vault/-/blob/${commit}/Meetings/2026-W36/%5Bmeeting%5D.md` };
+  const blob = `${JSON.stringify(Object.fromEntries(Object.keys(receipt).sort().map((key) => [key, receipt[key as keyof typeof receipt]])))}\n`;
+  mkdirSync(path.join(receipts, segment), { recursive: true });
+  writeFileSync(path.join(receipts, segment, `${artifact.revision}.json`), blob);
+  writeFileSync(path.join(receipts, `${segment}.json`), blob);
+  return receipt.markdown_url;
+}
+
+function twinRevisions(h: ReturnType<typeof harness>) {
+  const first = artifactAndAudio();
+  const incomplete = structuredClone(first.artifact) as typeof first.artifact;
+  incomplete.transcript_complete = false;
+  const older = parseTeamMemMeetingArtifact(incomplete);
+  const complete = structuredClone(older) as typeof older;
+  complete.transcript_complete = true;
+  complete.revision += 1;
+  const newer = parseTeamMemMeetingArtifact(complete);
+  const sources = [runtimeRecordingPath(h, "b"), runtimeRecordingPath(h, "c")];
+  for (const source of sources) writeFileSync(source, first.bytes);
+  const accepted: AcceptPublicationInput[] = [];
+  const journal = new FakeJournal();
+  const accept = journal.acceptPublication.bind(journal);
+  journal.acceptPublication = (input) => { accepted.push(input); accept(input); };
+  const events: string[] = [];
+  let now = 10_000, state = "awaiting_teammem";
+  const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+    clock: { now: () => now }, random: () => 0, log: (event: string) => { events.push(event); },
+    session: { state: () => state, publish: () => { state = "published"; } }, reconciliationEvidence: NOOP_PURGE });
+  const enqueue = (artifact: typeof older, source: string) =>
+    worker.enqueue({ artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: canonicalArtifactHash(artifact), recordingPath: source });
+  return { older, newer, sources, accepted, journal, events, worker, enqueue, advance: (ms: number) => { now += ms; } };
+}
+
+test("TeamMem twin receipts: each revision is accepted once, the latest wins, and the per-revision file is never a duplicate or a refusal", () => {
+  const h = harness();
+  try {
+    const run = twinRevisions(h);
+    const { older, newer } = run;
+    run.enqueue(older, run.sources[0]!);
+    const olderUrl = writeTwinReceipt(h.receipts, older, canonicalArtifactHash(older), "a".repeat(40));
+    run.worker.reconcile();
+    assert.deepEqual(run.accepted.map((row) => [row.revision, row.publicationUrl]), [[older.revision, olderUrl]]);
+
+    run.enqueue(newer, run.sources[1]!);
+    const newerUrl = writeTwinReceipt(h.receipts, newer, canonicalArtifactHash(newer), "b".repeat(40));
+    for (let poll = 0; poll < 3; poll += 1) { run.advance(60_000); run.worker.reconcile(); }
+    assert.deepEqual(run.accepted.map((row) => [row.revision, row.publicationUrl]), [[older.revision, olderUrl], [newer.revision, newerUrl]]);
+    assert.equal(run.journal.rows.get(`${older.occurrence_id}:${older.revision}`)?.publicationUrl, olderUrl);
+    assert.equal(run.journal.rows.get(`${newer.occurrence_id}:${newer.revision}`)?.publicationUrl, newerUrl);
+    for (const artifact of [older, newer]) {
+      const input = { receiptsDir: h.receipts, occurrenceId: artifact.occurrence_id, revision: artifact.revision, artifactHash: canonicalArtifactHash(artifact) };
+      assert.equal(readPublicationRefusal(input), null);
+      assert.equal(run.journal.rows.get(`${artifact.occurrence_id}:${artifact.revision}`)?.refusalReason, undefined);
+    }
+    assert.equal(readPublicationReceipt({ receiptsDir: h.receipts, occurrenceId: older.occurrence_id, revision: older.revision, artifactHash: canonicalArtifactHash(older) }), null);
+    assert.deepEqual(run.events.filter((event) => event !== "delivery_published" && event !== "delivery_evidence_deleted"), []);
+    assert.equal(run.events.filter((event) => event === "delivery_published").length, 2);
+  } finally { h.cleanup(); }
+});
+
+test("TeamMem twin receipts written for two revisions before one poll: only the latest is accepted and both copies are cleaned", () => {
+  const h = harness();
+  try {
+    const run = twinRevisions(h);
+    const { older, newer } = run;
+    run.enqueue(older, run.sources[0]!);
+    run.enqueue(newer, run.sources[1]!);
+    writeTwinReceipt(h.receipts, older, canonicalArtifactHash(older), "a".repeat(40));
+    const newerUrl = writeTwinReceipt(h.receipts, newer, canonicalArtifactHash(newer), "b".repeat(40));
+    for (let poll = 0; poll < 3; poll += 1) { run.worker.reconcile(); run.advance(60_000); }
+    assert.deepEqual(run.accepted.map((row) => [row.revision, row.publicationUrl]), [[newer.revision, newerUrl]]);
+    for (const revision of [older.revision, newer.revision]) assert.notEqual(run.journal.rows.get(`${older.occurrence_id}:${revision}`)?.deletedAtMs, null);
+    for (const source of run.sources) assert.equal(existsSync(source), false);
+    assert.equal(run.events.filter((event) => event === "delivery_published").length, 1);
+    assert.equal(run.events.some((event) => /refus|resynthesis|recovery/.test(event)), false);
+  } finally { h.cleanup(); }
+});

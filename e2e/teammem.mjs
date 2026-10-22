@@ -138,16 +138,26 @@ export function publish({ teammem, nowIso, allowPush, withheldReason }) {
  * hold note bytes that agree with the artifact. `cat-file -e` alone is not
  * enough, so the bytes themselves are inspected. */
 export function receiptOracle({ teammem, receiptsDir, artifact }) {
-  const receipts = [];
+  const files = [];
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const target = path.join(directory, entry.name);
       if (entry.isDirectory()) walk(target);
-      else if (entry.name.endsWith(".json")) receipts.push(target);
+      else if (entry.name.endsWith(".json")) files.push(target);
     }
   };
   if (existsSync(receiptsDir)) walk(receiptsDir);
-  if (receipts.length === 0) return { receipts: [], checks: [], status: "absent" };
+  if (files.length === 0) return { receipts: [], revisionReceipts: [], checks: [], status: "absent" };
+
+  // TeamMem writes `<segment>/<revision>.json` beside the latest `<segment>.json`.
+  // Only that exact shape is a twin; every other file stays a receipt of its own.
+  const latestOf = (filename) => {
+    const parts = path.relative(receiptsDir, filename).split(path.sep);
+    const latest = path.join(receiptsDir, `${parts[0]}.json`);
+    return parts.length === 2 && /^[1-9][0-9]*\.json$/.test(parts[1]) && files.includes(latest) ? latest : null;
+  };
+  const revisionReceipts = files.filter((filename) => latestOf(filename) !== null);
+  const receipts = files.filter((filename) => latestOf(filename) === null);
 
   const checks = [];
   const parsed = receipts.map((filename) => ({ filename, value: JSON.parse(readFileSync(filename, "utf8")) }));
@@ -171,8 +181,39 @@ export function receiptOracle({ teammem, receiptsDir, artifact }) {
       noteNamesOccurrence: artifact === null || note.includes(artifact.occurrenceId),
       noteWithholdsAudioPath: artifact === null || !note.includes(artifact.audioPath ?? "\u0000never"),
       urlNamesCommit: typeof receipt.value.markdown_url === "string" && receipt.value.markdown_url.includes(commit),
+      ...revisionTwins(receipt, revisionReceipts.filter((filename) => latestOf(filename) === receipt.filename)),
       loadAverage: loadAverage(),
     });
   }
-  return { receipts, checks, status: "present" };
+  return { receipts, revisionReceipts, checks, status: "present" };
+}
+
+/** The latest receipt's own-revision twin must equal it, by bytes or by
+ * content. A twin of another revision must name that earlier revision of the
+ * same occurrence. */
+function revisionTwins(latest, twins) {
+  const canonical = (value) => JSON.stringify(Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])));
+  const latestBytes = readFileSync(latest.filename);
+  let revisionTwin = "absent", revisionTwinsConsistent = true;
+  for (const filename of twins) {
+    const named = Number(path.basename(filename, ".json"));
+    const bytes = readFileSync(filename);
+    let value = null;
+    try { value = JSON.parse(bytes.toString("utf8")); } catch { /* a malformed twin differs */ }
+    const record = value !== null && typeof value === "object" && !Array.isArray(value);
+    if (named === Number(latest.value.revision)) {
+      revisionTwin = bytes.equals(latestBytes) ? "byte-equal" : record && canonical(value) === canonical(latest.value) ? "content-equal" : "differs";
+    } else if (!(record && named < Number(latest.value.revision) && value.revision === named
+      && value.occurrence_id === latest.value.occurrence_id && value.schema === latest.value.schema)) revisionTwinsConsistent = false;
+  }
+  return { revisionTwin, revisionTwinsConsistent: revisionTwinsConsistent && revisionTwin !== "differs",
+    revisionReceipts: twins.map((filename) => path.relative(path.dirname(latest.filename), filename)) };
+}
+
+/** The default lane's `publication_receipt` rule: exactly one latest receipt
+ * that passes every content check, with consistent per-revision twins. */
+export function publicationReceiptPasses(checks) {
+  return checks.length === 1 && checks.every((entry) => entry.commitExists && entry.commitIsAncestorOfRef && entry.noteBytes > 0
+    && entry.occurrenceMatchesArtifact && entry.revisionMatchesArtifact && entry.artifactHashMatches && entry.noteNamesOccurrence
+    && entry.urlNamesCommit && entry.revisionTwinsConsistent === true);
 }
