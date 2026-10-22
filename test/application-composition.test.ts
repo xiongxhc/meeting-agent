@@ -679,7 +679,7 @@ test("one row whose admission throws is isolated with backoff; later occurrences
   } finally { f.close(); }
 });
 
-async function liveIngress(f: Fixture, config: StandaloneConfigV1, slots: readonly ScriptedSlot[], frames: readonly unknown[], seedRows: (store: ReturnType<typeof openSessionStore>) => void = () => {}) {
+async function liveIngress(f: Fixture, config: StandaloneConfigV1, slots: readonly ScriptedSlot[], frames: readonly unknown[], seedRows: (store: ReturnType<typeof openSessionStore>) => void = () => {}, now: () => number = () => 10_000) {
   const peer = await httpPeer((_request, response) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ code: 0, data: {
     URL: peer.origin.replace("http:", "ws:") + "/ws?device_id=synthetic&service_id=1", ClientConfig: { PingInterval: 100, ReconnectCount: 1, ReconnectInterval: 0, ReconnectNonce: 0 } } })); });
   const server = new WebSocketServer({ server: peer.server, perMessageDeflate: false, maxPayload: 65536 });
@@ -690,7 +690,7 @@ async function liveIngress(f: Fixture, config: StandaloneConfigV1, slots: readon
   const seed = f.reopen();
   try { seedRows(seed); } finally { seed.close(); }
   const app = await composeApplication(config, f.owner, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: slots,
-    metadata: resolvedLookup([]), clock: { now: () => 10_000 }, feishu: { http, connection: createFeishuSocketOwner(Agent), readyTimeoutMs: 2000, handshakeTimeoutMs: 500 } });
+    metadata: resolvedLookup([]), clock: { now }, feishu: { http, connection: createFeishuSocketOwner(Agent), readyTimeoutMs: 2000, handshakeTimeoutMs: 500 } });
   await app.start();
   const [socket] = await connected as [WebSocket];
   const responses: unknown[] = [];
@@ -758,6 +758,76 @@ test("a meeting a stranger invited first is still joined when an allowed inviter
           store.getInviteOccurrence("9007199254740993@2026-09-02T14:00:00Z")?.lastBlockedReason === "inviter_not_allowed", false, "the organizer lane reopens");
       } finally { store.close(); }
     } finally { await second.close(); }
+  } finally { f.close(); }
+});
+
+test("an exact replay of an already refused or admitted invite is ACKed and leaves the invite row, the join and the admission log unchanged", async () => {
+  const f = fixture();
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const refused = "9007199254740993@2026-09-02T14:00:00Z", admitted = "9007199254740994@2026-09-02T14:00:00Z";
+  const snapshot = () => { const store = f.reopen(); try { return [refused, admitted].map((id) => ({ row: store.getInviteOccurrence(id), join: store.inviteJoinStatus(id), session: store.getSession(id)?.state ?? null })); } finally { store.close(); } };
+  const frames = [invitedBy("stranger", "9007199254740993", "ou_stranger"), invitedBy("allowed", "9007199254740994", "ou_allowed")];
+  try {
+    const first = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], frames);
+    try { await until(() => slot.launches.length === 1); } finally { await first.close(); }
+    const before = snapshot(); // After the owner closed: the replay is compared with the settled durable state.
+    assert.equal(before[0]!.join?.refusal, "inviter_not_allowed"); assert.equal(before[1]!.join?.allowed, true);
+    // Feishu redelivers both events to a later owner whose clock has moved on.
+    const second = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], frames, () => {}, () => 70_000);
+    try {
+      assert.deepEqual(second.responses, [{ code: 200 }, { code: 200 }], "a replay is still ACKed");
+      assert.equal(second.log.filter((code) => code === "invite_committed").length, 2);
+      assert.deepEqual(second.log.filter((code) => code.startsWith("invite_admission_")), [], "a replay is not decided or logged again");
+      assert.deepEqual(snapshot(), before, "invite rows and join decisions are byte-identical");
+      assert.equal(slot.launches.length, 1, "an admitted invite is never launched again by its replay");
+    } finally { await second.close(); }
+  } finally { f.close(); }
+});
+
+test("a decision lost after the commit is made by Feishu's exact redelivery, even after the tick refused the row as unverified", async () => {
+  for (const tickFirst of [true, false]) {
+    const f = fixture();
+    const slot = scriptedSlot(1, { joinMode: "silent" });
+    const id = "9007199254740996@2026-09-02T14:00:00Z", frame = invitedBy("allowed-lost", "9007199254740996", "ou_allowed");
+    // The owner committed the allowlisted invite and died before the join decision and the ACK.
+    const lost = (store: ReturnType<typeof openSessionStore>) => { store.acceptInvite(normalizeInvite(frame as never, scope), 10_000); };
+    const status = () => { const store = f.reopen(); try { return store.inviteJoinStatus(id); } finally { store.close(); } };
+    try {
+      if (tickFirst) {
+        // The restarted owner ticks before Feishu redelivers: it no longer knows the inviter and fails closed.
+        const first = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [], lost);
+        try { assert.equal(slot.launches.length, 0); } finally { await first.close(); }
+        assert.equal(status()?.refusal, "inviter_unverified");
+      }
+      const second = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [frame], tickFirst ? () => {} : lost, () => 40_000);
+      try {
+        assert.deepEqual(second.responses, [{ code: 200 }], "the redelivery is ACKed");
+        await until(() => slot.launches.length === 1);
+        assert.deepEqual(slot.launches.map((launch) => launch.occurrenceId), [id]);
+        assert.equal(status()?.allowed, true, tickFirst ? "redelivery after the tick" : "redelivery before any tick");
+      } finally { await second.close(); }
+    } finally { f.close(); }
+  }
+});
+
+test("an exact replay of a pre-allowlist invite by an allowed inviter admits its unverified session", async () => {
+  const f = fixture();
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const legacy = invite(1);
+  const raw = envelope("event-1", "9007199254740001", "Meeting 1");
+  const replay = { ...raw, event: { ...raw.event, meeting: { ...raw.event.meeting, meeting_no: "900000001" }, inviter: { id: "ou_allowed", user_type: 1 } } };
+  assert.equal(normalizeInvite(replay as never, scope).normalizedSha256, legacy.normalizedSha256, "the same event: an exact replay");
+  try {
+    const legacyRows = (store: ReturnType<typeof openSessionStore>) => {
+      store.acceptInvite(legacy, 1);
+      store.createSession({ occurrenceId: legacy.occurrenceId, providerMeetingId: legacy.providerMeetingId, occurrenceStartedAt: legacy.occurrenceStartedAt, nowMs: 1 });
+    };
+    const live = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [replay], legacyRows);
+    try {
+      assert.deepEqual(live.responses, [{ code: 200 }]);
+      await until(() => slot.launches.length === 1);
+      const store = f.reopen(); try { assert.equal(store.inviteJoinAllowed(legacy.occurrenceId), true); } finally { store.close(); }
+    } finally { await live.close(); }
   } finally { f.close(); }
 });
 

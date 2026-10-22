@@ -80,6 +80,17 @@ export type SessionState =
   | "notified"
   | "failed";
 
+/**
+ * Whether an exact replay (same event, same normalized hash) still needs the accept-time join decision.
+ * A replay whose join is decided changes nothing: an admitted session, or a refusal recorded on the row.
+ * `inviter_unverified` is not a decision but the tick's fail-closed placeholder for a decision lost after the
+ * commit, so the replay, which carries the inviter again, decides it. Residual: an operator retry also leaves
+ * that placeholder, so if the allowlist later gains a refused inviter, a replay of that already-ACKed event joins.
+ */
+export function replayNeedsJoinDecision(join: { readonly allowed: boolean; readonly refusal: string | null } | null): boolean {
+  return join === null || (!join.allowed && (join.refusal === null || join.refusal === "inviter_unverified"));
+}
+
 export const SESSION_STATE_VALUES: readonly SessionState[] = [
   "discovered",
   "joining",

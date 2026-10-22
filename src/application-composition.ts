@@ -49,6 +49,7 @@ import type { ConversationRuntimePort, FinalizedRecordingRuntime } from "./ports
 import type { InviteOccurrence, NormalizedInvite } from "./ports/feishu-ingress.ts";
 import type { FeishuOrganizerLookup, OrganizerReferenceEntry } from "./ports/feishu.ts";
 import type { BackfillSeedConfig, PublishStoredGenerationsInput, SessionStore, UnknownEndCustodySource } from "./ports/session-store.ts";
+import { replayNeedsJoinDecision } from "./ports/session-store.ts";
 import type { RecordingSummary } from "./ports/conversation-runtime.ts";
 import type { Clock } from "./sessions/coordinator.ts";
 import { createInviteDiscovery } from "./sessions/invite-discovery.ts";
@@ -584,8 +585,12 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     // The inviter is known only here, so the join decision is made right after the commit. A failure is left to
     // the next tick, which fails closed because the inviter is no longer known.
     const allowed = (invite.inviterId !== undefined && allowedInviters.has(invite.inviterId)) || (invite.chatId !== undefined && allowedChats.has(invite.chatId));
-    try { admitOne(invite.occurrenceId, allowed ? undefined : "inviter_not_allowed"); }
-    catch { log("invite_admission_failed"); }
+    try {
+      // An exact replay of an invite whose join is already decided changes nothing (replayNeedsJoinDecision). A replay
+      // whose decision was lost, even one the tick has since refused as unverified, or whose session predates the
+      // allowlist, is decided now.
+      if (result !== "replay" || replayNeedsJoinDecision(store.inviteJoinStatus(invite.occurrenceId))) admitOne(invite.occurrenceId, allowed ? undefined : "inviter_not_allowed");
+    } catch { log("invite_admission_failed"); }
     if (result !== "replay" && started) void discoverTick().catch(() => undefined);
   };
   let ingress: ReturnType<typeof createFeishuInviteIngress> | null = null;
