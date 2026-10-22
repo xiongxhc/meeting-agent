@@ -19,6 +19,10 @@ export function providerFaultPlan(cut) {
   return { providerFault: PROVIDER_FAULT_CUTS[cut],
     ...(Object.hasOwn(PROVIDER_FAULT_SPEAKING, cut) ? { providerFaultSpeaking: true, providerFaultWithholdFlushAck: PROVIDER_FAULT_SPEAKING[cut] } : {}) };
 }
+/** How far apart the held answer's terminal and the reported failure that interrupted
+ * it may be, either way. The Runtime ends the turn first and reports second,
+ * microseconds apart; the window stays far below the 2 s cleanup timeout. */
+export const FAILURE_AFTER_TERMINAL_NS = 100_000_000n;
 /** Recorded frames the cut requires after Runtime reported the failure (2 s). */
 export const FRAMES_AFTER_FAILURE = 100n;
 
@@ -57,13 +61,20 @@ export function providerFaultOracles({ cut, events, runtimeEvents, lifecycle, ch
   check("provider_fault_distinct_event", () => {
     const { start, rows } = startedSessionRows(lifecycle);
     const failures = rows.filter(row => row.event === "voice" && row.type === "voice_session_failed");
-    requireFact(failures.length > 0, "the recognition failure never reached the client");
-    requireFact(failures.every(row => row.session_id === start.session_id && row.recovery === "continue_session" && row.error?.stage === "speech_recognizer"),
-      "a voice failure was not a continue_session speech_recognizer event of the live session");
+    // A withheld flush ACK fails the interrupt of the held answer: the Runtime reports
+    // that once as a continue_session playback failure, and only on the withheld cut.
+    const withheld = PROVIDER_FAULT_SPEAKING[cut] === true;
+    const stageOf = row => row.error?.stage;
+    requireFact(failures.some(row => stageOf(row) === "speech_recognizer"), "the recognition failure never reached the client");
+    requireFact(failures.every(row => row.session_id === start.session_id && row.recovery === "continue_session" &&
+      (stageOf(row) === "speech_recognizer" || (withheld && stageOf(row) === "continuous_audio_output"))),
+    "a voice failure was not a continue_session speech_recognizer event of the live session");
+    const playbackFailures = failures.filter(row => stageOf(row) === "continuous_audio_output").length;
+    requireFact(!withheld || playbackFailures === 1, "the withheld flush was not reported once as a continue_session playback failure");
     const traced = runtimeEvents.filter(row => row.type === "voice_session_failed");
     requireFact(traced.length === failures.length && traced.some(row => row.monotonicNs === observed?.failureMonotonicNs && row.session_id === start.session_id) &&
       ns(observed.failureMonotonicNs) >= ns(observed.armedMonotonicNs), "the observed failure is not the traced Runtime event after the fault");
-    return `${failures.length} voice_session_failed continue_session speech_recognizer event(s) on session ${start.session_id}, kept in the run evidence`;
+    return `${failures.length - playbackFailures} speech_recognizer and ${playbackFailures} continuous_audio_output continue_session voice_session_failed event(s) on session ${start.session_id}, kept in the run evidence`;
   });
 
   check("voice_session_survives_provider_fault", () => {
@@ -113,10 +124,14 @@ export function providerFaultOracles({ cut, events, runtimeEvents, lifecycle, ch
   if (Object.hasOwn(PROVIDER_FAULT_SPEAKING, cut)) check("speaking_turn_ends_once_on_provider_fault", () => {
     const speaking = observed?.speaking, withheld = PROVIDER_FAULT_SPEAKING[cut];
     requireFact(speaking?.turn && speaking.generation && speaking.withholdFlushAck === withheld, "the failure was not injected while an answer was held");
+    // The Runtime ends the interrupted answer, then publishes the failure that caused the
+    // interrupt: the terminal follows the fault and lies within the window of the failure.
     const terminals = runtimeEvents.filter(row => ["turn_completed", "turn_cancelled", "turn_failed"].includes(row.event?.type) && row.event.turn_id === speaking.turn);
-    requireFact(terminals.length === 1 && ["turn_cancelled", "turn_failed"].includes(terminals[0].event.type) &&
-      terminals[0].session_id === speaking.sessionId && ns(terminals[0].monotonicNs) >= ns(observed.failureMonotonicNs),
-    "the held answer did not end exactly once, on the live session, after the failure");
+    const terminalNs = terminals.length === 1 ? ns(terminals[0].monotonicNs) : null, failureNs = ns(observed.failureMonotonicNs);
+    requireFact(terminalNs !== null && ["turn_cancelled", "turn_failed"].includes(terminals[0].event.type) &&
+      terminals[0].session_id === speaking.sessionId && terminalNs >= ns(observed.fault.monotonicNs) &&
+      (terminalNs >= failureNs ? terminalNs - failureNs : failureNs - terminalNs) <= FAILURE_AFTER_TERMINAL_NS,
+    "the held answer did not end exactly once, on the live session, after the fault and at its reported failure");
     const flushes = withheld ? childState?.withheldFlushes : childState?.flushes;
     requireFact((flushes ?? []).some(row => row.generation === speaking.generation), withheld ? "no flush reached the bridge to withhold" : "the bridge never acknowledged the held answer's flush");
     return `held answer ${speaking.turn} ended by ${terminals[0].event.type}; flush ${withheld ? "withheld" : "acknowledged"} by the bridge`;

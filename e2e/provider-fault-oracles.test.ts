@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { encodeAlignmentPage, pageWarnings, decodeAlignmentPage, ALIGNMENT_POLICY } from "../src/sessions/recording-alignment.ts";
 // @ts-expect-error Test-only oracle has no public declaration.
-import { providerFaultOracles, providerFaultMetadata, providerFaultPlan, PROVIDER_FAULT_CUTS, PROVIDER_FAULT_SPEAKING } from "./provider-fault-oracles.mjs";
+import { providerFaultOracles, providerFaultMetadata, providerFaultPlan, PROVIDER_FAULT_CUTS, PROVIDER_FAULT_SPEAKING, FAILURE_AFTER_TERMINAL_NS } from "./provider-fault-oracles.mjs";
 // @ts-expect-error Test-only oracle has no public declaration.
 import { captureTailOracles } from "./durable-oracles.mjs";
 
@@ -71,7 +71,8 @@ function fixture(cut = "provider-error") {
   const runtimeEvents: Array<Record<string, unknown>> = [{ type: "voice_session_failed", session_id: "42", monotonicNs: "200" }];
   if (speaking) {
     observed.speaking = { turn: "9", generation: "9", sessionId: "42", withholdFlushAck: PROVIDER_FAULT_SPEAKING[cut] };
-    runtimeEvents.push({ session_id: "42", generation_id: "9", event: { type: "turn_cancelled", turn_id: "9" }, monotonicNs: "230" });
+    // The Runtime ends the held answer, then publishes the failure that interrupted it.
+    runtimeEvents.push({ session_id: "42", generation_id: "9", event: { type: "turn_cancelled", turn_id: "9" }, monotonicNs: "190" });
     (PROVIDER_FAULT_SPEAKING[cut] ? childState.withheldFlushes : childState.flushes).push({ generation: "9" });
   }
   const row = (fields: Record<string, unknown>) => ({ observerPid: 7, ...fields });
@@ -84,6 +85,11 @@ function fixture(cut = "provider-error") {
     row({ event: "voice", type: "voice_session_ended", session_id: "42", monotonicNs: "870" }),
     row({ event: "gateway_exit", code: 0, signal: null, monotonicNs: "990" }),
   ] as Array<Record<string, unknown>> };
+  if (PROVIDER_FAULT_SPEAKING[cut] === true) {
+    runtimeEvents.push({ type: "voice_session_failed", session_id: "42", monotonicNs: "201" });
+    lifecycle.rows.splice(2, 0, row({ event: "voice", type: "voice_session_failed", session_id: "42", recovery: "continue_session",
+      error: { code: "adapter_failure", kind: "adapter", stage: "continuous_audio_output" }, monotonicNs: "201" }));
+  }
   const artifact = { meeting: { recording_gaps: [] as unknown[], processing_warnings: [] as Array<{ code: string }> } };
   const summary = { interactiveConnections: { recognition: connect ? 0 : 1 } };
   return { cut, events, runtimeEvents, lifecycle, childState, snapshot, artifact, summary, observed, setEntries };
@@ -98,7 +104,8 @@ for (const cut of Object.keys(PROVIDER_FAULT_CUTS)) test(`${cut}: every provider
     ...(Object.hasOwn(PROVIDER_FAULT_SPEAKING, cut) ? ["speaking_turn_ends_once_on_provider_fault"] : []), "provider_fault_not_a_recording_gap"]);
   assert.deepEqual(failing(f), [], JSON.stringify(rows));
   const metadata = providerFaultMetadata(f);
-  assert.equal(metadata.runtimeFailures.length, 1); assert.equal(metadata.runtimeFailures[0].error.stage, "speech_recognizer");
+  assert.deepEqual(metadata.runtimeFailures.map((row: { error: { stage: string } }) => row.error.stage),
+    PROVIDER_FAULT_SPEAKING[cut] === true ? ["speech_recognizer", "continuous_audio_output"] : ["speech_recognizer"]);
   assert.equal(metadata.artifactRecordingGaps, 0);
 });
 
@@ -194,13 +201,47 @@ test("speaking cuts: the held answer must end once after the failure and its flu
     assert.deepEqual(failing(none), ["speaking_turn_ends_once_on_provider_fault"]);
     const twice = fixture(cut); twice.runtimeEvents.push({ ...twice.runtimeEvents[1]!, monotonicNs: "240" });
     assert.deepEqual(failing(twice), ["speaking_turn_ends_once_on_provider_fault"]);
-    const before = fixture(cut); before.runtimeEvents[1]!.monotonicNs = "150";
+    const before = fixture(cut); before.runtimeEvents[1]!.monotonicNs = "105";
     assert.deepEqual(failing(before), ["speaking_turn_ends_once_on_provider_fault"]);
+    const early = fixture(cut); early.observed.fault.monotonicNs = "-1000000000"; early.observed.armedMonotonicNs = "-1000000000";
+    early.runtimeEvents[1]!.monotonicNs = String(200n - FAILURE_AFTER_TERMINAL_NS - 1n);
+    assert.deepEqual(failing(early), ["speaking_turn_ends_once_on_provider_fault"]);
+    const edge = fixture(cut); edge.observed.fault.monotonicNs = "-1000000000"; edge.observed.armedMonotonicNs = "-1000000000";
+    edge.runtimeEvents[1]!.monotonicNs = String(200n - FAILURE_AFTER_TERMINAL_NS);
+    assert.deepEqual(failing(edge), []);
+    const late = fixture(cut); late.runtimeEvents[1]!.monotonicNs = String(200n + FAILURE_AFTER_TERMINAL_NS + 1n);
+    assert.deepEqual(failing(late), ["speaking_turn_ends_once_on_provider_fault"]);
+    const lateEdge = fixture(cut); lateEdge.runtimeEvents[1]!.monotonicNs = String(200n + FAILURE_AFTER_TERMINAL_NS);
+    assert.deepEqual(failing(lateEdge), []);
     const noFlush = fixture(cut); noFlush.childState.flushes.length = 0; noFlush.childState.withheldFlushes.length = 0;
     assert.deepEqual(failing(noFlush), ["speaking_turn_ends_once_on_provider_fault"]);
     const notSpeaking = fixture(cut); notSpeaking.observed.speaking = null;
     assert.deepEqual(failing(notSpeaking), ["speaking_turn_ends_once_on_provider_fault"]);
   }
+});
+
+test("a playback failure is accepted only as the withheld flush, once, beside a recognition failure", () => {
+  const playback = (f: ReturnType<typeof fixture>, monotonicNs: string, error = { code: "adapter_failure", kind: "adapter", stage: "continuous_audio_output" }) => {
+    f.runtimeEvents.push({ type: "voice_session_failed", session_id: "42", monotonicNs });
+    f.lifecycle.rows.splice(2, 0, { observerPid: 7, event: "voice", type: "voice_session_failed", session_id: "42", recovery: "continue_session", error, monotonicNs });
+    return f;
+  };
+  for (const cut of ["provider-error", "provider-stall", "provider-error-speaking"])
+    assert.deepEqual(failing(playback(fixture(cut), "202")), ["provider_fault_distinct_event"], cut);
+  assert.deepEqual(failing(playback(fixture("provider-error-speaking-flush-timeout"), "202")), ["provider_fault_distinct_event"]);
+  const unreported = fixture("provider-error-speaking-flush-timeout");
+  unreported.lifecycle.rows.splice(2, 1); unreported.runtimeEvents.pop();
+  assert.deepEqual(failing(unreported), ["provider_fault_distinct_event"]);
+  const playbackOnly = fixture("provider-error-speaking-flush-timeout");
+  playbackOnly.lifecycle.rows.splice(1, 1); playbackOnly.runtimeEvents.splice(0, 1); playbackOnly.observed.failureMonotonicNs = "201";
+  assert.deepEqual(failing(playbackOnly), ["provider_fault_distinct_event"]);
+});
+
+test("RED: a runtime-stage invalid_state and an unended held answer fail the event and speaking oracles", () => {
+  const f = fixture("provider-error-speaking-flush-timeout");
+  f.lifecycle.rows[2]!.error = { code: "invalid_state", kind: "invalid_state", stage: "runtime" };
+  f.runtimeEvents.splice(1, 1);
+  assert.deepEqual(failing(f), ["provider_fault_distinct_event", "speaking_turn_ends_once_on_provider_fault"]);
 });
 
 test("RED: the C1 shape (Fatal on a withheld flush, new_session, capture refused) fails the session, event and capture oracles", () => {
