@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 import { URL } from "node:url";
 
-// Reviewed Runtime commit 873153c on feat/runtime-media-lease-evidence (tree 8d416c9d),
-// packaged as runtime-lease-873153c-20261022.
+// Reviewed Runtime commit 67433a1 on feat/runtime-media-lease-evidence (tree eec6810a),
+// packaged as runtime-lease-67433a1-20261022. SDK bytes are unchanged from runtime-lease-873153c-20261022.
 // Repin only together with a reviewed SDK package/consumer handoff.
 const expected = {
   "browser.d.ts": "8c184a30fc0876283f4af2158f2cb37d19549d4cbefe65eeef67e815303fd2c0",
@@ -34,6 +34,6 @@ try {
       typeof sdk.RuntimeClient?.prototype.startDrainableTimedVoiceSession !== "function") throw new Error();
   if (sdk.DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION !== 3 || sdk.TIMED_MEDIA_PROTOCOL_VERSION !== 2) throw new Error();
 } catch {
-  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime 873153c4395e31b5ba7fca66ee0b7adafecb0273 on feat/runtime-media-lease-evidence and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
+  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime 67433a150bb3c345fabb4f502fab3f349fdb7d9c on feat/runtime-media-lease-evidence and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
   process.exitCode = 1;
 }

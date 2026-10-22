@@ -558,7 +558,7 @@ prerequisite optional. `npm ci` removes a prior local bootstrap.
 
 Use an existing Runtime checkout path, but package only the immutable reviewed
 tree; never copy a concurrent worktree's `dist` or install a source alias. The
-pin is Runtime commit `873153c` (tree `8d416c9d`) on `feat/runtime-media-lease-evidence`,
+pin is Runtime commit `67433a1` (tree `eec6810a`) on `feat/runtime-media-lease-evidence`,
 the public Runtime feature branch.
 
 ```sh
@@ -566,7 +566,7 @@ export PATH=/opt/homebrew/opt/node@24/bin:$PATH # macOS Homebrew Node24, if need
 : "${RUNTIME_REPO:?Set the local Runtime checkout path}"
 SDK_STAGE=$(mktemp -d)
 mkdir "$SDK_STAGE/runtime"
-git -C "$RUNTIME_REPO" archive 873153c4395e31b5ba7fca66ee0b7adafecb0273 | tar -x -C "$SDK_STAGE/runtime"
+git -C "$RUNTIME_REPO" archive 67433a150bb3c345fabb4f502fab3f349fdb7d9c | tar -x -C "$SDK_STAGE/runtime"
 npm --prefix "$SDK_STAGE/runtime" ci --ignore-scripts --no-audit --no-fund
 npm --prefix "$SDK_STAGE/runtime" run build --workspace @conversation/runtime
 npm pack "$SDK_STAGE/runtime/packages/typescript" --ignore-scripts --pack-destination "$SDK_STAGE"
@@ -595,7 +595,7 @@ before opening the store; no helper changes permissions on existing user paths.
 Recording/provider keys and plaintext audio remain exclusively outside Meeting.
 
 The hardware-free encrypted restart test also needs a prebuilt gateway from that
-same immutable source, built from the same `873153c` commit staged above. Build
+same immutable source, built from the same `67433a1` commit staged above. Build
 it before starting the unchanged test deadlines:
 
 ```sh

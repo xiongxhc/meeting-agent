@@ -130,6 +130,30 @@ export const RUNTIME_PROFILES = {
       sha256: "01824aa411ed98707a2abedf73161c83e3d7b824d093198ac94f352c302dce38",
     },
   },
+  /** Runtime 67433a150bb3c345fabb4f502fab3f349fdb7d9c (tree eec6810a9cfd1d441df923ebd3cf252bffa67edf) on feat/runtime-media-lease-evidence.
+   * Its manifest.json records source, toolchain, build commands, focused gates and the
+   * clean-rebuild check. SDK checked by `scripts/check-runtime-sdk.mjs` in this tree. */
+  "runtime-lease-67433a1-20261022": {
+    name: "runtime-lease-67433a1-20261022",
+    root: path.join(ARTIFACTS, "runtime-lease-67433a1-20261022"),
+    revision: "67433a150bb3c345fabb4f502fab3f349fdb7d9c",
+    gateway: {
+      path: path.join(ARTIFACTS, "runtime-lease-67433a1-20261022/target/debug/conversation-runtime-gateway"),
+      sha256: "b48f903521ce4ef05b8cedeacf6f711c51d0695253144c096b2a25d5fa385696",
+    },
+    scriptedGateway: {
+      path: path.join(ARTIFACTS, "runtime-lease-67433a1-20261022/target/debug/conversation-runtime-gateway-scripted"),
+      sha256: "2b7a323c81811c50f962005f3ded63a5884094466d4574ff568fc7a5049e1326",
+    },
+    scriptedPeers: {
+      path: path.join(ARTIFACTS, "runtime-lease-67433a1-20261022/target/debug/conversation-runtime-scripted-peers"),
+      sha256: "298e6aeb7ac2bd438c64b59789b6be117d8226ea667633395bc5b610d4175dde",
+    },
+    sdkTarball: {
+      path: path.join(ARTIFACTS, "runtime-lease-67433a1-20261022/stage/conversation-runtime-0.1.0.tgz"),
+      sha256: "01824aa411ed98707a2abedf73161c83e3d7b824d093198ac94f352c302dce38",
+    },
+  },
 };
 
 // Independent identities from the closed package review, including its mandatory
@@ -167,7 +191,7 @@ RUNTIME_PROFILES[EXPIRY_EVIDENCE_PROFILE.name] = EXPIRY_EVIDENCE_PROFILE;
 Object.freeze(RUNTIME_PROFILES);
 
 /** The selected build. Swap this one line to move the whole harness. */
-export const RUNTIME_PIN = RUNTIME_PROFILES["runtime-lease-873153c-20261022"];
+export const RUNTIME_PIN = RUNTIME_PROFILES["runtime-lease-67433a1-20261022"];
 
 /** The accepted TeamMem staged tree the wheel is built from (D003 scope). */
 export const TEAMMEM_SOURCE = {
