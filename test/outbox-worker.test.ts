@@ -196,9 +196,9 @@ function durableWorker(h: ReturnType<typeof harness>, built: { artifact: Support
     transition: { occurrenceId: built.artifact.occurrence_id, fromState: "discovered", toState: "awaiting_teammem", reason: "test", terminalReason: null, nowMs: now },
     recording: { handle: "a".repeat(32), encryptedPath: source, sha256: SHA(built.bytes).slice(7), durationMs: 1, format: "opus", keyId: "fake-key", gaps: [], runtimeGaps: [] },
   });
-  const worker = () => createOutboxWorker({
+  const worker = (log?: (code: string) => void) => createOutboxWorker({
     outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal: store,
-    clock: { now: () => now }, random: () => 0, reconciliationEvidence: store,
+    clock: { now: () => now }, random: () => 0, reconciliationEvidence: store, ...(log === undefined ? {} : { log }),
     session: {
       state: (id) => store.getSession(id)?.state ?? null,
       publish: (id) => { store.transition({ occurrenceId: id, fromState: "awaiting_teammem", toState: "published", reason: "receipt", terminalReason: null, nowMs: now }); },
@@ -1834,5 +1834,136 @@ test("TeamMem twin receipts written for two revisions before one poll: only the 
     for (const source of run.sources) assert.equal(existsSync(source), false);
     assert.equal(run.events.filter((event) => event === "delivery_published").length, 1);
     assert.equal(run.events.some((event) => /refus|resynthesis|recovery/.test(event)), false);
+  } finally { h.cleanup(); }
+});
+
+/** Revisions 1..n of one occurrence, all incomplete, on the durable store; revision 1 is enqueued by `durableWorker`. */
+function durableIncompleteRevisions(h: ReturnType<typeof harness>, count: number) {
+  const first = artifactAndAudio();
+  const revisions = Array.from({ length: count }, (_, index) => parseTeamMemMeetingArtifact({ ...first.artifact, transcript_complete: false, revision: first.artifact.revision + index }));
+  const d = durableWorker(h, { ...first, artifact: revisions[0]!, serialized: canonicalArtifactJson(revisions[0]!), hash: canonicalArtifactHash(revisions[0]!) });
+  const row = (revision: number) => d.store().pending().find((candidate) => candidate.revision === revision);
+  return { d, revisions, row, hash: (index: number) => canonicalArtifactHash(revisions[index]!) };
+}
+
+test("an accepted incomplete higher revision supersedes a waiting lower one: no more polling, no deletion, custody unchanged", () => {
+  const h = harness();
+  const { d, revisions, row, hash } = durableIncompleteRevisions(h, 2);
+  const [lower, higher] = revisions as [typeof revisions[0], typeof revisions[0]];
+  try {
+    const events: string[] = [];
+    let worker = d.worker((code) => { events.push(code); });
+    worker.reconcile();
+    assert.equal(row(lower.revision)?.retryReason, "receipt_unavailable");
+    const higherBundle = worker.enqueue({ artifact: higher, serializedArtifact: canonicalArtifactJson(higher), artifactHash: hash(1), recordingPath: d.source });
+    writeTwinReceipt(h.receipts, higher, hash(1), "b".repeat(40));
+    d.advance(d.now() + 120_000);
+    worker.reconcile();
+    assert.notEqual(row(higher.revision)?.publishedAtMs, null);
+    d.advance(d.now() + 120_000);
+    worker.reconcile();
+    assert.equal(events.filter((code) => code === "delivery_superseded").length, 1);
+    const superseded = row(lower.revision)!;
+    assert.equal(superseded.publishedAtMs, null);
+
+    // Polls across almost the whole custody window, with the same receipt replayed, write nothing.
+    const deadline = lower.ended_at === higher.ended_at ? Date.parse(lower.ended_at) + 14 * 24 * 60 * 60 * 1000 : assert.fail("one occurrence end");
+    for (const at of [d.now() + 60_000, d.now() + 3_600_000, deadline - 86_400_000, deadline - 1]) {
+      d.advance(at);
+      writeTwinReceipt(h.receipts, higher, hash(1), "b".repeat(40));
+      worker.reconcile();
+      assert.deepEqual(row(lower.revision), superseded);
+    }
+    assert.equal(events.filter((code) => code === "delivery_superseded").length, 1);
+    assert.equal(events.filter((code) => code === "delivery_published").length, 1);
+    assert.deepEqual(d.store().notifications().map((intent) => intent.revision), [higher.revision]);
+    for (const evidence of [d.source, d.bundle, higherBundle]) assert.equal(existsSync(evidence), true);
+
+    // A restart re-derives the same state: still no write and no second publication.
+    d.reopen();
+    const restarted: string[] = [];
+    worker = d.worker((code) => { restarted.push(code); });
+    worker.reconcile();
+    assert.deepEqual(row(lower.revision), superseded);
+    assert.deepEqual(restarted, ["delivery_superseded"]);
+    assert.deepEqual(d.store().notifications().map((intent) => intent.revision), [higher.revision]);
+
+    // The 14-day deadline still deletes every copy, on the original date.
+    d.advance(deadline);
+    worker.reconcile();
+    assert.deepEqual(d.store().pending(), []);
+    for (const evidence of [d.source, d.bundle, higherBundle]) assert.equal(existsSync(evidence), false);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("only revisions below the accepted one are superseded; a higher pending revision keeps polling and still publishes", () => {
+  const h = harness();
+  const { d, revisions, row, hash } = durableIncompleteRevisions(h, 3);
+  const [lowest, middle, highest] = revisions as [typeof revisions[0], typeof revisions[0], typeof revisions[0]];
+  try {
+    const events: string[] = [];
+    const worker = d.worker((code) => { events.push(code); });
+    for (const artifact of [middle, highest]) worker.enqueue({ artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: canonicalArtifactHash(artifact), recordingPath: d.source });
+    writeTwinReceipt(h.receipts, middle, hash(1), "b".repeat(40));
+    worker.reconcile();
+    const lowestAfter = (d.advance(d.now() + 120_000), worker.reconcile(), row(lowest.revision)!);
+    const retries: number[] = [];
+    for (let poll = 0; poll < 4; poll += 1) {
+      d.advance(d.now() + 120_000);
+      worker.reconcile();
+      retries.push(row(highest.revision)!.retryCount);
+      assert.deepEqual(row(lowest.revision), lowestAfter);
+    }
+    assert.equal(row(highest.revision)!.retryReason, "receipt_unavailable");
+    assert.deepEqual(retries, [...retries].sort((a, b) => a - b));
+    assert.ok(retries.at(-1)! > retries[0]!);
+    assert.equal(events.filter((code) => code === "delivery_superseded").length, 1);
+
+    writeTwinReceipt(h.receipts, highest, hash(2), "c".repeat(40));
+    d.advance(d.now() + 120_000);
+    worker.reconcile();
+    assert.notEqual(row(highest.revision)?.publishedAtMs, null);
+    d.advance(d.now() + 120_000);
+    worker.reconcile();
+    assert.equal(row(middle.revision)?.publishedAtMs !== null, true);
+    assert.equal(row(lowest.revision)?.publishedAtMs, null);
+    assert.equal(events.filter((code) => code === "delivery_superseded").length, 1);
+    assert.deepEqual(d.store().notifications().map((intent) => intent.revision), [middle.revision, highest.revision]);
+    assert.equal(existsSync(d.source), true);
+  } finally { d.close(); h.cleanup(); }
+});
+
+test("an accepted higher revision in one occurrence never supersedes a lower pending revision of another", () => {
+  const h = harness();
+  try {
+    const base = artifactAndAudio();
+    const make = (occurrence: "a" | "b", revision: number) => parseTeamMemMeetingArtifact({ ...base.artifact, transcript_complete: false, revision,
+      ...(occurrence === "a" ? {} : { occurrence_id: base.artifact.occurrence_id.replace("board-sync@", "board-sync-b@"), provider_meeting_id: `${base.artifact.provider_meeting_id}-b` }) });
+    const aLower = make("a", base.artifact.revision), aHigher = make("a", base.artifact.revision + 1), bLower = make("b", base.artifact.revision);
+    assert.notEqual(bLower.occurrence_id, aLower.occurrence_id);
+    const journal = new FakeJournal();
+    const events: string[] = [];
+    let now = 10_000;
+    const worker = createOutboxWorker({ outboxDir: h.outbox, receiptsDir: h.receipts, recordingsDir: h.recordings, journal,
+      clock: { now: () => now }, random: () => 0, log: (code: string) => { events.push(code); },
+      session: { state: () => "awaiting_teammem", publish: () => undefined }, reconciliationEvidence: NOOP_PURGE });
+    for (const [artifact, digit] of [[aLower, "b"], [aHigher, "c"], [bLower, "d"]] as const) {
+      const source = runtimeRecordingPath(h, digit);
+      writeFileSync(source, base.bytes);
+      worker.enqueue({ artifact, serializedArtifact: canonicalArtifactJson(artifact), artifactHash: canonicalArtifactHash(artifact), recordingPath: source });
+    }
+    writeTwinReceipt(h.receipts, aHigher, canonicalArtifactHash(aHigher), "b".repeat(40));
+    const bRow = () => journal.rows.get(`${bLower.occurrence_id}:${bLower.revision}`)!;
+    const retries: number[] = [];
+    for (let poll = 0; poll < 4; poll += 1) { worker.reconcile(); retries.push(bRow().retryCount); now += 120_000; }
+    assert.notEqual(journal.rows.get(`${aHigher.occurrence_id}:${aHigher.revision}`)?.publishedAtMs, null);
+    assert.equal(bRow().retryReason, "receipt_unavailable");
+    assert.ok(retries.at(-1)! > retries[0]!, `occurrence B kept polling: ${retries.join(",")}`);
+    assert.equal(events.filter((code) => code === "delivery_superseded").length, 1);
+
+    const bUrl = writeTwinReceipt(h.receipts, bLower, canonicalArtifactHash(bLower), "c".repeat(40));
+    worker.reconcile();
+    assert.equal(bRow().publicationUrl, bUrl);
+    assert.equal(journal.rows.get(`${aLower.occurrence_id}:${aLower.revision}`)?.publishedAtMs, null);
   } finally { h.cleanup(); }
 });

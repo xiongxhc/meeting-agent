@@ -92,6 +92,7 @@ export function createOutboxWorker(options: {
   if (options.reconciliationEvidence === undefined) throw new Error("reconciliation purge dependency is required");
   if (typeof options.journal.acceptPublication !== "function") throw new Error("atomic publication and notification intent journal capability is required");
   const recordingOwners = new Map<string, string>();
+  const supersededLogged = new Set<string>();
   return {
     enqueue(input): string {
       let requestedArtifact: SupportedTeamMemMeetingArtifact;
@@ -175,7 +176,15 @@ export function createOutboxWorker(options: {
           options.onMaintenanceFailure?.("backfill_seed_cleanup_failed");
         }
       }
-      for (const current of [...options.journal.pending(), ...options.journal.recoverablePublications()]) {
+      const rows = [...options.journal.pending(), ...options.journal.recoverablePublications()];
+      // The highest accepted revision per occurrence. TeamMem replaces the
+      // projection with it, so a lower unpublished revision has nothing left to wait for.
+      const acceptedRevision = new Map<string, number>();
+      const noteAccepted = (row: DeliveryRow): void => {
+        acceptedRevision.set(row.occurrenceId, Math.max(acceptedRevision.get(row.occurrenceId) ?? 0, row.revision));
+      };
+      for (const row of rows) if (row.publishedAtMs !== null) noteAccepted(row);
+      for (const current of rows) {
         let publicationAccepted = current.publishedAtMs !== null;
         try {
           const state = options.session.state(current.occurrenceId);
@@ -216,6 +225,13 @@ export function createOutboxWorker(options: {
             // after a successful ownership claim. A remaining marker still
             // blocks cleanup of conflicting or malformed recording evidence.
             if ((state === "published" || state === "notified") && current.transcriptComplete && current.retryReason !== "recovery_unavailable") deleteOccurrenceEvidence(options, current, now, eligibleRows(options, current));
+            continue;
+          }
+          // Superseded: stop polling without writing anything. Custody is
+          // untouched; the retention deadline above still deletes on time.
+          if ((acceptedRevision.get(current.occurrenceId) ?? 0) > current.revision) {
+            const key = `${current.occurrenceId}:${current.revision}`;
+            if (!supersededLogged.has(key)) { supersededLogged.add(key); options.log?.("delivery_superseded"); }
             continue;
           }
           // The retry gate comes before any I/O: a waiting delivery costs
@@ -298,6 +314,7 @@ export function createOutboxWorker(options: {
             ...(consumed ? { consumedInboxAudio: true as const } : {}),
           });
           options.log?.("delivery_published");
+          noteAccepted(current);
           // A publication ends this occurrence's refusal alerts.
           for (const row of options.journal.pending()) {
             if (row.occurrenceId !== current.occurrenceId || row.refusalReason === undefined) continue;

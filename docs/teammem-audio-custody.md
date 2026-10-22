@@ -41,6 +41,14 @@ the delivery terminal. Only parse, path and integrity failures do, and they
 report `delivery_recovery_unavailable` to the maintenance lane. State changes
 are logged as static `delivery_*` codes.
 
+An unpublished `delivery_journal` row whose occurrence has a published row with
+a higher revision is superseded: it stops polling, logs `delivery_superseded`
+once per process start, and keeps its last `retry_reason` and
+`next_retry_at_ms`, so a past retry time on such a row is expected rather than
+a stalled delivery. Its recording and bundle keep their custody and are deleted
+at `ended_at + 14 days`, or earlier when a complete revision of the same
+occurrence publishes.
+
 A recording that no delivery row, delivery recording owner, backfill seed or
 unknown-end custody row covers still has a deadline. This happens when stop or
 finalize fails, when the finalize transaction fails, or when the process stops
