@@ -9,8 +9,13 @@ test("private outcome accepts canonical bytes and rejects wrong combinations, id
   for (const patch of [{ token: "secret" }, { reason: "join_not_issued" }, { outcome: "departure_unconfirmed", reason: ["cleanup_failed"] }, { physicalGenerationId: "A".repeat(32) }, { physicalGenerationId: "a".repeat(32) + "\n" }, { physicalClientId: "slot\n" }, { physicalClientId: ".." }, { observedAt: "2026-02-31T14:01:00.000Z" }, { bridgeSessionId: "" }]) {
     assert.throws(() => parseBridgeProcessOutcome({ ...fixture, ...patch }), /invalid_bridge_process/);
   }
-  for (const [outcome, reason] of [["no_join_action", "join_not_issued"], ["departure_unconfirmed", "evidence_unavailable"], ["departure_unconfirmed", "input_reap_failed"], ["departure_unconfirmed", "cleanup_failed"], ["departure_unconfirmed", "departure_not_observed"]]) {
+  for (const [outcome, reason] of [["no_join_action", "join_not_issued"], ["no_join_action", "client_not_running"], ["no_join_action", "client_pid_mismatch"], ["no_join_action", "client_not_unique"], ["departure_unconfirmed", "evidence_unavailable"], ["departure_unconfirmed", "input_reap_failed"], ["departure_unconfirmed", "cleanup_failed"], ["departure_unconfirmed", "departure_not_observed"]]) {
     assert.equal(parseBridgeProcessOutcome({ ...fixture, outcome, reason }).reason, reason);
+  }
+});
+test("a client the bridge could not bind is only ever a no-join outcome", () => {
+  for (const [outcome, reason] of [["departure_unconfirmed", "client_not_running"], ["departure_confirmed", "client_pid_mismatch"], ["no_join_action", "client_crashed"]]) {
+    assert.throws(() => parseBridgeProcessOutcome({ ...fixture, outcome, reason }), /invalid_bridge_process/);
   }
 });
 test("flat wire decoder rejects duplicate members without misreading escaped string colons", () => {

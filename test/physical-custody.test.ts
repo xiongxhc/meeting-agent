@@ -82,6 +82,8 @@ test("outcome persistence is atomic and only exact reaped confirmation or no-act
     for (const [id, result, state] of [
       ["b", { reaped: true, exitDiagnostic: null, outcome: null, failure: "outcome_missing" }, "quarantined"],
       ["c", { reaped: true, exitDiagnostic: null, outcome: { outcome: "no_join_action", reason: "join_not_issued" }, failure: null }, "cleared"],
+      // The bridge found no client to drive: it exited nonzero after its no-join outcome.
+      ["e", { reaped: true, exitDiagnostic: "nonzero_exit", outcome: { outcome: "no_join_action", reason: "client_not_running" }, failure: null }, "cleared"],
       ["d", { reaped: true, exitDiagnostic: null, outcome: { outcome: "departure_unconfirmed", reason: "departure_not_observed" }, failure: null }, "quarantined"],
     ] as const) {
       const own = { ...binding, physicalClientId: id, physicalGenerationId: id.repeat(32) };
@@ -89,5 +91,8 @@ test("outcome persistence is atomic and only exact reaped confirmation or no-act
       store.recordPhysicalOutcome(own, { ...result, outcome: result.outcome === null ? null : { ...outcome(own), ...result.outcome } }, 6);
       assert.equal(store.listPhysicalCustody().find((row) => row.physicalClientId === id)?.state, state);
     }
+    const missing = store.listPhysicalCustody().find((row) => row.physicalClientId === "e");
+    assert.equal(missing?.clearReason, "join_not_issued", "the clear proof is that no join was issued");
+    assert.equal(missing?.outcome?.reason, "client_not_running", "the cause stays in the recorded outcome");
   } finally { raw.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

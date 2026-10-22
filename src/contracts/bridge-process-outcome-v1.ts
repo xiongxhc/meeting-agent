@@ -12,9 +12,12 @@ export type BridgeProcessOutcome = CustodyBinding & {
   readonly observedAt: string;
 } & (
   | { readonly outcome: "departure_confirmed"; readonly reason: "departure_observed" }
-  | { readonly outcome: "no_join_action"; readonly reason: "join_not_issued" }
+  | { readonly outcome: "no_join_action"; readonly reason: "join_not_issued" | ClientUnavailableReason }
   | { readonly outcome: "departure_unconfirmed"; readonly reason: "departure_not_observed" | "evidence_unavailable" | "input_reap_failed" | "cleanup_failed" }
 );
+/** The bridge bound no Feishu/Lark client at launch, so it never issued a join. */
+export type ClientUnavailableReason = "client_not_running" | "client_pid_mismatch" | "client_not_unique";
+export const CLIENT_UNAVAILABLE_REASONS: readonly ClientUnavailableReason[] = ["client_not_running", "client_pid_mismatch", "client_not_unique"];
 export const OUTCOME_MAX_BYTES = 4096;
 const bindingKeys = ["physicalClientId", "physicalGenerationId", "occurrenceId", "bridgeSessionId"] as const;
 function invalid(): never { throw new Error("invalid_bridge_process_contract"); }
@@ -52,7 +55,7 @@ export function parseBridgeProcessOutcome(value: unknown): BridgeProcessOutcome 
   const canonical = raw.observedAt.includes(".") ? raw.observedAt : raw.observedAt.replace(/Z$/, ".000Z");
   if (!Number.isFinite(ms) || new Date(ms).toISOString() !== canonical) invalid();
   const valid = raw.outcome === "departure_confirmed" && raw.reason === "departure_observed" ||
-    raw.outcome === "no_join_action" && raw.reason === "join_not_issued" ||
+    raw.outcome === "no_join_action" && (raw.reason === "join_not_issued" || (CLIENT_UNAVAILABLE_REASONS as readonly unknown[]).includes(raw.reason)) ||
     raw.outcome === "departure_unconfirmed" && typeof raw.reason === "string" && ["departure_not_observed", "evidence_unavailable", "input_reap_failed", "cleanup_failed"].includes(raw.reason);
   if (!valid || Buffer.byteLength(JSON.stringify(raw)) + 1 > OUTCOME_MAX_BYTES) invalid();
   return { ...raw, ...binding } as BridgeProcessOutcome;

@@ -34,7 +34,9 @@ public struct BridgeProcessConfiguration {
     }
 
     public enum Arguments: Equatable { case help, run(path: String, inspection: Bool) }
-    public let pid: Int32
+    /// Optional: absent, the bridge resolves the running client from
+    /// bundleIdentifier and bundlePath at launch. Present, it must be that client.
+    public let pid: Int32?
     public let bundlePath: String
     public let bundleIdentifier: String
     public let bundleVersion: String
@@ -72,10 +74,10 @@ public struct BridgeProcessConfiguration {
         guard data.count <= 65_536, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeProcessError.invalidInput }
         let v3 = object["schema"] as? String == "feishu-bridge-config/v3"
         let v2 = object["schema"] as? String == "feishu-bridge-config/v2" || v3
-        var required: Set<String> = ["schema", "pid", "bundlePath", "bundleIdentifier", "bundleVersion", "locale", "evidenceRoot", "observationIntervalMs", "joinDeadlineMs", "actionDeadlineMs", "axCallTimeoutMs"]
+        var required: Set<String> = ["schema", "bundlePath", "bundleIdentifier", "bundleVersion", "locale", "evidenceRoot", "observationIntervalMs", "joinDeadlineMs", "actionDeadlineMs", "axCallTimeoutMs"]
         if v2 { required.insert("custody") }
         if v3 { required.insert("audio") }
-        guard required.isSubset(of: Set(object.keys)), Set(object.keys).isSubset(of: required.union(["selectors"])) else { throw BridgeProcessError.invalidInput }
+        guard required.isSubset(of: Set(object.keys)), Set(object.keys).isSubset(of: required.union(["selectors", "pid"])) else { throw BridgeProcessError.invalidInput }
         func string(_ key: String) throws -> String {
             guard let value = object[key] as? String, !value.isEmpty, value.utf8.count <= 1024, !value.contains("\0") else { throw BridgeProcessError.invalidInput }; return value
         }
@@ -124,7 +126,7 @@ public struct BridgeProcessConfiguration {
                 guard rowOrTile, speakerSelectors.highlight == nil || (!labels.identifiers.speakerGrid.isEmpty && !labels.identifiers.speakerTilePrefix.isEmpty) else { throw BridgeProcessError.invalidInput }
             }
         } else if !inspection || object["selectors"] != nil { throw BridgeProcessError.invalidInput }
-        return Self(pid: Int32(try integer("pid", 1...Int(Int32.max))), bundlePath: path,
+        return Self(pid: object["pid"] == nil ? nil : Int32(try integer("pid", 1...Int(Int32.max))), bundlePath: path,
                     bundleIdentifier: try string("bundleIdentifier"), bundleVersion: build, locale: locale, evidenceRoot: root,
                     observationInterval: Double(try integer("observationIntervalMs", 50...5000)) / 1000,
                     joinDeadline: Double(try integer("joinDeadlineMs", 100...120_000)) / 1000,

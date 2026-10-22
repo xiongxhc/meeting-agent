@@ -28,6 +28,19 @@ final class BridgeConfigurationTests: XCTestCase {
         XCTAssertNoThrow(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false))
         XCTAssertThrowsError(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: true))
     }
+    func testPidIsOptionalAndAnExplicitPidStaysStrict() throws {
+        var object = try JSONSerialization.jsonObject(with: meetingFixture("spikes/feishu/fixtures/process/config-v2.json")) as! [String: Any]
+        XCTAssertEqual(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false).pid, 123)
+        object.removeValue(forKey: "pid")
+        XCTAssertNil(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false).pid,
+                     "without a PID the bridge resolves the client at launch")
+        object["schema"] = "feishu-bridge-config/v3"; object["audio"] = ["captureDisplayId": 42, "outputDeviceUid": "synthetic-explicit-output"]
+        XCTAssertNil(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false).pid)
+        for invalid: Any in [0, -1, true, "123", 1.5, Int(Int32.max) + 1, NSNull()] {
+            object["pid"] = invalid
+            XCTAssertThrowsError(try BridgeProcessConfiguration.decode(JSONSerialization.data(withJSONObject: object), inspection: false), "\(invalid)")
+        }
+    }
     func testConfigurationReadsShortChunksAndRetriesInterruptedReadToEOF() throws {
         var calls = 0
         let data = try BridgeProcessConfiguration.readData(fd: -1) { _, buffer, count in

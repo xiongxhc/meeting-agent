@@ -28,8 +28,19 @@ Allowed pairs only:
 |outcome|reason|
 |---|---|
 |departure_confirmed|departure_observed|
-|no_join_action|join_not_issued|
+|no_join_action|join_not_issued, client_not_running, client_pid_mismatch, client_not_unique|
 |departure_unconfirmed|departure_not_observed, evidence_unavailable, input_reap_failed, cleanup_failed|
+
+The three `client_*` reasons are written before any UI action, AX handle, stdout
+line or media, when the bridge binds no Feishu/Lark client at launch. The static
+config's `pid` is optional: without it the bridge resolves the one running
+process whose bundle identifier and bundle path equal the config (live, with a
+launch time). `client_not_running` means no such process runs;
+`client_not_unique` means several run and no `pid` selects one;
+`client_pid_mismatch` means a configured `pid` is not such a process (for
+example, stale after a client restart). The bridge then exits nonzero with the
+same code as its diagnostic. Custody clears as `join_not_issued`, the proof
+kind; the cause stays in the recorded outcome.
 
 No UI text, audio, transcript, credentials or caught error strings belong here.
 Reserve join-action issuance before native press; never infer no-action from an

@@ -167,8 +167,15 @@ PATH="/opt/homebrew/opt/node@24/bin:$PATH" node --test spikes/feishu/test/protoc
 
 Do not run live modes until the operator grants Accessibility and selects a
 throwaway meeting. The bridge checks trust without prompting, never launches
-or activates an app, and binds an explicit PID plus bundle path/ID/build and
-process launch time. A PID/build/locale change requires a refreshed config.
+or activates an app. At launch it resolves the one running process whose
+bundle identifier and bundle path equal the config, and binds that PID plus
+bundle path/ID/build and process launch time. `pid` is optional, so a client
+restart needs no config edit; a build/locale change still requires a refreshed
+config. A configured `pid` must be that running client. Otherwise the bridge
+refuses before any UI action with `client_pid_mismatch`; with no such client it
+reports `client_not_running`, and with several and no `pid`,
+`client_not_unique`. Each is the exit diagnostic, and with custody also a
+`no_join_action` private outcome (see `docs/bridge-process-outcome-v1.md`).
 No app display name implies Feishu versus Lark API region.
 
 Create a private directory **outside every repository**, using its canonical
@@ -178,12 +185,12 @@ and every parent must be real directories, not symlinks; `/tmp` and `/var` are
 symlinks on macOS (use `/private/tmp` for disposable tests). The root can be
 created by the bridge only when its parent already exists.
 
-Inspection config shape (replace PID/path/metadata with the selected process):
+Inspection config shape (replace path/metadata with the installed client;
+add `"pid"` only to pick one of several running copies):
 
 ```json
 {
   "schema": "feishu-bridge-config/v1",
-  "pid": 12345,
   "bundlePath": "/Applications/Lark.app",
   "bundleIdentifier": "com.electron.lark",
   "bundleVersion": "7499.203",
@@ -197,8 +204,8 @@ Inspection config shape (replace PID/path/metadata with the selected process):
 ```
 
 The path/ID/build above are literal controller bundle inventory, not measured
-selectors or a marketing-version claim; verify them for each run. Obtain the
-exact PID from Activity Monitor, not the first similarly named process.
+selectors or a marketing-version claim; verify them for each run. If you set a
+`pid`, take it from Activity Monitor, not the first similarly named process.
 
 ```sh
 bridges/mac/.build/debug/FeishuBridgeSpike --config /Users/OPERATOR/meeting-agent-evidence/config.json --inspect-ax

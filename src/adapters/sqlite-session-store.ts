@@ -568,7 +568,9 @@ function recordPhysicalOutcome(db: Database.Database, value: CustodyBinding, res
     db.prepare(`UPDATE physical_client_custody SET outcome_json = ?, outcome_failure = ?, exit_diagnostic = ?, outcome_recorded_at_ms = ?,
       state = ?, cleared_at_ms = ?, clear_reason = ? WHERE physical_client_id = ? AND physical_generation_id = ? AND state = 'quarantined'`)
       .run(outcome === null ? null : JSON.stringify(outcome), failure, result.exitDiagnostic, nowMs, clear ? "cleared" : "quarantined", clear ? nowMs : null,
-        clear ? outcome.reason : null, binding.physicalClientId, binding.physicalGenerationId);
+        // The clear reason is the proof kind. Every no-join outcome proves no
+        // join was issued; its cause (e.g. client_not_running) stays in outcome_json.
+        clear ? (outcome.outcome === "no_join_action" ? "join_not_issued" : outcome.reason) : null, binding.physicalClientId, binding.physicalGenerationId);
   }).immediate();
 }
 function clearPhysicalClient(db: Database.Database, input: PhysicalClientClear): void {

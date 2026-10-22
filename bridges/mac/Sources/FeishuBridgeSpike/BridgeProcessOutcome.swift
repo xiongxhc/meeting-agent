@@ -39,6 +39,8 @@ public struct BridgeCleanupStatus: Equatable, Sendable {
     static let noAction = Self(outcome: "no_join_action", reason: "join_not_issued")
     static let confirmed = Self(outcome: "departure_confirmed", reason: "departure_observed")
     static func unconfirmed(_ reason: String) -> Self { Self(outcome: "departure_unconfirmed", reason: reason) }
+    /// No client could be bound at launch, so no join was ever issued.
+    public static func clientUnavailable(_ failure: ClientResolutionFailure) -> Self { Self(outcome: "no_join_action", reason: failure.rawValue) }
 }
 
 public struct BridgeProcessOutcome: Equatable, Sendable {
@@ -46,7 +48,7 @@ public struct BridgeProcessOutcome: Equatable, Sendable {
     public let outcome: String, reason: String, observedAt: String
     public init(binding: BridgeCustodyBinding, status: BridgeCleanupStatus, observedAt: String) throws {
         guard validAuditInstant(observedAt),
-              status == .confirmed || status == .noAction || status.outcome == "departure_unconfirmed" && ["departure_not_observed", "evidence_unavailable", "input_reap_failed", "cleanup_failed"].contains(status.reason) else { throw BridgeProcessError.invalidInput }
+              status == .confirmed || status == .noAction || status.outcome == "no_join_action" && ClientResolutionFailure(rawValue: status.reason) != nil || status.outcome == "departure_unconfirmed" && ["departure_not_observed", "evidence_unavailable", "input_reap_failed", "cleanup_failed"].contains(status.reason) else { throw BridgeProcessError.invalidInput }
         self.binding = binding; outcome = status.outcome; reason = status.reason; self.observedAt = observedAt
     }
     public static func decode(_ data: Data) throws -> Self {

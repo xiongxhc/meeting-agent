@@ -29,11 +29,26 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     }
     defer { signals.forEach { $0.cancel() } }
     let clock = SystemBridgeClock()
-    // Bind capture before constructing the AX owner. PID recycling between
-    // these reads can only make capture fail its launch-date check, never make
-    // it follow a later process by PID alone.
-    let captureLaunchDate = configuration.audio == nil ? nil : NSRunningApplication(processIdentifier: configuration.pid)?.launchDate
-    let backend = SystemAXBackend(pid: configuration.pid, bundlePath: configuration.bundlePath,
+    // Resolve the client once, before any AX handle, stdout or media: no
+    // running client (or a stale/foreign configured PID) is a no-join outcome
+    // and an exit diagnostic, never a crash or a hang. Capture binds the
+    // resolved launch time, so PID recycling can only make it fail its
+    // launch-date check, never follow a later process by PID alone.
+    let client: ResolvedClient
+    switch ClientProcessResolver.resolve(bundleIdentifier: configuration.bundleIdentifier, bundlePath: configuration.bundlePath,
+                                         explicitPid: configuration.pid,
+                                         running: ClientProcessResolver.systemProcesses(bundleIdentifier: configuration.bundleIdentifier)) {
+    case .success(let resolved): client = resolved
+    case .failure(let failure):
+        // A failed private write leaves the outcome missing, which the parent
+        // already treats as unresolved custody; the diagnostic stays the cause.
+        if let binding = configuration.custody, let writer = outcomeWriter {
+            _ = try? writer.write(BridgeProcessOutcome(binding: binding, status: .clientUnavailable(failure), observedAt: clock.now()))
+        }
+        throw failure
+    }
+    let captureLaunchDate = configuration.audio == nil ? nil : client.launchDate
+    let backend = SystemAXBackend(pid: client.pid, bundlePath: configuration.bundlePath,
                                   bundleId: configuration.bundleIdentifier, build: configuration.bundleVersion,
                                   callTimeout: configuration.axCallTimeout)
     let driver = AXAccessibilityDriver(backend: backend, clock: clock, cancellation: cancellation,
@@ -54,7 +69,7 @@ func run(_ configuration: BridgeProcessConfiguration, inspection: Bool) throws {
     let timedMedia: TimedMediaControlOwner?
     if let audio = configuration.audio, let timingClock {
         guard let captureLaunchDate else { throw BridgeProcessError.invalidInput }
-        let request = try CaptureRequest(pid: configuration.pid, bundlePath: configuration.bundlePath,
+        let request = try CaptureRequest(pid: client.pid, bundlePath: configuration.bundlePath,
             bundleIdentifier: configuration.bundleIdentifier, build: configuration.bundleVersion,
             launchDate: captureLaunchDate, displayID: audio.captureDisplayId)
         let session = TimedMediaSession(clock: timingClock,
@@ -92,6 +107,6 @@ do {
         try run(BridgeProcessConfiguration.read(path: path, inspection: inspection), inspection: inspection)
     }
 } catch {
-    diagnostic((error as? BridgeProcessError)?.rawValue ?? "bridge_failed")
+    diagnostic((error as? BridgeProcessError)?.rawValue ?? (error as? ClientResolutionFailure)?.rawValue ?? "bridge_failed")
     exit(2)
 }
