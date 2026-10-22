@@ -164,23 +164,6 @@ export const EXPIRY_EVIDENCE_PROFILE = Object.freeze({
   }),
 });
 RUNTIME_PROFILES[EXPIRY_EVIDENCE_PROFILE.name] = EXPIRY_EVIDENCE_PROFILE;
-
-// TEST package for the provider-fault D2 cuts only, never a repin: the Runtime
-// under test is ea9a8f626539af7f2adeb3a19fe4394592dfb36d. Its manifest.json
-// records source, build commands and focused gates. A recognition failure while
-// the agent is speaking and the playback flush is not acknowledged is a known
-// open case for this revision (the speaking flush-timeout cut).
-const PROVIDER_FAULT_ROOT = path.join(ARTIFACTS, "runtime-provider-fault-test-20261021");
-export const PROVIDER_FAULT_TEST_PROFILE = Object.freeze({
-  name: "runtime-provider-fault-test-20261021",
-  root: PROVIDER_FAULT_ROOT,
-  revision: "ea9a8f626539af7f2adeb3a19fe4394592dfb36d",
-  gateway: Object.freeze({ path: path.join(PROVIDER_FAULT_ROOT, "target/debug/conversation-runtime-gateway"), sha256: "1b521c4bf7c0dce5a271f59da56bcca5beca6e6718dc4a841336eacd86404802" }),
-  scriptedGateway: Object.freeze({ path: path.join(PROVIDER_FAULT_ROOT, "target/debug/conversation-runtime-gateway-scripted"), sha256: "46ebaab656fd7a6d178274398dd0630c533c90eacee80ef24d0ad9c580bf035b" }),
-  scriptedPeers: Object.freeze({ path: path.join(PROVIDER_FAULT_ROOT, "target/debug/conversation-runtime-scripted-peers"), sha256: "9cc9aa266fec1e8f85f230843c1c0e81d6eb0a7c7cf9811beea4cbe2390bcc38" }),
-  sdkTarball: Object.freeze({ path: path.join(PROVIDER_FAULT_ROOT, "stage/conversation-runtime-0.1.0.tgz"), sha256: "d3cbe3587b5857ecdd377eeb4d47d8ac697adeeec31e68ed480487f5287d843a" }),
-});
-RUNTIME_PROFILES[PROVIDER_FAULT_TEST_PROFILE.name] = PROVIDER_FAULT_TEST_PROFILE;
 Object.freeze(RUNTIME_PROFILES);
 
 /** The selected build. Swap this one line to move the whole harness. */

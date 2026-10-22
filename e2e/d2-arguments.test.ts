@@ -35,18 +35,19 @@ for (const [args, expected] of [
   });
 }
 
-test("provider-fault cuts parse and select the provider-fault TEST package; every other mode keeps the default pin", async () => {
+test("provider-fault cuts parse and run on the default pin, like every other mode; the retired TEST profile is refused", async () => {
   const module = await import(path.join(import.meta.dirname, "run.mjs"));
   const pins = await import(path.join(import.meta.dirname, "pins.mjs"));
   assert.equal(pins.RUNTIME_PIN.name, "runtime-lease-873153c-20261022");
   for (const cut of ["provider-connect", "provider-error", "provider-stall", "provider-error-speaking", "provider-error-speaking-flush-timeout"]) {
     const options = module.parseArguments(["--interactive", "--d2-cut", cut, "--out", "/private/tmp/unused-provider-fault"]);
     assert.equal(options.d2Cut, cut);
-    assert.equal(module.runtimeProfileFor(options), pins.PROVIDER_FAULT_TEST_PROFILE);
-    assert.equal(pins.resolveRuntimeProfile("runtime-provider-fault-test-20261021"), pins.PROVIDER_FAULT_TEST_PROFILE);
+    assert.equal(module.runtimeProfileFor(options), pins.RUNTIME_PIN);
   }
   for (const d2Cut of [null, "durable", "cancel-wins", "complete-wins", "repeated-close"])
     assert.equal(module.runtimeProfileFor({ d2Cut }), pins.RUNTIME_PIN);
+  assert.equal(Object.hasOwn(pins, "PROVIDER_FAULT_TEST_PROFILE"), false);
+  assert.throws(() => pins.resolveRuntimeProfile("runtime-provider-fault-test-20261021"), /unknown runtime profile/);
   assert.throws(() => module.parseArguments(["--d2-cut", "provider-error", "--out", "/private/tmp/unused-provider-fault"]), /D2 cuts require --interactive/);
 });
 

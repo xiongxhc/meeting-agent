@@ -23,7 +23,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
-import { PROVIDER_FAULT_TEST_PROFILE, RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
+import { RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
 import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, mediaTimingConfiguration, run, stage } from "./stage.mjs";
 import { publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 
@@ -192,10 +192,9 @@ export async function runL6Publication({ gate, publisher, channel, verifyRemote,
   return { report, failure, cleanup, evidence: controller.evidence() };
 }
 
-/** Provider-fault cuts run against the provider-fault TEST package; every other
- * mode keeps the default pin. */
-export function runtimeProfileFor({ d2Cut }) {
-  return Object.hasOwn(PROVIDER_FAULT_CUTS, d2Cut ?? "") ? PROVIDER_FAULT_TEST_PROFILE : RUNTIME_PIN;
+/** Every mode, the provider-fault cuts included, runs on the default pin. */
+export function runtimeProfileFor() {
+  return RUNTIME_PIN;
 }
 
 /** The real parent uses this decision before its publication block. */
