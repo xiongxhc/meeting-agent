@@ -9,7 +9,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { observeProcessSnapshot, processCleanupProof } from "./process-evidence.mjs";
-import { ADMISSION_HELPER_BASENAMES, ADMISSION_HELPER_ROLES, ADMISSION_HELPER_SCHEMA } from "./admission-helper-provenance.mjs";
+import { ADMISSION_HELPER_BASENAMES, ADMISSION_HELPER_ROLES, ADMISSION_HELPER_SCHEMA, BRIDGE_SPAWN_LIMIT, BRIDGE_SPAWN_SCHEMA } from "./admission-helper-provenance.mjs";
 
 export function requireIngress(value, reason) { if (!value) throw new Error(`ingress_${reason}`); }
 export function ingressFailure(error, fallback) {
@@ -613,6 +613,33 @@ export function ingressAdmissionHelperFact(value) {
   requireIngress(new Set(value.helpers.map(row => row.pid)).size === value.helpers.length, "admission_helper_record");
   return value;
 }
+export function ingressBridgeSpawnFact(value) {
+  value = ingressData(value);
+  ingressCloseRecord(value, ["schema", "ownerPid", "invalid", "bridges"], ["bridges"]);
+  requireIngress(value.schema === BRIDGE_SPAWN_SCHEMA && Number.isSafeInteger(value.ownerPid) && value.ownerPid > 0 && typeof value.invalid === "boolean" &&
+    Array.isArray(value.bridges) && value.bridges.length <= BRIDGE_SPAWN_LIMIT, "bridge_spawn_record");
+  ingressCloseRows(value.bridges, ["sequence", "pid", "exitObserved", "closeObserved", "code", "signal"]);
+  for (const [index, row] of value.bridges.entries()) requireIngress(row.sequence === index + 1 && (row.pid === null || Number.isSafeInteger(row.pid) && row.pid > 0) &&
+    typeof row.exitObserved === "boolean" && typeof row.closeObserved === "boolean" && (row.code === null || Number.isInteger(row.code)) &&
+    (row.signal === null || /^SIG[A-Z0-9]{1,12}$/.test(row.signal)), "bridge_spawn_record");
+  return value;
+}
+/** Phase owned-PID binding. The Runtime PID must be sampled under the owner. The bridge PID is bound by
+ * the owner's spawn registration when one exists (exactly one registered bridge, that PID, spawned by this
+ * owner, exited 0 and closed), else by sampling as before. A registration never relaxes the sampled cleanup proof. */
+export function ingressOwnedPidsBound(evidence, { role, ownerPid, result }) {
+  try {
+    const sampled = pid => evidence.observed.some(row => row.pid === pid && row.origins.includes(role));
+    const runtime = result?.activity?.runtimePids ?? [], bridge = result?.activity?.bridge ?? null;
+    if (!Array.isArray(runtime) || !runtime.every(sampled)) return false;
+    if (result?.bridgeSpawns === undefined) return bridge === null || sampled(bridge.pid);
+    const record = ingressBridgeSpawnFact(result.bridgeSpawns);
+    if (record.invalid || record.ownerPid !== ownerPid) return false;
+    if (bridge === null) return record.bridges.length === 0;
+    const [row] = record.bridges;
+    return record.bridges.length === 1 && row.pid === bridge.pid && row.exitObserved && row.closeObserved && row.code === 0 && row.signal === null;
+  } catch { return false; }
+}
 /** Registered helpers that settled cleanly and are not the owner itself. */
 function settledAdmissionHelpers(helpers, ownerPid) {
   if (helpers === undefined) return [];
@@ -670,8 +697,8 @@ export function assertIngressReopenOrigins(proof, ownerPid, helpers) {
 }
 export function ingressReopenPhaseFact(value) {
   value = ingressData(value);
-  ingressCloseRecord(value, ["success", "phase", "root", "databasePath", "state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "processBindingObserved", "admissionHelpers"],
-    ["state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "admissionHelpers"]);
+  ingressCloseRecord(value, ["success", "phase", "root", "databasePath", "state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "processBindingObserved", "admissionHelpers", "bridgeSpawns"],
+    ["state", "activity", "close", "removal", "observations", "failures", "ownerProcessProof", "child", "admissionHelpers", "bridgeSpawns"]);
   requireIngress(typeof value.success === "boolean" && [1, 2, 3].includes(value.phase) && typeof value.root === "string" && typeof value.databasePath === "string", "reopen_report");
   if (value.state !== undefined) value.state = ingressReopenState(value.state);
   if (value.close !== undefined) {
@@ -703,6 +730,7 @@ export function ingressReopenPhaseFact(value) {
   if (value.child !== undefined) ingressCloseRecord(value.child, ["exitObserved", "closeObserved", "code", "signal", "forced", "stdioSettled", "pid"]);
   if (value.ownerProcessProof !== undefined) value.ownerProcessProof = ingressReopenProcessFact(value.ownerProcessProof);
   if (value.admissionHelpers !== undefined) value.admissionHelpers = ingressAdmissionHelperFact(value.admissionHelpers);
+  if (value.bridgeSpawns !== undefined) { requireIngress(value.phase === 2, "reopen_report"); value.bridgeSpawns = ingressBridgeSpawnFact(value.bridgeSpawns); }
   return value;
 }
 function ingressReopenProcessFact(value) {
@@ -886,7 +914,7 @@ async function realMain(argv) {
       for (const [index, name] of ["stdout", "stderr"].entries()) writeFileSync(path.join(phaseDir, name), Buffer.concat(streams[index]), { mode: 0o600 });
       let result; try { result = boundedJson(phasePlan.summaryPath); } catch { result = { success: false, failure: "ingress_summary_missing" }; }
       const ownedPids = [...(result.activity?.runtimePids ?? []), ...(result.activity?.bridge ? [result.activity.bridge.pid] : [])];
-      if (!ownedPids.every(pid => evidence.observed.some(row => row.pid === pid && row.origins.includes(record.role)))) failure = true;
+      if (!ingressOwnedPidsBound(evidence, { role: record.role, ownerPid: child.pid, result })) failure = true;
       result.processBindingObserved = ownedPids.length;
       try { inventory(process.pid, record.role, `phase-${phasePlan.phase}-close`, true); } catch { failure = true; }
       const closeProof = ingressOwnerCloseProof(evidence, { phasePlan, role: record.role, ownerPid: child.pid, result });

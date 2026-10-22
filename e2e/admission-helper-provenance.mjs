@@ -84,3 +84,67 @@ export function createReopenAdmission(plan, { childProcessModule, ownerPid }) {
     attach(result) { return observer ? { ...result, admissionHelpers: observer.record() } : result; },
   };
 }
+
+// Owner-side record of the bridge child the composition spawns (src/adapters/child-bridge-process.ts).
+// Phase 2 binds the bridge PID from this registration, not from a 100 ms ps sample that a short-lived
+// healthy bridge can slip between. Only the PID of the genuinely returned ChildProcess and its exit/close facts
+// are kept; no argv, paths, environment or output.
+export const BRIDGE_SPAWN_SCHEMA = "meeting-ingress-bridge-spawns/v1";
+export const BRIDGE_SPAWN_LIMIT = 4;
+function bridgeShape(executable, args, options) {
+  try {
+    return typeof executable === "string" && Array.isArray(args) && args.length === 3 && typeof args[0] === "string" &&
+      args[0].slice(args[0].lastIndexOf("/") + 1) === "e2e-bridge-child.mjs" && args[1] === "--config" && typeof args[2] === "string" &&
+      !!options && typeof options === "object" && options.shell === false && options.detached === false &&
+      Array.isArray(options.stdio) && options.stdio.length === 4 && options.stdio.every(slot => slot === "pipe");
+  } catch { return false; }
+}
+/** `sync` re-binds named `spawn` imports of node:child_process (module.syncBuiltinESMExports) after patch and restore. */
+export function createBridgeSpawnObserver(childProcessModule, { ownerPid, sync }) {
+  const bridges = []; let invalid = !validPid(ownerPid) || typeof sync !== "function", descriptor = null;
+  function register(child) {
+    if (bridges.length === BRIDGE_SPAWN_LIMIT) { invalid = true; return; }
+    const entry = { sequence: bridges.length + 1, pid: null, exitObserved: false, closeObserved: false, code: null, signal: null };
+    bridges.push(entry);
+    try {
+      if (!validPid(child?.pid) || child.pid === ownerPid || bridges.some(row => row !== entry && row.pid === child.pid)) { invalid = true; return; }
+      entry.pid = child.pid;
+      child.once("exit", (code, signal) => {
+        entry.exitObserved = true;
+        entry.code = Number.isInteger(code) && code >= 0 && code <= 255 ? code : null;
+        entry.signal = typeof signal === "string" && /^SIG[A-Z0-9]{1,12}$/.test(signal) ? signal : null;
+      });
+      child.once("close", () => { entry.closeObserved = true; });
+    } catch { invalid = true; }
+  }
+  return {
+    start() {
+      if (descriptor !== null) return;
+      const current = Object.getOwnPropertyDescriptor(childProcessModule, "spawn"), original = current?.value;
+      if (!current || typeof original !== "function" || !current.writable || !current.configurable || typeof sync !== "function") { invalid = true; return; }
+      descriptor = current;
+      Object.defineProperty(childProcessModule, "spawn", { ...current, value: function observedBridgeSpawn(...args) {
+        const child = Reflect.apply(original, this, args);
+        if (bridgeShape(args[0], args[1], args[2])) register(child);
+        return child;
+      } });
+      sync();
+    },
+    stop() {
+      if (descriptor === null) return;
+      Object.defineProperty(childProcessModule, "spawn", descriptor); descriptor = null; sync();
+    },
+    record() {
+      return { schema: BRIDGE_SPAWN_SCHEMA, ownerPid, invalid: invalid || bridges.some(row => row.pid === null), bridges: bridges.map(row => ({ ...row })) };
+    },
+  };
+}
+/** Entry seam: register the bridge spawn only for the closed-generation reopen's bridge owner (phase 2). */
+export function createReopenBridgeSpawns(plan, { childProcessModule, ownerPid, sync }) {
+  const observer = plan.closedGenerationReopen === true && plan.phase === 2 ? createBridgeSpawnObserver(childProcessModule, { ownerPid, sync }) : null;
+  return {
+    start() { observer?.start(); },
+    stop() { observer?.stop(); },
+    attach(result) { return observer ? { ...result, bridgeSpawns: observer.record() } : result; },
+  };
+}

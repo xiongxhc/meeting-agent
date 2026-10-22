@@ -1,6 +1,7 @@
 // Built-child adapter; imports of this module do not load the SDK/application.
 import { lstatSync, readdirSync, writeFileSync } from "node:fs";
 import { Agent as HttpAgent } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
@@ -188,6 +189,8 @@ async function runRealEntry(plan) {
   ]);
   // Reopen owner only: record the lock's own helper children for parent origin attribution.
   const admission = provenance.createReopenAdmission(plan, { childProcessModule: childProcess.default, ownerPid: process.pid });
+  // Reopen bridge owner only: register the bridge child so the parent binds its PID without a lucky sample.
+  const bridgeSpawns = provenance.createReopenBridgeSpawns(plan, { childProcessModule: childProcess.default, ownerPid: process.pid, sync: syncBuiltinESMExports });
   const shutdown = new globalThis.AbortController();
   const signal = () => shutdown.abort(); for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(name, signal);
   let peer, app, run, http, connection, standaloneExit, compositionResult, ownerClosed = false, admitted = false, observerFailure = false, overflow = false;
@@ -382,10 +385,12 @@ async function runRealEntry(plan) {
     return peerClosePromise;
   }
   try {
+    bridgeSpawns.start();
     const result = await runIngressPhase(plan, effects, { signal: shutdown.signal });
-    return admission.attach(result);
+    bridgeSpawns.stop();
+    return bridgeSpawns.attach(admission.attach(result));
   }
-  finally { for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.off(name, signal); }
+  finally { bridgeSpawns.stop(); for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.off(name, signal); }
 }
 function readPrivateText(filename) {
   // Same bounded/no-follow file discipline; PIDs are numeric evidence only.

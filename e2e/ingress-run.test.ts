@@ -1244,3 +1244,78 @@ for (const changed of ["immutableTitle", "immutableAcceptance", "auditTitle", "a
   assert.equal(result.success, false, changed); assert.equal(f.calls.includes("ready3"), false);
   assert.ok(result.phases[1].failures.includes(changed.startsWith("immutable") ? "ingress_removal_immutable_mutation" : "ingress_removal_audit_mutation"), JSON.stringify(result.failures));
 });
+
+// H1: phase 2 binds the bridge PID from the owner's own spawn registration (the genuinely returned
+// ChildProcess and its exit/close), so a healthy bridge that lives shorter than one 100 ms ps sample still binds.
+const OWNER_ROLE = "ingress-phase-2", RUNTIME_PID = 777001;
+async function bridgeBindingApis() {
+  const h = await helpers(), { createProcessEvidence } = await import(path.join(import.meta.dirname, "process-evidence.mjs"));
+  const provenance = await import(path.join(import.meta.dirname, "admission-helper-provenance.mjs"));
+  return { h, createProcessEvidence, provenance };
+}
+/** Owner-rooted samples that show the owner and its Runtime but never the bridge. */
+function sampledWithoutBridge(h: { observeIngressInventory: (e: unknown, o: unknown) => unknown }, evidence: unknown, ownerPid: number, extra = "") {
+  const sample = (stdout: string) => ({ exit: 0, signal: null, stdout, stderr: "", durationMs: 1 });
+  h.observeIngressInventory(evidence, { rootPid: ownerPid, owner: OWNER_ROLE, stage: "phase-2-running", result: sample(`${ownerPid} 1 node\n${RUNTIME_PID} ${ownerPid} /x/conversation-runtime-gateway\n${extra}`) });
+}
+const settledBridge = (pid: number, extra: Record<string, unknown> = {}) => ({ sequence: 1, pid, exitObserved: true, closeObserved: true, code: 0, signal: null, ...extra });
+const bridgeRecord = (ownerPid: number, bridges: object[], extra: Record<string, unknown> = {}) => ({ schema: "meeting-ingress-bridge-spawns/v1", ownerPid, invalid: false, bridges, ...extra });
+const ownerResult = (bridgePid: number, bridgeSpawns?: object) => ({ activity: { runtimePids: [RUNTIME_PID], bridge: { pid: bridgePid } }, ...(bridgeSpawns ? { bridgeSpawns } : {}) });
+
+test("phase 2 binds a real bridge that exits before any sample from the owner's spawn registration", async () => {
+  const { h, createProcessEvidence, provenance } = await bridgeBindingApis();
+  const { spawn } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(process.env.TMPDIR ?? "/private/tmp", "bridge-binding-")); chmodSync(dir, 0o700);
+  const script = path.join(dir, "e2e-bridge-child.mjs"); writeFileSync(script, "process.exit(0);\n", { mode: 0o600 });
+  const module = { spawn } as { spawn: typeof spawn }; let synced = 0;
+  const observer = provenance.createBridgeSpawnObserver(module, { ownerPid: process.pid, sync: () => { synced++; } });
+  try {
+    observer.start(); assert.equal(synced, 1); assert.notEqual(module.spawn, spawn);
+    const unrelated = module.spawn("/usr/bin/true", [], { stdio: "ignore" });
+    const bridge = module.spawn(process.execPath, [script, "--config", path.join(dir, "config.json")], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: {}, shell: false, detached: false });
+    await Promise.all([new Promise(r => bridge.once("close", r)), new Promise(r => unrelated.once("close", r))]);
+    observer.stop(); assert.equal(module.spawn, spawn); assert.equal(synced, 2);
+    const record = observer.record();
+    assert.deepEqual(record, bridgeRecord(process.pid, [settledBridge(bridge.pid!)]), "only the bridge-shaped spawn is registered");
+    const evidence = createProcessEvidence(); sampledWithoutBridge(h, evidence, process.pid);
+    assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: process.pid, result: ownerResult(bridge.pid!, record) }), true);
+    assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: process.pid, result: ownerResult(bridge.pid!) }), false, "without registration an unsampled bridge stays unbound");
+  } finally { observer.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+const OWNER = 700001, BRIDGE = 700002;
+for (const [name, result, extraRows] of [
+  ["an unregistered, unsampled bridge PID", ownerResult(BRIDGE, bridgeRecord(OWNER, [])), ""],
+  ["a sampled bridge PID the owner never registered", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE + 1)])), `${BRIDGE} ${OWNER} node\n`],
+  ["a registration naming another PID", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE + 1)])), ""],
+  ["a second bridge spawn", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE), settledBridge(BRIDGE + 1, { sequence: 2 })])), ""],
+  ["a bridge that exited nonzero", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE, { code: 1 })])), ""],
+  ["a bridge killed by a signal", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE, { code: null, signal: "SIGKILL" })])), ""],
+  ["a bridge whose close was never observed", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE, { closeObserved: false })])), ""],
+  ["an invalid registration", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE)], { invalid: true })), ""],
+  ["a registration by another owner", ownerResult(BRIDGE, bridgeRecord(OWNER + 5, [settledBridge(BRIDGE)])), ""],
+  ["an unsampled Runtime", { activity: { runtimePids: [RUNTIME_PID + 1], bridge: { pid: BRIDGE } }, bridgeSpawns: bridgeRecord(OWNER, [settledBridge(BRIDGE)]) }, ""],
+  ["a registration with an extra private field", ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE, { argv: "private" })])), ""],
+] as const) {
+  test(`phase 2 bridge binding refuses ${name}`, async () => {
+    const { h, createProcessEvidence } = await bridgeBindingApis(), evidence = createProcessEvidence();
+    sampledWithoutBridge(h, evidence, OWNER, extraRows);
+    assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result }), false);
+  });
+}
+test("phase 2 bridge binding keeps the sampled path without a registration and accepts sampled plus registered", async () => {
+  const { h, createProcessEvidence } = await bridgeBindingApis(), evidence = createProcessEvidence();
+  sampledWithoutBridge(h, evidence, OWNER, `${BRIDGE} ${OWNER} node\n`);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: ownerResult(BRIDGE) }), true);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: ownerResult(BRIDGE, bridgeRecord(OWNER, [settledBridge(BRIDGE)])) }), true);
+  assert.equal(h.ingressOwnedPidsBound(evidence, { role: OWNER_ROLE, ownerPid: OWNER, result: { activity: { runtimePids: [], bridge: null } } }), true);
+});
+test("bridge spawn observer marks a bridge-shaped spawn that returns the owner PID or no PID invalid", async () => {
+  const { provenance } = await bridgeBindingApis(), { EventEmitter } = await import("node:events");
+  for (const pid of [OWNER, undefined]) {
+    const fake: { spawn: (...args: unknown[]) => object } = { spawn: () => Object.assign(new EventEmitter(), { pid }) };
+    const observer = provenance.createBridgeSpawnObserver(fake, { ownerPid: OWNER, sync: () => {} });
+    observer.start(); fake.spawn("/x/node", ["/x/e2e/fixtures/e2e-bridge-child.mjs", "--config", "/x/c.json"], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: {}, shell: false, detached: false }); observer.stop();
+    assert.equal(observer.record().invalid, true, String(pid));
+  }
+});
