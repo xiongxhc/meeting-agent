@@ -11,6 +11,9 @@ export type TimedMediaLease = {
   mediaProtocolVersion: 2 | 3;
   captureFormat: "pcm_s16le/24000/1/20ms"; timingContract: "capture-clock/v1";
 };
+/** `renew_media_lease`: the Runtime extended the SAME credential. Only the
+ * Runtime source session and the later expiry cross the wire. */
+export type MediaLeaseRenewal = { sessionId: string; expiresAtMs: string };
 export type ObservationTiming = { clockDomainId: string; hostBeforeNs: string; hostAfterNs: string };
 export type UiSnapshot = {
   type: "ui_snapshot"; snapshotSequence: number; observationTiming: ObservationTiming | null;
@@ -19,9 +22,11 @@ export type UiSnapshot = {
   barrierBefore: null | "stream_start" | "observation_drop" | "poll_gap" | "clock_reset";
 };
 export type BridgeCommandV2 = Exclude<BridgeCommand, { type: "connect_media" }> | { type: "connect_media"; mediaLease: TimedMediaLease };
+/** v2 only, with no v1 counterpart, so it is kept out of the v1-shaped union. */
+export type BridgeLeaseRenewalCommandV2 = { type: "renew_media_lease"; leaseRenewal: MediaLeaseRenewal };
 type UiEvent = Extract<BridgeEvent, { type: "joined" | "left" | "participant_joined" | "participant_left" | "active_speaker" }>;
 export type BridgeEventV2 = Exclude<BridgeEvent, UiEvent> | (UiEvent & { observationTiming: ObservationTiming | null; observationTimingReason: "timing_unavailable" | null }) | UiSnapshot;
-export type BridgeCommandMessageV2 = { schema: typeof BRIDGE_SESSION_SCHEMA_V2; sessionId: string; commandId: string } & BridgeCommandV2;
+export type BridgeCommandMessageV2 = { schema: typeof BRIDGE_SESSION_SCHEMA_V2; sessionId: string; commandId: string } & (BridgeCommandV2 | BridgeLeaseRenewalCommandV2);
 export type BridgeEventMessageV2 = { schema: typeof BRIDGE_SESSION_SCHEMA_V2; sessionId: string; sequence: number; observedAt: string } & BridgeEventV2;
 
 const uiTypes = new Set(["joined", "left", "participant_joined", "participant_left", "active_speaker"]);
@@ -59,7 +64,12 @@ function envelope(input: unknown, cap: number): Record<string, unknown> {
 }
 export function parseCommandV2(input: unknown): BridgeCommandMessageV2 {
   const value = envelope(input, 65536);
-  if (value.type !== "connect_media") {
+  if (value.type === "renew_media_lease") {
+    exact(value, ["schema", "sessionId", "commandId", "type", "leaseRenewal"]);
+    const renewal = object(value.leaseRenewal);
+    exact(renewal, ["sessionId", "expiresAtMs"]);
+    if (!text(value.commandId) || uint(renewal.sessionId) === 0n || uint(renewal.expiresAtMs) === 0n) fail();
+  } else if (value.type !== "connect_media") {
     if (!parseCommandShape({ ...value, schema: "bridge-session/v1" }).ok) fail();
   } else {
     exact(value, ["schema", "sessionId", "commandId", "type", "mediaLease"]);
@@ -133,6 +143,10 @@ function envelopeRejection(input: unknown, cap: number): BridgeRejectionV2 | nul
 }
 /** Explains a parseCommandV2 failure with the v1 rejection where the v1 grammar applies. */
 function commandRejection(value: Record<string, unknown>): BridgeRejectionV2 {
+  if (value.type === "renew_media_lease") {
+    if (!Object.hasOwn(value, "leaseRenewal")) return { code: "missing_field", path: "/leaseRenewal", detail: "leaseRenewal is required" };
+    return { code: "media_lease", path: "/leaseRenewal", detail: "renew_media_lease carries exactly schema, sessionId, commandId, type and a lease renewal" };
+  }
   if (value.type === "connect_media") {
     if (!Object.hasOwn(value, "mediaLease")) return { code: "missing_field", path: "/mediaLease", detail: "mediaLease is required" };
     return { code: "media_lease", path: "/mediaLease", detail: "connect_media carries exactly schema, sessionId, commandId, type and a timed media lease" };

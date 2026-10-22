@@ -449,11 +449,29 @@ another playback header ahead of flush can create TCP/FIFO head-of-line delay.
 No acoustic/interrupt-latency bound is claimed. No-played-progress2s checked1s
 means up to3s detection PLUS owned cleanup, not instant EOF detection.
 
-Automatic media recovery allows at most3 attempts over the lease,100ms apart,
-only after positively confirmed native AND socket cleanup. Each outage has one
-deadline from its first disconnect, capped by reconnectWindowMs and credential
-expiry; failed startup/cleanup consume it. Only complete new media readiness
-ends that outage. Reconnect authenticates again, emits reason3 barrier/new capture
+Automatic media recovery allows at most3 attempts per outage,100ms apart,
+only after positively confirmed native AND socket cleanup. A successful
+reconnect resets that count; across outages at most6 attempts fit in any
+rolling60s, after which a flapping link ends with `reconnect_exhausted`. Each
+outage has one deadline from its first disconnect, capped by reconnectWindowMs
+and the credential cutoff; failed startup/cleanup consume it. Only complete new
+media readiness ends that outage. Media that stops trying for any of these
+reasons, including a deadline that passes during the 100ms backoff, ends with
+`reconnect_exhausted`, never silently.
+
+A connected `connect_media` answers `ok` with detail `media_lease_renewal`,
+the bridge's advertisement that it understands `renew_media_lease`; an older
+bridge answers null and would treat the command as malformed input, so it must
+never be sent one. `renew_media_lease` (`leaseRenewal: {sessionId,
+expiresAtMs}`, decimal u64 strings) tells the bridge the Runtime extended the SAME credential. The bridge
+re-anchors its credential cutoff on the monotonic clock and moves it forward
+only; an outage in progress uses the new cutoff from its next attempt. The
+running cycle, capture and the encrypted recording it feeds are never touched.
+Answers, in this order of checks: `ok` (later, or equal and still live, expiry); `rejected` with `media_not_connected`
+(no running lease, including after media gave up), `media_session_mismatch`,
+`lease_expiry_regressed` or `lease_expired`; `failed` with
+`media_renewal_unavailable`. A malformed renewal is a protocol error, like any
+malformed command; a wrong bridge session is an ownership conflict. Reconnect authenticates again, emits reason3 barrier/new capture
 epoch, and preserves process clock/pair sequence and128metadata-records/s budget.
 Unconfirmed cleanup is terminal. Static media_disconnected reasons preserve
 `capture_delivery_interrupted`/`final_clock_pair_undelivered`; positively confirmed

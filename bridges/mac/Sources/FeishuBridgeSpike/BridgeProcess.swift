@@ -40,6 +40,8 @@ public final class BridgeProcess {
     private var shutdownCompleted = false
     private var departureConfirmed = false
     private var leftPublished = false
+    /// `command_result.detail` of a connected `connect_media`.
+    public static let mediaLeaseRenewalCapability = "media_lease_renewal"
     public var retainedRecordCount: Int { recorder?.records.count ?? 0 }
     public var usesTimedProtocol: Bool { v2Clock != nil }
 
@@ -61,6 +63,7 @@ public final class BridgeProcess {
 
     public func accept(_ message: BridgeCommandMessageV2) throws {
         guard v2Clock != nil else { throw BridgeProcessError.invalidInput }
+        if let renewal = message.leaseRenewal { return try acceptRenewal(message, renewal) }
         let legacy: BridgeCommandMessage
         if let value = message.legacy { legacy = value }
         else if let lease = message.mediaLease {
@@ -76,21 +79,53 @@ public final class BridgeProcess {
         guard v2Clock == nil else { throw BridgeProcessError.invalidInput }
         try acceptCommon(message, v2: nil)
     }
+    /// Ownership, exact replay, release, bound. Returns the command digest, or
+    /// nil after an exact replay has repeated its recorded answer.
+    private func admit(sessionId: String, commandId: String, bytes: Data) throws -> Data? {
+        guard bytes.count <= 65_536 else { throw BridgeProcessError.inputTooLarge }
+        let digest = Data(SHA256.hash(data: bytes))
+        if let owner, owner.session != sessionId { throw BridgeProcessError.ownershipConflict }
+        if let old = results[commandId] {
+            guard old.digest == digest else { throw BridgeProcessError.commandConflict }
+            try emit(.commandResult(commandId: commandId, outcome: old.outcome, detail: old.detail))
+            return nil
+        }
+        guard !released else { throw BridgeProcessError.closed }
+        guard results.count < maxCommands else { throw BridgeProcessError.stateLimit }
+        return digest
+    }
+    /// `renew_media_lease` moves only the reconnect-admission cutoff of the
+    /// running media lease. It never starts, stops or pauses capture.
+    private func acceptRenewal(_ message: BridgeCommandMessageV2, _ renewal: MediaLeaseRenewal) throws {
+        guard !stopped else { throw BridgeProcessError.closed }
+        guard owner != nil else { throw BridgeProcessError.ownershipConflict }
+        let bytes = try JSONSerialization.data(withJSONObject: JSONSerialization.jsonObject(with: message.bytes), options: [.sortedKeys])
+        guard let digest = try admit(sessionId: message.sessionId, commandId: message.commandId, bytes: bytes) else { return }
+        guard recorder?.record(command: message) == true else {
+            evidenceFailed = true; stopped = true; throw BridgeProcessError.evidenceUnavailable
+        }
+        results[message.commandId] = (digest, .failed, "command_incomplete")
+        var outcome: CommandOutcome = .rejected
+        var detail: String?
+        if joined, mediaOwned, let timedMedia {
+            switch timedMedia.renew(renewal) {
+            case .renewed, .unchanged: outcome = .ok
+            case .notActive: detail = "media_not_connected"
+            case .sessionMismatch: detail = "media_session_mismatch"
+            case .regressed: detail = "lease_expiry_regressed"
+            case .expired: detail = "lease_expired"
+            case .unavailable: outcome = .failed; detail = "media_renewal_unavailable"
+            }
+        } else { detail = "media_not_connected" }
+        results[message.commandId] = (digest, outcome, detail)
+        try emit(.commandResult(commandId: message.commandId, outcome: outcome, detail: detail))
+    }
     private func acceptCommon(_ message: BridgeCommandMessage, v2: BridgeCommandMessageV2?) throws {
         guard !stopped else { throw BridgeProcessError.closed }
         guard BridgeCommandMessage.contractViolation(sessionId: message.sessionId, commandId: message.commandId, command: message.command) == nil else { throw BridgeProcessError.invalidInput }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let bytes = try v2.map { try JSONSerialization.data(withJSONObject: JSONSerialization.jsonObject(with: $0.bytes), options: [.sortedKeys]) } ?? encoder.encode(message)
-        guard bytes.count <= 65_536 else { throw BridgeProcessError.inputTooLarge }
-        let digest = Data(SHA256.hash(data: bytes))
-        if let owner, owner.session != message.sessionId { throw BridgeProcessError.ownershipConflict }
-        if let old = results[message.commandId] {
-            guard old.digest == digest else { throw BridgeProcessError.commandConflict }
-            try emit(.commandResult(commandId: message.commandId, outcome: old.outcome, detail: old.detail))
-            return
-        }
-        guard !released else { throw BridgeProcessError.closed }
-        guard results.count < maxCommands else { throw BridgeProcessError.stateLimit }
+        guard let digest = try admit(sessionId: message.sessionId, commandId: message.commandId, bytes: bytes) else { return }
         if owner == nil {
             guard case .join(let occurrence, let number, let lease) = message.command,
                   number.utf8.count == 9, number.allSatisfy({ $0.isASCII && $0.isNumber }) else {
@@ -131,6 +166,10 @@ public final class BridgeProcess {
             if !timedMedia.start(lease) {
                 outcome = .failed; detail = "media_start_failed"
                 mediaCleanupConfirmed = timedMedia.stop()
+            } else {
+                // Advertises `renew_media_lease`: a bridge without it answers
+                // null, so the coordinator never sends it a renewal.
+                detail = BridgeProcess.mediaLeaseRenewalCapability
             }
             try pollMediaEvents()
         case .postDisclosure(let text):

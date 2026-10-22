@@ -27,9 +27,23 @@ public struct TimedMediaStopResult: Equatable, Sendable {
     public let drain: TimedMediaDrainOutcome
 }
 
+/// The answer to `renew_media_lease`. Only `.renewed` moves the reconnect
+/// admission cutoff, and only forward. No outcome touches capture.
+public enum TimedMediaRenewal: Equatable, Sendable {
+    case renewed, unchanged
+    /// No running lease: before start, after stop, or after media gave up.
+    case notActive
+    case sessionMismatch, regressed
+    /// The new expiry is already in the past; a lapsed lease is not revived.
+    case expired
+    /// The media owner could not answer within its bound.
+    case unavailable
+}
+
 public protocol TimedMediaControl: AnyObject {
     func start(_ lease: TimedMediaLease) -> Bool
     func stop() -> Bool
+    func renew(_ renewal: MediaLeaseRenewal) -> TimedMediaRenewal
     /// The typed stop result, available once `stop` has returned.
     func stopResult() -> TimedMediaStopResult?
     func takeEvents() -> [BridgeEvent]
@@ -60,6 +74,13 @@ public final class TimedMediaControlOwner: TimedMediaControl {
         typedStopResult = typed
         let result = typed?.cleanupConfirmed ?? false
         cleanupResult = result; return result
+    }
+    public func renew(_ renewal: MediaLeaseRenewal) -> TimedMediaRenewal {
+        guard cleanupResult == nil else { return .notActive }
+        guard pending == nil else { return .unavailable }
+        return perform(seconds: 0.25, observeCancellation: false) { [session] in
+            await session.renew(sessionId: renewal.sessionId, expiresAtMs: renewal.expiresAtMs)
+        } ?? .unavailable
     }
     public func takeEvents() -> [BridgeEvent] {
         guard pending == nil else { return [] }
@@ -96,24 +117,34 @@ private final class TimedMediaResultBox<Value: Sendable>: @unchecked Sendable {
 public actor TimedMediaSession {
     public typealias RendererFactory = @Sendable (@escaping @Sendable (UInt64, UInt64) -> Void) -> AudioOutputRenderer
     public static let maximumCloseSeconds = TimedMediaCycle.maximumCloseSeconds
+    /// Attempts per outage; the count restarts after a successful reconnect.
+    public static let reconnectAttemptLimit = 3
+    /// Attempts across outages in any rolling window, so a flapping link that
+    /// keeps recovering cannot reconnect forever.
+    public static let reconnectRateLimit = 6
+    public static let reconnectRateWindow: TimeInterval = 60
     private let factory: @Sendable (UInt64, TimeInterval?) -> TimedMediaCycle
     private let nowUnixMs: @Sendable () -> UInt64
     private let nowMonotonic: @Sendable () -> TimeInterval
     private var credentialDeadline: TimeInterval?
+    /// The running lease's Runtime session and wall expiry, for renewal checks.
+    private var activeLease: (sessionId: UInt64, expiresAtMs: UInt64)?
+    private var mediaEnded = false
     private var cycle: TimedMediaCycle?
     private var supervisor: Task<Void, Never>?
     private var stopRequested = false
-    private var reconnectDeadline: TimeInterval?
+    private var outageStartedAt: TimeInterval?
     private var attempts = 0
+    private var attemptTimes: [TimeInterval] = []
     public private(set) var diagnostics: Set<String> = []
     private var stopped: TimedMediaStopResult?
     public func stopResult() -> TimedMediaStopResult? { stopped }
     private var events: [BridgeEvent] = []
     public func takeEvents() -> [BridgeEvent] { let values = events; events.removeAll(); return values }
     private func event(_ value: BridgeEvent) {
-        // One initial connect, at most3 retry attempts and one terminal stop:
-        // <=15 lifecycle +4 unique static diagnostics, even without polling.
-        guard events.count < 24 else { return }
+        // Bounded between polls: at most6 retry attempts per rolling window
+        // (4 lifecycle events each) plus unique static diagnostics.
+        guard events.count < 32 else { return }
         events.append(value)
     }
     private func diagnostic(_ reason: String) {
@@ -144,13 +175,37 @@ public actor TimedMediaSession {
         let cutoff = before + Double(lease.expiresAtMs - wall) / 1000
         guard cutoff.isFinite, nowMonotonic() < cutoff else { return false }
         credentialDeadline = cutoff
+        activeLease = (lease.sessionId, lease.expiresAtMs)
         let first = factory(1, cutoff); cycle = first
         guard await first.start(lease), !stopRequested else { return false }
         event(.mediaConnected(endpoint: lease.connectEndpoint))
         supervisor = Task { await self.supervise(lease, first: first) }
         return true
     }
+    /// Moves the reconnect-admission cutoff forward to a renewed expiry of the
+    /// same credential. It never touches the running cycle, so capture and the
+    /// encrypted recording it feeds are unaffected whatever the answer.
+    public func renew(sessionId: UInt64, expiresAtMs: UInt64) -> TimedMediaRenewal {
+        guard !stopRequested, !mediaEnded, let current = activeLease, let deadline = credentialDeadline else { return .notActive }
+        guard sessionId == current.sessionId else { return .sessionMismatch }
+        guard expiresAtMs >= current.expiresAtMs else { return .regressed }
+        let before = nowMonotonic(), wall = nowUnixMs()
+        guard before.isFinite, before >= 0, expiresAtMs > wall else { return .expired }
+        guard expiresAtMs > current.expiresAtMs else { return .unchanged }
+        let cutoff = before + Double(expiresAtMs - wall) / 1000
+        guard cutoff.isFinite else { return .expired }
+        credentialDeadline = max(deadline, cutoff)
+        activeLease = (current.sessionId, expiresAtMs)
+        return .renewed
+    }
+    /// One outage's admission deadline, recomputed so a renewal during the
+    /// outage applies to the next attempt.
+    private func outageDeadline(_ lease: TimedMediaLease) -> TimeInterval? {
+        guard let outageStartedAt, let credentialDeadline else { return nil }
+        return min(outageStartedAt + Double(lease.reconnectWindowMs) / 1000, credentialDeadline)
+    }
     private func supervise(_ lease: TimedMediaLease, first: TimedMediaCycle) async {
+        defer { mediaEnded = true }
         var current = first
         while !stopRequested {
             let ended = await current.waitEnded()
@@ -162,27 +217,32 @@ public actor TimedMediaSession {
             guard ended.nativeCleanupConfirmed, ended.transportFailure else {
                 diagnostic("media_failed"); return
             }
-            if reconnectDeadline == nil {
-                guard let credentialDeadline else { return }
-                reconnectDeadline = min(ended.disconnectedAt + Double(lease.reconnectWindowMs) / 1000,
-                    credentialDeadline)
-            }
-            guard let deadline = reconnectDeadline, attempts < 3, ended.captureEpoch < UInt64.max,
-                  nowMonotonic() + 0.1 < deadline else {
+            if outageStartedAt == nil { outageStartedAt = ended.disconnectedAt }
+            let now = nowMonotonic()
+            attemptTimes.removeAll { now - $0 >= Self.reconnectRateWindow }
+            guard let deadline = outageDeadline(lease), attempts < Self.reconnectAttemptLimit,
+                  attemptTimes.count < Self.reconnectRateLimit, ended.captureEpoch < UInt64.max,
+                  now + 0.1 < deadline else {
                 diagnostic("reconnect_exhausted"); return
             }
-            attempts += 1
+            attempts += 1; attemptTimes.append(now)
             event(.reconnecting(attempt: attempts))
             do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
-            guard !stopRequested, !Task.isCancelled, nowMonotonic() < deadline else { return }
-            let next = factory(ended.captureEpoch + 1, deadline); current = next; cycle = next
+            guard !stopRequested, !Task.isCancelled else { return }
+            // The cutoff can pass during the backoff: that is a give-up too, so
+            // the coordinator can relaunch instead of media ending silently.
+            guard let admission = outageDeadline(lease), nowMonotonic() < admission else {
+                diagnostic("reconnect_exhausted"); return
+            }
+            let next = factory(ended.captureEpoch + 1, admission); current = next; cycle = next
             // Only complete ACK/native/capture readiness ends this outage.
-            // Failed attempts and their cleanup retain the original deadline.
+            // Failed attempts and their cleanup keep the outage's deadline.
             if await next.start(lease) {
-                reconnectDeadline = nil
+                let attempt = attempts
+                outageStartedAt = nil; attempts = 0
                 if !stopRequested {
                     event(.mediaConnected(endpoint: lease.connectEndpoint))
-                    event(.reconnected(attempt: attempts))
+                    event(.reconnected(attempt: attempt))
                 }
             }
         }

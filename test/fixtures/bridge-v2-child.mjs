@@ -15,7 +15,8 @@
 //                  valid one;
 //   spread:        10 such pairs, a 400 ms pause, 10 more, then one valid line;
 //   crash:         answers the join, then exits 3 without an outcome;
-//   media:         reports connect_media as connected (owns no media stack).
+//   media:         reports connect_media as connected (owns no media stack) and
+//                  answers renew_media_lease as the real bridge does.
 import { readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -36,7 +37,7 @@ if (config.evidenceRoot.includes("bridge-v2-")) {
 const binding = config.custody;
 const sessionId = binding.bridgeSessionId;
 const timing = { clockDomainId: "synthetic-clock", hostBeforeNs: "1000000000", hostAfterNs: "1000500000" };
-let sequence = 0, joined = false;
+let sequence = 0, joined = false, lease = null;
 function emit(payload) {
   sequence += 1;
   writeAll(1, JSON.stringify({ schema: "bridge-session/v2", sessionId, sequence, observedAt: "2026-09-02T14:01:00.000Z", ...payload }) + "\n");
@@ -79,7 +80,16 @@ if (config.bundleVersion === "hung") {
     } else if (command.type === "connect_media" && config.bundleVersion === "media") {
       // Stands in for a bridge whose media stack connected; no media is sent.
       emit({ type: "media_connected", endpoint: command.mediaLease.connectEndpoint });
-      result(command, "ok", null);
+      lease = { sessionId: command.mediaLease.sessionId, expiresAtMs: BigInt(command.mediaLease.expiresAtMs) };
+      result(command, "ok", "media_lease_renewal");
+    } else if (command.type === "renew_media_lease" && config.bundleVersion === "media") {
+      // Same order of answers as the Swift bridge's TimedMediaSession.renew.
+      const renewal = command.leaseRenewal, expiresAtMs = BigInt(renewal.expiresAtMs);
+      if (lease === null) result(command, "rejected", "media_not_connected");
+      else if (renewal.sessionId !== lease.sessionId) result(command, "rejected", "media_session_mismatch");
+      else if (expiresAtMs < lease.expiresAtMs) result(command, "rejected", "lease_expiry_regressed");
+      else if (expiresAtMs <= BigInt(Date.now())) result(command, "rejected", "lease_expired");
+      else { lease.expiresAtMs = expiresAtMs; result(command, "ok", null); }
     } else if (command.type === "connect_media") result(command, "failed", "synthetic bridge owns no media stack");
     else result(command, "rejected", "unsupported by the synthetic bridge");
   });

@@ -1,7 +1,8 @@
 {
   "commands": [
     {"schema":"bridge-session/v2","sessionId":"bridge-independent","commandId":"join-1","type":"join","meetingOccurrenceId":"synthetic-occurrence","meetingNo":"123456789","leaseId":"synthetic-physical-lease"},
-    {"schema":"bridge-session/v2","sessionId":"bridge-independent","commandId":"media-1","type":"connect_media","mediaLease":{"sessionId":"41","bridgeSessionId":"bridge-independent","connectEndpoint":"tcp://127.0.0.1:9001","credential":"fixture-token","expiresAtMs":"1060000","reconnectWindowMs":"10000","mediaProtocolVersion":2,"captureFormat":"pcm_s16le/24000/1/20ms","timingContract":"capture-clock/v1"}}
+    {"schema":"bridge-session/v2","sessionId":"bridge-independent","commandId":"media-1","type":"connect_media","mediaLease":{"sessionId":"41","bridgeSessionId":"bridge-independent","connectEndpoint":"tcp://127.0.0.1:9001","credential":"fixture-token","expiresAtMs":"1060000","reconnectWindowMs":"10000","mediaProtocolVersion":2,"captureFormat":"pcm_s16le/24000/1/20ms","timingContract":"capture-clock/v1"}},
+    {"schema":"bridge-session/v2","sessionId":"bridge-independent","commandId":"renew-1","type":"renew_media_lease","leaseRenewal":{"sessionId":"41","expiresAtMs":"1120000"}}
   ],
   "events": [
     {"schema":"bridge-session/v2","sessionId":"bridge-independent","sequence":1,"observedAt":"2026-09-01T00:00:00.000Z","type":"command_result","commandId":"join-1","outcome":"ok","detail":null},

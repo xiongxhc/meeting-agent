@@ -21,6 +21,7 @@ import { connectMediaClient, parseCaptureMediaTiming } from "../media-client.mjs
 import { createCaptureLifecycle } from "./scripted-capture-lifecycle.mjs";
 import { createPhysicalOutcomeEmitter, parsePhysicalOutcomeScenario, readPhysicalOutcomeClose } from "./bridge-scenarios.mjs";
 import { createBridgeEventEmitter, createBridgeObservationOwner } from "./bridge-observations.mjs";
+import { answerLeaseRenewal, parseLeaseRenewal } from "./lease-renewal.mjs";
 
 import { compileL4Plan, l4Configuration, l4PlanHash } from "../l4-campaign.mjs";
 import { bridgeLeaveFact } from "../voice-end-evidence.mjs";
@@ -48,7 +49,7 @@ const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
+  mediaClosedReason: null, leaseRenewals: [], left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
   capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [], joinTiming: joinClocks,
 };
 const FRAME_MS = 20;
@@ -107,7 +108,7 @@ const timing = () => {
   return { clockDomainId: "e2e-clock", hostBeforeNs: before.toString(), hostAfterNs: process.hrtime.bigint().toString() };
 };
 
-let media = null;
+let media = null, connectedLease = null;
 let capture = null, connectionWork = Promise.resolve();
 const connectionAbort = new globalThis.AbortController();
 let captureRunning = true, captureTimer = null, wakeCapture = null;
@@ -208,9 +209,18 @@ lines.on("line", (line) => {
       emit({ type: "command_result", commandId: command.commandId, outcome, detail });
       return;
     }
+    // A malformed renewal is a protocol failure, as in the real bridge's decoder.
+    const renewal = command.type === "renew_media_lease" ? parseLeaseRenewal(command) : undefined;
+    if (renewal === null) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
     // A first command other than join, or any command after release, is a protocol failure.
     if (released || (ownerLeaseId === null && command.type !== "join")) { observations?.dispose(); physicalOutcome.dispose(); process.exit(9); }
     commandResults.set(command.commandId, { line, answer: null });
+    if (renewal !== undefined) {
+      // Moves only the reconnect-admission expiry; capture is never touched.
+      const answer = answerLeaseRenewal(joinedNow && media !== null && !captureLifecycle.stopping ? connectedLease : null, renewal, Date.now());
+      state.leaseRenewals.push({ expiresAtMs: renewal.expiresAtMs.toString(), ...answer });
+      result(command, answer.outcome, answer.detail); persist(); return;
+    }
     if (command.type === "join" && ownerLeaseId !== null) { result(command, "rejected", "session_already_owned"); persist(); return; }
     if (command.type === "connect_media" && !joinedNow) { result(command, "rejected", "not_joined"); persist(); return; }
     if (command.type === "leave") {
@@ -285,9 +295,11 @@ lines.on("line", (line) => {
         return;
       }
       state.mediaConnected = true;
+      connectedLease = { sessionId: lease.sessionId, expiresAtMs: BigInt(lease.expiresAtMs) };
       persist();
       emit({ type: "media_connected", endpoint: lease.connectEndpoint });
-      result(command, "ok", null);
+      // As the Swift bridge: the connected answer advertises renew_media_lease.
+      result(command, "ok", "media_lease_renewal");
       capture = streamSilence();
       return;
     }

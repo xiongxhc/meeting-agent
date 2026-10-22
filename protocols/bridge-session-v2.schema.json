@@ -245,6 +245,35 @@
               "$ref": "#/$defs/nonEmptyString"
             }
           }
+        },
+        {
+          "type": "object",
+          "description": "Send only to a bridge whose ok connect_media answer carried detail media_lease_renewal; an older bridge answers null and cannot decode this command. The Runtime extended the same media credential. The bridge moves its reconnect-admission cutoff forward to expiresAtMs and never back; capture is not touched. command_result is ok, or rejected with media_not_connected, media_session_mismatch, lease_expiry_regressed or lease_expired, or failed with media_renewal_unavailable.",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "sessionId",
+            "commandId",
+            "type",
+            "leaseRenewal"
+          ],
+          "properties": {
+            "schema": {
+              "$ref": "#/$defs/schemaVersion"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "commandId": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "type": {
+              "const": "renew_media_lease"
+            },
+            "leaseRenewal": {
+              "$ref": "#/$defs/leaseRenewal"
+            }
+          }
         }
       ]
     },
@@ -1222,6 +1251,23 @@
           "$ref": "#/$defs/uint64"
         },
         "hostAfterNs": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "leaseRenewal": {
+      "type": "object",
+      "description": "Runtime source session (as in mediaLease.sessionId) and the renewed absolute expiry. No credential: renewal extends the credential connect_media delivered.",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "expiresAtMs"
+      ],
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/uint64"
+        },
+        "expiresAtMs": {
           "$ref": "#/$defs/uint64"
         }
       }

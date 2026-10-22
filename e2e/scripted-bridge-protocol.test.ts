@@ -15,6 +15,8 @@ import type { Readable, Writable } from "node:stream";
 import { providerFaultOracles } from "./provider-fault-oracles.mjs";
 // @ts-expect-error Test-only harness module has no public declaration.
 import { readStateFile } from "./state-file.mjs";
+// @ts-expect-error Test-only harness module has no public declaration.
+import { answerLeaseRenewal, parseLeaseRenewal } from "./fixtures/lease-renewal.mjs";
 
 const CHILD = path.join(import.meta.dirname, "fixtures/e2e-bridge-child.mjs");
 const SESSION = "bridge-session-1", OCCURRENCE = "123456789@2026-10-21T00:00:00Z", LEASE = "lease-1";
@@ -99,6 +101,35 @@ test("a non-join first command and a conflicting reused command ID are protocol 
     conflict.send({ type: "leave", reason: "coordinator_stop" }, join);
     assert.equal(await conflict.exit(), 9);
   } finally { conflict.child.kill(); conflict.cleanup(); }
+});
+
+test("renew_media_lease is answered like the real bridge and a malformed one is a protocol failure", { timeout: 60_000 }, async () => {
+  const c = startChild();
+  try {
+    const join = c.send({ type: "join", meetingOccurrenceId: OCCURRENCE, meetingNo: "123456789", leaseId: LEASE });
+    assert.equal((await c.result(join)).outcome, "ok");
+    const early = c.send({ type: "renew_media_lease", leaseRenewal: { sessionId: "41", expiresAtMs: "1120000" } });
+    assert.deepEqual([(await c.result(early)).outcome, (await c.result(early)).detail], ["rejected", "media_not_connected"]);
+    c.send({ type: "renew_media_lease", leaseRenewal: { sessionId: "41", expiresAtMs: "01" } });
+    assert.equal(await c.exit(), 9);
+  } finally { c.child.kill(); c.cleanup(); }
+  const command = (renewal: unknown) => ({ schema: "bridge-session/v2", sessionId: SESSION, commandId: "r", type: "renew_media_lease", leaseRenewal: renewal });
+  assert.equal(parseLeaseRenewal({ ...command({ sessionId: "41", expiresAtMs: "1" }), extra: true }), null);
+  for (const renewal of [{ sessionId: "41" }, { sessionId: 41, expiresAtMs: "1" }, { sessionId: "0", expiresAtMs: "1" }, { sessionId: "41", expiresAtMs: "18446744073709551616" }, null]) {
+    assert.equal(parseLeaseRenewal(command(renewal)), null, JSON.stringify(renewal));
+  }
+  const renewal = (expiresAtMs: bigint, sessionId = "41") => ({ sessionId, expiresAtMs });
+  const lease = { sessionId: "41", expiresAtMs: 1_060_000n };
+  assert.deepEqual(answerLeaseRenewal(null, renewal(2_000_000n), 1_000_000), { outcome: "rejected", detail: "media_not_connected" });
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(2_000_000n, "42"), 1_000_000), { outcome: "rejected", detail: "media_session_mismatch" });
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(1_050_000n), 1_000_000), { outcome: "rejected", detail: "lease_expiry_regressed" });
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(1_100_000n), 1_200_000), { outcome: "rejected", detail: "lease_expired" });
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(1_060_000n), 1_060_000), { outcome: "rejected", detail: "lease_expired" },
+    "as Swift: an unchanged expiry that has passed is expired, not ok");
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(1_060_000n), 1_000_000), { outcome: "ok", detail: null }, "an unchanged live expiry is ok");
+  assert.deepEqual(answerLeaseRenewal(lease, renewal(1_120_000n), 1_000_000), { outcome: "ok", detail: null });
+  assert.equal(lease.expiresAtMs, 1_120_000n);
+  assert.deepEqual(parseLeaseRenewal(command({ sessionId: "41", expiresAtMs: "1120000" })), renewal(1_120_000n));
 });
 
 // The provider-fault cuts require the bridge to see the meeting end itself and

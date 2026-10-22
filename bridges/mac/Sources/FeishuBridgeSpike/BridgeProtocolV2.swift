@@ -43,10 +43,26 @@ public struct TimedMediaLease: Sendable {
     }
 }
 
+/// `renew_media_lease`: the Runtime extended the SAME credential to a later
+/// expiry. Only the Runtime source session and the new expiry cross the wire;
+/// the credential, endpoint and window are fixed by `connect_media`.
+public struct MediaLeaseRenewal: Equatable, Sendable {
+    public let sessionId: UInt64
+    public let expiresAtMs: UInt64
+    init(sessionId: UInt64, expiresAtMs: UInt64) { self.sessionId = sessionId; self.expiresAtMs = expiresAtMs }
+    init(_ value: [String: Any]) throws {
+        guard Set(value.keys) == ["sessionId", "expiresAtMs"] else { throw BridgeProcessError.invalidInput }
+        sessionId = try TimedMediaLease.integer(value["sessionId"])
+        expiresAtMs = try TimedMediaLease.integer(value["expiresAtMs"])
+        guard sessionId > 0, expiresAtMs > 0 else { throw BridgeProcessError.invalidInput }
+    }
+}
+
 public struct BridgeCommandMessageV2: Sendable {
     public let sessionId: String, commandId: String
     public let legacy: BridgeCommandMessage?
     public let mediaLease: TimedMediaLease?
+    public let leaseRenewal: MediaLeaseRenewal?
     let bytes: Data
     public static func decode(_ bytes: Data) throws -> Self {
         guard bytes.count <= 65_536, var object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
@@ -56,11 +72,16 @@ public struct BridgeCommandMessageV2: Sendable {
         if object["type"] as? String == "connect_media" {
             guard Set(object.keys) == ["schema", "sessionId", "commandId", "type", "mediaLease"],
                   let raw = object["mediaLease"] as? [String: Any] else { throw BridgeProcessError.invalidInput }
-            return Self(sessionId: session, commandId: command, legacy: nil, mediaLease: try TimedMediaLease(raw, bridgeSessionId: session), bytes: bytes)
+            return Self(sessionId: session, commandId: command, legacy: nil, mediaLease: try TimedMediaLease(raw, bridgeSessionId: session), leaseRenewal: nil, bytes: bytes)
+        }
+        if object["type"] as? String == "renew_media_lease" {
+            guard Set(object.keys) == ["schema", "sessionId", "commandId", "type", "leaseRenewal"],
+                  let raw = object["leaseRenewal"] as? [String: Any] else { throw BridgeProcessError.invalidInput }
+            return Self(sessionId: session, commandId: command, legacy: nil, mediaLease: nil, leaseRenewal: try MediaLeaseRenewal(raw), bytes: bytes)
         }
         object["schema"] = bridgeSessionSchema
         let legacy = try JSONDecoder().decode(BridgeCommandMessage.self, from: JSONSerialization.data(withJSONObject: object))
-        return Self(sessionId: session, commandId: command, legacy: legacy, mediaLease: nil, bytes: bytes)
+        return Self(sessionId: session, commandId: command, legacy: legacy, mediaLease: nil, leaseRenewal: nil, bytes: bytes)
     }
 }
 
