@@ -27,6 +27,9 @@ export async function connectPostmeetingRuntime(transport: RuntimeTransport): Pr
   return Object.assign(port, { runtimeProfile });
 }
 
+/** The renewal method a lease-renewal SDK adds (Runtime C2); absent from the pinned SDK. */
+type MediaLeaseRenewingSdk = { renewMediaLease(): Promise<bigint> };
+
 export type ConversationRuntimeClientOptions = {
   /** Receives the SDK's own timed session so an owner can call its
    * authoritative stopIfActive; the adapter never reimplements that state. */
@@ -70,6 +73,21 @@ export function createConversationRuntimeClient(sdk: ConversationRuntimeSdk, opt
       })();
       return { timingContract: "capture-clock/v1", bridgeSessionId: input.bridgeSessionId,
         sessionId: session.mediaLease.sessionId, mediaLease: session.mediaLease };
+    },
+    // Renewal needs an SDK that has it (today's pinned SDK does not, so no
+    // probe is sent) and a gateway whose status -- the same status its ready
+    // message carried -- advertises `media_lease_renewal`. Without both the
+    // session does not renew; that is never treated as a media loss.
+    async supportsMediaLeaseRenewal() {
+      if (typeof (sdk as Partial<MediaLeaseRenewingSdk>).renewMediaLease !== "function") return false;
+      const status = await sdk.status();
+      return (status.capabilities as readonly string[]).includes("media_lease_renewal");
+    },
+    renewMediaLease(input) {
+      const renew = (sdk as Partial<MediaLeaseRenewingSdk>).renewMediaLease;
+      if (typeof renew !== "function") return Promise.reject(new Error("media lease renewal is not supported by this SDK"));
+      if (input.sessionId !== sdk.currentSessionId) return Promise.reject(new Error("media lease renewal names a different session"));
+      return renew.call(sdk);
     },
     seedConversationContext: (exchanges, operationId) =>
       sdk.seedConversationContext(exchanges, operationId),

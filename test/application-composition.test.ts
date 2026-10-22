@@ -18,7 +18,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { ClientCommand } from "@conversation/runtime";
+import { RuntimeClient, type ClientCommand } from "@conversation/runtime";
 
 import { acquireApplicationOwnerLock, type ApplicationOwnerLock } from "../src/adapters/application-owner-lock.ts";
 import { createFeishuSdkHttp } from "../src/adapters/feishu-sdk-http.ts";
@@ -104,6 +104,8 @@ type RuntimeScript = {
   finalizeMode?: "accept" | "reject";
   closeFails?: boolean;
   recordingsDir: string;
+  /** A media lease lifetime other than 60 s. */
+  leaseMs?: number;
 };
 
 type ScriptedRuntime = {
@@ -145,7 +147,7 @@ function scriptedRuntimes(script: RuntimeScript) {
           }
           accept();
           transport.push({ type: "timed_voice_session_started", protocol_version: 4, request_id: command.requestId, media_lease: { media_protocol_version: 3, session_id: id,
-            connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expires_at_ms: String(Date.now() + 60_000), reconnect_window_ms: "10000",
+            connect_endpoint: "tcp://127.0.0.1:9001", credential: "a".repeat(64), expires_at_ms: String(Date.now() + (script.leaseMs ?? 60_000)), reconnect_window_ms: script.leaseMs === undefined ? "10000" : String(Math.floor(script.leaseMs / 2)),
             capture_format: "pcm_s16le/24000/1/20ms", timing_contract: "capture-clock/v1" } });
           deliver({ type: "voice_session_started", session_id: id, privacy: { privacy_mode: "local_only",
             components: ["speech_recognition", "language_model", "speech_synthesis", "audio_io"].map((kind) => ({ kind, execution_location: "local", provider_label: "Synthetic" })) } });
@@ -1007,6 +1009,45 @@ test("real v2 children: the timed join reaches joined, the owner lock descriptor
 // ---------------------------------------------------------------------------
 // 4. Runtime owner
 // ---------------------------------------------------------------------------
+
+test("the operator view reports a degraded and lapsed media-lease renewal while recording continues, and the log names it", async () => {
+  // The pinned SDK has neither renewMediaLease nor the capability flag (its
+  // ready parser refuses it); a refusing method and a status that advertises
+  // the flag stand in for a renewal-capable SDK and gateway.
+  const proto = RuntimeClient.prototype as unknown as { renewMediaLease?: () => Promise<bigint>; status(): Promise<{ capabilities: readonly string[] }> };
+  const status = proto.status;
+  proto.renewMediaLease = () => Promise.reject(new Error("scripted renewal refusal"));
+  proto.status = async function (this: unknown) { const value = await status.call(this); return { ...value, capabilities: [...value.capabilities, "media_lease_renewal"] }; };
+  const f = fixture();
+  try {
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, leaseMs: 1500 });
+    const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+    // Admitted on the real clock: the lease expiry the SDK checks is wall time, so the session's clock must be too.
+    const id = await (async () => { const store = f.reopen(); try { const value = invite(1); store.acceptInvite(value, Date.now()); store.admitInviteJoin(value.occurrenceId, Date.now()); return value.occurrenceId; } finally { store.close(); } })();
+    const log: string[] = [];
+    const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]),
+      clock: { now: () => Date.now() } });
+    try {
+    await app.start();
+    await app.discover();
+    await until(() => slot.sent().some((command) => command.type === "connect_media"));
+    const outcome = () => app.occurrenceOutcomes().find((value) => value.occurrenceId === id)!;
+    assert.equal(outcome().leaseRenewal, "inactive", "nothing renews until the bridge advertises it");
+    const connect = slot.sent().find((command) => command.type === "connect_media")!;
+    slot.emit({ type: "media_connected", endpoint: "tcp://127.0.0.1:9001" });
+    slot.emit({ type: "command_result", commandId: connect.commandId, outcome: "ok", detail: "media_lease_renewal" });
+    await until(() => outcome().leaseRenewal === "degraded", 5000);
+    assert.ok(outcome().leaseRenewalFailures >= 1);
+    assert.equal(outcome().phase, "live", "a failing renewal never ends the generation");
+    await until(() => outcome().leaseRenewal === "lapsed", 8000);
+    assert.equal(outcome().generations, 1, "a lapsed lease is not a relaunch");
+    slot.left("ended");
+    const settled = await app.awaitOccurrence(id);
+    assert.equal(settled.leaseRenewal, "lapsed");
+    assert.ok(log.includes("occurrence_media_lease_renewal_lapsed"), "the lapse is never silent");
+    } finally { await app.close(); }
+  } finally { delete proto.renewMediaLease; proto.status = status; f.close(); }
+});
 
 test("the connected v4 control identity is awaited before spawn and join, and timed UI evidence binds to it", async () => {
   const f = fixture();

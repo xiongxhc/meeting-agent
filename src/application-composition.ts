@@ -53,7 +53,7 @@ import { replayNeedsJoinDecision } from "./ports/session-store.ts";
 import type { RecordingSummary } from "./ports/conversation-runtime.ts";
 import type { Clock } from "./sessions/coordinator.ts";
 import { createInviteDiscovery } from "./sessions/invite-discovery.ts";
-import type { CreateMeetingSessionOptions, MeetingSession } from "./sessions/meeting-session.ts";
+import type { CreateMeetingSessionOptions, MeetingSession, MeetingSessionState } from "./sessions/meeting-session.ts";
 import { recognitionOutageWarnings, type RecognitionOutage } from "./domain/transcript.ts";
 import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
 import type { StandaloneConfigV1 } from "./standalone-config.ts";
@@ -142,6 +142,10 @@ export type OccurrenceOutcome = {
   readonly runtimeCleanup: StdioGatewayCleanupOutcome["status"] | null;
   /** Bridge generations started for this occurrence (recoveries + 1). */
   readonly generations: number;
+  /** The current generation's media-lease renewal (null before its session
+   * exists): `degraded` or `lapsed` while media still flows is never a relaunch. */
+  readonly leaseRenewal: MeetingSessionState["leaseRenewal"] | null;
+  readonly leaseRenewalFailures: number;
 };
 
 export type DiscoveryTick = { readonly resolved: number; readonly launched: number; readonly deferred: number };
@@ -404,6 +408,9 @@ function createRuntimeOwner(client: RuntimeClient<4>, transport: OwnedRuntimeTra
     authorizeVoiceResponse: (value) => inner.authorizeVoiceResponse(value),
     skipVoiceResponse: (value) => inner.skipVoiceResponse(value),
     processText: (value) => inner.processText(value),
+    // Renewal stays dormant until the SDK and the gateway both have it (see the adapter).
+    supportsMediaLeaseRenewal: () => inner.supportsMediaLeaseRenewal!(),
+    renewMediaLease: (value) => inner.renewMediaLease!(value),
     readRecordingAlignment: (value) => inner.readRecordingAlignment(value),
     reconcileRecording: (value) => inner.reconcileRecording(value),
     reconcileFinalizedRecording: (value) => inner.reconcileFinalizedRecording(value),
@@ -650,9 +657,11 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
   }
 
   function outcomeOf(entry: OccurrenceEntry): OccurrenceOutcome {
+    const state = entry.session?.state() ?? null;
     return { occurrenceId: entry.occurrenceId, bridgeId: entry.bridgeId, organizer: entry.identity.organizer, phase: entry.phase,
       controlSessionId: entry.runtime?.controlSessionId ?? null, failure: entry.failure, finalization: entry.finalization, custody: entry.custody,
-      runtimeClose: entry.runtime?.closeOutcome() ?? "pending", runtimeCleanup: entry.runtime?.cleanupOutcome() ?? null, generations: entry.generations };
+      runtimeClose: entry.runtime?.closeOutcome() ?? "pending", runtimeCleanup: entry.runtime?.cleanupOutcome() ?? null, generations: entry.generations,
+      leaseRenewal: state?.leaseRenewal ?? null, leaseRenewalFailures: state?.leaseRenewalFailures ?? 0 };
   }
 
   /** Explicit unknown-end classification of a stopped recording (D002/D007);
@@ -711,6 +720,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       await runGeneration(entry, recovery);
       const state = entry.session?.state() ?? null;
       if (state !== null) outages = state.recognitionOutages;
+      if (state?.leaseRenewal === "degraded" || state?.leaseRenewal === "lapsed") log(`occurrence_media_lease_renewal_${state.leaseRenewal}`);
       const listening = storeOpen && store.getSession(entry.occurrenceId)?.state === "listening";
       if (!listening) break;
       // Only a recovery that could not continue gives up; a first generation

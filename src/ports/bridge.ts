@@ -109,7 +109,7 @@ export function createDisclosurePublisher(
 /** A `command_result` correlated back to the command that provoked it. */
 export type BridgeCommandResult = {
   readonly commandId: string;
-  readonly commandType: BridgeCommand["type"] | null;
+  readonly commandType: BridgeCommand["type"] | "renew_media_lease" | null;
   readonly outcome: "ok" | "rejected" | "failed";
   readonly detail: string | null;
 };

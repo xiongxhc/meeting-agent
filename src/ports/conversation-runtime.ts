@@ -106,6 +106,12 @@ export type ConversationRuntimePort = {
   skipVoiceResponse(input: { readonly sessionId: bigint; readonly segmentId: string; readonly reason: string }): Promise<void>;
   /** Post-meeting only; the SDK refuses this while its voice session is live. */
   processText(input: ProcessTextRequest): Promise<ProcessedText>;
+  /** Whether the connected Runtime advertised `media_lease_renewal` (read
+   * after its ready message). False means "do not renew", never a media loss. */
+  supportsMediaLeaseRenewal?(): Promise<boolean>;
+  /** Extends the live media credential by one lifetime; resolves to the new
+   * expiry (Unix ms). Call only after `supportsMediaLeaseRenewal` is true. */
+  renewMediaLease?(input: { readonly sessionId: bigint }): Promise<bigint>;
   /** Post-meeting finalization. Bridge-observed gaps remain separate evidence. */
   finalizeRecording(input: { readonly sessionId: bigint }): Promise<FinalizedRecording>;
   readRecordingAlignment(input: { readonly capability: FinalizedRecordingCapability }): AsyncIterable<RecordingAlignmentPage | RecordingAlignmentComplete>;

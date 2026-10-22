@@ -58,8 +58,9 @@ import {
   type CaptureDrain,
 } from "../contracts/bridge-session-v1.ts";
 import { createTeamVaultIndexOrDegradedAsync } from "../adapters/team-vault-index.ts";
-import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2 } from "../contracts/bridge-session-v2.ts";
-import type { BridgeTransportV2 } from "../ports/bridge-v2.ts";
+import { clearTimeout, setTimeout } from "node:timers";
+import { parseCommandV2, parseEventV2, type BridgeEventMessageV2, type BridgeCommandV2, type BridgeLeaseRenewalCommandV2 } from "../contracts/bridge-session-v2.ts";
+import { createBridgeMediaLeaseRenewer, type BridgeTransportV2 } from "../ports/bridge-v2.ts";
 import type { BackfillSeedConfig, SessionStore } from "../ports/session-store.ts";
 import { LiveProvisionalCorrelator, type LiveCatchupClock, type ProvisionalResolution } from "./live-provisional.ts";
 import { createJoinFailureDiagnostic } from "./join-failure-diagnostic.ts";
@@ -265,9 +266,15 @@ export type MeetingSessionState = {
    * whether another generation may be started. Null otherwise. */
   readonly bridgeRetryAllowed: boolean | null;
   /** Why this generation was ended for recovery, when it was; null otherwise. */
-  readonly recoveryCause: "bridge_closed" | "media_connect_failed" | "runtime_voice_terminal" | null;
+  readonly recoveryCause: "bridge_closed" | "media_connect_failed" | "runtime_voice_terminal" | "media_lost" | null;
   /** Local-clock instant this generation started joining. */
   readonly generationStartedAt: string;
+  /** Media-lease renewal: `inactive` until both the Runtime and the bridge
+   * advertise it (`unsupported` when the Runtime does not); `degraded` after a
+   * failed renewal while media still flows; `lapsed` once the lease expired
+   * unrenewed. None of these ends recording. */
+  readonly leaseRenewal: "inactive" | "unsupported" | "renewing" | "degraded" | "lapsed";
+  readonly leaseRenewalFailures: number;
 };
 
 export type MeetingSession = {
@@ -355,6 +362,15 @@ type QueueItem =
   | { readonly source: "runtime"; readonly event: RuntimeEvent }
   | { readonly source: "bridge_closed" };
 
+/** Bridge reasons after which it makes no further media attempt. */
+const MEDIA_GIVE_UP_REASONS = new Set(["reconnect_exhausted", "media_failed"]);
+/** The bridge's connected answer that advertises `renew_media_lease`. */
+const BRIDGE_RENEWAL_CAPABILITY = "media_lease_renewal";
+/** First retry after a failed renewal; doubles, never later than a third of what is left. */
+const RENEWAL_RETRY_BASE_MS = 1000;
+/** Retries never come closer together than this, so they cannot bunch up as the lease runs out. */
+const RENEWAL_RETRY_FLOOR_MS = 250;
+
 export function createMeetingSession(options: CreateMeetingSessionOptions): MeetingSession {
   const {
     identity,
@@ -379,7 +395,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
   // later and recordings are atomically associated at finalization.
 
   const validator = createBridgeSessionValidator(bridgeSessionId);
-  const issuedCommandTypes = new Map<string, BridgeCommand["type"]>();
+  const issuedCommandTypes = new Map<string, BridgeCommand["type"] | BridgeLeaseRenewalCommandV2["type"]>();
   let commandSeq = 0;
   const nextCommandId =
     options.nextCommandId ??
@@ -580,7 +596,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
 
   // ---- outbound ---------------------------------------------------------
 
-  async function issue(command: BridgeCommand | BridgeCommandV2): Promise<void> {
+  async function issue(command: BridgeCommand | BridgeCommandV2 | BridgeLeaseRenewalCommandV2): Promise<void> {
     const commandId = nextCommandId();
     if (options.timedEvidence) {
       if (issuedCommandTypes.has(commandId)) throw new Error("duplicate bridge command identifier");
@@ -676,6 +692,91 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
       catch (error) { routingErrors.push({ source: "join_cleanup", error }); }
     }
     await terminate("bridge_failure", clock.now(), "local_clock");
+  }
+
+  let leaseRenewal: MeetingSessionState["leaseRenewal"] = "inactive";
+  let leaseRenewalFailures = 0;
+  /** What degraded renewal, so only the same side's next success clears it. */
+  let renewalDegradedBy: "runtime" | "bridge" | null = null;
+  /** The issued timed lease, until the bridge's connected answer says whether it renews. */
+  let pendingRenewalLease: { readonly sessionId: bigint; readonly expiresAtMs: bigint } | null = null;
+
+  function renewalFailed(side: "runtime" | "bridge", error: unknown): void {
+    leaseRenewalFailures += 1;
+    routingErrors.push({ source: side, error });
+    if (leaseRenewal === "renewing" || leaseRenewal === "degraded") { leaseRenewal = "degraded"; renewalDegradedBy = side; }
+  }
+  function renewalSucceeded(side: "runtime" | "bridge"): void {
+    if (leaseRenewal === "degraded" && renewalDegradedBy === side) { leaseRenewal = "renewing"; renewalDegradedBy = null; }
+  }
+
+  /** Keeps the bridge's reconnect admission in step with the Runtime lease,
+   * once the Runtime (after its ready message) and the bridge (in its
+   * connected answer) both advertise renewal. Renews at a third of the
+   * remaining lifetime, one call in flight, and forwards each new expiry. A
+   * failure while media flows is `degraded` and retried with backoff; a lapse
+   * stops renewing. Neither ends the generation: only an actual media loss
+   * does. Stops with the session; capture is never touched. */
+  async function startLeaseRenewal(sessionId: bigint, expiresAtMs: bigint): Promise<void> {
+    const renew = runtime.renewMediaLease, supports = runtime.supportsMediaLeaseRenewal;
+    if (renew === undefined || supports === undefined) return;
+    const signal = sessionEnded.signal;
+    let supported = false;
+    try { supported = await supports.call(runtime); } catch (error) { routingErrors.push({ source: "runtime", error }); }
+    if (signal.aborted) return;
+    // Unsupported means "do not renew", never "media lost".
+    if (!supported) { leaseRenewal = "unsupported"; return; }
+    leaseRenewal = "renewing";
+    const forwarder = createBridgeMediaLeaseRenewer(sessionId, expiresAtMs, (command) => issue(command));
+    let failuresInRow = 0;
+    // One Runtime call in flight: a call that timed out stays the one in
+    // flight until it settles, and its late answer is discarded.
+    let unsettled = false;
+    // One timer at a time (the next renewal, or the in-flight call's timeout),
+    // cleared once when the session ends.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (ms: number, run: () => void) => { timer = setTimeout(run, Math.min(Math.max(0, Math.floor(ms)), 2_147_483_647)); timer.unref?.(); };
+    signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+    const schedule = () => {
+      if (signal.aborted) return;
+      const remaining = Number(forwarder.expiresAtMs() - BigInt(clock.now()));
+      if (!(remaining > 0)) { leaseRenewal = "lapsed"; return; }
+      const cadence = remaining / 3;
+      arm(failuresInRow === 0 ? cadence : Math.max(RENEWAL_RETRY_FLOOR_MS, Math.min(cadence, RENEWAL_RETRY_BASE_MS * 2 ** (failuresInRow - 1))), () => { void renewOnce(); });
+    };
+    const renewOnce = async () => {
+      if (signal.aborted) return;
+      const remaining = Number(forwarder.expiresAtMs() - BigInt(clock.now()));
+      if (!(remaining > 0)) { leaseRenewal = "lapsed"; return; }
+      if (unsettled) {
+        failuresInRow += 1;
+        renewalFailed("runtime", new Error("the previous media lease renewal is still unanswered"));
+        schedule(); return;
+      }
+      // Half of what is left, so a late answer still leaves time to retry.
+      const budget = Math.max(1, remaining / 2);
+      unsettled = true;
+      const call = renew.call(runtime, { sessionId });
+      call.then(() => { unsettled = false; }, () => { unsettled = false; });
+      try {
+        const next = await Promise.race([
+          call,
+          new Promise<never>((_, reject) => { arm(budget, () => reject(new Error("media lease renewal timed out"))); }),
+        ]);
+        clearTimeout(timer);
+        if (signal.aborted) return;
+        await forwarder.forward(next);
+        failuresInRow = 0;
+        renewalSucceeded("runtime");
+      } catch (error) {
+        clearTimeout(timer);
+        if (signal.aborted) return;
+        failuresInRow += 1;
+        renewalFailed("runtime", error);
+      }
+      schedule();
+    };
+    schedule();
   }
 
   function requireRuntimeSessionId(): bigint {
@@ -921,6 +1022,9 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         // The claim rides on the terminal event, so the last one seen is the
         // one that describes the capture this recording finalizes.
         if (event.captureDrain !== undefined) captureDrain = event.captureDrain;
+        // The bridge stopped trying: nothing is captured until a new
+        // generation brings a new lease and a new media path.
+        if (options.timedEvidence && MEDIA_GIVE_UP_REASONS.has(event.reason)) await endGenerationForRecovery("media_lost", true);
         return;
 
       case "chat_disclosure":
@@ -954,6 +1058,18 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
           abortSpeaking(`media_command_${event.outcome}`);
           if (!mediaEverConnected) captureLostAt ??= generationStartedAt;
           await endGenerationForRecovery("media_connect_failed", true);
+        }
+        // Renewal starts only once the bridge's connected answer advertises it;
+        // an older bridge cannot decode the command.
+        if (commandType === "connect_media" && event.outcome === "ok" && event.detail === BRIDGE_RENEWAL_CAPABILITY && pendingRenewalLease !== null) {
+          const lease = pendingRenewalLease; pendingRenewalLease = null;
+          void startLeaseRenewal(lease.sessionId, lease.expiresAtMs);
+        }
+        // The bridge keeps its old reconnect cutoff while media still flows:
+        // degraded, not lost. A real loss arrives as its own event.
+        if (commandType === "renew_media_lease") {
+          if (event.outcome === "ok") renewalSucceeded("bridge");
+          else renewalFailed("bridge", new Error(`bridge refused the lease renewal: ${event.detail ?? event.outcome}`));
         }
         return;
       }
@@ -1038,6 +1154,15 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
             // it. A new generation brings a new voice session and media lease.
             for (const segmentId of [...openTurns]) settle(segmentId, "failed", "provider_unavailable");
             await endGenerationForRecovery("runtime_voice_terminal", true);
+            return;
+          }
+          // The Runtime's unresumable media drop: the voice session is kept,
+          // but nothing is recorded until a new media path exists. Recording
+          // restarts through a new generation, never by waiting on the
+          // provider. Other audio_capture errors are not a media loss.
+          if (value.error.stage === "audio_capture" && (value.error.code as string) === "media_lease_lost") {
+            for (const segmentId of [...openTurns]) settle(segmentId, "failed", "provider_unavailable");
+            await endGenerationForRecovery("media_lost", true);
             return;
           }
           // continue_session: the Runtime keeps the voice session and the
@@ -1522,6 +1647,7 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         timedVoiceAdmitted = true;
         joinDiagnostic?.phase("connect_media_send");
         markJoinTiming(options.joinTiming, "connect_media_send_started");
+        pendingRenewalLease = { sessionId: handle.sessionId, expiresAtMs: handle.mediaLease.expiresAtMs };
         await issue({ type: "connect_media", mediaLease: { sessionId: handle.sessionId.toString(), bridgeSessionId,
           connectEndpoint: handle.mediaLease.connectEndpoint, credential: handle.mediaLease.credential,
           expiresAtMs: handle.mediaLease.expiresAtMs.toString(), reconnectWindowMs: handle.mediaLease.reconnectWindowMs.toString(),
@@ -1617,6 +1743,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         bridgeRetryAllowed,
         recoveryCause,
         generationStartedAt,
+        leaseRenewal,
+        leaseRenewalFailures,
       };
     },
 
