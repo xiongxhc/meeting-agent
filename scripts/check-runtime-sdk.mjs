@@ -3,20 +3,20 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 import { URL } from "node:url";
 
-// Reviewed Runtime commit 316a3f6 on feat/meeting-online-profile (tree dd73d353),
-// packaged as runtime14d. SDK bytes are unchanged from runtime14c.
+// Reviewed Runtime commit 873153c on feat/runtime-media-lease-evidence (tree 8d416c9d),
+// packaged as runtime-lease-873153c-20261022.
 // Repin only together with a reviewed SDK package/consumer handoff.
 const expected = {
   "browser.d.ts": "8c184a30fc0876283f4af2158f2cb37d19549d4cbefe65eeef67e815303fd2c0",
   "browser.js": "7348df3eed1f89412d45f9138141a86a6c86e35e6ff52d2a0ab786b3ae239cca",
-  "client.d.ts": "fe6dd1738f652814ddd6567ed1d60602220ae6c31a8876afceb64c4f6075c76d",
-  "client.js": "77a267a897c1f964fa16fd90793edb59e37db691bf9c56c803bf4b158d17e76a",
+  "client.d.ts": "79b6e7de2374fd37412cfc3f9da048a2d29cfb054d351a1f48addff1197b15da",
+  "client.js": "e3eee4456b5b92b93d7a89f1fbff19fdbde47c3f47d23ec13c12742e665dd904",
   "framing.d.ts": "5fcd94408934a9539074553d3b06746645f0141d59caf35c1327e00ae8bf5eab",
   "framing.js": "4597247a27a2d00432a59ae57aa3a95d125e738a349bfebfc648c11b0aefbf51",
   "index.d.ts": "04c93991e06301718d5f8730d28f8954004448ee6c80c81b5aac885e00400f32",
   "index.js": "55268849b500a84c93d00e1e9a2e93245a856bee5e93de2265569b69dc730751",
-  "protocol.d.ts": "2fd4f644b3da9038bbf0cab49deb1b4298548f72c8c3bf3a6d8ba4ced1e38bc2",
-  "protocol.js": "0b7cdbca69ff5f6ad5db3f6d2725a2b9d2f2df061665a671d51df4b8c0725a5f",
+  "protocol.d.ts": "7a6c37de7a69db60580ff38f481d2bb039e927f761c151b7039980f2d325468f",
+  "protocol.js": "32fc3d343593809259a708d5e867cdce78fd75aafd49d99a44e207c9df0dda08",
   "stdio.d.ts": "48225a81896fcb24caa2a640a855688a36e6591d701fdae252bc48a72497d257",
   "stdio.js": "44b3c0654cf0b631f248c024fe90be2702c120134b9213a654f0cc0119df3901",
 };
@@ -34,6 +34,6 @@ try {
       typeof sdk.RuntimeClient?.prototype.startDrainableTimedVoiceSession !== "function") throw new Error();
   if (sdk.DRAINABLE_TIMED_MEDIA_PROTOCOL_VERSION !== 3 || sdk.TIMED_MEDIA_PROTOCOL_VERSION !== 2) throw new Error();
 } catch {
-  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime 316a3f6017aa483bc13af845d1049924fac62d01 on feat/meeting-online-profile and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
+  process.stderr.write("Runtime SDK prerequisite missing or incompatible: after npm ci, build/pack reviewed Runtime 873153c4395e31b5ba7fca66ee0b7adafecb0273 on feat/runtime-media-lease-evidence and npm install --save-dev --ignore-scripts --no-save --package-lock=false /path/to/conversation-runtime-0.1.0.tgz. See README local SDK bootstrap. No fallback is enabled.\n");
   process.exitCode = 1;
 }

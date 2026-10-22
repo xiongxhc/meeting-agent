@@ -236,7 +236,7 @@ export async function runRecovery(options) {
       ...(warningCut === "acceptance-transaction-abort" ? [] : ["warning acceptance SQL transaction-abort cut not selected"])] };
   let staged, active, failure = null, cleanupConfirmed = true;
   try {
-    assert.equal(RUNTIME_PIN.name, "runtime14d");
+    assert.equal(RUNTIME_PIN.name, "runtime-lease-873153c-20261022");
     evidence.runtimePins = await verifyPins(); evidence.runtimeRevision = RUNTIME_PIN.revision;
     const build = run("/opt/homebrew/opt/node@24/bin/npm", ["run", "build"], {
       cwd: REPO, env: { ...process.env, PATH: `/opt/homebrew/opt/node@24/bin:${process.env.PATH ?? ""}` },

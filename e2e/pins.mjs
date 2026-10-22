@@ -106,6 +106,30 @@ export const RUNTIME_PROFILES = {
       sha256: "0501d127fb90ef5a3ac41001a6b26e535f5d71e9400a53ecf31fd200442e0e06",
     },
   },
+  /** Runtime 873153c4395e31b5ba7fca66ee0b7adafecb0273 (tree 8d416c9d5e63647ffb7fad780898f74eefc20483) on feat/runtime-media-lease-evidence.
+   * Its manifest.json records source, toolchain, build commands, focused gates and the
+   * clean-rebuild check. SDK checked by `scripts/check-runtime-sdk.mjs` in this tree. */
+  "runtime-lease-873153c-20261022": {
+    name: "runtime-lease-873153c-20261022",
+    root: path.join(ARTIFACTS, "runtime-lease-873153c-20261022"),
+    revision: "873153c4395e31b5ba7fca66ee0b7adafecb0273",
+    gateway: {
+      path: path.join(ARTIFACTS, "runtime-lease-873153c-20261022/target/debug/conversation-runtime-gateway"),
+      sha256: "0c80199dc3563bc2e3f0f1868d9f79e94fce7585d6efb17ce307e05cef34a39e",
+    },
+    scriptedGateway: {
+      path: path.join(ARTIFACTS, "runtime-lease-873153c-20261022/target/debug/conversation-runtime-gateway-scripted"),
+      sha256: "660679008e6d53d99fe494d085861fde98fbb48cdb44a1115e531722c6a88463",
+    },
+    scriptedPeers: {
+      path: path.join(ARTIFACTS, "runtime-lease-873153c-20261022/target/debug/conversation-runtime-scripted-peers"),
+      sha256: "e7db0fe55e3d1e1183308f8b69fa2da28cdd14d4ec207b3925583b6f8f603208",
+    },
+    sdkTarball: {
+      path: path.join(ARTIFACTS, "runtime-lease-873153c-20261022/stage/conversation-runtime-0.1.0.tgz"),
+      sha256: "01824aa411ed98707a2abedf73161c83e3d7b824d093198ac94f352c302dce38",
+    },
+  },
 };
 
 // Independent identities from the closed package review, including its mandatory
@@ -160,7 +184,7 @@ RUNTIME_PROFILES[PROVIDER_FAULT_TEST_PROFILE.name] = PROVIDER_FAULT_TEST_PROFILE
 Object.freeze(RUNTIME_PROFILES);
 
 /** The selected build. Swap this one line to move the whole harness. */
-export const RUNTIME_PIN = RUNTIME_PROFILES.runtime14d;
+export const RUNTIME_PIN = RUNTIME_PROFILES["runtime-lease-873153c-20261022"];
 
 /** The accepted TeamMem staged tree the wheel is built from (D003 scope). */
 export const TEAMMEM_SOURCE = {
@@ -170,8 +194,8 @@ export const TEAMMEM_SOURCE = {
     if (repository === undefined) throw new Error("MEETING_E2E_TEAMMEM_REPOSITORY must be set to the TeamMem meeting-storage checkout");
     return repository;
   },
-  /** Tree of 1ebf774, the accepted head of the TeamMem meeting-storage lane. */
-  tree: "6ad2443462a283a4a66e33389068f70b5984df5a",
+  /** Tree of 67c8a75, the accepted head of the TeamMem meeting-storage lane. */
+  tree: "8fe927c0f79e953bc3d4690a1d1cdcd092d593e4",
 };
 
 export async function sha256File(filename) {

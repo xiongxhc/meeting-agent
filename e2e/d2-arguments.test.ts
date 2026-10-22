@@ -38,7 +38,7 @@ for (const [args, expected] of [
 test("provider-fault cuts parse and select the provider-fault TEST package; every other mode keeps the default pin", async () => {
   const module = await import(path.join(import.meta.dirname, "run.mjs"));
   const pins = await import(path.join(import.meta.dirname, "pins.mjs"));
-  assert.equal(pins.RUNTIME_PIN.name, "runtime14d");
+  assert.equal(pins.RUNTIME_PIN.name, "runtime-lease-873153c-20261022");
   for (const cut of ["provider-connect", "provider-error", "provider-stall", "provider-error-speaking", "provider-error-speaking-flush-timeout"]) {
     const options = module.parseArguments(["--interactive", "--d2-cut", cut, "--out", "/private/tmp/unused-provider-fault"]);
     assert.equal(options.d2Cut, cut);

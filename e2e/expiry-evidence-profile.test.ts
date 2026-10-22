@@ -26,9 +26,9 @@ function writableDirectories(root: string) {
 function remove(root: string) { writableDirectories(root); rmSync(root, { recursive: true, force: true }); }
 
 test("explicit evidence selection preserves accepted default and refuses arbitrary profiles before effects", async () => {
-  assert.equal(RUNTIME_PIN, RUNTIME_PROFILES.runtime14d);
-  assert.equal(RUNTIME_PIN.gateway.sha256, "cfc7517cdfb5fdf599b5fa70bbfa2befeefea0ee267a9f7ba2a7d12935bd4c08");
-  assert.equal(RUNTIME_PIN.sdkTarball.sha256, EXPIRY_EVIDENCE_PROVENANCE.sdkSha256);
+  assert.equal(RUNTIME_PIN, RUNTIME_PROFILES["runtime-lease-873153c-20261022"]);
+  assert.equal(RUNTIME_PIN.gateway.sha256, "0c80199dc3563bc2e3f0f1868d9f79e94fce7585d6efb17ce307e05cef34a39e");
+  assert.equal(RUNTIME_PIN.sdkTarball.sha256, "01824aa411ed98707a2abedf73161c83e3d7b824d093198ac94f352c302dce38");
   assert.equal(resolveRuntimeProfile(), RUNTIME_PIN);
   assert.equal(resolveRuntimeProfile(EXPIRY_EVIDENCE_PROFILE.name), EXPIRY_EVIDENCE_PROFILE);
   for (const runtimeProfile of ["unknown", "toString", { ...EXPIRY_EVIDENCE_PROFILE }]) {
