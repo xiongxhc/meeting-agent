@@ -249,3 +249,31 @@ for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) {
     });
   }
 }
+
+// Real slots on the fast-join build: media starts ~25 ms after the L4 origin and the provider sees each 20 ms frame
+// only after an append lag (35-55 ms observed). The verifier requires every selected frame's capture start >= origin + 1400 ms.
+for (const l4Case of ["sent-drop", "sent-named"]) {
+  test(`${l4Case} driver selects a capture-safe range under append lag`, async () => {
+    for (const mediaStartMs of [0, 7, 13, 19, 25]) for (const lagMs of [0, 20, 40, 60, 80, 100]) {
+      const clock = virtualPoller(), f = readiness(l4Case), events: Array<Record<string, string>> = [];
+      const plan = compileL4Plan(l4Case, origin), audio = Buffer.alloc(960).toString("base64");
+      const mediaStart = BigInt(mediaStartMs) * 1000000n, lag = BigInt(lagMs) * 1000000n, frame = 20000000n;
+      const captureStart = (sequence: number) => mediaStart + BigInt(sequence - 1) * frame;
+      let range = { startFrame: 0, endFrame: 0 };
+      const provider = { get submitted() {
+        while (captureStart(f.tracker.snapshot().appended + 1) + frame + lag <= clock.host()) f.tracker.append("one", audio);
+        return f.tracker.snapshot();
+      }, transcript(_text: string, selected: { startFrame: number; endFrame: number }) {
+        range = selected; events.push({ type: "voice_transcript_final", segment_id: "1", session_id: "41" }, { type: "response_skipped", segment_id: "1", session_id: "41" });
+      } };
+      await clock.settle(driveL4Capture({ l4Case, provider, runtimeEvents: () => events, nowHostNs: clock.host, budgetMs: 6000,
+        child() { const emitted = plan.events.filter((row: { emitAtHostNs: string }) => BigInt(row.emitAtHostNs) <= clock.host()).length;
+          return { ...f.child, observationPlan: { ...f.child.observationPlan, emitted, phase: emitted === plan.events.length ? "completed" : "running" } }; },
+        waitFor: clock.waitFor }));
+      const at = `media +${mediaStartMs} ms, lag ${lagMs} ms, frames ${range.startFrame}-${range.endFrame}`;
+      assert.equal(range.endFrame - range.startFrame + 1, 50, at);
+      assert.ok(captureStart(range.startFrame) >= 1400000000n, `first selected frame captured before origin + 1400 ms: ${at}`);
+      assert.ok(captureStart(range.endFrame) + frame <= 3300000000n, `last selected frame ends after origin + 3300 ms: ${at}`);
+    }
+  });
+}

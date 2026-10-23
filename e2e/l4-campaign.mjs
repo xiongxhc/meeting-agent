@@ -120,16 +120,17 @@ export async function driveL4Capture({ l4Case, provider, child, runtimeEvents, w
     requireFact(!l4HasLiveOutput(runtimeEvents()), "l4_runtime_decision_refused");
     const state = child();
     if (state?.l4?.origin) requireFact(nowHostNs() <= BigInt(state.l4.origin.hostNs) + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
+    // Non-conflict selection waits until the next unappended frame was certainly captured after the verifier's 1400 ms floor.
     return state?.joined && state.mediaConnected && provider.submitted.ready && provider.submitted.valid && state.observationPlan?.emitted >= 6 &&
-      (!conflict || nowHostNs() >= BigInt(state.l4.origin.hostNs) + 1480000000n);
+      nowHostNs() >= BigInt(state.l4.origin.hostNs) + (conflict ? 1480000000n : 1500000000n);
   }, "l4_observed_readiness");
   const state = child(), plan = compileL4Plan(l4Case, state.l4?.origin);
   requireFact(state.l4?.case === l4Case && state.l4.planSha256 === l4PlanHash(plan) &&
     state.observationPlan.planned === rows && state.observationPlan.phase === "running", "l4_plan_binding_refused");
   const now = nowHostNs(), base = BigInt(state.l4.origin.hostNs);
-  requireFact(now >= base + (conflict ? 1480000000n : 1400000000n) && now <= base + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
-  const observed = provider.submitted;
-  const range = { connection: observed.connection, startFrame: observed.appended + 1, endFrame: observed.appended + 50 };
+  requireFact(now >= base + (conflict ? 1480000000n : 1500000000n) && now <= base + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
+  const observed = provider.submitted, skip = conflict ? 1 : 3; // two-frame margin past the append lag
+  const range = { connection: observed.connection, startFrame: observed.appended + skip, endFrame: observed.appended + skip + 49 };
   const before = runtimeEvents().length;
   await wait(() => { const current = provider.submitted;
     requireFact(current.valid && current.ready && current.connection === range.connection, "l4_recognition_connection_changed");

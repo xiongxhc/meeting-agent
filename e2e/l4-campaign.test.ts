@@ -84,19 +84,19 @@ test("selected controller waits observed readiness/range/real final and watermar
   const tracker = { connection: "one", appended: 70, valid: true, ready: true }, events: Array<Record<string, string>> = [];
   let sent = 0;
   const provider = { get submitted() { return { ...tracker }; }, transcript(text: string, range: { startFrame: number; endFrame: number }) {
-    assert.equal(text, l4.L4_TEXT); assert.equal(range.startFrame, 71); assert.equal(range.endFrame, 120); sent++;
+    assert.equal(text, l4.L4_TEXT); assert.equal(range.startFrame, 73); assert.equal(range.endFrame, 122); sent++;
     events.push({ type: "voice_transcript_final", segment_id: "1", session_id: "41" }, { type: "response_skipped", segment_id: "1", session_id: "41" }); } };
   const waitFor = async (check: () => unknown, { name }: { name: string }) => {
-    if (name === "l4_submitted_window") tracker.appended = 120;
+    if (name === "l4_submitted_window") tracker.appended = 122;
     if (name === "l4_following_confirmation") child.observationPlan.emitted = 18;
     if (name === "l4_observations_complete") { child.observationPlan.phase = "completed"; child.observationPlan.emitted = 38; }
     const result = check(); assert.ok(result, name); return result;
   };
-  const result = await l4.driveL4Capture({ l4Case: "sent-named", provider, child: () => child, runtimeEvents: () => events, waitFor, nowHostNs: () => BigInt(origin.hostNs) + 1400000000n, budgetMs: 100 });
+  const result = await l4.driveL4Capture({ l4Case: "sent-named", provider, child: () => child, runtimeEvents: () => events, waitFor, nowHostNs: () => BigInt(origin.hostNs) + 1500000000n, budgetMs: 100 });
   assert.equal(sent, 1); assert.equal(result.segmentId, "1"); assert.equal(result.rawRows, 38);
   for (const change of [{ joined: false }, { mediaConnected: false }, { observationPlan: { phase: "running", planned: 38, emitted: 5 } }]) {
     await assert.rejects(l4.driveL4Capture({ l4Case: "sent-named", provider, child: () => ({ ...child, ...change }), runtimeEvents: () => events,
-      waitFor: async (check: () => unknown) => { if (!check()) throw new Error("prerequisite_missing"); return check(); }, nowHostNs: () => BigInt(origin.hostNs) + 1400000000n, budgetMs: 100 }));
+      waitFor: async (check: () => unknown) => { if (!check()) throw new Error("prerequisite_missing"); return check(); }, nowHostNs: () => BigInt(origin.hostNs) + 1500000000n, budgetMs: 100 }));
   }
 });
 /** The builder's synthesis input: published project names, then the canonical transcript. */
