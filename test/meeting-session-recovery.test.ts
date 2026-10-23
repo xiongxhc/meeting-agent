@@ -13,7 +13,7 @@ import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import timers from "node:timers";
 import { syncBuiltinESMExports } from "node:module";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { openSessionStore } from "../src/adapters/sqlite-session-store.ts";
 import { buildMeetingIdentity } from "../src/domain/meeting.ts";
 import { createCoordinator } from "../src/sessions/coordinator.ts";
@@ -290,36 +290,61 @@ function assertStillRecording(h: Harness) {
   assert.equal(h.runtimeCommands().includes("stop_voice_session"), false);
 }
 
-test("the live session renews at a third of the remaining lifetime and forwards each expiry to the bridge", async () => {
-  const calls: bigint[] = [];
-  const h = await harness({ leaseMs: 900, renew: async ({ sessionId }) => { calls.push(sessionId); return BigInt(Date.now() + 900); } });
+/** Mocked setTimeout and Date, including the session's own node:timers
+ * import, so lease timing is exact rather than wall-clock with slack. */
+function mockedTime(t: TestContext) {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: NOW_MS });
+  // Mocked time does not move within a tick, so a timer re-armed at zero delay
+  // from its own callback would loop forever (a mutant without the retry
+  // floor does this). Cap the arms so such a loop fails the test at once.
+  const mockedSetTimeout = timers.setTimeout;
+  let arms = 0;
+  timers.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+    arms += 1;
+    if (arms > 2000) throw new Error("runaway timer re-arming under mocked time");
+    return mockedSetTimeout(...args);
+  }) as typeof timers.setTimeout;
+  syncBuiltinESMExports();
+  return {
+    /** Advances 1 ms at a time, letting the session settle after each step;
+     * stops early once `stop` holds, so a runaway mutant fails fast. */
+    async advance(h: Harness, ms: number, stop: () => boolean = () => false) {
+      for (let step = 0; step < ms && !stop(); step += 1) { t.mock.timers.tick(1); await h.settle(); }
+    },
+    restore() { t.mock.timers.reset(); syncBuiltinESMExports(); },
+  };
+}
+
+test("the live session renews at a third of the remaining lifetime and forwards each expiry to the bridge", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
+  const calls: number[] = [];
+  const h = await harness({ leaseMs: 900, renew: async ({ sessionId }) => { assert.equal(sessionId, 42n, "always the live voice session"); calls.push(Date.now() - NOW_MS); return BigInt(Date.now() + 900); } });
   try {
     await h.session.join(); await h.settle();
-    await wait(200);
-    assert.equal(calls.length, 0, "nothing is renewed before a third of the lifetime has passed");
-    await wait(250); await h.settle();
-    assert.ok(calls.length >= 1, "renewed by about a third of the lifetime");
-    await wait(500); await h.settle();
-    assert.ok(calls.length >= 2 && calls.length <= 4, `one renewal per third of the lifetime (${calls.length} in ~950 ms)`);
-    assert.ok(calls.every((sessionId) => sessionId === 42n), "always the live voice session");
-    assert.ok(h.renewals.length >= 2);
-    assert.deepEqual(h.renewals.map(BigInt), [...h.renewals.map(BigInt)].sort((a, b) => (a < b ? -1 : 1)), "expiries only move forward");
+    await time.advance(h, 299);
+    assert.deepEqual(calls, [], "nothing is renewed before a third of the lifetime has passed");
+    await time.advance(h, 1);
+    assert.deepEqual(calls, [300], "renewed at exactly a third of the lifetime");
+    await time.advance(h, 600);
+    assert.deepEqual(calls, [300, 600, 900], "then once per third of each renewed lifetime");
+    assert.deepEqual(h.renewals.map(Number), [NOW_MS + 1200, NOW_MS + 1500, NOW_MS + 1800], "each renewed expiry reaches the bridge, only forward");
     assert.equal(h.session.state().leaseRenewal, "renewing");
     assertStillRecording(h);
     h.emit({ type: "left", reason: "ended", observationTiming: null, observationTimingReason: "timing_unavailable" }); await h.settle();
-    const after = calls.length;
-    await wait(500);
-    assert.equal(calls.length, after, "the renewal timer stops with the session");
-  } finally { await h.cleanup(); }
+    await time.advance(h, 1000);
+    assert.deepEqual(calls, [300, 600, 900], "the renewal timer stops with the session");
+  } finally { time.restore(); await h.cleanup(); }
 });
 
-test("without the Runtime capability, or a bridge that does not advertise renewal, nothing is renewed and nothing relaunches", { timeout: 20_000 }, async () => {
+test("without the Runtime capability, or a bridge that does not advertise renewal, nothing is renewed and nothing relaunches", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
+  try {
   for (const options of [{}, { supported: false }, { bridgeAdvertises: false }]) {
     const calls: bigint[] = [];
     const h = await harness({ leaseMs: 300, ...("supported" in options || "bridgeAdvertises" in options ? { renew: async ({ sessionId }: { readonly sessionId: bigint }) => { calls.push(sessionId); return BigInt(Date.now() + 300); } } : {}), ...options });
     try {
       await h.session.join(); await h.settle();
-      await wait(450); await h.settle();
+      await time.advance(h, 450);
       assert.equal(calls.length, 0, JSON.stringify(options));
       assert.equal(h.bridgeCommands.includes("renew_media_lease"), false);
       // The real SDK on a gateway that does not advertise the flag (`{}`), and a
@@ -333,86 +358,110 @@ test("without the Runtime capability, or a bridge that does not advertise renewa
       assertStillRecording(h);
     } finally { await h.cleanup(); }
   }
+  } finally { time.restore(); }
 });
 
-test("the actual adapter over an SDK without renewMediaLease reports no renewal support: no status probe, no renewal, no relaunch", { timeout: 20_000 }, async () => {
+test("the actual adapter over an SDK without renewMediaLease reports no renewal support: no status probe, no renewal, no relaunch", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
   const h = await harness({ leaseMs: 300, sdkWithoutRenewal: true });
   try {
     await h.session.join(); await h.settle();
-    await wait(450); await h.settle();
+    await time.advance(h, 450);
     assert.equal(h.bridgeCommands.includes("renew_media_lease"), false);
     assert.equal(h.runtimeCommands().includes("status"), false);
     assert.equal(h.session.state().leaseRenewal, "unsupported");
     assertStillRecording(h);
-  } finally { await h.cleanup(); }
+  } finally { time.restore(); await h.cleanup(); }
 });
 
-test("the real pinned SDK renews once the gateway's ready advertises media_lease_renewal, and forwards each expiry to the bridge", { timeout: 20_000 }, async () => {
+test("the real pinned SDK renews once the gateway's ready advertises media_lease_renewal, and forwards each expiry to the bridge", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
   const h = await harness({ leaseMs: 900, runtimeCapabilities: [...TEST_RUNTIME_CAPABILITIES, "media_lease_renewal"] });
+  const renewCalls = () => h.runtimeCommands().filter((type) => type === "renew_media_lease").length;
   try {
     await h.session.join(); await h.settle();
-    await wait(200); await h.settle();
-    assert.equal(h.runtimeCommands().includes("renew_media_lease"), false, "nothing before a third of the lifetime");
-    await wait(500); await h.settle();
+    await time.advance(h, 299);
+    assert.equal(renewCalls(), 0, "nothing before a third of the lifetime");
+    await time.advance(h, 1);
     assert.equal(h.runtimeCommands().filter((type) => type === "status").length, 1, "one capability probe, answered");
-    assert.ok(h.runtimeCommands().includes("renew_media_lease"), "the SDK sent the renewal");
-    assert.ok(h.renewals.length >= 1, "the renewed expiry reached the bridge");
+    assert.equal(renewCalls(), 1, "the SDK sent the renewal at a third of the lifetime");
+    assert.deepEqual(h.renewals.map(Number), [NOW_MS + 1200], "the gateway's renewed expiry reached the bridge");
     assert.equal(h.session.state().leaseRenewal, "renewing");
     assert.equal(h.session.state().leaseRenewalFailures, 0);
     assertStillRecording(h);
-  } finally { await h.cleanup(); }
+  } finally { time.restore(); await h.cleanup(); }
 });
 
-for (const [name, renew, extra] of [
-  ["a refused renewal", async () => { throw new Error("renewal refused"); }, {}],
-  ["a renewal that never answers", () => new Promise<bigint>(() => undefined), {}],
-  ["a renewal the bridge cannot apply", async () => BigInt(Date.now() + 600), { renewalOutcome: "rejected" as const }],
+type RenewalCheckpoint = { readonly atMs: number; readonly calls: readonly number[]; readonly failures: number; readonly state: string };
+// Each trace is exact on mocked time (600 ms lease, first call at 200 ms):
+// - refused: retried 250 ms later (the floor); the 700 ms attempt finds the lease passed.
+// - never answers: the 200 ms call times out at 400 (half of what was left); the 650 ms attempt lapses.
+// - the bridge cannot apply: the Runtime keeps renewing every third of its new lifetime and each bridge refusal is a failure.
+for (const [name, renew, extra, checkpoints] of [
+  ["a refused renewal", async () => { throw new Error("renewal refused"); }, {},
+    [{ atMs: 449, calls: [200], failures: 1, state: "degraded" }, { atMs: 450, calls: [200, 450], failures: 2, state: "degraded" },
+     { atMs: 1000, calls: [200, 450], failures: 2, state: "lapsed" }]],
+  ["a renewal that never answers", () => new Promise<bigint>(() => undefined), {},
+    [{ atMs: 399, calls: [200], failures: 0, state: "renewing" }, { atMs: 400, calls: [200], failures: 1, state: "degraded" },
+     { atMs: 1000, calls: [200], failures: 1, state: "lapsed" }]],
+  ["a renewal the bridge cannot apply", async () => BigInt(Date.now() + 600), { renewalOutcome: "rejected" as const },
+    [{ atMs: 200, calls: [200], failures: 1, state: "degraded" }, { atMs: 400, calls: [200, 400], failures: 2, state: "degraded" },
+     { atMs: 1000, calls: [200, 400, 600, 800, 1000], failures: 5, state: "degraded" }]],
 ] as const) {
-  test(`${name} while media flows marks renewal degraded and retries; it never relaunches`, async () => {
-    let calls = 0;
-    const h = await harness({ leaseMs: 600, renew: () => { calls += 1; return renew(); }, ...extra });
+  test(`${name} while media flows marks renewal degraded and retries; it never relaunches`, { timeout: 30_000 }, async (t) => {
+    const time = mockedTime(t);
+    const calls: number[] = [];
+    const h = await harness({ leaseMs: 600, renew: () => { calls.push(Date.now() - NOW_MS); return renew(); }, ...extra });
     try {
       await h.session.join(); await h.settle();
-      await wait(450); await h.settle();
-      assert.equal(h.session.state().leaseRenewal, "degraded");
-      assert.ok(h.session.state().leaseRenewalFailures >= 1);
-      assertStillRecording(h);
-      await wait(500); await h.settle();
-      assert.ok(calls >= 2 || h.session.state().leaseRenewal === "lapsed", "it retried before the lease lapsed");
-      assertStillRecording(h);
-    } finally { await h.cleanup(); }
+      let elapsed = 0;
+      for (const point of checkpoints as readonly RenewalCheckpoint[]) {
+        await time.advance(h, point.atMs - elapsed); elapsed = point.atMs;
+        assert.deepEqual({ calls, failures: h.session.state().leaseRenewalFailures, state: h.session.state().leaseRenewal },
+          { calls: [...point.calls], failures: point.failures, state: point.state }, `at ${point.atMs} ms`);
+        assertStillRecording(h);
+      }
+    } finally { time.restore(); await h.cleanup(); }
   });
 }
 
-test("retries of a failing renewal stay at least a floor apart and none is sent once the lease has passed", async () => {
+test("retries of a failing renewal stay at least a floor apart and none is sent once the lease has passed", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
   const at: number[] = [];
-  let expiry = 0;
-  const h = await harness({ leaseMs: 900, renew: async () => { at.push(Date.now()); throw new Error("renewal refused"); } });
+  // Capped: without the floor, retries would bunch up toward the lapse.
+  const cap = 8;
+  const h = await harness({ leaseMs: 900, renew: async () => { if (at.length < cap) at.push(Date.now() - NOW_MS); throw new Error("renewal refused"); } });
   try {
-    expiry = Date.now() + 900;
     await h.session.join(); await h.settle();
-    await wait(1400); await h.settle();
+    await time.advance(h, 1400, () => at.length >= cap);
+    // First at a third of 900 ms; retries never closer than 250 ms; at 1050 the
+    // lease (900) has passed, so that attempt lapses without a call.
+    assert.deepEqual(at, [300, 550, 800]);
     assert.equal(h.session.state().leaseRenewal, "lapsed");
-    const gaps = at.slice(1).map((value, index) => value - at[index]!);
-    assert.ok(gaps.every((gap) => gap >= 200), `no retries bunched near the lapse (gaps ${gaps.join(",")} ms)`);
-    assert.ok(at.length >= 2 && at.length <= 4, `${at.length} calls`);
-    assert.ok(at.every((value) => value < expiry + 50), "nothing is sent after the lease has passed");
+    assert.equal(h.session.state().leaseRenewalFailures, 3);
     assertStillRecording(h);
-  } finally { await h.cleanup(); }
+  } finally { time.restore(); await h.cleanup(); }
 });
 
-test("a renewal that timed out is still the one call in flight: no second call overlaps it", async () => {
-  let inFlight = 0, most = 0, calls = 0;
-  const h = await harness({ leaseMs: 900, renew: () => { calls += 1; inFlight += 1; most = Math.max(most, inFlight); return new Promise<bigint>(() => undefined); } });
+test("a renewal that timed out is still the one call in flight: no second call overlaps it", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
+  let inFlight = 0, most = 0;
+  const at: number[] = [];
+  const h = await harness({ leaseMs: 900, renew: () => { at.push(Date.now() - NOW_MS); inFlight += 1; most = Math.max(most, inFlight); return new Promise<bigint>(() => undefined); } });
   try {
     await h.session.join(); await h.settle();
-    await wait(1300); await h.settle();
+    await time.advance(h, 600);
+    // Called at 300 with half of what is left (300 ms) to answer; it times out at 600.
+    assert.equal(h.session.state().leaseRenewalFailures, 1, "the timeout is a failure");
+    assert.equal(h.session.state().leaseRenewal, "degraded");
+    await time.advance(h, 700);
+    // The 850 attempt finds the call still unsettled: a failure, not a second call. At 1100 the lease has passed.
+    assert.deepEqual(at, [300], "the unanswered call is never overlapped");
     assert.equal(most, 1, "one call in flight");
-    assert.equal(calls, 1, "the unanswered call is not overlapped");
-    assert.ok(h.session.state().leaseRenewalFailures >= 2, "each skipped attempt still counts as a failure");
+    assert.equal(h.session.state().leaseRenewalFailures, 2, "the skipped attempt still counts as a failure");
     assert.equal(h.session.state().leaseRenewal, "lapsed");
     assertStillRecording(h);
-  } finally { await h.cleanup(); }
+  } finally { time.restore(); await h.cleanup(); }
 });
 
 test("the renewal loop holds one timer and one abort listener, and clears its timer when the session ends", async () => {
@@ -451,18 +500,21 @@ test("the renewal loop holds one timer and one abort listener, and clears its ti
   }
 });
 
-test("once the lease lapses renewal stops and is reported; recording continues", async () => {
-  let calls = 0;
-  const h = await harness({ leaseMs: 300, renew: async () => { calls += 1; throw new Error("renewal refused"); } });
+test("once the lease lapses renewal stops and is reported; recording continues", { timeout: 30_000 }, async (t) => {
+  const time = mockedTime(t);
+  const calls: number[] = [];
+  const h = await harness({ leaseMs: 300, renew: async () => { calls.push(Date.now() - NOW_MS); throw new Error("renewal refused"); } });
   try {
     await h.session.join(); await h.settle();
-    await wait(700); await h.settle();
+    // First at 100 ms; the retry floor puts the next attempt at 350 ms, after the 300 ms lease.
+    await time.advance(h, 349);
+    assert.equal(h.session.state().leaseRenewal, "degraded");
+    await time.advance(h, 1);
     assert.equal(h.session.state().leaseRenewal, "lapsed");
-    const after = calls;
-    await wait(300);
-    assert.equal(calls, after, "a lapsed lease is not renewed");
+    await time.advance(h, 300);
+    assert.deepEqual(calls, [100], "a lapsed lease is not renewed");
     assertStillRecording(h);
-  } finally { await h.cleanup(); }
+  } finally { time.restore(); await h.cleanup(); }
 });
 
 for (const reason of ["reconnect_exhausted", "media_failed"]) {

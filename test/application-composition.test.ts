@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -1014,9 +1015,11 @@ test("real v2 children: the timed join reaches joined, the owner lock descriptor
 // 4. Runtime owner
 // ---------------------------------------------------------------------------
 
-test("the operator view reports a degraded and lapsed media-lease renewal while recording continues, and the log names it", { timeout: 30_000 }, async () => {
+test("the operator view reports a degraded and lapsed media-lease renewal while recording continues, and the log names it", { timeout: 60_000 }, async (t) => {
   // The real pinned SDK against a scripted gateway that advertises
-  // media_lease_renewal and refuses every renewal.
+  // media_lease_renewal and refuses every renewal. Startup runs on real time;
+  // the renewal phase runs on mocked setTimeout and Date (including the
+  // session's own node:timers import), so no step waits on the wall clock.
   const f = fixture();
   try {
     const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, leaseMs: 1500, refusesLeaseRenewal: true });
@@ -1026,25 +1029,38 @@ test("the operator view reports a degraded and lapsed media-lease renewal while 
     const log: string[] = [];
     const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]),
       clock: { now: () => Date.now() } });
+    let mocked = false;
+    const restore = () => { if (mocked) { mocked = false; t.mock.timers.reset(); syncBuiltinESMExports(); } };
     try {
     await app.start();
     await app.discover();
     await until(() => slot.sent().some((command) => command.type === "connect_media"));
     const outcome = () => app.occurrenceOutcomes().find((value) => value.occurrenceId === id)!;
     assert.equal(outcome().leaseRenewal, "inactive", "nothing renews until the bridge advertises it");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() }); syncBuiltinESMExports(); mocked = true;
+    const turns = async () => { for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve)); };
+    /** Mocked milliseconds until the predicate holds; at most the lease lifetime and its last retry. */
+    const advanceUntil = async (done: () => boolean) => { let ms = 0; while (!done() && ms < 2000) { t.mock.timers.tick(1); ms += 1; await turns(); } return ms; };
     const connect = slot.sent().find((command) => command.type === "connect_media")!;
     slot.emit({ type: "media_connected", endpoint: "tcp://127.0.0.1:9001" });
     slot.emit({ type: "command_result", commandId: connect.commandId, outcome: "ok", detail: "media_lease_renewal" });
-    await until(() => outcome().leaseRenewal === "degraded", 5000);
-    assert.ok(outcome().leaseRenewalFailures >= 1);
+    await turns();
+    const toDegraded = await advanceUntil(() => outcome().leaseRenewal === "degraded");
+    assert.equal(outcome().leaseRenewal, "degraded", `degraded after ${toDegraded} mocked ms`);
+    assert.ok(toDegraded > 0 && toDegraded <= 500, "the first renewal comes at a third of what was left, at most 500 ms");
+    assert.equal(outcome().leaseRenewalFailures, 1);
     assert.equal(outcome().phase, "live", "a failing renewal never ends the generation");
-    await until(() => outcome().leaseRenewal === "lapsed", 8000);
+    const toLapsed = await advanceUntil(() => outcome().leaseRenewal === "lapsed");
+    assert.equal(outcome().leaseRenewal, "lapsed", `lapsed after a further ${toLapsed} mocked ms`);
+    assert.ok(outcome().leaseRenewalFailures >= 2, "it retried before the lease lapsed");
+    assert.equal(outcome().phase, "live");
     assert.equal(outcome().generations, 1, "a lapsed lease is not a relaunch");
+    restore();
     slot.left("ended");
     const settled = await app.awaitOccurrence(id);
     assert.equal(settled.leaseRenewal, "lapsed");
     assert.ok(log.includes("occurrence_media_lease_renewal_lapsed"), "the lapse is never silent");
-    } finally { await app.close(); }
+    } finally { restore(); await app.close(); }
   } finally { f.close(); }
 });
 
