@@ -45,7 +45,7 @@ import { inspectStateRoot, readStandaloneConfig } from "../dist/src/standalone-c
 
 import { startFixtureProvider } from "./fixture-provider.mjs";
 import { readStateFile } from "./state-file.mjs";
-import { JOIN_TIMING_FILE, createJoinTimingRecorder } from "./join-latency-evidence.mjs";
+import { JOIN_TIMING_FILE, createJoinTimingRecorder, readJoinTimingRows } from "./join-latency-evidence.mjs";
 import { interactiveGatewayToml, liveGatewayToml, postmeetingOnlineGatewayToml } from "./gateway-config.mjs";
 import { startInteractiveProvider } from "./interactive-provider.mjs";
 import { RESERVE_ID, SCOPE, inviteEnvelope, startFeishuPeer } from "./feishu-peer.mjs";
@@ -118,6 +118,13 @@ export function waitFor(check, { budgetMs, name, signal, pollMs = 25 }) {
       if (Date.now() >= deadline) { clearInterval(timer); reject(new Error(`e2e_timeout:${name}`)); }
     }, pollMs);
   });
+}
+/** The Team Vault index builds off the join path and closes with its own
+ * namespace+HEAD read. The question read counts start only once that build has
+ * settled, so they count retrieval reads and never the build's closing read. */
+export async function vaultReadBaseline({ readJoinTiming, revisionReads, budgetMs = 15_000 }) {
+  await waitFor(() => readJoinTiming().rows.some((row) => row?.event === "meeting_phase" && row.phase === "vault_index_built"), { budgetMs, name: "vault_index_built" });
+  return revisionReads();
 }
 function readJson(filename) {
   return readStateFile(filename);
@@ -541,7 +548,7 @@ async function driveInteractive(provider, getComposition) {
   await turn("near_name", "Meetbop, please summarize.", false);
   event("name_gate_negative", { languageCalls: provider.calls.filter((entry) => entry.route === "language").length, playback: state().playback.length });
   const revisionReads = () => vaultReads().filter((entry) => entry.type === "vault_revision_read").length;
-  let before = revisionReads();
+  let before = await vaultReadBaseline({ readJoinTiming: () => readJoinTimingRows(path.join(plan.controlDir, JOIN_TIMING_FILE)), revisionReads });
   const current = await turn("current", "Meetbot, what is copper budget?", true);
   event("current_question_answered", { ...current, vaultReadsBefore: before, vaultReadsAfter: revisionReads() });
   before = revisionReads();
