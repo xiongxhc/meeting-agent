@@ -312,6 +312,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
   // operation, never while a live entry could own it.
   const RETENTION_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
   const retentionWarnings: { code: "retention_grace_applied"; count: number }[] = [];
+  const publishFailedLogged = new Set<string>();
   function sweepRetention(): string {
     try {
       input.supervisor.assertOwnership();
@@ -326,10 +327,17 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
       for (const row of open.sessions) {
         if (input.supervisor.occurrenceIsLive(row.occurrenceId)) continue;
         // A meeting interrupted after bridge failures publishes what its stored
-        // generations recorded; only an occurrence with nothing stored fails.
-        if (row.state === "listening" && input.supervisor.publishInterrupted?.(row.occurrenceId, now) === true) {
-          log("retention_capture_published");
-          continue;
+        // generations recorded; only an occurrence with nothing stored fails. A
+        // publication that throws leaves the row listening for the next sweep
+        // (logged once per occurrence) and never stops this one.
+        if (row.state === "listening") {
+          let published: boolean;
+          try { published = input.supervisor.publishInterrupted?.(row.occurrenceId, now) === true; } catch {
+            if (!publishFailedLogged.has(row.occurrenceId)) { publishFailedLogged.add(row.occurrenceId); log("retention_capture_publish_failed"); }
+            continue;
+          }
+          publishFailedLogged.delete(row.occurrenceId);
+          if (published) { log("retention_capture_published"); continue; }
         }
         input.store.transition({ occurrenceId: row.occurrenceId, fromState: row.state, toState: "failed", reason: "fail", terminalReason: "capture_interrupted", nowMs: now });
         log("retention_capture_adopted");

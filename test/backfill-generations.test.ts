@@ -243,3 +243,46 @@ test("when no generation saw the end, the last generation's capture loss runs to
       "the 19 minutes after the first generation's loss are reported");
   } finally { f.cleanup(); }
 });
+
+test("only the last generation's open capture loss runs to the end; an earlier generation's loss closes where the next one connected", async () => {
+  const f = fixture("2026-09-02T14:00:00Z");
+  try {
+    const occurrenceId = f.identity.occurrenceId;
+    // Generation 1, the longest, captured 14:01-14:21 and failed with its capture loss still open.
+    const first = recordGeneration(f.store, occurrenceId, f.dirs.recordingsDir, 1, f.startMs + 60_000, 1_200_000, "alice");
+    f.store.completeReconciliationGeneration(occurrenceId, first.bridgeSessionId, f.startMs + 1_260_000, "local_clock");
+    const firstGaps = [{ direction: "capture" as const, startedAt: "2026-09-02T14:21:00.000Z", endedAt: null }];
+    f.coordinator.recordBridgeFailure(occurrenceId, 1, firstGaps, recordingInput(first, firstGaps), true);
+    // Generation 2 connected media at 14:22, captured to 14:30 and failed at 14:31; no generation saw the end.
+    const second = recordGeneration(f.store, occurrenceId, f.dirs.recordingsDir, 2, f.startMs + 1_320_000, 480_000, "bob");
+    f.store.completeReconciliationGeneration(occurrenceId, second.bridgeSessionId, f.startMs + 1_860_000, "local_clock");
+    const secondGaps = [{ direction: "capture" as const, startedAt: "2026-09-02T14:21:00.000Z", endedAt: "2026-09-02T14:22:00.000Z" },
+      { direction: "capture" as const, startedAt: "2026-09-02T14:30:00.000Z", endedAt: null }];
+    f.coordinator.recordBridgeFailure(occurrenceId, 1, secondGaps, recordingInput(second, secondGaps), true);
+    const published = f.store.publishStoredGenerations({ occurrenceId, nowMs: f.startMs + 2_000_000, reason: "bridge_failure_exhausted",
+      seed: { ...seedConfig, identity: f.identity } });
+    assert.deepEqual(published, { attempt: 1, endedAt: "2026-09-02T14:31:00.000Z", generations: 2 });
+    selectAlignment(f.store, occurrenceId, first); selectAlignment(f.store, occurrenceId, second);
+    const { artifact } = await buildOnce(f.store, f.dirs, f.startMs + 2_000_001);
+    assert.deepEqual(artifact.recording_gaps.map((gap) => [gap.started_at, gap.ended_at]),
+      [["2026-09-02T14:21:00.000Z", "2026-09-02T14:22:00.000Z"], ["2026-09-02T14:30:00.000Z", "2026-09-02T14:31:00.000Z"]],
+      "generation 2's eight captured minutes are not reported as loss");
+  } finally { f.cleanup(); }
+});
+
+test("the published end is the end of capture: a generation completed later without a stored recording does not move it", () => {
+  const f = fixture("2026-09-02T14:00:00Z");
+  try {
+    const occurrenceId = f.identity.occurrenceId;
+    const first = recordGeneration(f.store, occurrenceId, f.dirs.recordingsDir, 1, f.startMs + 60_000, 1_200_000, "alice");
+    f.store.completeReconciliationGeneration(occurrenceId, first.bridgeSessionId, f.startMs + 1_260_000, "local_clock");
+    f.coordinator.recordBridgeFailure(occurrenceId, 1, [], recordingInput(first, []), true);
+    // A relaunched generation was in flight when the process stopped; a restart sweep completes it a day later.
+    f.store.beginReconciliationGeneration(occurrenceId, "bridge-2", f.startMs + 1_320_000);
+    const sweptAt = f.startMs + 24 * 60 * 60 * 1000;
+    f.store.completeReconciliationGeneration(occurrenceId, "bridge-2", sweptAt, "local_clock");
+    const published = f.store.publishStoredGenerations({ occurrenceId, nowMs: sweptAt, reason: "capture_interrupted",
+      seed: { ...seedConfig, identity: f.identity } });
+    assert.deepEqual(published, { attempt: 1, endedAt: "2026-09-02T14:21:00.000Z", generations: 1 });
+  } finally { f.cleanup(); }
+});

@@ -250,3 +250,37 @@ test("metadata completion refuses missing reference identity and cannot create a
     assert.equal(store.getSession(claim.occurrenceId),null);
   }finally{store.close();}
 });
+
+test("a session-less invite row the store cannot refuse (admitted by an earlier build, or under an unsettled claim) reports the fail-closed refusal",()=>{
+  const store=openSessionStore({filename:":memory:"});
+  try{
+    const admitted=normalizeInvite(envelope("event-a","9007199254740993"),scope),claimed=normalizeInvite(envelope("event-c","9007199254740995"),scope);
+    store.acceptInvite(admitted,1);store.completeInviteClaim(store.claimInviteMetadata(2)!,resolved(),3);
+    assert.equal(store.getInviteOccurrence(admitted.occurrenceId)?.state,"admitted");
+    store.acceptInvite(claimed,4);assert.equal(store.claimInviteMetadata(5)?.occurrenceId,claimed.occurrenceId);
+    for(const id of [admitted.occurrenceId,claimed.occurrenceId]){
+      const before=store.getInviteOccurrence(id);
+      assert.equal(store.admitInviteJoin(id,6,"inviter_unverified"),"inviter_unverified");
+      assert.deepEqual(store.getInviteOccurrence(id),before,"the row is left as it is");
+      assert.deepEqual(store.inviteJoinStatus(id),{session:null,terminalReason:null,refusal:"inviter_unverified",allowed:false});
+    }
+  }finally{store.close();}
+});
+
+test("the allowed decision is appended, never written over an existing audit row",()=>{
+  const dir=mkdtempSync(path.join(os.tmpdir(),"invite-audit-")),filename=path.join(dir,"db");
+  const store=openSessionStore({filename}),raw=new Database(filename);
+  try{
+    raw.exec("CREATE TRIGGER transitions_append_only BEFORE UPDATE ON transitions BEGIN SELECT RAISE(ABORT,'transitions_append_only'); END");
+    const fresh=normalizeInvite(envelope("event-f","9007199254740993"),scope),legacy=normalizeInvite(envelope("event-l","9007199254740995"),scope);
+    store.acceptInvite(fresh,1);
+    assert.equal(store.admitInviteJoin(fresh.occurrenceId,2),"admitted");
+    assert.deepEqual(store.listTransitions(fresh.occurrenceId).map((row)=>[row.fromState,row.toState,row.reason]),[[null,"discovered","invite_allowed"]]);
+    // A session from before the allowlist gets its decision as a further row.
+    store.acceptInvite(legacy,1);
+    store.createSession({occurrenceId:legacy.occurrenceId,providerMeetingId:legacy.providerMeetingId,occurrenceStartedAt:legacy.occurrenceStartedAt,nowMs:1});
+    assert.equal(store.admitInviteJoin(legacy.occurrenceId,2),"admitted");
+    assert.deepEqual(store.listTransitions(legacy.occurrenceId).map((row)=>[row.fromState,row.toState,row.reason]),[[null,"discovered",null],["discovered","discovered","invite_allowed"]]);
+    assert.equal(store.inviteJoinAllowed(fresh.occurrenceId)&&store.inviteJoinAllowed(legacy.occurrenceId),true);
+  }finally{raw.close();store.close();rmSync(dir,{recursive:true,force:true});}
+});

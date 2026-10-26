@@ -472,6 +472,11 @@ const INVITE_ALLOWED = "invite_allowed";
 function inviteJoinAllowed(db: Database.Database, id: string): boolean {
   return db.prepare("SELECT 1 FROM transitions WHERE occurrence_id=? AND reason=? LIMIT 1").get(id, INVITE_ALLOWED) !== undefined;
 }
+/** Only an unclaimed pending row or an already refused row can record a refusal; an admitted row or one under an
+ * organizer claim cannot. */
+function inviteRefusable(row: InviteOccurrence): boolean {
+  return (row.state === "pending_metadata" && row.claimToken === null) || row.state === "metadata_blocked";
+}
 function inviteJoinRefusal(row: InviteOccurrence): string | null {
   return row.state === "metadata_blocked" && row.lastBlockedReason !== null && JOIN_REFUSALS.includes(row.lastBlockedReason) ? row.lastBlockedReason : null;
 }
@@ -498,11 +503,11 @@ function admitInviteJoin(db: Database.Database, id: string, now: number, refusal
     const outcome = refusal ?? (now - observedAtMs > INVITE_JOIN_WINDOW_MS ? "invite_stale" as const : null);
     if (outcome !== null) {
       // Recorded on the invite row; an in-flight organizer claim is left to settle and the next decision records it.
-      if ((row.state === "pending_metadata" && row.claimToken === null) || row.state === "metadata_blocked") blockInvite(db,id,outcome,now);
+      if (inviteRefusable(row)) blockInvite(db,id,outcome,now);
       return outcome;
     }
-    createSession(db,{occurrenceId:row.occurrenceId,providerMeetingId:row.providerMeetingId,occurrenceStartedAt:row.occurrenceStartedAt,nowMs:now});
-    db.prepare("UPDATE transitions SET reason=? WHERE occurrence_id=? AND from_state IS NULL").run(INVITE_ALLOWED, id);
+    // The creation audit row carries the allowed decision; the append-only table is never rewritten.
+    createSession(db,{occurrenceId:row.occurrenceId,providerMeetingId:row.providerMeetingId,occurrenceStartedAt:row.occurrenceStartedAt,nowMs:now},INVITE_ALLOWED);
     // A refusal parked the organizer lane; the now-joined meeting gets a fresh organizer generation.
     if (inviteJoinRefusal(row) !== null) {
       db.prepare(`UPDATE feishu_invite_occurrences SET state='pending_metadata',generation_attempts=0,generation_started_at_ms=NULL,
@@ -511,12 +516,13 @@ function admitInviteJoin(db: Database.Database, id: string, now: number, refusal
     return "admitted" as const;
   }).immediate();
 }
-/** The join decision for the operator: the session, a recorded refusal, or none yet. */
+/** The join decision for the operator: the session, a recorded refusal, or none yet. A session-less row that cannot
+ * record a refusal is reported as the tick's fail-closed refusal, which a replay of its invite may still decide. */
 function inviteJoinStatus(db: Database.Database, id: string): { readonly session: string | null; readonly terminalReason: string | null; readonly refusal: string | null; readonly allowed: boolean } | null {
   const row = getInviteOccurrence(db,id);
   if (!row) return null;
   const session = getSession(db,id);
-  return { session: session?.state ?? null, terminalReason: session?.terminalReason ?? null, refusal: session ? null : inviteJoinRefusal(row), allowed: session !== null && inviteJoinAllowed(db,id) };
+  return { session: session?.state ?? null, terminalReason: session?.terminalReason ?? null, refusal: session ? null : inviteJoinRefusal(row) ?? (inviteRefusable(row) ? null : "inviter_unverified"), allowed: session !== null && inviteJoinAllowed(db,id) };
 }
 function resolvedInviteOrganizer(db: Database.Database, id: string): BackfillSeedFinalizationInput["identity"]["organizer"] {
   const organizer = getInviteOccurrence(db,id)?.organizer ?? null;
@@ -752,7 +758,7 @@ function deriveOccurrenceSegment(occurrenceId: string): string {
   }
 }
 
-function createSession(db: Database.Database, input: CreateSessionInput): SessionRow {
+function createSession(db: Database.Database, input: CreateSessionInput, reason: string | null = null): SessionRow {
   const occurrenceSegment = deriveOccurrenceSegment(input.occurrenceId);
   const run = db.transaction(() => {
     if (selectSessionRaw(db, input.occurrenceId) !== undefined) {
@@ -777,8 +783,8 @@ function createSession(db: Database.Database, input: CreateSessionInput): Sessio
       );
       db.prepare(
         `INSERT INTO transitions (occurrence_id, from_state, to_state, reason, terminal_reason, occurred_at_ms)
-         VALUES (?, NULL, 'discovered', NULL, NULL, ?)`,
-      ).run(input.occurrenceId, input.nowMs);
+         VALUES (?, NULL, 'discovered', ?, NULL, ?)`,
+      ).run(input.occurrenceId, reason, input.nowMs);
     });
   });
   run();
@@ -3209,8 +3215,10 @@ function publishStoredGenerations(db: Database.Database, input: PublishStoredGen
   const binding = db.prepare(`SELECT bridge_session_id FROM recording_recovery_bindings WHERE occurrence_id = ? AND failure_attempt = ?`)
     .get(input.occurrenceId, anchor.attempt) as { bridge_session_id: string };
   const recovery = getRecordingRecovery(db, input.occurrenceId, binding.bridge_session_id, anchor.handle)!;
-  // The end of capture: the last terminal of a generation that left a recording
-  // (a generation completed later, e.g. by a restart sweep, did not capture).
+  // The end of capture: the last terminal of a generation whose recording is
+  // stored for publication. A generation completed later without one (e.g. the
+  // one in flight at a crash, completed by the restart sweep) may have captured,
+  // but its recording is not published, so it does not move the end.
   const terminal = db.prepare(`SELECT max(generation.terminal_at_ms) AS at FROM reconciliation_generations AS generation
     JOIN recording_recovery_bindings AS binding ON binding.generation_id = generation.generation_id
     WHERE generation.occurrence_id = ?`).get(input.occurrenceId) as { at: number | null };

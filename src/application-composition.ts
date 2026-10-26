@@ -820,14 +820,18 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
   }
 
   /** One durable join decision; every refusal or stale drop is a failed session with its reason. */
-  function admitOne(occurrenceId: string, refusal?: "inviter_not_allowed" | "inviter_unverified"): void {
+  function admitOne(occurrenceId: string, refusal?: "inviter_not_allowed" | "inviter_unverified", logged?: Set<string>): void {
     // A refusal never touches an existing session; an allowed invite may admit a session that predates the allowlist.
     if (refusal !== undefined && store.getSession(occurrenceId) !== null) return;
     const outcome = store.admitInviteJoin(occurrenceId, clock.now(), refusal);
-    if (outcome !== "admitted" && outcome !== "existing_session") log(`invite_admission_${outcome}`);
+    if (outcome === "admitted" || outcome === "existing_session" || logged?.has(occurrenceId) === true) return;
+    logged?.add(occurrenceId);
+    log(`invite_admission_${outcome}`);
   }
 
   const unadmittedLogged = new Set<string>();
+  // A row the store cannot refuse (admitted by an earlier build, or under an unsettled claim) is re-decided each tick, logged once.
+  const refusalLogged = new Set<string>();
   // Per-row admission failures back off in memory so one bad row never stops later joins.
   const admissionBackoff = new Map<string, { failures: number; retryAtMs: number }>();
 
@@ -853,7 +857,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
             // A recorded refusal is final for that invite; only a later allowed invite (at accept) reopens it.
             if (occurrence.state === "metadata_blocked" && ["inviter_not_allowed", "inviter_unverified", "invite_stale"].includes(occurrence.lastBlockedReason ?? "")) continue;
             // Otherwise the accept-time decision was lost (crash): the inviter is no longer known, so it fails closed.
-            admitOne(occurrence.occurrenceId, inviteAdmission === "allowlist" ? "inviter_unverified" : "inviter_not_allowed");
+            admitOne(occurrence.occurrenceId, inviteAdmission === "allowlist" ? "inviter_unverified" : "inviter_not_allowed", refusalLogged);
             admissionBackoff.delete(occurrence.occurrenceId);
             continue;
           }

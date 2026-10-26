@@ -289,6 +289,40 @@ test("a stale listening session and its open capture generation are adopted into
   } finally { store.close(); r.close(); }
 });
 
+test("a stale row whose publication throws stays listening and is retried by the next sweep, logged once; the sweep goes on and a row with nothing stored still fails", async () => {
+  const r = roots();
+  const wall = START_MS + 60_000;
+  const store = openSessionStore({ filename: r.filename, nowMs: START_MS });
+  const log: string[] = [];
+  const flaky = staleCapture(store, () => START_MS, "-a");
+  const empty = staleCapture(store, () => START_MS, "-bb");
+  const file = orphan(r, "after-a-throw", START_MS);
+  let throws = 2;
+  const sup = { ...supervisor(), publishInterrupted: (id: string) => {
+    if (id !== flaky) return false;
+    if (throws > 0) { throws -= 1; throw new Error("synthetic transient publication failure"); }
+    store.transition({ occurrenceId: id, fromState: "listening", toState: "finalizing", reason: "advance", terminalReason: null, nowMs: wall });
+    return true;
+  } };
+  const owner = maintenance(store, r, () => wall, sup, log);
+  try {
+    await owner.tick("custody");
+    assert.equal(store.getSession(flaky)?.state, "listening", "a throw leaves the row for the next sweep");
+    assert.equal(store.getSession(empty)?.state, "failed", "nothing stored still fails");
+    assert.equal(store.getSession(empty)?.terminalReason, "capture_interrupted");
+    assert.equal(retentionRow(r.filename, file.handle)?.state, "assigned", "retention adoption still runs for later files");
+    assert.equal(log.includes("maintenance_retention_sweep_failed"), false);
+    await owner.tick("custody");
+    assert.equal(store.getSession(flaky)?.state, "listening");
+    assert.equal(log.filter((code) => code === "retention_capture_publish_failed").length, 1, "two throws, one log line");
+    await owner.tick("custody");
+    assert.equal(store.getSession(flaky)?.state, "finalizing", "published on the next sweep");
+    assert.equal(log.filter((code) => code === "retention_capture_published").length, 1);
+    assert.equal(log.includes("retention_capture_adopted") && log.filter((code) => code === "retention_capture_adopted").length, 1, "only the empty row was failed");
+    await owner.close();
+  } finally { store.close(); r.close(); }
+});
+
 test("composition start sweeps before any lane tick: an old unowned recording is adopted under the grace with a counted warning and a stale listening row is failed", async () => {
   const dir = realpathSync(mkdtempSync(path.join(realpathSync(tmpdir()), "meeting-retention-composition-")));
   const stateRoot = path.join(dir, "state");

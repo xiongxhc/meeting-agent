@@ -817,6 +817,29 @@ test("a decision lost after the commit is made by Feishu's exact redelivery, eve
   }
 });
 
+test("an invite an earlier build admitted without a session is refused once by the tick, logged once, and shown as refused", async () => {
+  const f = fixture();
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const earlier = invite(7, "900000007");
+  try {
+    const live = await liveIngress(f, { ...f.config, admission: ALLOWED }, [slot], [], (store) => {
+      store.acceptInvite(earlier, 1);
+      store.completeInviteClaim(store.claimInviteMetadata(2)!, { status: "resolved", organizer: { ...scope, idType: "open_id", id: "ou_creator", displayName: "Creator", source: "reservation" },
+        reference: { kind: "reservation", reserveId: "reserve" } }, 3);
+    });
+    try {
+      await live.app.discover(); await live.app.discover();
+      assert.equal(slot.launches.length, 0);
+      assert.equal(live.log.filter((code) => code === "invite_admission_inviter_unverified").length, 1, "three ticks, one log line");
+    } finally { await live.close(); }
+    const store = f.reopen();
+    try {
+      assert.equal(store.getInviteOccurrence(earlier.occurrenceId)?.state, "admitted");
+      assert.deepEqual(store.inviteJoinStatus(earlier.occurrenceId), { session: null, terminalReason: null, refusal: "inviter_unverified", allowed: false });
+    } finally { store.close(); }
+  } finally { f.close(); }
+});
+
 test("an exact replay of a pre-allowlist invite by an allowed inviter admits its unverified session", async () => {
   const f = fixture();
   const slot = scriptedSlot(1, { joinMode: "silent" });
@@ -1840,7 +1863,7 @@ test("after a crash in the middle of a relaunched meeting, the restart sweep pub
     // The restarted process: its start sweep finds the listening row and the open generation.
     const log: string[] = [];
     const restarted = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir }).factory,
-      bridgeSlots: [scriptedSlot(1)], metadata: resolvedLookup(["900000001"]), clock: { now: () => 20_000 },
+      bridgeSlots: [scriptedSlot(1)], metadata: resolvedLookup(["900000001"]), clock: { now: () => Date.parse(OBSERVED_AT) + 3_600_000 },
       maintenance: { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) } });
     await restarted.start();
     assert.ok(log.includes("retention_capture_published"));
@@ -1851,6 +1874,7 @@ test("after a crash in the middle of a relaunched meeting, the restart sweep pub
       const seed = store.getBackfillSeed(id!);
       assert.equal(seed?.capability.recordingHandle, runtimes.owned[0]!.handle, "generation 1's recording ships");
       assert.deepEqual(seed?.processingWarnings, [{ code: "meeting_end_unobserved", detail: "capture_interrupted" }]);
+      assert.equal(seed?.endedAt, OBSERVED_AT, "the end of capture is generation 1's failure, not the restart sweep");
       assert.equal(seed?.provenance.sttProvider, "unavailable_current_sdk", "nothing a Runtime status would supply is invented");
       assert.equal(store.listOpenCaptureRows().generations.length, 0, "the interrupted generation was completed first");
     } finally { store.close(); }
