@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { boundedBytes, boundedJson, ingressData, ingressPathExists, ingressReceiverFact } from "./ingress-run.mjs";
-import { readR2BaselineState, measureR2Sources } from "./r2-baseline.mjs";
+import { readR2BaselineState, measureR2Sources, repositoryMigrations } from "./r2-baseline.mjs";
 import { ARTIFACTS } from "./pins.mjs";
 
 export const ACCEPTED_R2_BUNDLE = "8dca90932fe04c98c21f50346287eb13702f28832be3e0c5ef83985862705d81";
@@ -112,7 +112,8 @@ export function readTerminalState({ root, databasePath, occurrenceId }) {
     const result = db.transaction(() => {
       const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name);
       requireTerminal(same(tables, TABLES), "schema_tables");
-      requireTerminal(same(db.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map(row => row.version), Array.from({ length: 31 }, (_, i) => i + 1)), "schema_versions");
+      // Exactly at repository head: no pending migration file, no unknown version.
+      requireTerminal(same(db.prepare("SELECT version,name FROM schema_migrations ORDER BY version").all(), repositoryMigrations()), "schema_versions");
       const schemaSha256 = hash(JSON.stringify({ definitions: db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all(),
         migrations: db.prepare("SELECT * FROM schema_migrations ORDER BY version").all() }));
       const one = (table, sql) => { requireTerminal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n === 1, "cardinality"); const row = db.prepare(sql).get(occurrenceId); requireTerminal(row, "occurrence_binding"); return row; };

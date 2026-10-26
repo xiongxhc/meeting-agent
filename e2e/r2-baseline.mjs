@@ -8,6 +8,14 @@ import { initialRuntimeSettled } from "./recovery-run.mjs";
 import { readKnownEndRecoveryState } from "./recovery-state.mjs";
 
 function requireFact(value, reason) { if (!value) throw new Error(reason); }
+const MIGRATIONS_DIR = path.join(import.meta.dirname, "..", "migrations");
+/** Repository migration ledger: every migrations/*.sql, versioned by numeric
+ * prefix and ascending, the rule the store's migration runner applies. */
+export function repositoryMigrations(directory = MIGRATIONS_DIR) {
+  return readdirSync(directory).filter(name => name.endsWith(".sql")).map(name => {
+    const match = /^(\d+)_/.exec(name); requireFact(match, "migration file lacks a numeric version prefix"); return { version: Number.parseInt(match[1], 10), name };
+  }).sort((a, b) => a.version - b.version);
+}
 export function assertR2Plan(plan) {
   requireFact(!plan.r2Baseline || !(plan.interactive || plan.initialR1 || plan.d2Cut || plan.onlyRefusals || plan.packageRefusals), "R2 baseline cannot combine modes");
 }
@@ -67,7 +75,7 @@ export function preflightR2Database(databasePath) {
   const db = new Database(databasePath, { readonly: true, fileMustExist: true });
   try {
     requireFact(db.readonly, "R2 database was not opened readonly");
-    requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 32, "unsupported R2 schema");
+    requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === repositoryMigrations().at(-1)?.version, "unsupported R2 schema");
   } finally { db.close(); }
 }
 export function readR2BaselineState({ databasePath, occurrenceId }) {
@@ -80,7 +88,7 @@ export function readR2BaselineState({ databasePath, occurrenceId }) {
   try {
     requireFact(db.readonly && db.pragma("journal_mode", { simple: true }) !== "wal", "R2 reader requires a non-WAL snapshot");
     return db.transaction(() => {
-      requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === 32, "unsupported R2 schema");
+      requireFact(db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()?.version === repositoryMigrations().at(-1)?.version, "unsupported R2 schema");
       const counts = {};
       for (const [name, table] of Object.entries({ sessions: "sessions", seeds: "backfill_seeds", delivery: "delivery_journal", jobs: "backfill_jobs" }))
         counts[name] = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;

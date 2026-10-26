@@ -217,6 +217,13 @@ test("C guarded readonly reader rejects foreign root, sidecar, symlink and schem
     assert.throws(() => readTerminalState({ root: path.join(f.root, "recordings"), databasePath: f.databasePath, occurrenceId: f.invite.occurrenceId }), /terminal_root_binding/);
     writeFileSync(f.databasePath + "-wal", "synthetic"); assert.throws(f.read, /terminal_database_sidecar/); rmSync(f.databasePath + "-wal");
     const linked = path.join(f.root, "linked.db"); symlinkSync(f.databasePath, linked); assert.throws(() => readTerminalState({ root: f.root, databasePath: linked, occurrenceId: f.invite.occurrenceId }), /terminal_physical_path/);
+    const { repositoryMigrations } = await import(path.join(import.meta.dirname, "r2-baseline.mjs")), head = repositoryMigrations().at(-1);
+    assert.ok(head.version >= 32 && repositoryMigrations().length === head.version);
+    const edit = (sql: string, ...args: unknown[]) => { const db = new Database(f.databasePath); db.prepare(sql).run(...args); db.close(); };
+    edit("DELETE FROM schema_migrations WHERE version=?", head.version); assert.throws(f.read, /unsupported R2 schema/);
+    edit("INSERT INTO schema_migrations (version,name,applied_at_ms) VALUES (?,?,?)", head.version + 1, `${head.version + 1}_unknown.sql`, END); assert.throws(f.read, /unsupported R2 schema/);
+    edit("UPDATE schema_migrations SET version=? WHERE version=?", head.version, head.version + 1); assert.throws(f.read, /terminal_schema_versions/);
+    edit("DELETE FROM schema_migrations WHERE version=1"); assert.throws(f.read, /terminal_schema_versions/);
     const db = new Database(f.databasePath); db.exec("CREATE TABLE unexpected(value TEXT)"); db.close(); assert.throws(f.read, /terminal_schema_tables/);
   } finally { f.close(); }
 });
