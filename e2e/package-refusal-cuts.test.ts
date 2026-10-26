@@ -84,3 +84,22 @@ test("package cut driver refuses an app outside the private root before copying 
     assert.equal(existsSync(path.join(root, "package-refusal-cuts")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("only the cut that reaches composition may print coordinator-log lines; the grammar refusal must keep stdout empty", async () => {
+  const runPackageRefusalCuts = await helper();
+  const staged = fixture();
+  try {
+    const logLine = "meeting-agent: 2026-10-23T00:00:00.000Z composition_lock_verified\n";
+    // Injected process results: both main cuts print one coordinator-log line with their expected exit and stderr.
+    const run = (_command: string, args: readonly string[]) => {
+      const config = args[2] ?? "";
+      if (config.endsWith("runtime_wire_version.json")) return { exit: 64, signal: null, stdout: logLine, stderr: "meeting-agent: standalone config grammar error in runtime.protocolVersion\n" };
+      if (config.endsWith("bridge_static_unsupported.json")) return { exit: 70, signal: null, stdout: logLine, stderr: "meeting-agent: composition_unavailable bridge_slot_invalid\n" };
+      return { exit: 0, signal: null, stdout: "", stderr: "" };
+    };
+    const result = await runPackageRefusalCuts({ staged, run });
+    const status = (name: string) => result.cuts.find((cut: { name: string }) => cut.name === name)?.status;
+    assert.equal(status("runtime_wire_version"), "fail", "a grammar refusal exits before the lock and must print nothing");
+    assert.equal(status("bridge_static_unsupported"), "pass", "a refusal inside composition may print coordinator-log lines");
+  } finally { rmSync(staged.root, { recursive: true, force: true }); }
+});

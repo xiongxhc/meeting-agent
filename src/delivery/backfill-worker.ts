@@ -269,7 +269,7 @@ export function createBackfillWorker(options: BackfillWorkerOptions): BackfillWo
       built = await buildTimedTeamMemMeetingArtifactV2({
         identity: { occurrenceId: claim.seed.occurrenceId as MeetingIdentity["occurrenceId"], providerMeetingId: claim.seed.providerMeetingId,
           meetingNo: claim.seed.meetingNo, occurrenceStartedAt: claim.seed.occurrenceStartedAt,
-          title: claim.seed.title, organizer: claim.seed.organizer },
+          title: claim.seed.title, organizer: claim.seed.organizer, ...(claim.seed.organizerUnresolvedReason === null ? {} : { organizerUnresolvedReason: claim.seed.organizerUnresolvedReason }) },
         provider: claim.seed.provider,
         revision: claim.targetRevision,
         endedAt: claim.seed.endedAt,

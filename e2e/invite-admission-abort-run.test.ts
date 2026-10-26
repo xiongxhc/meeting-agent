@@ -199,3 +199,11 @@ for (const [role, dependency, file] of dependencyFiles) test(`finite dependency 
     writeFileSync(filename, bytes); renameSync(filename, filename + ".missing"); assert.throws(() => entry.qualifyInviteAbortSources(root));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("the strict invite-abort lifecycle list admits the three operator-log codes once each", async () => {
+  const codes: unknown = [...(await runner()).INVITE_ABORT_LIFECYCLE_CODES];
+  assert.ok(Array.isArray(codes));
+  for (const code of ["invite_admitted", "bridge_joined", "organizer_dm_sent"]) assert.equal(codes.filter((value: unknown) => value === code).length, 1, code);
+  assert.equal(codes.includes("invite_admission_admitted"), false);
+  assert.equal(new Set(codes).size, codes.length, "the list stays a strict set");
+});

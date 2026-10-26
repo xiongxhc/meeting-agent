@@ -7,11 +7,16 @@ import { makeOccurrenceId, type OccurrenceId } from "./occurrence-id.ts";
 
 /**
  * Where the organizer was resolved from. Matches TeamMem's
- * `organizer_source`: `reservation` (Feishu reservation's reserve_user_id)
- * or `calendar_event` (the calendar event's organizer). There is no third
- * source -- never `host_user`, never inferred from attendees.
+ * `organizer_source`: `reservation` (Feishu reservation's reserve_user_id),
+ * `calendar_event` (the calendar event's organizer) or `meeting_list`
+ * (Feishu's meeting list organizer for this exact occurrence) -- never
+ * `host_user`, never inferred from attendees.
  */
-export type OrganizerSource = "reservation" | "calendar_event";
+export type OrganizerSource = "reservation" | "calendar_event" | "meeting_list";
+
+/** Why a meeting has no organizer: `instant_meeting` only when Feishu reported this
+ * exact occurrence with no organizer; every other null is `organizer_unresolved`. */
+export type OrganizerUnresolvedReason = "instant_meeting" | "organizer_unresolved";
 
 export type Organizer = {
   readonly feishuUserId: string;
@@ -25,10 +30,11 @@ export type MeetingIdentity = {
   readonly meetingNo: string;
   readonly occurrenceStartedAt: string;
   readonly title: string;
-  /** null only for an instant meeting, which has no reservation and no
-   * calendar event -- the organizer notification then fails closed rather
-   * than guessing a recipient. */
+  /** null when no organizer is known -- the organizer notification then
+   * fails closed rather than guessing a recipient. */
   readonly organizer: Organizer | null;
+  /** With a null organizer, why; absent means `organizer_unresolved`. */
+  readonly organizerUnresolvedReason?: OrganizerUnresolvedReason;
 };
 
 export type BuildMeetingIdentityInput = {
@@ -37,6 +43,7 @@ export type BuildMeetingIdentityInput = {
   readonly occurrenceStartedAt: string;
   readonly title: string;
   readonly organizer: Organizer | null;
+  readonly organizerUnresolvedReason?: OrganizerUnresolvedReason;
 };
 
 /**
@@ -53,5 +60,6 @@ export function buildMeetingIdentity(input: BuildMeetingIdentityInput): MeetingI
     occurrenceStartedAt: input.occurrenceStartedAt,
     title: input.title,
     organizer: input.organizer,
+    ...(input.organizer === null && input.organizerUnresolvedReason !== undefined ? { organizerUnresolvedReason: input.organizerUnresolvedReason } : {}),
   };
 }

@@ -25,7 +25,7 @@ const outbox = {} as OutboxWorker;
 
 const seed: BackfillSeed = {
   occurrenceId: "synthetic@2026-09-02T14:00:00Z", provider: "feishu", providerMeetingId: "synthetic",
-  meetingNo: "000000000", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "Synthetic", organizer: null,
+  meetingNo: "000000000", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "Synthetic", organizer: null, organizerUnresolvedReason: "instant_meeting",
   endedAt: "2026-09-02T14:10:00Z", endedAtMs: 1_000, stopAtMs: 1_000_000, expiresAtMs: 2_000_000,
   bridgeSessionId: "bridge", generationId: "generation", capability: testCapability,
   recordingPath: "/private/recordings/recording.enc", recordingFormat: "pcm_s16le/24000/1/20ms",

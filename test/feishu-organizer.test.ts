@@ -43,12 +43,35 @@ test("real SDK reservation reads require exact active occurrence before reserve/
   }
 });
 
-test("missing reference resolves no organizer and never performs HTTP; the join does not wait on it (instant meeting)", async () => {
-  const http = createFeishuSdkHttp({request:async()=>{throw new Error("must_not_call");}});
-  const adapter = createFeishuOrganizerMetadata({...scope,appSecret:new RedactedSecret("synthetic"),http,references:[]});
-  const store = openSessionStore({filename:":memory:"}); store.acceptInvite(normalizeInvite(envelope(),scope),1);
-  try { assert.deepEqual(await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal),{status:"blocked",reason:"reference_missing",retryable:false}); }
-  finally { await http.close(); store.close(); }
+test("with no configured reference the organizer comes from Feishu's meeting list entry for this exact occurrence only", async () => {
+  // envelope(): meeting id 9007199254740993, number 900000001, start 1788357600 s.
+  for (const mode of ["ok", "other_instance", "denied_http", "denied_code", "no_organizer", "no_display"] as const) {
+    const queries: URLSearchParams[] = [];
+    const peer = await httpPeer((req,res) => {
+      const url = new URL(req.url!, "http://fixture");
+      res.setHeader("content-type","application/json");
+      if (url.pathname.endsWith("/tenant_access_token/internal")) { res.end(JSON.stringify({code:0,tenant_access_token:"synthetic-token",expire:7200})); return; }
+      assert.equal(req.method,"GET"); assert.equal(url.pathname,"/open-apis/vc/v1/meeting_list"); queries.push(url.searchParams);
+      if (mode === "denied_http") { res.writeHead(403); res.end("{}"); return; }
+      if (mode === "denied_code") { res.end(JSON.stringify({code:99991672,msg:"no permission"})); return; }
+      const entry = { meeting_id:"900000001", meeting_instance_id: mode === "other_instance" ? "9007199254740000" : "9007199254740993", meeting_type:1,
+        ...(mode === "no_organizer" ? {} : { user_id:"ou_organizer", organizer: mode === "no_display" ? "" : "Organizer" }) };
+      res.end(JSON.stringify({code:0,data:{has_more:false,meeting_list:[entry]}}));
+    });
+    const http = createFeishuSdkHttp({ request: peer.request, connection:createFeishuSocketOwner(Agent) });
+    const store = openSessionStore({filename:":memory:"}); store.acceptInvite(normalizeInvite(envelope(),scope),1);
+    const adapter = createFeishuOrganizerMetadata({ ...scope, appSecret:new RedactedSecret("synthetic-secret"), http, references:[] });
+    try {
+      const result = await adapter.resolve(store.listInviteOccurrences()[0]!,new AbortController().signal);
+      const query = queries[0]!;
+      assert.deepEqual([query.get("meeting_no"),query.get("meeting_status"),query.get("user_id_type"),query.get("start_time"),query.get("end_time")],
+        ["900000001","1","open_id",String(1788357600-3600),String(1788357600+3600)], mode);
+      if (mode === "ok") assert.deepEqual(result, {status:"resolved",organizer:{...scope,idType:"open_id",id:"ou_organizer",displayName:"Organizer",source:"meeting_list"},
+        reference:{kind:"meeting_list",meetingInstanceId:"9007199254740993"}});
+      else assert.deepEqual(result, {status:"blocked",retryable:mode === "other_instance",reason:{other_instance:"occurrence_mismatch",denied_http:"permission_denied",
+        denied_code:"permission_denied",no_organizer:"organizer_not_reported",no_display:"display_missing"}[mode]}, mode);
+    } finally { await http.close(); store.close(); await peer.close(); }
+  }
 });
 
 test("owned SDK HTTP timeout aborts actual socket work and close waits for settlement", async () => {

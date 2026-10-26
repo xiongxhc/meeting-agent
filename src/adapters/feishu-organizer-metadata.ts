@@ -1,9 +1,12 @@
 import { Client, Domain } from "@larksuiteoapi/node-sdk";
 import type { RedactedSecret } from "../config.ts";
 import { boundedInviteString, inviteSecondsToUtc, validateFeishuScope, type FeishuScope } from "../ports/feishu-ingress.ts";
-import type { FeishuOrganizerLookup, MetadataBlockedReason, OrganizerReferenceEntry, OrganizerResolution } from "../ports/feishu.ts";
+import type { FeishuOrganizerLookup, MetadataBlockedReason, OrganizerReference, OrganizerReferenceEntry, OrganizerResolution } from "../ports/feishu.ts";
 import { validateOrganizerReferenceKeys } from "../ports/feishu.ts";
 import { FeishuHttpError, redactedFeishuLogger, type FeishuSdkHttp } from "./feishu-sdk-http.ts";
+
+/** Half-width of the meeting list query window around the occurrence start. */
+const MEETING_LIST_WINDOW_S = 3600;
 
 export function createFeishuOrganizerMetadata(options: FeishuScope & {
   readonly appSecret: RedactedSecret; readonly http: FeishuSdkHttp;
@@ -31,12 +34,28 @@ export function createFeishuOrganizerMetadata(options: FeishuScope & {
   const blocked = (reason: MetadataBlockedReason,retryable=false): OrganizerResolution => ({status:"blocked",reason,retryable});
   return { async resolve(invite,signal) {
     if (invite.region !== options.region || invite.tenantKey !== options.tenantKey || invite.appId !== options.appId) return blocked("reference_invalid");
-    const reference = references.find((entry)=>entry.region===invite.region && entry.tenantKey===invite.tenantKey && entry.appId===invite.appId && entry.meetingNo===invite.meetingNo)?.reference;
-    if (!reference) return blocked("reference_missing");
+    // A configured reservation or calendar event is the stricter path; otherwise Feishu's meeting list names the organizer.
+    const reference: OrganizerReference = references.find((entry)=>entry.region===invite.region && entry.tenantKey===invite.tenantKey && entry.appId===invite.appId && entry.meetingNo===invite.meetingNo)?.reference
+      ?? { kind: "meeting_list", meetingInstanceId: invite.providerMeetingId };
     try { return await options.http.withSignal(signal,async()=>{
       signal.throwIfAborted();
       let id: string | undefined, displayName: string | undefined;
-      if (reference.kind === "reservation") {
+      if (reference.kind === "meeting_list") {
+        // GET /open-apis/vc/v1/meeting_list: this meeting number, in progress, around this occurrence's start.
+        const startSeconds = Date.parse(invite.occurrenceStartedAt) / 1000;
+        const listed = await client.vc.v1.meetingList.get({params:{start_time:String(startSeconds - MEETING_LIST_WINDOW_S),end_time:String(startSeconds + MEETING_LIST_WINDOW_S),
+          meeting_no:invite.meetingNo,meeting_status:1,user_id_type:"open_id",page_size:20}});
+        if (listed.code !== 0) return blocked("permission_denied");
+        // Only the entry for this exact occurrence counts: never another meeting on the same number.
+        const matches = (listed.data?.meeting_list ?? []).filter((item)=>item.meeting_instance_id === invite.providerMeetingId);
+        if (matches.length === 0) return blocked("occurrence_mismatch",true);
+        const item = matches[0]!;
+        if (matches.length > 1 || item.meeting_id !== invite.meetingNo) return blocked("reference_invalid");
+        // meeting_type and meeting_subtype are not read: the pinned SDK documents no values. Classify an
+        // instant meeting from them here once a live check records what they mean.
+        if (!item.user_id) return blocked("organizer_not_reported");
+        id = item.user_id; displayName = item.organizer;
+      } else if (reference.kind === "reservation") {
         const active = await client.vc.v1.reserve.getActiveMeeting({path:{reserve_id:reference.reserveId},params:{with_participants:false,user_id_type:"open_id"}});
         if (active.code !== 0) return blocked("metadata_unavailable");
         const meeting = active.data?.meeting;
@@ -54,7 +73,7 @@ export function createFeishuOrganizerMetadata(options: FeishuScope & {
         if (contact.code !== 0) return blocked("permission_denied");
         if (contact.data?.user?.open_id !== id) return blocked("identity_invalid");
         displayName = contact.data.user.name;
-      } else {
+      } else if (reference.kind === "calendar_event") {
         if (reference.occurrenceId !== invite.occurrenceId || reference.providerMeetingId !== invite.providerMeetingId || reference.occurrenceStartedAt !== invite.occurrenceStartedAt) return blocked("reference_invalid");
         const response = await client.calendar.v4.calendarEvent.get({path:{calendar_id:reference.calendarId,event_id:reference.eventId},params:{user_id_type:"open_id"}});
         if (response.code !== 0) return blocked("permission_denied");
@@ -64,7 +83,7 @@ export function createFeishuOrganizerMetadata(options: FeishuScope & {
         if (event.vchat?.vc_info && (event.vchat.vc_info.unique_id !== invite.providerMeetingId || event.vchat.vc_info.meeting_no !== invite.meetingNo)) return blocked("reference_invalid");
         id = event.event_organizer?.user_id; displayName = event.event_organizer?.display_name;
         if (reference.vcOrganizerOpenId !== undefined && reference.vcOrganizerOpenId !== id) return blocked("identity_invalid");
-      }
+      } else return blocked("reference_invalid");
       if (!id) return blocked("identity_invalid"); boundedInviteString(id);
       if (!displayName?.trim()) return blocked("display_missing"); boundedInviteString(displayName,4096);
       signal.throwIfAborted();

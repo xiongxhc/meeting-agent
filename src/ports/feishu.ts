@@ -5,19 +5,23 @@ export type OrganizerReference =
   | { readonly kind: "reservation"; readonly reserveId: string }
   | { readonly kind: "calendar_event"; readonly calendarId: string; readonly eventId: string;
       readonly occurrenceId: string; readonly providerMeetingId: string; readonly occurrenceStartedAt: string;
-      readonly vcOrganizerOpenId?: string };
+      readonly vcOrganizerOpenId?: string }
+  /** Feishu's meeting list entry whose `meeting_instance_id` is this occurrence's meeting ID. */
+  | { readonly kind: "meeting_list"; readonly meetingInstanceId: string };
 export type OrganizerReferenceEntry = FeishuScope & { readonly meetingNo: string; readonly reference: OrganizerReference };
 /** Reject unowned payload instead of persisting arbitrary caller fields. */
 export function validateOrganizerReferenceKeys(reference: OrganizerReference): void {
   const keys = reference.kind === "reservation" ? ["kind","reserveId"] : reference.kind === "calendar_event"
-    ? ["kind","calendarId","eventId","occurrenceId","providerMeetingId","occurrenceStartedAt","vcOrganizerOpenId"] : [];
+    ? ["kind","calendarId","eventId","occurrenceId","providerMeetingId","occurrenceStartedAt","vcOrganizerOpenId"]
+    : reference.kind === "meeting_list" ? ["kind","meetingInstanceId"] : [];
   if (keys.length === 0 || Object.keys(reference).some((key)=>!keys.includes(key))) throw new Error("invalid_invite_reference");
 }
 export type ResolvedInviteOrganizer = FeishuScope & {
   readonly idType: "open_id"; readonly id: string; readonly displayName: string;
-  readonly source: "reservation" | "calendar_event";
+  readonly source: "reservation" | "calendar_event" | "meeting_list";
 };
-export type MetadataBlockedReason = "reference_missing" | "permission_denied" | "identity_invalid" | "display_missing" |
+/** `organizer_not_reported`: Feishu returned this exact occurrence with no organizer (an instant meeting). */
+export type MetadataBlockedReason = "reference_missing" | "organizer_not_reported" | "permission_denied" | "identity_invalid" | "display_missing" |
   "reference_invalid" | "occurrence_mismatch" | "inactive_meeting" | "metadata_unavailable" | "timeout" | "cancelled" |
   "retry_exhausted" | "clock_regression" | "counter_exhausted";
 export type OrganizerResolution =

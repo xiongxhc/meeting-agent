@@ -27,6 +27,8 @@ function requirePrivateStage(staged) {
  * runtime launch, socket, credential/key read or artifact seed occurs. On an
  * admitted host the composition may read the staged synthetic app-secret.
  * Raw process output is retained; config/launcher bytes are never reported. */
+const COORDINATOR_LOG = /^(meeting-agent: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z [a-z0-9_]+(:[a-z0-9_]+)?\n)*$/;
+
 export function runPackageRefusalCuts({ staged, run = runProcess, check = () => {} }) {
   requirePrivateStage(staged);
   const cuts = [];
@@ -91,11 +93,12 @@ export function runPackageRefusalCuts({ staged, run = runProcess, check = () => 
     writeFileSync(filename, JSON.stringify(value), { mode: 0o600 });
     return filename;
   }
-  function mainCut(name, value, source, exit, stderr) {
+  function mainCut(name, value, source, exit, stderr, composes = false) {
     const filename = writeConfig(name, value);
     const observed = run(NODE24, [staged.mainPath, "--standalone-config", filename], { cwd: staged.root, timeout: 15_000 });
+    // stdout is the coordinator log: only a cut that reaches composition may log static codes before it refuses.
     record(name, source, `exit ${exit}; ${stderr.trim()}`, observed,
-      observed.exit === exit && observed.stdout === "" && observed.stderr === stderr);
+      observed.exit === exit && (composes ? COORDINATOR_LOG.test(observed.stdout) : observed.stdout === "") && observed.stderr === stderr);
   }
   mainCut("runtime_wire_version", { ...config, runtime: { ...config.runtime, protocolVersion: 3 } },
     "unmodified built main → src/standalone-config.ts parseStandaloneConfig", 64,
@@ -105,7 +108,7 @@ export function runPackageRefusalCuts({ staged, run = runProcess, check = () => 
   writeFileSync(bridgePath, JSON.stringify({ schema: "feishu-bridge-config/v999", audio: { captureDisplayId: 1, outputDeviceUid: "synthetic-refusal" } }), { mode: 0o600 });
   mainCut("bridge_static_unsupported", { ...config, bridgeSlots: config.bridgeSlots.map((slot) => ({ ...slot, staticConfigPath: bridgePath })) },
     "unmodified built main → owner lock → src/application-composition.ts preflightBridgeStaticConfig", 70,
-    "meeting-agent: composition_unavailable bridge_slot_invalid\n");
+    "meeting-agent: composition_unavailable bridge_slot_invalid\n", true);
 
   const missingLauncher = path.join(directory, "launcher-not-installed");
   const preparedConfigPath = writeConfig("missing_launcher", { ...config, runtime: { ...config.runtime, launcherPath: missingLauncher } });

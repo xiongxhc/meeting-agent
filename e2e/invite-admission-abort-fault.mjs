@@ -9,7 +9,7 @@ import process from "node:process";
 import { normalizeInvite } from "../dist/src/ports/feishu-ingress.js";
 import { ingressData } from "./ingress-run.mjs";
 export const INVITE_ABORT_TRIGGER = "e2e_invite_admission_abort";
-export const INVITE_ABORT_SCHEMA_SHA256 = "21f1cdbb98349ef69c6cc995399472607101091c6da183555dbffc48b4897c18";
+export const INVITE_ABORT_SCHEMA_SHA256 = "ecb108acb85e3c999744364b1c909a57487144c8d30d108f05022def2ca0e8ba";
 export const INVITE_ABORT_TABLES = Object.freeze(["feishu_invite_occurrences", "feishu_invite_events", "sessions", "bridge_leases", "physical_client_custody", "reconciliation_generations", "recordings", "bridge_failure_recordings", "recording_recovery_bindings", "unknown_end_custody", "backfill_seeds", "delivery_journal", "notification_intents"]);
 const roots = new WeakMap();
 const demand = (v, reason) => { if (!v) throw new Error(`invite_abort_${reason}`); };
@@ -31,7 +31,7 @@ function inspectBinding(root, databasePath, expectedRoot) {
   demand(!exists(databasePath + "-wal") && !exists(databasePath + "-shm"), "WAL"); return { database: identity(s), parents: parents.join("/") };
 }
 function schema(db) { const rows = db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name LIMIT 124").all(); demand(rows.length <= 123, "schema"); return rows; }
-function migrations(db) { const rows = db.prepare("SELECT version,name,applied_at_ms FROM schema_migrations ORDER BY version LIMIT 32").all(); demand(rows.length === 31 && rows.every((r, i) => r.version === i + 1 && typeof r.name === "string" && Number.isSafeInteger(r.applied_at_ms) && r.applied_at_ms >= 0) && hash(JSON.stringify(rows.map(({ version, name }) => ({ version, name })))) === "a5e47c8a05f412df529d5764cff91030e3f58e4889457b1bb45ccdcda4f0878f", "schema29"); return JSON.stringify(rows); }
+function migrations(db) { const rows = db.prepare("SELECT version,name,applied_at_ms FROM schema_migrations ORDER BY version LIMIT 33").all(); demand(rows.length === 32 && rows.every((r, i) => r.version === i + 1 && typeof r.name === "string" && Number.isSafeInteger(r.applied_at_ms) && r.applied_at_ms >= 0) && hash(JSON.stringify(rows.map(({ version, name }) => ({ version, name })))) === "f07314e786022dd570742cac8a15412f748d1bcc26c71a0df01b52f486bb9a43", "schema29"); return JSON.stringify(rows); }
 export function createInviteAdmissionAbortFault(input) {
   const keys = ["root", "databasePath", "appDatabasePath", "configDatabasePath", "freshRoot", "owner", "envelope", "scope"];
   demand(input && Object.getPrototypeOf(input) === Object.prototype && Reflect.ownKeys(input).length === keys.length && Reflect.ownKeys(input).every(k => typeof k === "string" && keys.includes(k)), "input");

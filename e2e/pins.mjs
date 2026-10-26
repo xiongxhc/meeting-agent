@@ -225,8 +225,8 @@ export const TEAMMEM_SOURCE = {
     if (repository === undefined) throw new Error("MEETING_E2E_TEAMMEM_REPOSITORY must be set to the TeamMem meeting-storage checkout");
     return repository;
   },
-  /** Tree of 67c8a75, the accepted head of the TeamMem meeting-storage lane. */
-  tree: "8fe927c0f79e953bc3d4690a1d1cdcd092d593e4",
+  /** Tree of d316582, the accepted head of the TeamMem meeting-storage lane (organizer_unresolved + meeting_list). */
+  tree: "35bdc5571f9eb81ad88fd949946dfb982ccdd92c",
 };
 
 export async function sha256File(filename) {

@@ -22,6 +22,19 @@ has the same region/app/tenant plus a nine-digit `meetingNo` and exactly one:
   source-backed occurrence linkage. The optional VC organizer ID is only an
   additional equality check, never a fallback organizer.
 
+Without a configured reference, the organizer comes from Feishu's meeting list
+(`vc.v1.meetingList.get`, `GET /open-apis/vc/v1/meeting_list`). The query uses the invite's
+meeting number, `meeting_status=1` (in progress), `user_id_type=open_id` and a window of
+one hour either side of the occurrence start. Only the entry whose `meeting_instance_id` equals
+the invite's meeting ID is used, and its `meeting_id` must equal the meeting number. Its
+`user_id` and `organizer` become the organizer, with source `meeting_list`, and the DM
+recipient. A refusal (`permission_denied`), no matching entry (`occurrence_mismatch`,
+retried with backoff) or another error leaves the invite `metadata_blocked` with its reason.
+The meeting is still recorded and published with `organizer_unresolved`. An entry for this
+exact occurrence that names no organizer is `organizer_not_reported`, and the meeting is
+published as `instant_meeting`. `meeting_type` and `meeting_subtype` are not read, because
+their values are not documented in the pinned SDK.
+
 The joining number selects a configured candidate; it proves no identity. For
 reservations, the SDK reads the active meeting and checks exact ID/start/number
 before reading reservation creator and Contact identity/display. Calendar lookup
@@ -64,9 +77,10 @@ logs `invite_admission_session_unverified`.
 An allowed invite alone admits its occurrence for joining. The organizer only addresses
 the post-publication direct message, so no organizer outcome (missing reference,
 permission error, 5xx, timeout, retry exhaustion) blocks or delays the join or the
-encrypted recording. An instant meeting has no reservation or calendar event, so it
-has no organizer: it is still recorded and published, and the notification fails
-closed with `organizer_unresolved`. An organizer resolved after the join is bound into
+encrypted recording. A meeting whose organizer stays unknown
+is still recorded and published, and the notification fails closed with
+`organizer_unresolved`. An instant meeting whose organizer Feishu reports for this
+occurrence gets that organizer and the DM (D044). An organizer resolved after the join is bound into
 the backfill seed when the recording is finalized. One resolved after that still
 addresses the DM when publication is accepted. Only an organizer resolved after
 publication acceptance is not used, and that intent stays `organizer_unresolved`.

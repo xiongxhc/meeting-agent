@@ -82,7 +82,7 @@ test("deadline detects synchronous overrun after the effect returns", async () =
 
 test("reader refuses migration/schema drift and private filesystem substitution", async () => {
   const r = await runner(), f = fixture(), store = openSessionStore({ filename: f.databasePath }); chmodSync(f.databasePath, 0o600);
-  try { const baseline = r.readBacklogProjection(f.databasePath); assert.equal(baseline.migrations.length, 31); const db = new Database(f.databasePath); db.prepare("UPDATE schema_migrations SET name='drift' WHERE version=30").run(); db.close(); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_schema/); chmodSync(f.root, 0o755); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_reader/); } finally { store.close(); rmSync(f.root, { recursive: true, force: true }); }
+  try { const baseline = r.readBacklogProjection(f.databasePath); assert.equal(baseline.migrations.length, 32); const db = new Database(f.databasePath); db.prepare("UPDATE schema_migrations SET name='drift' WHERE version=30").run(); db.close(); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_schema/); chmodSync(f.root, 0o755); assert.throws(() => r.readBacklogProjection(f.databasePath), /backlog_reader/); } finally { store.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
 async function synthetic() {
@@ -208,4 +208,12 @@ for (const settleMetadata of [false, true]) test(`deadline after actual durable 
     assert.equal(result.currentSnapshot.counts.feishu_invite_occurrences, 1); assert.equal(result.currentSnapshot.counts.feishu_invite_events, 1); assert.equal(result.currentSnapshot.occurrences[0].state, settleMetadata ? "metadata_blocked" : "pending_metadata"); assert.equal(result.currentSnapshot.occurrences[0].total_attempts, settleMetadata ? 1 : 0); assert.equal(result.currentSnapshot.sessions[0].state, "discovered"); assert.equal(result.currentSnapshot.transitions[0].reason, "invite_allowed"); assert.deepEqual(result.currentSnapshot, r.readBacklogProjection(f.databasePath));
     assert.equal(result.deliveries.length, 0); assert.equal(result.closes.length, 1); assert.equal(result.closes[0].receiver.observations[0].code, 200); assert.equal(result.closes[0].commits.length, 1); assert.deepEqual(calls, [1]);
   } finally { if (!closed) { await discovery.close(); store.close(); } rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the strict backlog log list admits the three operator-log codes once each", async () => {
+  const codes: unknown = [...(await runner()).BACKLOG_LOG_CODES];
+  assert.ok(Array.isArray(codes));
+  for (const code of ["invite_admitted", "bridge_joined", "organizer_dm_sent"]) assert.equal(codes.filter((value: unknown) => value === code).length, 1, code);
+  assert.equal(codes.includes("invite_admission_admitted"), false);
+  assert.equal(new Set(codes).size, codes.length, "the list stays a strict set");
 });

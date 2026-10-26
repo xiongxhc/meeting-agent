@@ -481,6 +481,7 @@ function identityOf(occurrence: InviteOccurrence): MeetingIdentity {
     title: occurrence.title,
     organizer: occurrence.organizer === null ? null
       : { feishuUserId: occurrence.organizer.id, displayName: occurrence.organizer.displayName, source: occurrence.organizer.source },
+    organizerUnresolvedReason: occurrence.lastBlockedReason === "organizer_not_reported" ? "instant_meeting" : "organizer_unresolved",
   });
 }
 

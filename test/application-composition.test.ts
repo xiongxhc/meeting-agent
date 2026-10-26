@@ -351,7 +351,7 @@ test("one application-owned store opens inside the private root after the lock; 
     assert.equal(f.owner.closed(), 0, "the caller closes the lock last");
     await assert.rejects(app.discover(), /closed/);
     const reopened = f.reopen();
-    try { assert.equal(reopened.schemaVersion, 31); } finally { reopened.close(); }
+    try { assert.equal(reopened.schemaVersion, 32); } finally { reopened.close(); }
   } finally { f.close(); }
 });
 
@@ -529,33 +529,79 @@ function heldLookup() {
     resolved: () => release({ status: "resolved", organizer: { ...scope, idType: "open_id", id: "ou_creator", displayName: "Creator", source: "reservation" }, reference: { kind: "reservation", reserveId: "reserve-900000001" } }) };
 }
 
-test("an invite with no organizer reference is launched and recorded through the production resolver; no organizer is fabricated", async () => {
+// Production passes no references: the shipped resolver asks Feishu's meeting list
+// for this exact occurrence. invite(1) is meeting 9007199254740001, number 900000001.
+async function meetingListPeer(mode: "ok" | "denied" | "instant" | "hang") {
+  const calls: string[] = [];
+  const peer = await httpPeer((req, res) => {
+    const url = new URL(req.url!, "http://fixture");
+    res.setHeader("content-type", "application/json");
+    if (url.pathname.includes("/auth/")) { res.end(JSON.stringify({ code: 0, tenant_access_token: "synthetic", expire: 7200 })); return; }
+    calls.push(url.pathname);
+    if (mode === "hang") return;
+    if (mode === "denied") { res.writeHead(403); res.end("{}"); return; }
+    res.end(JSON.stringify({ code: 0, data: { meeting_list: [{ meeting_id: "900000001", meeting_instance_id: "9007199254740001",
+      ...(mode === "instant" ? {} : { user_id: "ou_creator", organizer: "Creator" }) }] } }));
+  });
+  const http = createFeishuSdkHttp({ request: peer.request, connection: createFeishuSocketOwner(Agent) });
+  return { http, calls: () => calls, close: async () => { await http.close(); await peer.close(); } };
+}
+
+for (const mode of ["ok", "denied", "instant"] as const) {
+  test(`through the production resolver, a meeting list answer (${mode}) sets the seed organizer or its unresolved reason, and the meeting is recorded either way`, async () => {
+    const f = fixture();
+    const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+    const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+    const peer = await meetingListPeer(mode);
+    let app: ComposedApplication | undefined;
+    try {
+      const [id] = await admitted(f, 1);
+      app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], feishu: { http: peer.http }, clock: { now: () => 10_000 } });
+      await app.start();
+      assert.equal((await app.discover()).launched, 1);
+      await until(() => slot.sent().some((command) => command.type === "connect_media"));
+      slot.left("ended");
+      assert.equal((await app.awaitOccurrence(id!)).failure, null);
+      await app.close();
+      assert.deepEqual(peer.calls(), ["/open-apis/vc/v1/meeting_list"]);
+      const store = f.reopen();
+      try {
+        const seed = store.getBackfillSeed(id!);
+        assert.ok(seed, "the meeting is recorded and queued for publication");
+        assert.equal(store.getRecording(id!)?.handle, runtimes.owned[0]!.handle);
+        if (mode === "ok") {
+          assert.deepEqual(seed.organizer, { feishuUserId: "ou_creator", displayName: "Creator", source: "meeting_list" });
+          assert.equal(seed.organizerUnresolvedReason, null);
+        } else {
+          assert.equal(seed.organizer, null, "no host or inviter is substituted");
+          assert.equal(seed.organizerUnresolvedReason, mode === "instant" ? "instant_meeting" : "organizer_unresolved");
+          assert.equal(store.getInviteOccurrence(id!)?.state, "metadata_blocked");
+          assert.equal(store.getInviteOccurrence(id!)?.lastBlockedReason, mode === "instant" ? "organizer_not_reported" : "permission_denied");
+        }
+      } finally { store.close(); }
+    } finally { await app?.close().catch(() => undefined); await peer.close(); f.close(); }
+  });
+}
+
+test("a meeting list lookup that never answers adds no dependency to the join: the join is sent while the lookup is outstanding", async () => {
   const f = fixture();
   const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
-  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
-  const http = createFeishuSdkHttp({ request: async () => { throw new Error("must_not_call"); } });
+  const slot = scriptedSlot(1, { joinMode: "silent" });
+  const peer = await meetingListPeer("hang");
+  const phases: string[] = [];
+  let app: ComposedApplication | undefined;
   try {
     const [id] = await admitted(f, 1);
-    // No metadata seam and no references: the resolver main.ts composes.
-    const app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], feishu: { http }, clock: { now: () => 10_000 } });
+    app = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], feishu: { http: peer.http }, clock: { now: () => 10_000 },
+      joinTiming: (phase) => { phases.push(phase); } });
     await app.start();
-    assert.equal((await app.discover()).launched, 1);
-    await until(() => slot.sent().some((command) => command.type === "connect_media"));
-    slot.left("ended");
-    const outcome = await app.awaitOccurrence(id!);
-    assert.equal(outcome.failure, null);
-    const store = f.reopen();
-    try {
-      const seed = store.getBackfillSeed(id!);
-      assert.ok(seed, "the instant meeting is recorded and queued for publication");
-      assert.equal(seed.organizer, null, "no host, inviter or attendee is substituted");
-      assert.equal(store.getRecording(id!)?.handle, runtimes.owned[0]!.handle);
-      assert.equal(store.getSession(id!)?.state, "finalizing");
-      assert.equal(store.getInviteOccurrence(id!)?.state, "metadata_blocked");
-      assert.equal(store.getInviteOccurrence(id!)?.lastBlockedReason, "reference_missing", "the unresolved organizer stays operator-visible");
-    } finally { store.close(); }
+    void app.discover().catch(() => undefined);
+    await until(() => peer.calls().length === 1 && phases.includes("join_send_resolved"), 5_000);
+    assert.ok(slot.sent().some((command) => command.type === "join"), "the join is sent");
+    assert.deepEqual(peer.calls(), ["/open-apis/vc/v1/meeting_list"], "the lookup is still outstanding");
+    assert.deepEqual(app.liveOccurrenceIds(), [id]);
     await app.close();
-  } finally { await http.close(); f.close(); }
+  } finally { await app?.close().catch(() => undefined); await peer.close(); f.close(); }
 });
 
 test("an organizer API 5xx, a permission error or a lookup that never answers never blocks or delays the join", async () => {

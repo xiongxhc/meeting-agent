@@ -73,8 +73,8 @@ export const meetingArtifactBase = z.object({
   started_at: wholeSecondInstant,
   ended_at: instant,
   organizer: z.object({ person_id: boundedText(200), display_name: boundedText(200) }).strict().nullable(),
-  organizer_source: z.enum(["reservation", "calendar_event"]).nullable(),
-  organizer_unresolved_reason: z.literal("instant_meeting").nullable(),
+  organizer_source: z.enum(["reservation", "calendar_event", "meeting_list"]).nullable(),
+  organizer_unresolved_reason: z.enum(["instant_meeting", "organizer_unresolved"]).nullable(),
   transcript_complete: z.boolean(),
   summary: boundedText(20_000),
   participants: z.array(participant).min(1).max(500),
@@ -161,7 +161,7 @@ export function validateRelationships(artifact: SupportedTeamMemMeetingArtifact)
 
   const organizerIsNull = artifact.organizer === null;
   issue(organizerIsNull === (artifact.organizer_source === null), "organizer_source must be null exactly when organizer is null");
-  issue(organizerIsNull === (artifact.organizer_unresolved_reason === "instant_meeting"), "organizer_unresolved_reason must be instant_meeting exactly when organizer is null");
+  issue(organizerIsNull === (artifact.organizer_unresolved_reason !== null), "organizer_unresolved_reason must be set exactly when organizer is null");
 
   const participants = new Map<string, string>();
   for (const entry of artifact.participants) {

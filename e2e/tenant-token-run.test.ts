@@ -266,3 +266,11 @@ test("actual frame decoder owner reaches the same production receiver projection
   const hash = "a".repeat(64), send = { wireMessageId: "tenant-original-wire", eventId: "component-event", hash, occurrenceId: "component-occurrence" };
   assert.doesNotThrow(() => (assertAck as (send: unknown, delivery: unknown) => void)(send, { commit: { ordinal: 1, wireMessageId: send.wireMessageId, eventId: send.eventId, expectedHash: hash, persistedHash: hash, immutable: { occurrenceId: send.occurrenceId }, ackFloor: 0 }, receiver: projected }));
 });
+
+test("the strict lifecycle list admits the three operator-log codes once each", () => {
+  const codes: unknown = Reflect.get(loaded as object, "LOGS");
+  assert.ok(Array.isArray(codes));
+  for (const code of ["invite_admitted", "bridge_joined", "organizer_dm_sent"]) assert.equal(codes.filter((value: unknown) => value === code).length, 1, code);
+  assert.equal(codes.includes("invite_admission_admitted"), false);
+  assert.equal(new Set(codes).size, codes.length, "the list stays a strict set");
+});

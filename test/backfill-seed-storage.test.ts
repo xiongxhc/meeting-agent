@@ -13,6 +13,8 @@ import { createCoordinator } from "../src/sessions/coordinator.ts";
 import { createMeetingSession } from "../src/sessions/meeting-session.ts";
 import type { ConversationRuntimePort, RuntimeEvent } from "../src/ports/conversation-runtime.ts";
 import { testCapability } from "./lib/runtime-sdk.ts";
+import { normalizeInvite } from "../src/ports/feishu-ingress.ts";
+import { envelope, scope } from "./lib/feishu-fixtures.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ENDED_AT = "2026-09-02T14:10:00.123Z";
@@ -40,7 +42,7 @@ function seedInput(identity: ReturnType<typeof buildMeetingIdentity>, endedAt = 
   return { ...seedConfig(), terminalReason: "ended", terminalSource: "bridge_observed", endedAt, identity };
 }
 
-function fixture(options: Pick<OpenSessionStoreOptions, "seedIdentityCheckpoint"> = {}) {
+function fixture(options: Pick<OpenSessionStoreOptions, "seedIdentityCheckpoint" | "migrationsDir"> = {}) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "meeting-backfill-seed-"));
   const filename = path.join(dir, "state.db");
   const recordingsDir = path.join(dir, "recordings");
@@ -133,7 +135,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
   mkdirSync(oldMigrations);
   cpSync(path.resolve("migrations"), oldMigrations, {
     recursive: true,
-    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028|029|030|031)_/.test(path.basename(source)),
+    filter: (source) => path.basename(source) === "migrations" || !/^(?:023|024|025|026|027|028|029|030|031|032)_/.test(path.basename(source)),
   });
   try {
     const oldStore = openSessionStore({ filename, migrationsDir: oldMigrations, nowMs: 1 });
@@ -144,7 +146,7 @@ test("migrations 023 through 025 add bounded seed work state without inventing l
 
     const upgraded = openSessionStore({ filename, nowMs: 2 });
     try {
-      assert.equal(upgraded.schemaVersion, 31);
+      assert.equal(upgraded.schemaVersion, 32);
       assert.equal(upgraded.getBackfillSeed(identity.occurrenceId), null);
       const schema = new Map(upgraded.describeSchema().map((table) => [table.name, table]));
       assert.match(schema.get("backfill_seeds")?.sql ?? "", /STRICT/);
@@ -195,14 +197,14 @@ test("SQL rejects an unparseable seed end while preserving canonical UTC second 
         bridge_session_id,generation_id,source_session_id,capability_recording_handle,capability_sha256,capability_key_id,capability_authorization,
         recording_path,recording_format,recording_encryption,recording_bytes,recording_device,recording_inode,recording_duration_ms,
         recording_sha256,recording_key_id,bridge_gaps_json,runtime_gaps_json,processing_warnings_json,runtime_profile,
-        stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version
+        stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version,organizer_unresolved_reason
       ) SELECT
         @occurrenceId,'feishu',@providerMeetingId,@meetingNo,@occurrenceStartedAt,@title,
         NULL,NULL,NULL,@endedAt,@endedAtMs,@stopAtMs,@expiresAtMs,
         recovery.bridge_session_id,recovery.generation_id,recovery.source_session_id,recovery.recording_handle,recovery.sha256,recovery.key_id,recovery.authorization,
         recording.encrypted_path,recording.format,'aes-256-gcm',@recordingBytes,@recordingDevice,@recordingInode,recording.duration_ms,
         recording.sha256,recording.key_id,'[]','[]','[]','online',
-        'provider-stt','stt-v1','stream-v1','final-v2','provider-text','text-v3','meeting-agent/test'
+        'provider-stt','stt-v1','stream-v1','final-v2','provider-text','text-v3','meeting-agent/test','organizer_unresolved'
       FROM recording_recovery_bindings AS recovery
       JOIN recordings AS recording ON recording.occurrence_id=recovery.occurrence_id
       WHERE recovery.occurrence_id=@occurrenceId`);
@@ -238,6 +240,7 @@ test("qualifying finalization atomically persists one exact immutable seed and s
       occurrenceStartedAt: "2026-09-02T14:00:00Z",
       title: "Seeded meeting",
       organizer: { feishuUserId: "ou_organizer", displayName: "Organizer", source: "reservation" as const },
+      organizerUnresolvedReason: null,
       endedAt: ENDED_AT,
       endedAtMs: ENDED_AT_MS,
       expiresAtMs: ENDED_AT_MS + 14 * DAY_MS,
@@ -499,4 +502,79 @@ test("meeting session seeds only exact bridge-observed ended with supplied prove
       }
     } finally { await session.dispose(); store.close(); rmSync(dir, { recursive: true, force: true }); }
   }
+});
+
+test("migration 032 rebuilds the invite and seed tables for meeting_list, keeps every v31 row, and marks legacy null organizers instant", () => {
+  const legacy = mkdtempSync(path.join(os.tmpdir(), "meeting-migrations-031-"));
+  cpSync(path.resolve("migrations"), legacy, { recursive: true, filter: (source) => !source.endsWith("032_organizer_meeting_list.sql") });
+  const f = fixture({ migrationsDir: legacy });
+  try {
+    assert.equal(f.store.schemaVersion, 31);
+    f.store.acceptInvite(normalizeInvite(envelope(), scope), 1);
+    // v31 seeds are written with v31 SQL: one with a reservation organizer, one without.
+    const parents = [1, 2].map((ordinal) => {
+      const digit = String(ordinal), endedAt = `2026-09-02T14:1${digit}:00Z`;
+      const identity = buildMeetingIdentity({ providerMeetingId: `v31-${digit}`, meetingNo: `800${digit}`, occurrenceStartedAt: `2026-09-02T14:00:0${digit}Z`, title: `v31 ${digit}`, organizer: null });
+      const capability = { sourceSessionId: BigInt(61 + ordinal), recordingHandle: digit.repeat(32), sha256: digit.repeat(64), keyId: digit.repeat(16), authorization: digit.repeat(64) };
+      const encryptedPath = path.join(f.dir, `${capability.recordingHandle}.crsr`);
+      writeFileSync(encryptedPath, Buffer.from(`v31-${digit}`));
+      f.coordinator.discover(identity); f.coordinator.advance(identity.occurrenceId, "joining"); f.coordinator.advance(identity.occurrenceId, "listening");
+      const bridgeSessionId = `bridge-v31-${digit}`;
+      f.store.beginReconciliationGeneration(identity.occurrenceId, bridgeSessionId, Date.parse(endedAt) - 1_000);
+      f.store.setReconciliationRuntimeSession(identity.occurrenceId, bridgeSessionId, capability.sourceSessionId);
+      f.coordinator.finalizeWithRecording(identity.occurrenceId, { kind: "advance", toState: "finalizing" }, { recovery: { bridgeSessionId, capability },
+        handle: capability.recordingHandle, encryptedPath, sha256: capability.sha256, durationMs: 10, format: "pcm_s16le/24000/1/20ms", keyId: capability.keyId,
+        gaps: [], runtimeGaps: [] }, bridgeSessionId, Date.parse(endedAt), "bridge_observed");
+      return { identity, endedAt, endedAtMs: Date.parse(endedAt), encryptedPath, organized: ordinal === 1 };
+    });
+    f.store.close();
+    const v31 = new Database(f.filename);
+    try {
+      v31.pragma("foreign_keys = ON");
+      const insert = v31.prepare(`INSERT INTO backfill_seeds (
+        occurrence_id,provider,provider_meeting_id,meeting_no,occurrence_started_at,title,
+        organizer_person_id,organizer_display_name,organizer_source,ended_at,ended_at_ms,stop_at_ms,expires_at_ms,
+        bridge_session_id,generation_id,source_session_id,capability_recording_handle,capability_sha256,capability_key_id,capability_authorization,
+        recording_path,recording_format,recording_encryption,recording_bytes,recording_device,recording_inode,recording_duration_ms,
+        recording_sha256,recording_key_id,bridge_gaps_json,runtime_gaps_json,processing_warnings_json,runtime_profile,
+        stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version
+      ) SELECT @occurrenceId,'feishu',@providerMeetingId,@meetingNo,@occurrenceStartedAt,@title,@personId,@displayName,@source,@endedAt,@endedAtMs,@stopAtMs,@expiresAtMs,
+        recovery.bridge_session_id,recovery.generation_id,recovery.source_session_id,recovery.recording_handle,recovery.sha256,recovery.key_id,recovery.authorization,
+        recording.encrypted_path,recording.format,'aes-256-gcm',@recordingBytes,@recordingDevice,@recordingInode,recording.duration_ms,
+        recording.sha256,recording.key_id,'[]','[]','[]','online','provider-stt','stt-v1','stream-v1','final-v2','provider-text','text-v3','meeting-agent/test'
+      FROM recording_recovery_bindings AS recovery JOIN recordings AS recording ON recording.occurrence_id=recovery.occurrence_id WHERE recovery.occurrence_id=@occurrenceId`);
+      for (const parent of parents) {
+        const stat = lstatSync(parent.encryptedPath, { bigint: true });
+        assert.equal(insert.run({ occurrenceId: parent.identity.occurrenceId, providerMeetingId: parent.identity.providerMeetingId, meetingNo: parent.identity.meetingNo,
+          occurrenceStartedAt: parent.identity.occurrenceStartedAt, title: parent.identity.title,
+          personId: parent.organized ? "ou_organizer" : null, displayName: parent.organized ? "Organizer" : null, source: parent.organized ? "reservation" : null,
+          endedAt: parent.endedAt, endedAtMs: parent.endedAtMs, stopAtMs: parent.endedAtMs + 11 * DAY_MS, expiresAtMs: parent.endedAtMs + 14 * DAY_MS,
+          recordingBytes: Number(stat.size), recordingDevice: stat.dev.toString(), recordingInode: stat.ino.toString() }).changes, 1);
+      }
+    } finally { v31.close(); }
+    for (const pass of [1, 2]) {
+      const store = openSessionStore({ filename: f.filename });
+      try {
+        assert.equal(store.schemaVersion, 32, `pass ${pass}`);
+        assert.deepEqual(store.getBackfillSeed(parents[0]!.identity.occurrenceId)?.organizer, { feishuUserId: "ou_organizer", displayName: "Organizer", source: "reservation" });
+        assert.equal(store.getBackfillSeed(parents[0]!.identity.occurrenceId)?.organizerUnresolvedReason, null);
+        assert.equal(store.getBackfillSeed(parents[1]!.identity.occurrenceId)?.organizer, null);
+        assert.equal(store.getBackfillSeed(parents[1]!.identity.occurrenceId)?.organizerUnresolvedReason, "instant_meeting", "it was published as an instant meeting");
+        assert.equal(store.listInviteOccurrences().length, 1);
+      } finally { store.close(); }
+    }
+    const raw = new Database(f.filename);
+    try {
+      raw.pragma("foreign_keys = ON");
+      assert.deepEqual(raw.pragma("foreign_key_check"), []);
+      for (const table of ["feishu_invite_occurrences", "backfill_seeds"]) {
+        const sql = (raw.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table) as { sql: string }).sql;
+        assert.match(sql, /'reservation','calendar_event','meeting_list'/, table);
+      }
+      assert.equal((raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name LIKE '%_v32'").get() as { n: number }).n, 0);
+      assert.throws(() => raw.prepare("UPDATE backfill_seeds SET title='x'").run(), /immutable/);
+      assert.throws(() => raw.prepare("DELETE FROM backfill_seeds").run(), /immutable/);
+      assert.ok(raw.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='feishu_invite_pending'").get());
+    } finally { raw.close(); }
+  } finally { try { f.close(); } catch { /* closed above */ } rmSync(legacy, { recursive: true, force: true }); }
 });

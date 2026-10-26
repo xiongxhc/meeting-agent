@@ -330,7 +330,7 @@ const INVITE_SELECT = `SELECT occurrence_id AS occurrenceId, region, tenant_key 
   organizer_source AS source, organizer_open_id AS id, organizer_display_name AS displayName, reference_json AS referenceJson
   FROM feishu_invite_occurrences`;
 type InviteRaw = Omit<InviteOccurrence, "organizer" | "reference"> & {
-  source: "reservation" | "calendar_event" | null; id: string | null; displayName: string | null; referenceJson: string | null;
+  source: "reservation" | "calendar_event" | "meeting_list" | null; id: string | null; displayName: string | null; referenceJson: string | null;
 };
 function inviteRow(raw: InviteRaw): InviteOccurrence {
   const { source, id, displayName, referenceJson, ...row } = raw;
@@ -425,11 +425,14 @@ function completeInviteClaim(db: Database.Database, claim: InviteClaim, result: 
     const row = fencedInvite(db,claim,now), organizer = result.organizer;
     if (now < row.lastAttemptAtMs!) { blockInvite(db,row.occurrenceId,"clock_regression",now); return; }
     if (organizer.region !== row.region || organizer.tenantKey !== row.tenantKey || organizer.appId !== row.appId || organizer.idType !== "open_id" ||
-        !["reservation","calendar_event"].includes(organizer.source) || organizer.source !== result.reference.kind) throw new Error("invalid_invite_organizer");
+        !["reservation","calendar_event","meeting_list"].includes(organizer.source) || organizer.source !== result.reference.kind) throw new Error("invalid_invite_organizer");
     boundedInviteString(organizer.id); boundedInviteString(organizer.displayName,4096);
     validateOrganizerReferenceKeys(result.reference);
     if(result.reference.kind === "reservation") boundedInviteString(result.reference.reserveId);
-    else {
+    else if(result.reference.kind === "meeting_list") {
+      // The meeting list entry is bound to this occurrence by its instance ID.
+      if(result.reference.meetingInstanceId !== row.providerMeetingId) throw new Error("invalid_invite_reference");
+    } else {
       boundedInviteString(result.reference.calendarId);boundedInviteString(result.reference.eventId);
       if(result.reference.occurrenceId !== row.occurrenceId || result.reference.providerMeetingId !== row.providerMeetingId ||
           result.reference.occurrenceStartedAt !== row.occurrenceStartedAt) throw new Error("invalid_invite_reference");
@@ -530,6 +533,10 @@ function inviteJoinStatus(db: Database.Database, id: string): { readonly session
 function resolvedInviteOrganizer(db: Database.Database, id: string): BackfillSeedFinalizationInput["identity"]["organizer"] {
   const organizer = getInviteOccurrence(db,id)?.organizer ?? null;
   return organizer === null ? null : { feishuUserId: organizer.id, displayName: organizer.displayName, source: organizer.source };
+}
+/** Feishu reported this exact occurrence with no organizer: the only instant meeting (D044, D045). */
+function organizerUnresolvedReasonOf(lastBlockedReason: string | null | undefined): "instant_meeting" | "organizer_unresolved" {
+  return lastBlockedReason === "organizer_not_reported" ? "instant_meeting" : "organizer_unresolved";
 }
 
 // ---------------------------------------------------------------------------
@@ -658,13 +665,22 @@ function applyMigrations(db: Database.Database, migrationsDir: string, nowMs: nu
 
   for (const file of files) {
     if (already.has(file.version)) continue;
-    const apply = db.transaction(() => {
-      db.exec(file.sql);
-      db.prepare(
-        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)",
-      ).run(file.version, file.name, nowMs);
-    });
-    apply();
+    // A table rebuild (SQLite cannot widen a CHECK in place) must run with foreign keys off,
+    // which SQLite only allows outside a transaction; every reference is checked before commit.
+    const rebuild = file.sql.startsWith("-- meeting-migration: foreign-keys-off\n");
+    if (rebuild) db.pragma("foreign_keys = OFF");
+    try {
+      const apply = db.transaction(() => {
+        db.exec(file.sql);
+        if (rebuild && (db.pragma("foreign_key_check") as unknown[]).length > 0) throw new Error(`migration ${file.name} broke a foreign key`);
+        db.prepare(
+          "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)",
+        ).run(file.version, file.name, nowMs);
+      });
+      apply();
+    } finally {
+      if (rebuild) db.pragma("foreign_keys = ON");
+    }
   }
 }
 
@@ -1192,8 +1208,10 @@ function assertBackfillRecordingBindingUnchanged(expected: BackfillRecordingBind
 function prepareBackfillSeed(db: Database.Database, value: FinalizeSessionInput): PreparedBackfillSeed {
   const given = value.backfillSeed;
   // The join never waits for the organizer, so one resolved after the launch is bound here, at the seed.
+  const late = given === undefined || given.identity.organizer !== null ? null : resolvedInviteOrganizer(db, value.transition.occurrenceId);
   const input = given === undefined || given.identity.organizer !== null ? given
-    : { ...given, identity: { ...given.identity, organizer: resolvedInviteOrganizer(db, value.transition.occurrenceId) } };
+    : { ...given, identity: late !== null ? { ...given.identity, organizer: late }
+      : { ...given.identity, organizer: null, organizerUnresolvedReason: organizerUnresolvedReasonOf(getInviteOccurrence(db, value.transition.occurrenceId)?.lastBlockedReason) } };
   if (input === undefined || (input as { terminalReason?: unknown }).terminalReason !== "ended" ||
       (input as { terminalSource?: unknown }).terminalSource !== "bridge_observed" ||
       value.transition.toState !== "finalizing" || value.transition.terminalReason !== null ||
@@ -1230,7 +1248,7 @@ function prepareSeedFields(db: Database.Database, input: BackfillSeedFinalizatio
   if (input.identity.organizer !== null) {
     boundedSeedText(input.identity.organizer.feishuUserId, "organizer id", 200, 800);
     boundedSeedText(input.identity.organizer.displayName, "organizer display name", 200, 800);
-    if (input.identity.organizer.source !== "reservation" && input.identity.organizer.source !== "calendar_event") {
+    if (!["reservation", "calendar_event", "meeting_list"].includes(input.identity.organizer.source)) {
       throw seedViolation("invalid backfill seed organizer source");
     }
   }
@@ -1265,15 +1283,16 @@ function insertBackfillSeed(db: Database.Database, seed: PreparedBackfillSeed): 
     bridge_session_id,generation_id,source_session_id,capability_recording_handle,capability_sha256,capability_key_id,capability_authorization,
     recording_path,recording_format,recording_encryption,recording_bytes,recording_device,recording_inode,recording_duration_ms,
     recording_sha256,recording_key_id,bridge_gaps_json,runtime_gaps_json,processing_warnings_json,runtime_profile,
-    stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version
+    stt_provider,stt_model,live_stream_model,final_batch_model,text_provider,text_model,agent_version,organizer_unresolved_reason
   ) VALUES (
     @occurrenceId,@provider,@providerMeetingId,@meetingNo,@occurrenceStartedAt,@title,
     @organizerPersonId,@organizerDisplayName,@organizerSource,@endedAt,@endedAtMs,@stopAtMs,@expiresAtMs,
     @bridgeSessionId,@generationId,@sourceSessionId,@capabilityRecordingHandle,@capabilitySha256,@capabilityKeyId,@capabilityAuthorization,
     @recordingPath,@recordingFormat,@recordingEncryption,@recordingBytes,@recordingDevice,@recordingInode,@recordingDurationMs,
     @recordingSha256,@recordingKeyId,@bridgeGapsJson,@runtimeGapsJson,@warningsJson,@runtimeProfile,
-    @sttProvider,@sttModel,@liveStreamModel,@finalBatchModel,@textProvider,@textModel,@agentVersion
+    @sttProvider,@sttModel,@liveStreamModel,@finalBatchModel,@textProvider,@textModel,@agentVersion,@organizerUnresolvedReason
   )`).run({
+    organizerUnresolvedReason: organizer === null ? seed.input.identity.organizerUnresolvedReason ?? "organizer_unresolved" : null,
     occurrenceId: seed.occurrenceId, provider: seed.input.provider,
     providerMeetingId: seed.input.identity.providerMeetingId, meetingNo: seed.input.identity.meetingNo,
     occurrenceStartedAt: seed.input.identity.occurrenceStartedAt, title: seed.input.identity.title,
@@ -1302,7 +1321,8 @@ function insertBackfillSeed(db: Database.Database, seed: PreparedBackfillSeed): 
 
 type BackfillSeedRaw = {
   occurrence_id: string; provider: string; provider_meeting_id: string; meeting_no: string; occurrence_started_at: string; title: string;
-  organizer_person_id: string | null; organizer_display_name: string | null; organizer_source: "reservation" | "calendar_event" | null;
+  organizer_person_id: string | null; organizer_display_name: string | null; organizer_source: "reservation" | "calendar_event" | "meeting_list" | null;
+  organizer_unresolved_reason?: "instant_meeting" | "organizer_unresolved" | null;
   ended_at: string; ended_at_ms: number; stop_at_ms: number; expires_at_ms: number; bridge_session_id: string; generation_id: string;
   source_session_id: string; capability_recording_handle: string; capability_sha256: string; capability_key_id: string; capability_authorization: string;
   recording_path: string; recording_format: string; recording_encryption: string; recording_bytes: number; recording_device: string; recording_inode: string;
@@ -1322,6 +1342,7 @@ function getBackfillSeed(db: Database.Database, occurrenceId: string): BackfillS
     meetingNo: row.meeting_no, occurrenceStartedAt: row.occurrence_started_at, title: row.title,
     organizer: row.organizer_person_id === null ? null : { feishuUserId: row.organizer_person_id,
       displayName: row.organizer_display_name!, source: row.organizer_source! },
+    organizerUnresolvedReason: row.organizer_person_id === null ? row.organizer_unresolved_reason ?? "instant_meeting" : null,
     endedAt: row.ended_at, endedAtMs: row.ended_at_ms, stopAtMs: row.stop_at_ms, expiresAtMs: row.expires_at_ms,
     bridgeSessionId: row.bridge_session_id, generationId: row.generation_id,
     capability: { sourceSessionId: BigInt(row.source_session_id), recordingHandle: row.capability_recording_handle,
@@ -2208,7 +2229,7 @@ function validateSeededDelivery(db: Database.Database, row: DeliveryRow, seed: B
   const organizer = seed.organizer === null ? null : { person_id: seed.organizer.feishuUserId, display_name: seed.organizer.displayName };
   const sameOrganizer = JSON.stringify(artifact.organizer) === JSON.stringify(organizer)
     && artifact.organizer_source === (seed.organizer?.source ?? null)
-    && artifact.organizer_unresolved_reason === (seed.organizer === null ? "instant_meeting" : null);
+    && artifact.organizer_unresolved_reason === seed.organizerUnresolvedReason;
   const provenance = artifact.provenance;
   const audio = artifact.audio;
   if (artifact.provider !== seed.provider || artifact.provider_meeting_id !== seed.providerMeetingId ||

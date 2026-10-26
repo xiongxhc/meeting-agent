@@ -16,7 +16,7 @@
 
 import type { CustodyBinding, BridgeProcessOutcome } from "../contracts/bridge-process-outcome-v1.ts";
 import type { CaptureDrain } from "../contracts/bridge-session-v1.ts";
-import type { MeetingIdentity } from "../domain/meeting.ts";
+import type { MeetingIdentity, OrganizerUnresolvedReason } from "../domain/meeting.ts";
 import type { AlignmentRecoveryPermit } from "./recording-alignment-authority.ts";
 import type { BridgeShutdownResult, BridgeProcessFailure } from "./bridge-process.ts";
 import type { FinalizedRecordingCapability, RecordingAlignmentPage, RecordingAlignmentComplete } from "./conversation-runtime.ts";
@@ -312,6 +312,8 @@ export type BackfillSeed = {
   readonly occurrenceStartedAt: string;
   readonly title: string;
   readonly organizer: MeetingIdentity["organizer"];
+  /** Set exactly when `organizer` is null. */
+  readonly organizerUnresolvedReason: OrganizerUnresolvedReason | null;
   readonly endedAt: string;
   readonly endedAtMs: number;
   readonly stopAtMs: number;

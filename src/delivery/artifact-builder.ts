@@ -326,7 +326,7 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
     ended_at: input.endedAt,
     organizer: input.identity.organizer === null ? null : { person_id: input.identity.organizer.feishuUserId, display_name: input.identity.organizer.displayName },
     organizer_source: input.identity.organizer?.source ?? null,
-    organizer_unresolved_reason: input.identity.organizer === null ? "instant_meeting" : null,
+    organizer_unresolved_reason: input.identity.organizer === null ? input.identity.organizerUnresolvedReason ?? "organizer_unresolved" : null,
     transcript_complete: input.transcript.transcriptComplete,
     summary: synthesis.summary,
     participants,
