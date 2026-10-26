@@ -103,6 +103,10 @@ type RuntimeScript = {
    * the same stop request is then rejected; the SDK reports already_terminal. */
   stopMode?: "accept" | "reject" | "reject_as_inactive" | "terminal_then_reject" | "hang" | "already_ended";
   finalizeMode?: "accept" | "reject";
+  /** Advertise closed_recording_adoption and answer adopt_closed_recording as the Runtime does. */
+  adoption?: boolean;
+  /** Refuse every adoption of an existing file with this code. */
+  adoptRefusal?: "recording_unreadable" | "recording_not_closed";
   closeFails?: boolean;
   recordingsDir: string;
   /** A media lease lifetime other than 60 s. */
@@ -121,6 +125,8 @@ type ScriptedRuntime = {
   readonly deliver: (event: Record<string, unknown>) => void;
 };
 
+const handleFor = (sessionId: string) => sessionId.padStart(32, "0").replaceAll(/[^0-9a-f]/g, "a");
+
 function scriptedRuntimes(script: RuntimeScript) {
   const owned: ScriptedRuntime[] = [];
   let next = 100n;
@@ -130,7 +136,7 @@ function scriptedRuntimes(script: RuntimeScript) {
     const startMode = script.startModeFor?.(ownerIndex) ?? script.startMode ?? "accept";
     const controlSessionId = next++;
     const id = controlSessionId.toString();
-    const handle = id.padStart(32, "0").replaceAll(/[^0-9a-f]/g, "a");
+    const handle = handleFor(id);
     const recordingPath = path.join(script.recordingsDir, `${handle}.crsr`);
     let closes = 0;
     const close = transport.close.bind(transport);
@@ -181,6 +187,21 @@ function scriptedRuntimes(script: RuntimeScript) {
             recording: { recording_handle: handle, encrypted_path: recordingPath, sha256: "b".repeat(64), key_id: "c".repeat(16), duration_ms: "10", format: "pcm_s16le/24000/1/20ms", gaps: [] },
             recovery_capability: { source_session_id: id, recording_handle: handle, sha256: "b".repeat(64), key_id: "c".repeat(16), authorization: "d".repeat(64) } });
           return;
+        case "adopt_closed_recording": {
+          // The scripted file of session S is named by handleFor(S); any other file answers to another session.
+          const reject = (code: string) => transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId,
+            error: { code, kind: "invalid_state", stage: "runtime", message: "scripted adoption refusal" } });
+          const source = String(command.sourceSessionId), wanted = String(command.recordingHandle);
+          const file = path.join(script.recordingsDir, `${wanted}.crsr`);
+          if (!existsSync(file)) { reject("recording_not_found"); return; }
+          if (script.adoptRefusal !== undefined) { reject(script.adoptRefusal); return; }
+          if (handleFor(source) !== wanted) { reject("recording_identity_mismatch"); return; }
+          accept();
+          transport.push({ type: "recording_finalized", protocol_version: 4, request_id: command.requestId,
+            recording: { recording_handle: wanted, encrypted_path: file, sha256: "b".repeat(64), key_id: "c".repeat(16), duration_ms: "10", format: "pcm_s16le/24000/1/20ms", gaps: [] },
+            recovery_capability: { source_session_id: source, recording_handle: wanted, sha256: "b".repeat(64), key_id: "c".repeat(16), authorization: "d".repeat(64) } });
+          return;
+        }
         case "authorize_voice_response": accept({ turn_id: "99" }); return;
         case "renew_media_lease":
           transport.push({ type: "command_rejected", protocol_version: 4, request_id: command.requestId, error: { code: "invalid_state", kind: "invalid_state", stage: "runtime", message: "scripted renewal refusal" } }); return;
@@ -188,7 +209,8 @@ function scriptedRuntimes(script: RuntimeScript) {
       }
     };
     const readyStatus = { profile: "online", transport: "stdio", privacy_mode: "hybrid", language_location: "remote", model_id: "scripted-text-model",
-      memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ["text", "conversation_context_seed", "voice_session", ...(script.refusesLeaseRenewal ? ["media_lease_renewal"] : [])],
+      memory_enabled: false, memory_location: null, telemetry_enabled: false, capabilities: ["text", "conversation_context_seed", "voice_session", ...(script.refusesLeaseRenewal ? ["media_lease_renewal"] : []),
+        ...(script.adoption ? ["closed_recording_adoption"] : [])],
       components: [{ kind: "speech_recognition", execution_location: "remote", provider_label: "scripted-stt" }, { kind: "language_model", execution_location: "remote", provider_label: "scripted-text" },
         { kind: "speech_synthesis", execution_location: "local", provider_label: "scripted-tts" }, { kind: "audio_io", execution_location: "local", provider_label: "scripted-audio" }],
       last_context_seed_operation_id: null };
@@ -1893,6 +1915,119 @@ test("after a crash in the middle of a relaunched meeting, the restart sweep pub
     await crashed.close().catch(() => undefined);
     f.close();
   }
+});
+
+/** One process runs `generations` bridge generations (each but the last fails) and dies
+ * with the last one live; its gateway closes that recording at exit. A second process
+ * then starts over the same state with a Runtime scripted by `restart`. */
+async function crashThenRestart(f: Fixture, generations: 1 | 2, restart: Omit<RuntimeScript, "recordingsDir">) {
+  const runtimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir });
+  const slot = scriptedSlot(1, { outcome: "departure_confirmed" });
+  const [id] = await admitted(f, 1);
+  const lanes = { intervalsMs: Object.fromEntries(MAINTENANCE_LANES.map((lane) => [lane, 3_600_000])) };
+  const crashed = await composeFor(f, { startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]), clock: { now: () => 10_000 },
+    bridgeRecoveryDelayMs: () => 0, maintenance: lanes });
+  await crashed.start();
+  await crashed.discover();
+  const connects = () => slot.sent().filter((command) => command.type === "connect_media").length;
+  await until(() => connects() === 1);
+  if (generations === 2) { slot.left("bridge_failure"); await until(() => connects() === 2, 5000); }
+  const live = runtimes.owned[generations - 1]!;
+  writeFileSync(live.recordingPath, Buffer.from(`ciphertext-closed-at-exit-${live.controlSessionId}`));
+  const log: string[] = [];
+  const restartRuntimes = scriptedRuntimes({ recordingsDir: f.config.dataPaths.recordingsDir, ...restart });
+  const restarted = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: restartRuntimes.factory,
+    bridgeSlots: [scriptedSlot(1)], metadata: resolvedLookup(["900000001"]), clock: { now: () => 20_000 }, maintenance: lanes });
+  try { await restarted.start(); } catch (error) { await restarted.close(); await crashed.close().catch(() => undefined); throw error; }
+  return { id: id!, runtimes, live, log, restartRuntimes,
+    async close() { await restarted.close(); await crashed.close().catch(() => undefined); } };
+}
+
+test("after a crash during a single-generation meeting, the restart adopts the closed recording and publishes it with an unknown end", async () => {
+  const f = fixture();
+  try {
+    const run = await crashThenRestart(f, 1, { adoption: true });
+    try {
+      assert.ok(run.log.includes("recording_adopted"));
+      assert.ok(run.log.includes("retention_capture_published"));
+      assert.ok(!run.log.includes("retention_capture_adopted"), "the meeting is not failed");
+      assert.ok(run.restartRuntimes.owned[0]!.commands().includes("adopt_closed_recording"));
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(run.id)?.state, "finalizing");
+        const seed = store.getBackfillSeed(run.id);
+        assert.equal(seed?.capability.recordingHandle, run.live.handle, "the crashed generation's recording ships");
+        assert.equal(seed?.capability.sourceSessionId, run.live.controlSessionId);
+        assert.deepEqual(seed?.processingWarnings, [{ code: "meeting_end_unobserved", detail: "capture_interrupted" }]);
+        assert.equal(Date.parse(seed!.endedAt), 10_000 + 10, "the end is where the recording ends, not the restart");
+        const [generation] = store.listRecordingGenerations(run.id);
+        const evidence = store.getTimedEvidenceBinding(generation!.generationId, 20_000);
+        assert.equal(evidence.kind === "timed" ? evidence.state : evidence.kind, "closed", "the dead writer's timed evidence is settled, so the final reader accepts it");
+        assert.equal(store.listOpenCaptureRows().generations.length, 0);
+      } finally { store.close(); }
+    } finally { await run.close(); }
+  } finally { f.close(); }
+});
+
+test("after a crash in the middle of a relaunched meeting, the restart adopts the live generation's recording and publishes both generations", async () => {
+  const f = fixture();
+  try {
+    const run = await crashThenRestart(f, 2, { adoption: true });
+    try {
+      assert.ok(run.log.includes("recording_adopted"));
+      assert.ok(run.log.includes("retention_capture_published"));
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(run.id)?.state, "finalizing");
+        assert.deepEqual(store.listRecordingGenerations(run.id).map((generation) => generation.recordingHandle), run.runtimes.owned.map((runtime) => runtime.handle),
+          "both generations reach the publication");
+        const seed = store.getBackfillSeed(run.id);
+        // Equal durations: the latest generation ships (D038); the other keeps its 14-day custody.
+        assert.equal(seed?.capability.recordingHandle, run.live.handle);
+        assert.deepEqual(seed?.processingWarnings, [{ code: "meeting_end_unobserved", detail: "capture_interrupted" }]);
+        assert.ok(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: run.id, attempt: 1 }), "generation 1 keeps a deletion deadline");
+        assert.equal(store.listAssignedRecordingRetention().some((row) => row.recordingHandle === run.live.handle), false, "the adopted file is never swept as an orphan");
+      } finally { store.close(); }
+    } finally { await run.close(); }
+  } finally { f.close(); }
+});
+
+test("a gateway that does not advertise closed_recording_adoption is never asked: the single-generation crash fails as before", async () => {
+  const f = fixture();
+  try {
+    const run = await crashThenRestart(f, 1, {});
+    try {
+      assert.ok(run.log.includes("recording_adoption_unavailable"));
+      assert.ok(!run.restartRuntimes.owned[0]!.commands().includes("adopt_closed_recording"), "nothing is sent");
+      assert.ok(run.log.includes("retention_capture_adopted"));
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(run.id)?.state, "failed");
+        assert.equal(store.getBackfillSeed(run.id), null);
+        const retained = store.listAssignedRecordingRetention().find((row) => row.recordingHandle === run.live.handle);
+        assert.ok(retained && retained.deadlineMs >= 20_000 + 72 * 3_600_000, "the file is kept under orphan retention, not deleted");
+      } finally { store.close(); }
+    } finally { await run.close(); }
+  } finally { f.close(); }
+});
+
+test("a recording the Runtime refuses to adopt is not published and stays under retention", async () => {
+  const f = fixture();
+  try {
+    const run = await crashThenRestart(f, 1, { adoption: true, adoptRefusal: "recording_unreadable" });
+    try {
+      assert.ok(run.log.includes("recording_adoption_refused_recording_unreadable"));
+      assert.ok(run.log.includes("recording_adoption_not_found"));
+      assert.ok(!run.log.includes("recording_adopted"));
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(run.id)?.state, "failed");
+        assert.equal(store.getBackfillSeed(run.id), null, "no seed without a Runtime-minted capability");
+        assert.ok(store.listAssignedRecordingRetention().some((row) => row.recordingHandle === run.live.handle), "the file keeps a deadline");
+        assert.ok(existsSync(run.live.recordingPath));
+      } finally { store.close(); }
+    } finally { await run.close(); }
+  } finally { f.close(); }
 });
 
 test("the default backoff grows and is capped", () => {

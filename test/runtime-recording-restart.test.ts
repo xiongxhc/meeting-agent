@@ -54,8 +54,9 @@ function encryptedChunks(filename: string): number {
   return count;
 }
 
-// Only the overall case adds the 60s launcher assessment setup budget.
-test("actual encrypted Runtime recording restarts with private authority and stages SDK pages into SQLite", { timeout: 30_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, async () => {
+/** `closed_at_exit`: the first gateway is never asked to stop or finalize; it
+ * closes the recording when its input ends, and the second gateway adopts it. */
+async function restartRecording(mode: "finalized" | "closed_at_exit"): Promise<void> {
   const binary = pinnedRuntimeGateway();
   const root = mkdtempSync(path.join(os.tmpdir(), "meeting-authenticated-alignment-"));
   const runtimeRoot = path.join(root, "runtime"), stateRoot = path.join(root, "meeting");
@@ -217,18 +218,21 @@ capture_format = "pcm_s16le/24000/1/20ms"
         assert.equal(flush.subarray(0, 6).toString("hex"), "4d4544310104"); flush[5] = 5; media?.write(flush);
       }
     });
-    stage = "voice-stop"; await bounded(voice.stop());
-    stage = "recording-finalize";
-    const finalized = await bounded(first.finalizeRecording({ sessionId: firstId }));
     const identity = buildMeetingIdentity({ providerMeetingId: "synthetic-runtime", meetingNo: "000000000", occurrenceStartedAt: "2026-09-02T14:00:00Z", title: "Synthetic", organizer: null });
     const coordinator = createCoordinator({ store, clock: { now: () => 1000 }, bridgeLeaseTtlMs: 30000, maxConcurrentSessions: 1 });
     coordinator.discover(identity); coordinator.advance(identity.occurrenceId, "joining"); coordinator.advance(identity.occurrenceId, "listening");
     store.beginReconciliationGeneration(identity.occurrenceId, "bridge-independent", 1000); store.setReconciliationRuntimeSession(identity.occurrenceId, "bridge-independent", firstId);
-    coordinator.finalizeWithRecording(identity.occurrenceId, { kind: "advance", toState: "finalizing" }, {
-      handle: finalized.recordingHandle, sha256: finalized.sha256, keyId: finalized.keyId, encryptedPath: finalized.encryptedPath,
-      format: finalized.format, durationMs: Number(finalized.durationMs), gaps: [], runtimeGaps: [],
-      recovery: { bridgeSessionId: "bridge-independent", capability: finalized.recoveryCapability },
-    }, "bridge-independent");
+    const recordingInput = (recording: Awaited<ReturnType<typeof first.finalizeRecording>>) => ({
+      handle: recording.recordingHandle, sha256: recording.sha256, keyId: recording.keyId, encryptedPath: recording.encryptedPath,
+      format: recording.format, durationMs: Number(recording.durationMs), gaps: [], runtimeGaps: [],
+      recovery: { bridgeSessionId: "bridge-independent", capability: recording.recoveryCapability } });
+    let finalized: Awaited<ReturnType<typeof first.finalizeRecording>> | undefined;
+    if (mode === "finalized") {
+      stage = "voice-stop"; await bounded(voice.stop());
+      stage = "recording-finalize";
+      finalized = await bounded(first.finalizeRecording({ sessionId: firstId }));
+      coordinator.finalizeWithRecording(identity.occurrenceId, { kind: "advance", toState: "finalizing" }, recordingInput(finalized), "bridge-independent");
+    }
     store.close();
     const pid = Number(readFileSync(path.join(runtimeRoot, "runtime-owned.pid"), "utf8"));
     stage = "first-close"; await bounded(first.close()); assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
@@ -237,6 +241,20 @@ capture_format = "pcm_s16le/24000/1/20ms"
     const second = await start();
     clients.push(second); assert.notEqual(second.currentSessionId, firstId);
     store = openSessionStore({ filename: databasePath });
+    if (mode === "closed_at_exit") {
+      // What Meeting's restart relies on: the file is named by its handle and answers to the voice session id.
+      stage = "adoption";
+      const files = readdirSync(path.join(runtimeRoot, "recordings")).filter((file) => /^[0-9a-f]{32}\.crsr$/.test(file));
+      assert.equal(files.length, 1);
+      const recordingHandle = files[0]!.slice(0, 32);
+      await assert.rejects(bounded(second.adoptClosedRecording({ sourceSessionId: firstId + 1n, recordingHandle })), { code: "recording_identity_mismatch" });
+      finalized = await bounded(second.adoptClosedRecording({ sourceSessionId: firstId, recordingHandle }));
+      assert.equal(finalized.recordingHandle, recordingHandle);
+      assert.equal(finalized.recoveryCapability.sourceSessionId, firstId);
+      assert.deepEqual(await bounded(second.adoptClosedRecording({ sourceSessionId: firstId, recordingHandle })), finalized, "a replay answers identically");
+      store.recordBridgeFailure({ occurrenceId: identity.occurrenceId, nowMs: 1000, maxRetries: 4, deferExhaustion: true, gaps: [], recording: recordingInput(finalized) });
+    }
+    assert.ok(finalized);
     const recovery = store.getRecordingRecovery(identity.occurrenceId, "bridge-independent", finalized.recordingHandle); assert.ok(recovery);
     // This rejection is actual Runtime authorization, not a fake-capability peer.
     const forged = second.readRecordingAlignment({ capability: { ...recovery.capability, authorization: "0".repeat(64) } })[Symbol.asyncIterator]();
@@ -274,4 +292,11 @@ capture_format = "pcm_s16le/24000/1/20ms"
     else primaryFailure ??= new Error("synthetic Runtime cleanup unconfirmed; private fixture retained");
   }
   if (primaryFailure) throw primaryFailure;
-});
+}
+
+// Only the overall case adds the 60s launcher assessment setup budget.
+test("actual encrypted Runtime recording restarts with private authority and stages SDK pages into SQLite", { timeout: 30_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, () =>
+  restartRecording("finalized"));
+
+test("a recording the gateway closed at exit is adopted by the next gateway with the same private authority and stages the same pages", { timeout: 30_000 + LAUNCHER_PREFLIGHT_TIMEOUT_MS }, () =>
+  restartRecording("closed_at_exit"));

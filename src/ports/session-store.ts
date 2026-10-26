@@ -526,6 +526,15 @@ export type OpenCaptureRows = {
   readonly generations: readonly { readonly occurrenceId: string; readonly bridgeSessionId: string }[];
 };
 
+/** A generation a previous process left open with a Runtime voice session and
+ * no stored recording: its recording, if the gateway closed it, may be adopted. */
+export type UnfinalizedGeneration = {
+  readonly occurrenceId: string;
+  readonly bridgeSessionId: string;
+  readonly runtimeSessionId: bigint;
+  readonly createdAtMs: number;
+};
+
 export type FinalizeSessionInput = {
   readonly transition: TransitionInput;
   readonly recording: RecordingInput;
@@ -832,6 +841,10 @@ export type SessionStore = {
   /** Final, monotonic settlement; a deletion only at or after the deadline. */
   settleRecordingRetention(handle: string, outcome: "released" | "deleted", nowMs: number): void;
   listOpenCaptureRows(): OpenCaptureRows;
+  /** Open generations of listening occurrences that have a Runtime session and no recording. */
+  listUnfinalizedGenerations(): readonly UnfinalizedGeneration[];
+  /** Whether any stored recording, failed recording, recovery binding or seed already names this handle. */
+  isRecordingHandleStored(handle: string): boolean;
   getRecordingRecovery(occurrenceId: string, bridgeSessionId: string, recordingHandle: string): RecordingRecovery | null;
   beginRecordingAlignment(generationId: string, ownerId: string, replace?: boolean):
     { readonly kind: "selected"; readonly selected: SelectedAlignment } | { readonly kind: "claimed"; readonly attempt: AlignmentAttempt };

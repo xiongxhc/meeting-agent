@@ -28,7 +28,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { FINALIZED_RECORDING_PROTOCOL_VERSION, RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
+import { CommandRejectedError, FINALIZED_RECORDING_PROTOCOL_VERSION, RuntimeClient, StdioGatewayTransport, type RuntimeStatus, type RuntimeTransport, type StdioGatewayCleanupOutcome, type DrainableTimedVoiceSession, type TimedVoiceSession } from "@conversation/runtime";
 
 import type { ApplicationOwnerLock } from "./adapters/application-owner-lock.ts";
 import { createChildBridgeSlot } from "./adapters/child-bridge-process.ts";
@@ -38,6 +38,7 @@ import { createFeishuOrganizerMetadata } from "./adapters/feishu-organizer-metad
 import { createFeishuOrganizerSender } from "./adapters/feishu-organizer-sender.ts";
 import { createFeishuSocketOwner, type FeishuSocketOwner } from "./adapters/feishu-sdk-connection.ts";
 import { createFeishuSdkHttp, type FeishuSdkHttp } from "./adapters/feishu-sdk-http.ts";
+import { listRecordingSources } from "./adapters/filesystem-outbox.ts";
 import { openSessionStore } from "./adapters/sqlite-session-store.ts";
 import { createApplicationMaintenance, type MaintenanceLane, type MaintenanceOptions, type MaintenanceStatus } from "./application-maintenance.ts";
 import { createMeetingAgentApplication, type MeetingAgentApplication } from "./application.ts";
@@ -56,6 +57,7 @@ import { createInviteDiscovery } from "./sessions/invite-discovery.ts";
 import type { CreateMeetingSessionOptions, MeetingSession, MeetingSessionState } from "./sessions/meeting-session.ts";
 import { recognitionOutageWarnings, type RecognitionOutage } from "./domain/transcript.ts";
 import { markJoinTiming, type JoinTimingObserver } from "./sessions/join-timing.ts";
+import { recoverPendingLiveEvidence } from "./sessions/live-provisional.ts";
 import type { StandaloneConfigV1 } from "./standalone-config.ts";
 
 export const STATE_DATABASE_NAME = "orchestration.db";
@@ -632,8 +634,20 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
         publishInterrupted: (occurrenceId, nowMs) => {
           const occurrence = store.getInviteOccurrence(occurrenceId);
           if (occurrence === null) return false;
-          return store.publishStoredGenerations({ occurrenceId, nowMs, reason: "capture_interrupted",
-            seed: { ...interruptedSeedConfig(version), identity: identityOf(occurrence) } }) !== null;
+          const published = store.publishStoredGenerations({ occurrenceId, nowMs, reason: "capture_interrupted",
+            seed: { ...interruptedSeedConfig(version), identity: identityOf(occurrence) } });
+          if (published === null) return false;
+          // D007: the recordings that do not ship keep their own unknown-end deadline,
+          // as they do when a live process publishes them (runOccurrence).
+          for (let attempt = 1; attempt <= 64; attempt += 1) {
+            const failed = store.getBridgeFailureRecording(occurrenceId, attempt);
+            if (failed === null || attempt === published.attempt || failed.encryptedPath === null || failed.keyId === null) continue;
+            try {
+              store.assignUnknownEndCustody({ kind: "bridge_failure", occurrenceId, attempt }, nowMs,
+                { recordingHandle: failed.handle, encryptedPath: failed.encryptedPath, sha256: failed.sha256, keyId: failed.keyId });
+            } catch { log("occurrence_custody_refused"); }
+          }
+          return true;
         },
       },
       ...(options.maintenance ? { options: options.maintenance } : {}),
@@ -903,6 +917,59 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     return discoveryInFlight;
   }
 
+  /** D002/D007: a generation the previous process left open never had its
+   * recording finalized, but its gateway closed the file at exit. A Runtime that
+   * advertises closed_recording_adoption verifies that file and answers as a
+   * live finalize would; the recording is then stored as that generation's
+   * failed recording, so the restart sweep publishes it with every other stored
+   * generation. Any refusal leaves the file to the retention sweep. */
+  async function adoptClosedRecordings(): Promise<void> {
+    const generations = store.listUnfinalizedGenerations();
+    if (generations.length === 0) return;
+    let transport: OwnedRuntimeTransport | undefined;
+    try {
+      // Startup is bounded like an occurrence's; the adoptions themselves are Runtime-local file checks.
+      const startup = AbortSignal.any([shutdown.signal, AbortSignal.timeout(budgetMs)]);
+      const expired = new Promise<never>((_resolve, reject) => startup.addEventListener("abort", () => reject(new Error("runtime_startup_timeout")), { once: true }));
+      void expired.catch(() => undefined);
+      transport = await Promise.race([startTransport({ occurrenceId: generations[0]!.occurrenceId, signal: startup }), expired]);
+      const client = await Promise.race([RuntimeClient.connect(transport, 4), expired]);
+      const status = await Promise.race([client.status(), expired]);
+      if (!status.capabilities.includes("closed_recording_adoption")) { log("recording_adoption_unavailable"); return; }
+      const files = listRecordingSources(dataPaths.recordingsDir).filter((file) => !store.isRecordingHandleStored(file.handle));
+      for (const generation of generations) {
+        if (closing) return;
+        let adopted = false;
+        for (const file of files) {
+          if (store.isRecordingHandleStored(file.handle)) continue;
+          let recording;
+          try { recording = await client.adoptClosedRecording({ sourceSessionId: generation.runtimeSessionId, recordingHandle: file.handle }); }
+          catch (error) {
+            // A file of another session answers identity_mismatch; anything else is stated.
+            if (!(error instanceof CommandRejectedError)) throw error;
+            if (error.code !== "recording_identity_mismatch") log(`recording_adoption_refused_${error.code}`);
+            continue;
+          }
+          const binding = { occurrenceId: generation.occurrenceId, bridgeSessionId: generation.bridgeSessionId, runtimeSessionId: generation.runtimeSessionId };
+          // The owner lock makes this the only process: the prior writer is gone.
+          await recoverPendingLiveEvidence({ store, binding, nowMs: () => clock.now(), exclusivePriorOwnerClosed: async () => undefined });
+          store.recordBridgeFailure({ occurrenceId: generation.occurrenceId, nowMs: clock.now(), maxRetries: MAX_BRIDGE_RELAUNCHES, deferExhaustion: true, gaps: [],
+            recording: { recovery: { bridgeSessionId: generation.bridgeSessionId, capability: recording.recoveryCapability },
+              handle: recording.recordingHandle, encryptedPath: recording.encryptedPath, sha256: recording.sha256, durationMs: Number(recording.durationMs),
+              format: recording.format, keyId: recording.keyId, gaps: [], runtimeGaps: recording.gaps.map((gap) => ({ ...gap })) } });
+          // The end of capture is unobserved: the generation ends where its recording does, never later than now.
+          store.completeReconciliationGeneration(generation.occurrenceId, generation.bridgeSessionId,
+            Math.min(clock.now(), generation.createdAtMs + Number(recording.durationMs)), "local_clock");
+          log("recording_adopted");
+          adopted = true;
+          break;
+        }
+        if (!adopted) log("recording_adoption_not_found");
+      }
+    } catch { log("recording_adoption_failed"); }
+    finally { if (transport !== undefined) await transport.close().catch(() => undefined); }
+  }
+
   return {
     stateDatabasePath: databasePath,
     async start(): Promise<void> {
@@ -911,6 +978,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       started = true;
       // Before any occurrence launches, so no live entry exists: recordings and
       // capture rows a previous process left get their retention now.
+      await adoptClosedRecordings();
       log(maintenance.sweepRetention());
       // Maintenance lanes start before, and never wait on, Feishu ingress readiness.
       maintenance.start();

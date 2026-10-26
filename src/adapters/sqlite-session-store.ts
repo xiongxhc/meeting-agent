@@ -67,6 +67,7 @@ import {
   type BackfillWarningClaim,
   type BackfillSeedCleanupClaim,
   type OpenCaptureRows,
+  type UnfinalizedGeneration,
   type RecordingFileObservation,
   type RecordingRetention,
   type UnknownEndCustody,
@@ -227,6 +228,8 @@ export function openSessionStore(options: OpenSessionStoreOptions): SessionStore
     listAssignedRecordingRetention: () => listAssignedRecordingRetention(db),
     settleRecordingRetention: (handle, outcome, nowMs) => settleRecordingRetention(db, handle, outcome, nowMs),
     listOpenCaptureRows: () => listOpenCaptureRows(db),
+    listUnfinalizedGenerations: () => listUnfinalizedGenerations(db),
+    isRecordingHandleStored: (handle) => isRecordingHandleStored(db, handle),
     getRecordingRecovery: (occurrenceId, bridgeSessionId, recordingHandle) => getRecordingRecovery(db, occurrenceId, bridgeSessionId, recordingHandle),
     beginRecordingAlignment: (generationId, ownerId, replace) => beginRecordingAlignment(db, generationId, ownerId, replace),
     appendRecordingAlignment: (attempt, page) => appendRecordingAlignment(db, attempt, page),
@@ -3863,6 +3866,23 @@ function settleRecordingRetention(db: Database.Database, handle: string, outcome
   const changed = db.prepare(`UPDATE recording_retention SET state=?,settled_at_ms=? WHERE recording_handle=? AND state='assigned'
       AND (?='released' OR ?>=deadline_ms)`).run(outcome, nowMs, handle, outcome, nowMs).changes;
   if (changed !== 1) throw new Error("recording retention settlement refused");
+}
+
+function listUnfinalizedGenerations(db: Database.Database): readonly UnfinalizedGeneration[] {
+  const rows = db.prepare(`SELECT generation.occurrence_id, generation.bridge_session_id, generation.runtime_session_id, generation.created_at_ms
+    FROM reconciliation_generations AS generation JOIN sessions AS session ON session.occurrence_id = generation.occurrence_id
+    WHERE generation.terminal_at_ms IS NULL AND generation.runtime_session_id IS NOT NULL AND generation.recording_handle IS NULL
+      AND session.state = 'listening' ORDER BY generation.occurrence_id, generation.created_at_ms, generation.bridge_session_id`)
+    .all() as Array<{ occurrence_id: string; bridge_session_id: string; runtime_session_id: string; created_at_ms: number }>;
+  return rows.map((row) => ({ occurrenceId: row.occurrence_id, bridgeSessionId: row.bridge_session_id,
+    runtimeSessionId: BigInt(row.runtime_session_id), createdAtMs: row.created_at_ms }));
+}
+
+function isRecordingHandleStored(db: Database.Database, handle: string): boolean {
+  return db.prepare(`SELECT 1 FROM recordings WHERE handle = @handle
+    UNION ALL SELECT 1 FROM bridge_failure_recordings WHERE handle = @handle
+    UNION ALL SELECT 1 FROM recording_recovery_bindings WHERE recording_handle = @handle
+    UNION ALL SELECT 1 FROM backfill_seeds WHERE capability_recording_handle = @handle LIMIT 1`).get({ handle }) !== undefined;
 }
 
 function listOpenCaptureRows(db: Database.Database): OpenCaptureRows {
