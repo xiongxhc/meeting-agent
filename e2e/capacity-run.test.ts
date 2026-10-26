@@ -406,3 +406,21 @@ test('v3 actual raw snapshot retains intermediate poll progress even before targ
     captureProgress(projected, 1, 2, '1', '2', '960'); persist(); assert.throws(() => snapshot(), /capacity_capture_regressed/);
   } finally { rmSync(staged.root, { recursive: true, force: true }); }
 });
+test('entry failure line names the error class, code and message with secrets redacted', async () => {
+  const { capacityEntryFailureLine } = await entry();
+  const error = Object.assign(new TypeError('open /private/tmp/x/plan.json failed: Bearer abc.def token=hunter2 key 0123456789abcdef0123456789abcdef'), { code: 'ERR_X' });
+  const line = capacityEntryFailureLine(Object.assign(new Error('capacity_entry_arguments', { cause: error })));
+  assert.match(line, /^capacity_entry_failed name=Error code=none message=capacity_entry_arguments cause=TypeError code=ERR_X message=open \/private\/tmp\/x\/plan\.json failed: /);
+  for (const secret of ['abc.def', 'hunter2', '0123456789abcdef0123456789abcdef']) assert.equal(line.includes(secret), false, secret);
+  assert.equal(line.includes('\n'), false); assert.ok(line.length <= 1024);
+  assert.equal(capacityEntryFailureLine('plain'), 'capacity_entry_failed name=string code=none message=none');
+  assert.equal(capacityEntryFailureLine(new RangeError('x'), 'capacity_owner_failed'), 'capacity_owner_failed name=RangeError code=none message=x');
+});
+test('entry config check accepts the staged admission the parser normalizes and still refuses a different file', async () => {
+  const { assertCapacityStandaloneConfig } = await entry();
+  const config = { ...baseline().standaloneConfig, admission: { allowedInviterIds: ['ou_e2e_inviter'] } };
+  const bytes = (value: unknown) => Buffer.from(JSON.stringify(value));
+  assert.doesNotThrow(() => assertCapacityStandaloneConfig(parseStandaloneConfig, bytes(config), config));
+  assert.throws(() => assertCapacityStandaloneConfig(parseStandaloneConfig, bytes({ ...config, admission: { allowedInviterIds: ['ou_other'] } }), config));
+  assert.throws(() => assertCapacityStandaloneConfig(parseStandaloneConfig, bytes({ ...config, admission: { allowedInviterIds: ['ou_e2e_inviter'], allowedChatIds: ['oc_x'] } }), config));
+});

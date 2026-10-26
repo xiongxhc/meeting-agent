@@ -1,5 +1,6 @@
 // Built actual-owner adapter. Static imports create no owner, SDK or listener.
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { fstatSync, openSync, closeSync, constants, readSync, readdirSync, writeFileSync, renameSync, lstatSync } from 'node:fs';
 import { Agent as HttpAgent } from 'node:http';
@@ -51,7 +52,10 @@ export async function runCapacityOwner(plan, effects, { signal, budgetMs = 30000
       await step('end', { occurrenceId: outcome.occurrenceId, reason: 'removed' }); await step('settled', outcome.occurrenceId);
     }
     final = await step('snapshot'); final.victim = victim; final.liveBaseline = baseline; final.failureBaseline = isolated; assertCapacityStopped(plan, final);
-  } catch (error) { failures.push(/^capacity_[A-Za-z_]+$/.test(error?.message ?? '') ? error.message : /^ingress_[A-Za-z_]+$/.test(error?.message ?? '') ? error.message : 'capacity_owner_failed'); }
+  } catch (error) {
+    const code = /^(capacity|ingress)_[A-Za-z_]+$/.test(error?.message ?? '') ? error.message : 'capacity_owner_failed';
+    if (code === 'capacity_owner_failed') process.stderr.write(`${capacityEntryFailureLine(error, code)}\n`); failures.push(code);
+  }
   finally {
     abort(); globalThis.clearTimeout(timer); signal?.removeEventListener('abort', abort); let timeout;
     try {
@@ -64,13 +68,19 @@ export async function runCapacityOwner(plan, effects, { signal, budgetMs = 30000
     activity: final?.activity, baseline, victim, controls: plan.count === 1 ? 'not-applicable' : plan.count - 1, close, failures, observations, preserved: true };
 }
 
+/** The staged file must parse to what the plan's own config parses to; the
+ * parser fills defaults such as `admission.allowedChatIds`. */
+export function assertCapacityStandaloneConfig(parse, bytes, expected) {
+  assert.deepEqual(parse(bytes), parse(Buffer.from(JSON.stringify(expected))));
+}
+
 async function realEntry(plan) {
   const [sdk, main, configApi, lockApi, composition, httpApi, socketApi, peers, lifecycle] = await Promise.all([
     import('@larksuiteoapi/node-sdk'), import('../dist/src/main.js'), import('../dist/src/standalone-config.js'), import('../dist/src/adapters/application-owner-lock.js'), import('../dist/src/application-composition.js'),
     import('../dist/src/adapters/feishu-sdk-http.js'), import('../dist/src/adapters/feishu-sdk-connection.js'), import('./feishu-peer.mjs'), import('./composition-lifecycle.mjs'),
   ]);
   validateCapacityPlan(plan);
-  assert.deepEqual(configApi.parseStandaloneConfig(capacityPrivateBytes(plan.standaloneConfigPath, { mode: 0o600 })), plan.standaloneConfig);
+  assertCapacityStandaloneConfig(configApi.parseStandaloneConfig, capacityPrivateBytes(plan.standaloneConfigPath, { mode: 0o600 }), plan.standaloneConfig);
   const codec = await import('../dist/src/ports/feishu-ingress.js');
   for (const send of plan.sends) { const n = codec.normalizeInvite(send.envelope, peers.SCOPE); requireCapacity(n.occurrenceId === send.occurrenceId && n.normalizedSha256 === send.hash && Object.entries(send.immutableExpected).every(([k, v]) => n[k] === v), 'entry_invite_identity'); }
   const shutdown = new globalThis.AbortController(), signal = () => shutdown.abort(); for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(name, signal);
@@ -170,8 +180,19 @@ async function realEntry(plan) {
   try { const result = await runCapacityOwner(plan, effects, { signal: shutdown.signal }); return { ...result, label: 'attempted-application' }; }
   finally { for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(name, signal); }
 }
+/** One bounded stderr line naming the failure's class, code and message, and
+ * those of its direct cause (under `label`); bearer values, key=value secrets and long opaque
+ * runs that hold a digit are redacted. */
+export function capacityEntryFailureLine(error, label = 'capacity_entry_failed') {
+  const word = value => typeof value === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(value) ? value : 'none';
+  const text = value => typeof value !== 'string' || value === '' ? 'none' : value.replace(/\s+/g, ' ')
+    .replace(/\b(Bearer)\s+\S+/gi, '$1 [redacted]').replace(/\b(secret|token|key|password|authorization)([=:\s]+)\S+/gi, '$1$2[redacted]')
+    .replace(/(?=[A-Za-z0-9+/_=-]*[0-9])[A-Za-z0-9+/_=-]{24,}/g, '[redacted]').slice(0, 400);
+  const part = value => value instanceof Error ? `name=${word(value.name)} code=${word(value.code)} message=${text(value.message)}` : `name=${typeof value} code=none message=none`;
+  return `${label} ${part(error)}${error instanceof Error && error.cause !== undefined ? ` cause=${part(error.cause).slice(5)}` : ''}`.slice(0, 1024);
+}
 const copy = value => globalThis.structuredClone(value);
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void (async () => {
   requireCapacity(process.argv.length === 4 && process.argv[2] === '--plan' && path.isAbsolute(process.argv[3]), 'entry_arguments'); const plan = capacityPrivateJson(process.argv[3]);
   const result = await realEntry(plan); requireCapacity(JSON.stringify(result).length <= 1048576, 'summary_extent'); writeFileSync(plan.summaryPath, JSON.stringify(result), { mode: 0o600, flag: 'wx' }); process.exitCode = result.success ? 0 : 70;
-})().catch(() => { process.stderr.write('capacity_entry_failed\n'); process.exitCode = 70; });
+})().catch(error => { process.stderr.write(`${capacityEntryFailureLine(error)}\n`); process.exitCode = 70; });
