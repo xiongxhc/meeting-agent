@@ -238,31 +238,41 @@ async function buildTimedArtifact(input: TimedArtifactBuildInput, version: "v1" 
     return leftStart < rightStart ? -1 : leftStart > rightStart ? 1 : leftEnd < rightEnd ? -1 : leftEnd > rightEnd ? 1
       : left.segmentId < right.segmentId ? -1 : left.segmentId > right.segmentId ? 1 : 0;
   }) : value.segments;
-  let previousEnd: string | null = null;
-  const transcript: TeamMemMeetingArtifact["transcript"] = segments.map((segment) => {
+  let previousEnd: string | null = null, clamped = 0, dropped = 0;
+  const transcript: TeamMemMeetingArtifact["transcript"] = [];
+  for (const segment of segments) {
     const evidence = getOwnedTimedSampleSnapshot(segment.sampleEvidence), range = segment.range, wall = segment.wall;
     if (!evidence || !range || !wall || evidence.sampleRateHz !== range.sampleRateHz ||
       evidence.possibleSamples !== range.endSampleExclusive - range.startSampleInclusive || evidence.possibleSamples <= 0n) throw new Error("timed sample evidence or wall mapping unavailable");
-    const start = orderKey(wall.startedAt), end = orderKey(wall.endedAt);
-    if (start > end || start < meetingStart || end > meetingEnd || (version === "v1" && previousEnd !== null && start < previousEnd) || ids.has(segment.segmentId)) {
-      throw new Error("timed transcript is not representable as ordered nonoverlapping artifact intervals");
-    }
-    previousEnd = end; ids.add(segment.segmentId);
+    const end = orderKey(wall.endedAt), early = orderKey(wall.startedAt) < meetingStart;
+    const start = early ? meetingStart : orderKey(wall.startedAt);
+    if (orderKey(wall.startedAt) > end || ids.has(segment.segmentId)) throw new Error("timed transcript is not representable as ordered nonoverlapping artifact intervals");
+    ids.add(segment.segmentId);
     let confidence = 0;
     if (segment.speaker.kind === "named") {
       if (namedTimedCandidate(segment.sampleEvidence!) !== segment.speaker.feishuUserId) throw new Error("timed named evidence mismatch");
       const lower = new Map(evidence.candidateLower).get(segment.speaker.feishuUserId)!;
       confidence = Number(lower * 1000000n / evidence.possibleSamples) / 1000000;
     }
-    return { segment_id: segment.segmentId, started_at: wall.startedAt, ended_at: wall.endedAt, text: segment.text,
-      speaker: toArtifactSpeaker(segment, names), attribution_confidence: confidence,
+    // Wall times are local estimates: speech estimated before the occurrence
+    // start is dropped, or clamped to the start when it runs past it.
+    if (end <= meetingStart) { dropped += 1; continue; }
+    if (early) clamped += 1;
+    if (end > meetingEnd || (version === "v1" && previousEnd !== null && start < previousEnd)) {
+      throw new Error("timed transcript is not representable as ordered nonoverlapping artifact intervals");
+    }
+    previousEnd = end;
+    transcript.push({ segment_id: segment.segmentId, started_at: early ? `${meetingStart}Z` : wall.startedAt,
+      ended_at: wall.endedAt, text: segment.text, speaker: toArtifactSpeaker(segment, names), attribution_confidence: confidence,
       provenance: { stage: segment.wording === "reconciled" ? "final_batch" : "live_stream",
-        model: segment.wording === "reconciled" ? input.provenance.finalBatchModel : input.provenance.liveStreamModel } };
-  });
+        model: segment.wording === "reconciled" ? input.provenance.finalBatchModel : input.provenance.liveStreamModel } });
+  }
   if (transcript.length && value.warnings.filter(({ code }) => code === "local_wall_timestamp_estimate").length !== 1) throw new Error("timed local-wall warning required");
+  const warnings = clamped + dropped === 0 ? value.warnings : [...value.warnings,
+    { code: "transcript_before_meeting_start", detail: `${clamped} segment(s) clamped to the meeting start, ${dropped} dropped as wholly before it` }];
   return version === "v1"
-    ? assembleArtifact(input, participants, transcript, value.warnings)
-    : assembleArtifactV2(input, participants, transcript, value.warnings);
+    ? assembleArtifact(input, participants, transcript, warnings)
+    : assembleArtifactV2(input, participants, transcript, warnings);
 }
 
 async function assembleArtifactV2(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },

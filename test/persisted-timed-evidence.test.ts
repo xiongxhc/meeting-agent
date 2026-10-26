@@ -189,6 +189,7 @@ test("timed builder uses admitted wall endpoints and historical hash independent
     assert.equal(built.artifact.transcript_complete, false);
     assert.equal(built.artifact_hash, canonicalArtifactHash(parseTeamMemMeetingArtifact(JSON.parse(built.serialized))));
     assert.equal(built.artifact.processing_warnings.filter(({ code }) => code === "local_wall_timestamp_estimate").length, 1);
+    assert.equal(built.artifact.processing_warnings.some(({ code }) => code === "transcript_before_meeting_start"), false, "an in-window transcript carries no pre-start warning");
     for (const changed of [
       { ...input, audio: { ...input.audio, sha256: `sha256:${"e".repeat(64)}` } },
       { ...input, transcript: { ...transcript, source: { ...transcript.source, sourceSessionId: 99n } } },
@@ -206,6 +207,37 @@ test("timed builder uses admitted wall endpoints and historical hash independent
       assert.equal(calls, 1, "known unrepresentable timing must refuse before paid synthesis");
     }
     assert.equal(calls, 1, "invalid evidence refuses before processText");
+  } finally { f.close(); }
+});
+
+test("a transcript segment estimated before the meeting start is clamped or dropped with a warning instead of failing the build", async () => {
+  const f = fixture();
+  try {
+    const transcript = await reconciler.reconcilePersistedTimedSpeakers({ occurrenceId: f.identity.occurrenceId, bridgeSessionId: "bridge",
+      recordingHandle: testCapability.recordingHandle, store: f.store, nowMs: () => 1001,
+      runtime: { async reconcileFinalizedRecording() { throw new Error("synthetic unavailable"); } } });
+    const only = transcript.segments[0]!;
+    const before = { ...only, segmentId: "before", wall: { ...only.wall!, startedAt: "2026-09-02T13:59:58.000000Z", endedAt: "2026-09-02T13:59:59.000000Z" } };
+    const straddling = { ...only, wall: { ...only.wall!, startedAt: "2026-09-02T13:59:59.990000Z" } };
+    let synthesised = "";
+    const input = { identity: f.identity, provider: "feishu", revision: 1, endedAt: "2026-09-02T14:10:00Z",
+      attendance: [{ feishuUserId: "person", displayName: "Person", joinedAt: "2026-09-02T14:00:00Z", leftAt: "2026-09-02T14:10:00Z" }],
+      transcript: { ...transcript, segments: [before, straddling] }, selectedAlignment: f.selected, sessionId: 99n, meetingEnded: true, recordingGaps: [], processingWarnings: [],
+      runtime: { async processText(request: { sessionId: bigint; input: string }) {
+        synthesised = request.input;
+        return { output: { summary: "Synthetic summary", projects: [], decisions: [], action_items: [], discussion_points: [], person_summaries: [] }, warnings: [] };
+      } },
+      provenance: { runtimeProfile: "online" as const, sttProvider: "synthetic", sttModel: "synthetic", textProvider: "synthetic", textModel: "synthetic",
+        agentVersion: "test", processedAt: "2026-09-02T14:11:00Z", finalBatchModel: "synthetic-final", liveStreamModel: "synthetic-live" },
+      audio: { format: "pcm_s16le", encryption: "aes-256-gcm", durationSeconds: 0.02, bytes: 1000, sha256: `sha256:${testCapability.sha256}`, expiresAt: "2026-09-16T14:10:00Z" } };
+    for (const build of [builder.buildTimedTeamMemMeetingArtifact, builder.buildTimedTeamMemMeetingArtifactV2]) {
+      const built = await build(input);
+      assert.deepEqual(built.artifact.transcript.map(({ segment_id, started_at, ended_at }) => ({ segment_id, started_at, ended_at })),
+        [{ segment_id: only.segmentId, started_at: "2026-09-02T14:00:00.000000Z", ended_at: only.wall!.endedAt }], "the straddling segment starts at the meeting start");
+      assert.deepEqual(built.artifact.processing_warnings.filter(({ code }) => code === "transcript_before_meeting_start"),
+        [{ code: "transcript_before_meeting_start", detail: "1 segment(s) clamped to the meeting start, 1 dropped as wholly before it" }]);
+      assert.doesNotMatch(synthesised, /"before"/, "a dropped segment is never sent to synthesis");
+    }
   } finally { f.close(); }
 });
 

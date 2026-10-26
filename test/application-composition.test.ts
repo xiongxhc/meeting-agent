@@ -1710,30 +1710,35 @@ test("a crashed bridge child (no confirmed departure) keeps its client quarantin
   } finally { f.close(); }
 });
 
-test("relaunch is bounded: past the retry limit the stored generations are published and the slot is freed", async () => {
+test("relaunch is bounded: after four bridge-failure relaunches the stored generations are published and the slot is freed", async () => {
   const f = fixture();
   try {
     const { app, slot, id, delays, connects } = await recoveringOccurrence(f);
-    for (let generation = 1; generation <= 3; generation += 1) {
-      await until(() => connects() === generation, 5000);
-      slot.left("bridge_failure");
-    }
-    const outcome = await app.awaitOccurrence(id);
-    assert.equal(outcome.generations, 3);
-    assert.deepEqual(delays, [1, 2]);
-    assert.deepEqual(app.liveOccurrenceIds(), []);
-    const store = f.reopen();
     try {
-      assert.equal(store.getSession(id)?.state, "finalizing");
-      for (const attempt of [1, 2, 3]) assert.ok(store.getBridgeFailureRecording(id, attempt), `attempt ${attempt} recording kept`);
-      const seed = store.getBackfillSeed(id);
-      assert.deepEqual(seed?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"), [{ code: "meeting_end_unobserved", detail: "bridge_failure_exhausted" }]);
-      // Equal durations: the latest generation ships; the others keep their 14-day deadline.
-      assert.equal(seed?.capability.recordingHandle, store.getBridgeFailureRecording(id, 3)?.handle);
-      for (const attempt of [1, 2]) assert.ok(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt }), `attempt ${attempt} custody`);
-      assert.equal(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt: 3 }), null);
-    } finally { store.close(); }
-    await app.close();
+      for (let generation = 1; generation <= 5; generation += 1) {
+        await until(() => connects() === generation, 5000);
+        slot.left("bridge_failure");
+      }
+      // A ceiling above 4 would launch a sixth generation and never settle: fail, never hang.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([app.awaitOccurrence(id),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("occurrence did not settle after the fifth generation")), 5000); })])
+        .finally(() => clearTimeout(timer));
+      assert.equal(outcome.generations, 5, "the first generation and exactly four relaunches");
+      assert.deepEqual(delays, [1, 2, 3, 4]);
+      assert.deepEqual(app.liveOccurrenceIds(), []);
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(id)?.state, "finalizing");
+        for (const attempt of [1, 2, 3, 4, 5]) assert.ok(store.getBridgeFailureRecording(id, attempt), `attempt ${attempt} recording kept`);
+        const seed = store.getBackfillSeed(id);
+        assert.deepEqual(seed?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"), [{ code: "meeting_end_unobserved", detail: "bridge_failure_exhausted" }]);
+        // Equal durations: the latest generation ships; the others keep their 14-day deadline.
+        assert.equal(seed?.capability.recordingHandle, store.getBridgeFailureRecording(id, 5)?.handle);
+        for (const attempt of [1, 2, 3, 4]) assert.ok(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt }), `attempt ${attempt} custody`);
+        assert.equal(store.getUnknownEndCustody({ kind: "bridge_failure", occurrenceId: id, attempt: 5 }), null);
+      } finally { store.close(); }
+    } finally { await app.close(); }
   } finally { f.close(); }
 });
 
@@ -1826,21 +1831,26 @@ test("relaunches are bounded at four: a Runtime that keeps refusing ends in publ
     const log: string[] = [];
     const app = await composeFor(f, { log: (code) => log.push(code), startRuntimeTransport: runtimes.factory, bridgeSlots: [slot], metadata: resolvedLookup(["900000001"]),
       clock: { now: () => 10_000 }, bridgeRecoveryDelayMs: () => 0 });
-    await app.start();
-    await app.discover();
-    await until(() => slot.sent().some((command) => command.type === "connect_media"));
-    slot.left("bridge_failure");
-    const outcome = await app.awaitOccurrence(id!);
-    assert.equal(runtimes.owned.length, 5, "the first generation and exactly four relaunches");
-    assert.equal(outcome.generations, 5);
-    assert.equal(log.filter((code) => code === "occurrence_bridge_relaunch_refused").length, 3);
-    const store = f.reopen();
     try {
-      assert.equal(store.getSession(id!)?.state, "finalizing");
-      assert.deepEqual(store.getBackfillSeed(id!)?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"),
-        [{ code: "meeting_end_unobserved", detail: "bridge_recovery_failed" }]);
-    } finally { store.close(); }
-    await app.close();
+      await app.start();
+      await app.discover();
+      await until(() => slot.sent().some((command) => command.type === "connect_media"));
+      slot.left("bridge_failure");
+      // A wrong ceiling fails within seconds and never leaves the app open.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([app.awaitOccurrence(id!),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("occurrence did not settle after the fifth generation")), 5000); })])
+        .finally(() => clearTimeout(timer));
+      assert.equal(runtimes.owned.length, 5, "the first generation and exactly four relaunches");
+      assert.equal(outcome.generations, 5);
+      assert.equal(log.filter((code) => code === "occurrence_bridge_relaunch_refused").length, 3);
+      const store = f.reopen();
+      try {
+        assert.equal(store.getSession(id!)?.state, "finalizing");
+        assert.deepEqual(store.getBackfillSeed(id!)?.processingWarnings.filter(({ code }) => code === "meeting_end_unobserved"),
+          [{ code: "meeting_end_unobserved", detail: "bridge_recovery_failed" }]);
+      } finally { store.close(); }
+    } finally { await app.close(); }
   } finally { f.close(); }
 });
 

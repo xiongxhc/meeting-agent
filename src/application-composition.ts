@@ -69,13 +69,13 @@ const MAX_APP_SECRET_BYTES = 4_096;
 const DISCOVERY_PAGE = 64;
 const MAX_METADATA_RESOLUTIONS_PER_TICK = 256;
 
-/** Wait before relaunching a failed bridge generation: 1 s doubling per
- * attempt, capped at 10 s. The number of attempts is bounded by the store's
- * bridge failure retry limit. */
-/** Relaunches of any cause per occurrence; the store's bridge failure retry
- * limit bounds the failures that ended a running generation. */
+/** D038: at most 4 relaunches per occurrence, of any cause. The store's bridge
+ * failure retry limit is set to the same bound, so bridge failures alone may
+ * use all 4 before the stored generations are published. */
 const MAX_BRIDGE_RELAUNCHES = 4;
 
+/** Wait before relaunching a failed bridge generation: 1 s doubling per
+ * attempt, capped at 10 s. */
 export function defaultBridgeRecoveryDelayMs(attempt: number): number {
   return Math.min(1000 * 2 ** Math.max(0, attempt - 1), 10_000);
 }
@@ -558,6 +558,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     application = createMeetingAgentApplication({
       config: legacyConfig, store, clock, liveEvidence: "timed", bridgeLeaseTtlMs: BRIDGE_LEASE_TTL_MS, maxConcurrentSessions: wrappedSlots.length,
       backfillSeedConfigFor: (identity) => requireEntry(identity).runtime!.seedConfig, deferBridgeFailureExhaustion: true,
+      bridgeFailureRetryLimit: MAX_BRIDGE_RELAUNCHES,
       adapters: { bridgeSlots: wrappedSlots, bridgeIdFor: (identity) => requireEntry(identity).bridgeId, runtimeFor: (identity) => requireEntry(identity).runtime!.port },
       ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
     });
