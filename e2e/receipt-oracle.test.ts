@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 // @ts-expect-error Test-only JavaScript TeamMem module has no public declaration.
-import { publicationReceiptPasses, receiptOracle } from "./teammem.mjs";
+import { l6ReceiptCheck, publicationReceiptPasses, receiptOracle } from "./teammem.mjs";
 
 const ENV = { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "e2e", GIT_AUTHOR_EMAIL: "e2e@example.invalid",
   GIT_COMMITTER_NAME: "e2e", GIT_COMMITTER_EMAIL: "e2e@example.invalid", GIT_AUTHOR_DATE: "2026-10-22T00:00:00Z", GIT_COMMITTER_DATE: "2026-10-22T00:00:00Z" };
@@ -155,4 +155,31 @@ test("every content check still gates the latest receipt", (t) => {
     writeFileSync(path.join(v.receiptsDir, `${SEGMENT}.json`), mutate(v.commits));
     assert.equal(publicationReceiptPasses(receiptOracle({ teammem: v.teammem, receiptsDir: v.receiptsDir, artifact: artifact(1) }).checks), false, label);
   }
+});
+
+/** The L6 lane builds its row from its own bounded Git reads; the twins come
+ * from the same layout rule as the default lane. */
+function l6Row(v: ReturnType<typeof vault>, commit: string) {
+  const accepted = JSON.parse(receiptBytes(1, commit));
+  const note = { exit: 0, stdout: `# Receipt 1\n\n${OCCURRENCE}\n` };
+  return l6ReceiptCheck({ receiptsDir: v.receiptsDir, accepted, candidate: commit, note, commitExists: true, commitIsAncestorOfRef: true,
+    noteMatchesArtifact: true, artifact: { occurrenceId: OCCURRENCE, revision: 1, actualHash: HASH, audioPath: "/never/audio.enc" } });
+}
+
+test("the L6 inline receipt row carries the twin verdict and passes the default publication rule", (t) => {
+  const v = vault(t);
+  publish(v.receiptsDir, 1, v.commits[0]!);
+  const row = l6Row(v, v.commits[0]!);
+  assert.equal(row.revisionTwin, "byte-equal");
+  assert.equal(row.revisionTwinsConsistent, true);
+  assert.equal(publicationReceiptPasses([row]), true);
+});
+
+test("the L6 inline receipt row fails the publication rule when its twin disagrees", (t) => {
+  const v = vault(t);
+  publish(v.receiptsDir, 1, v.commits[0]!);
+  writeFileSync(path.join(v.receiptsDir, SEGMENT, "1.json"), receiptBytes(1, v.commits[1]!));
+  const row = l6Row(v, v.commits[0]!);
+  assert.equal(row.revisionTwin, "differs");
+  assert.equal(publicationReceiptPasses([row]), false);
 });

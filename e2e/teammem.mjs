@@ -137,7 +137,9 @@ export function publish({ teammem, nowIso, allowPush, withheldReason }) {
  * repository, be an ancestor of the published ref, and its named path must
  * hold note bytes that agree with the artifact. `cat-file -e` alone is not
  * enough, so the bytes themselves are inspected. */
-export function receiptOracle({ teammem, receiptsDir, artifact }) {
+/** TeamMem's receipt layout: latest receipts, and the per-revision twins of
+ * each latest. */
+function receiptLayout(receiptsDir) {
   const files = [];
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -147,7 +149,6 @@ export function receiptOracle({ teammem, receiptsDir, artifact }) {
     }
   };
   if (existsSync(receiptsDir)) walk(receiptsDir);
-  if (files.length === 0) return { receipts: [], revisionReceipts: [], checks: [], status: "absent" };
 
   // TeamMem writes `<segment>/<revision>.json` beside the latest `<segment>.json`.
   // Only that exact shape is a twin; every other file stays a receipt of its own.
@@ -158,6 +159,12 @@ export function receiptOracle({ teammem, receiptsDir, artifact }) {
   };
   const revisionReceipts = files.filter((filename) => latestOf(filename) !== null);
   const receipts = files.filter((filename) => latestOf(filename) === null);
+  return { receipts, revisionReceipts, twinsOf: (latest) => revisionReceipts.filter((filename) => latestOf(filename) === latest) };
+}
+
+export function receiptOracle({ teammem, receiptsDir, artifact }) {
+  const { receipts, revisionReceipts, twinsOf } = receiptLayout(receiptsDir);
+  if (receipts.length + revisionReceipts.length === 0) return { receipts: [], revisionReceipts: [], checks: [], status: "absent" };
 
   const checks = [];
   const parsed = receipts.map((filename) => ({ filename, value: JSON.parse(readFileSync(filename, "utf8")) }));
@@ -181,7 +188,7 @@ export function receiptOracle({ teammem, receiptsDir, artifact }) {
       noteNamesOccurrence: artifact === null || note.includes(artifact.occurrenceId),
       noteWithholdsAudioPath: artifact === null || !note.includes(artifact.audioPath ?? "\u0000never"),
       urlNamesCommit: typeof receipt.value.markdown_url === "string" && receipt.value.markdown_url.includes(commit),
-      ...revisionTwins(receipt, revisionReceipts.filter((filename) => latestOf(filename) === receipt.filename)),
+      ...revisionTwins(receipt, twinsOf(receipt.filename)),
       loadAverage: loadAverage(),
     });
   }
@@ -208,6 +215,24 @@ function revisionTwins(latest, twins) {
   }
   return { revisionTwin, revisionTwinsConsistent: revisionTwinsConsistent && revisionTwin !== "differs",
     revisionReceipts: twins.map((filename) => path.relative(path.dirname(latest.filename), filename)) };
+}
+
+/** The L6 lane's receipt row, from its own bounded Git reads, with the same
+ * twin verdict the default lane computes for the accepted latest receipt. */
+export function l6ReceiptCheck({ receiptsDir, accepted, candidate, note, artifact, commitExists, commitIsAncestorOfRef, noteMatchesArtifact }) {
+  const { receipts, twinsOf } = receiptLayout(receiptsDir);
+  const latest = receipts.flatMap((filename) => {
+    try { const value = JSON.parse(readFileSync(filename, "utf8")); return value?.occurrence_id === accepted.occurrence_id ? [{ filename, value }] : []; } catch { return []; }
+  });
+  return { schema: accepted.schema, markdownUrl: accepted.markdown_url, vaultCommit: accepted.vault_commit,
+    commitExists, commitIsAncestorOfRef, noteBytes: Buffer.byteLength(note.stdout),
+    occurrenceMatchesArtifact: accepted.occurrence_id === artifact.occurrenceId,
+    revisionMatchesArtifact: accepted.revision === artifact.revision,
+    artifactHashMatches: accepted.artifact_hash === artifact.actualHash,
+    noteNamesOccurrence: note.stdout.includes(artifact.occurrenceId),
+    noteWithholdsAudioPath: !note.stdout.includes(artifact.audioPath),
+    urlNamesCommit: accepted.markdown_url.includes(`/-/blob/${candidate}/`), noteMatchesArtifact,
+    ...(latest.length === 1 ? revisionTwins(latest[0], twinsOf(latest[0].filename)) : { revisionTwin: "absent", revisionTwinsConsistent: false, revisionReceipts: [] }) };
 }
 
 /** The default lane's `publication_receipt` rule: exactly one latest receipt

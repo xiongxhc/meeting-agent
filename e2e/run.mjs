@@ -25,7 +25,7 @@ import Database from "better-sqlite3";
 
 import { RUNTIME_PIN, TEAMMEM_SOURCE, sha256File, verifyPins } from "./pins.mjs";
 import { CAPTURE_FRAME_LIMIT, NODE24, PROVIDER_CREDENTIAL_ENV, RECORDING_KEY_ENV, loadAverage, mediaTimingConfiguration, run, stage } from "./stage.mjs";
-import { publicationReceiptPasses, publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
+import { l6ReceiptCheck, publicationReceiptPasses, publish, receiptOracle, stageTeamMem } from "./teammem.mjs";
 
 import { createProcessEvidence, observeProcessSnapshot } from "./process-evidence.mjs";
 import { keyPresent, negativeProofs, recordedProcessProof } from "./negative-proofs.mjs";
@@ -582,16 +582,8 @@ async function liveRun({ staged, teammem, outDir, interactive, r2Baseline, d2Cut
               !note.stdout.includes(artifact.audioPath) && accepted.artifact_hash === artifact.actualHash;
             // Reuse these bounded actual checks in the ordinary R2 oracle;
             // do not repeat its unselected synchronous Git calls afterward.
-            receipt = { receipts: [accepted.occurrence_id], status: "present", valid: true, checks: [{
-              schema: accepted.schema, markdownUrl: accepted.markdown_url, vaultCommit: accepted.vault_commit,
-              commitExists, commitIsAncestorOfRef, noteBytes: Buffer.byteLength(note.stdout),
-              occurrenceMatchesArtifact: accepted.occurrence_id === artifact.occurrenceId,
-              revisionMatchesArtifact: accepted.revision === artifact.revision,
-              artifactHashMatches: accepted.artifact_hash === artifact.actualHash,
-              noteNamesOccurrence: note.stdout.includes(artifact.occurrenceId),
-              noteWithholdsAudioPath: !note.stdout.includes(artifact.audioPath),
-              urlNamesCommit: accepted.markdown_url.includes(`/-/blob/${candidate}/`), noteMatchesArtifact,
-            }] };
+            receipt = { receipts: [accepted.occurrence_id], status: "present", valid: true, checks: [l6ReceiptCheck({
+              receiptsDir: staged.directories.receiptsDir, accepted, candidate, note, artifact, commitExists, commitIsAncestorOfRef, noteMatchesArtifact })] };
             return { commitExists, commitIsAncestorOfRef, noteMatchesArtifact, receiptCanonical: true };
           } });
         check("l6_receipt_gate", l6.failure === null && l6.report?.exactlyOneSend && l6.cleanup, l6.failure ?? "actual held polls, remote receipt and one durable send verified");
