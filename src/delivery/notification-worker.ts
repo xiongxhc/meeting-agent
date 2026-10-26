@@ -36,6 +36,8 @@ export function createNotificationWorker(options: {
   readonly dedupSafetyMarginMs: number;
   readonly maxAttempts?: number;
   readonly afterSend?: (row: NotificationRow) => void;
+  /** Static codes only; `organizer_dm_sent` after the sent state is durable. */
+  readonly log?: (code: string) => void;
 }): NotificationWorker {
   const maxAttempts = options.maxAttempts ?? 8;
   for (const [name, value] of Object.entries({ requestTimeoutMs: options.requestTimeoutMs, claimTtlMs: options.claimTtlMs, dedupSafetyMarginMs: options.dedupSafetyMarginMs, maxAttempts })) {
@@ -65,6 +67,7 @@ export function createNotificationWorker(options: {
           providerAccepted = true;
           options.afterSend?.(row);
           options.store.completeNotification({ occurrenceId: row.occurrenceId, revision: row.revision, claimToken, providerMessageId: sent.messageId, sentAtMs: options.clock.now() });
+          options.log?.("organizer_dm_sent");
         } catch (error) {
           // A failed local commit is deliberately left claimed. After its
           // bounded lease expires the same durable UUID is tried again.

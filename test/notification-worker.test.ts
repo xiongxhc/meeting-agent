@@ -344,3 +344,55 @@ test("SQLite bounds opaque claim and provider message identifiers", () => {
     assert.equal(h.store.getSession(OCCURRENCE)?.state, "published", "oversized provider evidence rolls back notified transition");
   } finally { h.close(); }
 });
+
+test("organizer_dm_sent is logged once, only after the sent state is durable", async () => {
+  const h = harness();
+  try {
+    accept(h.store);
+    let now = 20;
+    const sender = new ExpiringDedupSender();
+    const log: string[] = [];
+    let crash = true;
+    const worker = () => createNotificationWorker({
+      store: h.store, sender, clock: { now: () => now }, random: () => 0,
+      requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000, log: (code) => log.push(code),
+      afterSend: () => { if (crash) throw new Error("synthetic process death before local commit"); },
+    });
+    await worker().poll();
+    assert.deepEqual(log, [], "a provider acceptance without the local commit is not a sent DM");
+    now += 11; sender.now = now; crash = false;
+    await worker().poll();
+    assert.equal(h.store.notifications()[0]!.state, "sent");
+    await worker().poll();
+    assert.deepEqual(log, ["organizer_dm_sent"]);
+  } finally { h.close(); }
+});
+
+test("organizer_dm_sent is not logged when the sent-state commit itself fails, and is logged once after the retried commit", async () => {
+  const h = harness();
+  try {
+    accept(h.store);
+    let now = 20, failCommit = true;
+    const sender = new ExpiringDedupSender();
+    const log: string[] = [];
+    // A store whose completeNotification throws once, after the provider accepted the send.
+    const store = new Proxy(h.store, { get(target, key, receiver) {
+      if (key === "completeNotification") return (...args: Parameters<SessionStore["completeNotification"]>) => {
+        if (failCommit) { failCommit = false; throw new Error("synthetic sent-state commit failure"); }
+        return target.completeNotification(...args);
+      };
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const worker = () => createNotificationWorker({ store, sender, clock: { now: () => now }, random: () => 0,
+      requestTimeoutMs: 5, claimTtlMs: 10, dedupSafetyMarginMs: 60_000, log: (code) => log.push(code) });
+    await worker().poll();
+    assert.equal(sender.accepted.size, 1, "the provider accepted the send");
+    assert.equal(h.store.notifications()[0]!.state, "claimed", "the failed commit leaves the row claimed");
+    assert.deepEqual(log, [], "no sent line before the sent state is durable");
+    now += 11; sender.now = now;
+    await worker().poll();
+    assert.equal(h.store.notifications()[0]!.state, "sent");
+    assert.deepEqual(log, ["organizer_dm_sent"]);
+  } finally { h.close(); }
+});

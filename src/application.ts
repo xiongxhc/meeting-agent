@@ -75,6 +75,8 @@ export type CreateMeetingAgentApplicationOptions = {
   readonly deferBridgeFailureExhaustion?: boolean;
   /** PRIVATE test-entry join-latency observer (sessions/join-timing.ts). */
   readonly joinTiming?: JoinTimingObserver;
+  /** Coordinator log passed to each session (static codes). */
+  readonly log?: (code: string) => void;
 };
 
 export type MeetingAgentApplication = {
@@ -173,6 +175,7 @@ export function createMeetingAgentApplication(
           const lifecycleOptions = {
             ...sessionOptions,
             ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
+            ...(options.log === undefined ? {} : { log: options.log }),
             onInactive: () => {
               if (tracked.session !== undefined) sessions.delete(tracked.session);
               void cleanup(owner);

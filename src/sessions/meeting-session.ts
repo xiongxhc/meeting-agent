@@ -350,6 +350,8 @@ export type CreateMeetingSessionOptions = {
   /** PRIVATE test-entry observer of join-path phase boundaries (see
    * join-timing.ts). Production composition never sets it. */
   readonly joinTiming?: JoinTimingObserver;
+  /** Coordinator log: static codes only. A throwing sink never alters the session. */
+  readonly log?: (code: string) => void;
 } & ({ readonly bridge: BridgeTransport; readonly timedEvidence?: undefined } | {
   readonly bridge: BridgeTransportV2;
   readonly timedEvidence: { readonly store: SessionStore; readonly catchupClock?: LiveCatchupClock;
@@ -1001,6 +1003,8 @@ export function createMeetingSession(options: CreateMeetingSessionOptions): Meet
         } else if (!isRecoveryGeneration) {
           throw new Error("duplicate joined event for an already-listening bridge generation");
         }
+        // Logged once the bridge confirmed the invited occurrence, so a mismatch or a duplicate never logs it.
+        try { options.log?.("bridge_joined"); } catch { /* logging never alters the session */ }
         return;
 
       case "left":

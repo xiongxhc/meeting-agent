@@ -563,6 +563,7 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
       bridgeFailureRetryLimit: MAX_BRIDGE_RELAUNCHES,
       adapters: { bridgeSlots: wrappedSlots, bridgeIdFor: (identity) => requireEntry(identity).bridgeId, runtimeFor: (identity) => requireEntry(identity).runtime!.port },
       ...(options.joinTiming === undefined ? {} : { joinTiming: options.joinTiming }),
+      log,
     });
   } catch (error) { store.close(); storeOpen = false; throw error instanceof Error && /duplicate slot/.test(error.message) ? new Error("bridge_slot_invalid") : error; }
 
@@ -839,7 +840,8 @@ export async function composeApplication(config: StandaloneConfigV1, owner: Appl
     // A refusal never touches an existing session; an allowed invite may admit a session that predates the allowlist.
     if (refusal !== undefined && store.getSession(occurrenceId) !== null) return;
     const outcome = store.admitInviteJoin(occurrenceId, clock.now(), refusal);
-    if (outcome === "admitted" || outcome === "existing_session" || logged?.has(occurrenceId) === true) return;
+    if (outcome === "admitted") { log("invite_admitted"); return; }
+    if (outcome === "existing_session" || logged?.has(occurrenceId) === true) return;
     logged?.add(occurrenceId);
     log(`invite_admission_${outcome}`);
   }

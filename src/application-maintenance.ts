@@ -256,7 +256,7 @@ export function createApplicationMaintenance(input: CreateMaintenanceInput): Mai
     sink: options.warningSink ?? createFilesystemOperatorWarningSink({ outboxDir: input.dataPaths.outboxDir }),
   });
   const notification = input.notificationSender === undefined ? null
-    : createNotificationWorker({ store: input.store, sender: input.notificationSender, clock, random, ...NOTIFICATION_SETTINGS });
+    : createNotificationWorker({ store: input.store, sender: input.notificationSender, clock, random, log, ...NOTIFICATION_SETTINGS });
 
   // --- custody lane -----------------------------------------------------------
   const custodyOutcomes: CustodyOutcome[] = [];

@@ -743,6 +743,21 @@ function invitedBy(eventId: string, id: string, inviter?: string) {
 
 const ALLOWED = { allowedInviterIds: ["ou_allowed"], allowedChatIds: [] };
 
+test("the coordinator log names each admitted and refused invite once and the bridge join", async () => {
+  const f = fixture(2);
+  const slots = [scriptedSlot(1), scriptedSlot(2)];
+  try {
+    const live = await liveIngress(f, { ...f.config, admission: ALLOWED }, slots,
+      [invitedBy("allowed", "9007199254740993", "ou_allowed"), invitedBy("stranger", "9007199254740994", "ou_stranger")]);
+    try {
+      await until(() => live.log.includes("bridge_joined"));
+      assert.deepEqual(live.log.filter((code) => code.startsWith("invite_admi")), ["invite_admitted", "invite_admission_inviter_not_allowed"]);
+      assert.ok(live.log.indexOf("occurrence_launched") < live.log.indexOf("bridge_joined"));
+      assert.equal(live.log.filter((code) => code === "bridge_joined").length, 1);
+    } finally { await live.close(); }
+  } finally { f.close(); }
+});
+
 test("only allowlisted inviters are joined; others are recorded on the invite row and never joined; a lost decision fails closed", async () => {
   const f = fixture(2);
   const slots = [scriptedSlot(1, { joinMode: "silent" }), scriptedSlot(2, { joinMode: "silent" })];

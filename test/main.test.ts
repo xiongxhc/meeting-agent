@@ -67,7 +67,7 @@ type Overrides = Partial<{
   readConfig(filename: string): StandaloneConfigV1;
   inspectStateRoot(config: StandaloneConfigV1): void;
   acquireOwnerLock(stateRoot: string): Promise<ApplicationOwnerLock>;
-  composeAfterAdmission(config: StandaloneConfigV1, owner: ApplicationOwnerLock): Promise<CompositionResult>;
+  composeAfterAdmission(config: StandaloneConfigV1, owner: ApplicationOwnerLock, log: (code: string) => void): Promise<CompositionResult>;
   closeError: Error;
 }>;
 
@@ -95,10 +95,10 @@ function seam(f: Fixture, overrides: Overrides = {}): { readonly dependencies: S
         },
       };
     },
-    async composeAfterAdmission(value, owner) {
+    async composeAfterAdmission(value, owner, log) {
       calls.composed.push({ config: value, owner }); calls.order.push("compose");
       owner.assertCurrentOwnership();
-      if (overrides.composeAfterAdmission) return overrides.composeAfterAdmission(value, owner);
+      if (overrides.composeAfterAdmission) return overrides.composeAfterAdmission(value, owner, log);
       return { status: "composition_unavailable" };
     },
     report(channel, line) { calls.lines.push({ channel, line }); },
@@ -258,6 +258,26 @@ test("a composition failure or an unconfirmed owner close still exits 70 with ex
   } finally { f.close(); }
 });
 
+test("composition log codes reach the coordinator log on stdout with a UTC time; a code that is not static is withheld", async (t) => {
+  const f = fixture();
+  try {
+    const { counts } = withCounters(t);
+    const codes = ["composition_started", "invite_committed", "invite_admission_inviter_not_allowed", "occurrence_launched",
+      "occurrence_bridge_recovery_scheduled", "delivery_receipt_waiting", "delivery_published", "maintenance_outbox_publication_refused:quote_refused"];
+    const { dependencies, calls } = seam(f, { async composeAfterAdmission(_config, _owner, log) {
+      for (const code of [...codes, `leaked ${f.dir}`, "ou_creator/Creator"]) log(code);
+      return { status: "composition_closed", clean: true };
+    } });
+    assert.equal(await runStandalone(["--standalone-config", path.join(f.dir, "standalone.json")], dependencies), 0);
+    const logged = calls.lines.filter(({ channel }) => channel === "stdout").map(({ line }) => line);
+    for (const line of logged) assert.match(line, /^meeting-agent: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z [a-z_:]+$/);
+    assert.deepEqual(logged.map((line) => line.split(" ")[2]), [...codes, "log_code_withheld", "log_code_withheld"]);
+    assert.deepEqual(calls.lines.filter(({ channel }) => channel === "stderr").map(({ line }) => line), ["meeting-agent: composition_closed"]);
+    assertRedacted(f, calls);
+    assert.deepEqual(counts, { spawn: 0, fetch: 0 });
+  } finally { f.close(); }
+});
+
 // ---------------------------------------------------------------------------
 // Real-process wiring: node src/main.ts with an empty environment.
 // ---------------------------------------------------------------------------
@@ -370,7 +390,9 @@ test("real process: a state root held by another process exits 75 and never comp
     assert.deepEqual([holderExit.code, holderExit.signal], [0, null]);
 
     const admitted = await runMain(["--standalone-config", file]);
-    assert.deepEqual([admitted.code, admitted.stdout], [70, ""]);
+    assert.equal(admitted.code, 70);
+    assert.match(admitted.stdout, /^meeting-agent: \S+Z composition_lock_verified$/m, "the real entry hands the coordinator log to the composition");
+    assert.doesNotMatch(admitted.stdout, /meeting-standalone-main|app-secret|tenant-a|cli_test/);
     assert.match(admitted.stderr, /composition_unavailable/);
     assert.doesNotMatch(admitted.stderr, /meeting-standalone-main|app-secret/);
     assert.equal(lstatSync(path.join(f.stateRoot, "application.lock")).isFile(), true);

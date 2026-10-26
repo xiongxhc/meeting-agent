@@ -106,6 +106,8 @@ type HarnessOptions = {
    * by the retrieval-wiring suite to inject a router built against a
    * call-tracking fake Team Vault index. */
   readonly retrieval?: RetrievalRouter;
+  /** Coordinator log sink, threaded straight to CreateMeetingSessionOptions.log. */
+  readonly log?: (code: string) => void;
 };
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -135,6 +137,7 @@ function harness(options: HarnessOptions = {}): Harness {
     disclosureText: DISCLOSURE_TEXT,
     ...(options.maxQueuedEvents === undefined ? {} : { maxQueuedEvents: options.maxQueuedEvents }),
     ...(options.retrieval === undefined ? {} : { retrieval: options.retrieval }),
+    ...(options.log === undefined ? {} : { log: options.log }),
   });
 
   return {
@@ -1682,6 +1685,32 @@ test("a runtime call that fails inside the session is recorded, and the session 
 // process with it under Node's default. One malformed or duplicated event must
 // cost that event, never the meeting.
 // ---------------------------------------------------------------------------
+
+test("bridge_joined is logged once, on the bridge's joined event for the invited occurrence, never on join() alone, a mismatch or a duplicate", async () => {
+  const mismatchLog: string[] = [];
+  const mismatch = harness({ log: (code) => mismatchLog.push(code) });
+  try {
+    await mismatch.session.join();
+    assert.deepEqual(mismatchLog, [], "join() resolving is not the bridge's joined event");
+    mismatch.bridge.emit(mismatch.bridge.event({ type: "joined", meetingOccurrenceId: "other-meeting@2026-09-02T14:00:00Z" }));
+    await mismatch.session.settled();
+    assert.deepEqual(mismatchLog, [], "a joined event for another meeting is left, never logged as joined");
+  } finally {
+    await mismatch.cleanup();
+  }
+  const log: string[] = [];
+  const h = harness({ log: (code) => log.push(code) });
+  try {
+    await joined(h);
+    assert.deepEqual(log, ["bridge_joined"]);
+    h.bridge.emit(h.bridge.event({ type: "joined", meetingOccurrenceId: IDENTITY.occurrenceId }));
+    await h.session.settled();
+    assert.equal(h.session.state().routingErrors.length, 1, "the duplicate is a routing error");
+    assert.deepEqual(log, ["bridge_joined"], "a duplicate joined event is not a second join");
+  } finally {
+    await h.cleanup();
+  }
+});
 
 test("a duplicate joined event is recorded as a routing error, not thrown", async () => {
   const h = harness();

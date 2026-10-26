@@ -58,7 +58,8 @@ export type StandaloneDependencies = {
   readonly readConfig: (filename: string) => StandaloneConfigV1;
   readonly inspectStateRoot: (config: StandaloneConfigV1) => void;
   readonly acquireOwnerLock: (stateRoot: string) => Promise<ApplicationOwnerLock>;
-  readonly composeAfterAdmission: (config: StandaloneConfigV1, owner: ApplicationOwnerLock) => Promise<CompositionResult>;
+  /** `log` is the coordinator log: static composition codes only. */
+  readonly composeAfterAdmission: (config: StandaloneConfigV1, owner: ApplicationOwnerLock, log: (code: string) => void) => Promise<CompositionResult>;
   readonly report: (channel: "stdout" | "stderr", line: string) => void;
 };
 
@@ -87,8 +88,8 @@ function lockMessage(error: unknown): string {
   return `meeting-agent: ${code}`;
 }
 
-function composeAfterAdmission(config: StandaloneConfigV1, owner: ApplicationOwnerLock): Promise<CompositionResult> {
-  return runStandaloneComposition(config, owner);
+function composeAfterAdmission(config: StandaloneConfigV1, owner: ApplicationOwnerLock, log: (code: string) => void): Promise<CompositionResult> {
+  return runStandaloneComposition(config, owner, { log });
 }
 
 const realDependencies: StandaloneDependencies = {
@@ -137,9 +138,14 @@ export async function runStandalone(argv: readonly string[], dependencies: Stand
     return lockExitCode(error);
   }
 
+  // Lifecycle codes go to stdout, the coordinator log. A code that is not a static
+  // token is withheld, so no path, identity or text can reach the log.
+  const log = (code: string): void => {
+    dependencies.report("stdout", `meeting-agent: ${new Date().toISOString()} ${/^[a-z0-9_]+(:[a-z0-9_]+)?$/.test(code) ? code : "log_code_withheld"}`);
+  };
   let exit = EXIT_FAILURE;
   try {
-    const composition = await dependencies.composeAfterAdmission(config, owner);
+    const composition = await dependencies.composeAfterAdmission(config, owner, log);
     const detail = composition.status === "composition_unavailable" && composition.reason !== undefined ? ` ${composition.reason}` : "";
     dependencies.report("stderr", `meeting-agent: ${composition.status}${detail}`);
     if (composition.status === "composition_closed" && composition.clean) exit = EXIT_OK;
