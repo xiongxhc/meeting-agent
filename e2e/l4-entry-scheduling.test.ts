@@ -60,7 +60,7 @@ const origin = { hostNs: "0", wallMs: Date.parse("2026-10-06T12:00:00Z") };
 function readiness(l4Case = "sent-conflict") {
   const plan = compileL4Plan(l4Case, origin), tracker = createSubmittedFrameTracker();
   tracker.connect("one"); tracker.update("one", { type: "transcription", audio: { input: { format: { type: "audio/pcm", rate: 24000 } } } });
-  const child = { joined: true, mediaConnected: true, framesSent: 0,
+  const child = { joined: true, mediaConnected: true, framesSent: 0, firstFrameHostStartNs: "0",
     l4: { case: l4Case, origin, planSha256: l4PlanHash(plan), bridgeSessionId: "bridge", disclosureCommandId: "chat" },
     observationPlan: { phase: "running", planned: plan.events.length, emitted: 6 } };
   return { tracker, child };
@@ -254,7 +254,8 @@ for (const l4Case of ["sent-named", "unavailable-missing", "sent-drop"]) {
 // only after an append lag (35-55 ms observed). The verifier requires every selected frame's capture start >= origin + 1400 ms.
 for (const l4Case of ["sent-drop", "sent-named"]) {
   test(`${l4Case} driver selects a capture-safe range under append lag`, async () => {
-    for (const mediaStartMs of [0, 7, 13, 19, 25]) for (const lagMs of [0, 20, 40, 60, 80, 100]) {
+    // 250 ms: the load-drift lag of the 29e65d4 sent-named run (51 frames sent in 1236 ms).
+    for (const mediaStartMs of [0, 7, 13, 19, 25]) for (const lagMs of [0, 20, 40, 60, 80, 100, 150, 250]) {
       const clock = virtualPoller(), f = readiness(l4Case), events: Array<Record<string, string>> = [];
       const plan = compileL4Plan(l4Case, origin), audio = Buffer.alloc(960).toString("base64");
       const mediaStart = BigInt(mediaStartMs) * 1000000n, lag = BigInt(lagMs) * 1000000n, frame = 20000000n;
@@ -268,7 +269,7 @@ for (const l4Case of ["sent-drop", "sent-named"]) {
       } };
       await clock.settle(driveL4Capture({ l4Case, provider, runtimeEvents: () => events, nowHostNs: clock.host, budgetMs: 6000,
         child() { const emitted = plan.events.filter((row: { emitAtHostNs: string }) => BigInt(row.emitAtHostNs) <= clock.host()).length;
-          return { ...f.child, observationPlan: { ...f.child.observationPlan, emitted, phase: emitted === plan.events.length ? "completed" : "running" } }; },
+          return { ...f.child, firstFrameHostStartNs: mediaStart.toString(), observationPlan: { ...f.child.observationPlan, emitted, phase: emitted === plan.events.length ? "completed" : "running" } }; },
         waitFor: clock.waitFor }));
       const at = `media +${mediaStartMs} ms, lag ${lagMs} ms, frames ${range.startFrame}-${range.endFrame}`;
       assert.equal(range.endFrame - range.startFrame + 1, 50, at);
@@ -277,3 +278,37 @@ for (const l4Case of ["sent-drop", "sent-named"]) {
     }
   });
 }
+
+// Sent-conflict on the fast-join build: the verifier requires the first selected frame's capture start in
+// origin + [1460, 1500] ms. Selection at 1480..1500 ms with a 35-55 ms append lag must not take the
+// still-unappended older frame; it takes the first frame whose capture start reaches 1460 ms.
+test("sent-conflict driver selects its first frame inside the 1460..1500 ms capture phase under append lag", async () => {
+  for (const firstStartMs of [0, 3, 7, 11, 13, 19, 25, 31]) for (const lagMs of [0, 10, 20, 35, 45, 55, 80, 100, 150, 250]) {
+    const clock = virtualPoller(), f = readiness(), events: Array<Record<string, string>> = [];
+    const plan = compileL4Plan("sent-conflict", origin), audio = Buffer.alloc(960).toString("base64");
+    const first = BigInt(firstStartMs) * 1000000n, lag = BigInt(lagMs) * 1000000n, frame = 20000000n;
+    const captureStart = (sequence: number) => first + BigInt(sequence - 1) * frame;
+    let range = { startFrame: 0, endFrame: 0 };
+    const provider = { get submitted() {
+      while (captureStart(f.tracker.snapshot().appended + 1) + frame + lag <= clock.host()) f.tracker.append("one", audio);
+      return f.tracker.snapshot();
+    }, transcript(_text: string, selected: { startFrame: number; endFrame: number }) {
+      range = selected; events.push({ type: "voice_transcript_final", segment_id: "1", session_id: "41" }, { type: "response_skipped", segment_id: "1", session_id: "41" });
+    } };
+    await clock.settle(driveL4Capture({ l4Case: "sent-conflict", provider, runtimeEvents: () => events, nowHostNs: clock.host, budgetMs: 6000,
+      child() { const emitted = plan.events.filter((row: { emitAtHostNs: string }) => BigInt(row.emitAtHostNs) <= clock.host()).length;
+        return { ...f.child, firstFrameHostStartNs: first.toString(), observationPlan: { ...f.child.observationPlan, emitted, phase: emitted === 64 ? "completed" : "running" } }; },
+      waitFor: clock.waitFor }));
+    const at = `first frame +${firstStartMs} ms, lag ${lagMs} ms, frames ${range.startFrame}-${range.endFrame}`;
+    assert.equal(range.endFrame - range.startFrame + 1, 50, at);
+    assert.ok(captureStart(range.startFrame) >= 1460000000n && captureStart(range.startFrame) <= 1500000000n, `conflict phase floor missed: ${at}`);
+    assert.ok(captureStart(range.endFrame) + frame <= 3300000000n, at);
+  }
+});
+for (const l4Case of ["sent-conflict", "sent-drop"]) test(`${l4Case} selection refuses a child without a capture origin`, async () => {
+  const clock = virtualPoller(), f = readiness(l4Case);
+  const pending = driveL4Capture({ l4Case, provider: { get submitted() { return f.tracker.snapshot(); }, transcript() {} },
+    child: () => ({ ...f.child, firstFrameHostStartNs: undefined }), runtimeEvents: () => [], nowHostNs: clock.host, budgetMs: 2000, waitFor: clock.waitFor });
+  clock.jump(1480000000n);
+  await assert.rejects(clock.settle(pending), /l4_capture_origin_refused/);
+});

@@ -295,6 +295,7 @@ lines.on("line", (line) => {
         return;
       }
       state.mediaConnected = true;
+      state.firstFrameHostStartNs = media.firstFrameHostStartNs;
       connectedLease = { sessionId: lease.sessionId, expiresAtMs: BigInt(lease.expiresAtMs) };
       persist();
       emit({ type: "media_connected", endpoint: lease.connectEndpoint });

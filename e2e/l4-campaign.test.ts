@@ -79,7 +79,7 @@ test("submitted range uses real append observations and exact four provider mess
 });
 test("selected controller waits observed readiness/range/real final and watermark before end permission", async () => {
   const l4 = await load(); assert.equal(typeof l4.driveL4Capture, "function");
-  const plan = l4.compileL4Plan("sent-named", origin), child = { joined: true, mediaConnected: true,
+  const plan = l4.compileL4Plan("sent-named", origin), child = { joined: true, mediaConnected: true, firstFrameHostStartNs: origin.hostNs,
     l4: { case: "sent-named", origin, planSha256: l4.l4PlanHash(plan) }, observationPlan: { phase: "running", planned: 38, emitted: 6 } };
   const tracker = { connection: "one", appended: 70, valid: true, ready: true }, events: Array<Record<string, string>> = [];
   let sent = 0;
@@ -223,7 +223,7 @@ test("sent-conflict oracle earns positive samples from actual production cursor 
 });
 test("sent-conflict driver selects 50 future actual tracker frames only within its fixed 1480..1500ms window", async () => {
   const l4 = await load(), plan = l4.compileL4Plan("sent-conflict", origin);
-  const child = { joined: true, mediaConnected: true, l4: { case: "sent-conflict", origin, planSha256: l4.l4PlanHash(plan) }, observationPlan: { phase: "running", planned: 64, emitted: 6 } };
+  const child = { joined: true, mediaConnected: true, firstFrameHostStartNs: "10060000000", l4: { case: "sent-conflict", origin, planSha256: l4.l4PlanHash(plan) }, observationPlan: { phase: "running", planned: 64, emitted: 6 } };
   const tracker = l4.createSubmittedFrameTracker(); tracker.connect("one"); tracker.update("one", { type: "transcription", audio: { input: { format: { type: "audio/pcm", rate: 24000 } } } });
   for (let i = 0; i < 70; i++) tracker.append("one", Buffer.alloc(960).toString("base64"));
   const events: Array<Record<string, string>> = []; let sent = 0, offset = 1470000000n;

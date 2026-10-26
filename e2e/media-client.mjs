@@ -252,6 +252,8 @@ export function createConnectedMediaClient({ socket, credential, sessionId, brid
   const client = {
     socket, inbound, ready,
     get capturePosition() { return capturePosition(); },
+    /** Nominal capture start of frame 1; frame k starts k-1 frames (20 ms each) later. Null when the long-tail origin moves it. */
+    get firstFrameHostStartNs() { return mediaTiming === "omit-final-pair-long" ? null : String(started + 20000000n); },
     get closedReason() { return failure; },
     get finishEvidence() { return { sessionId: String(sessionId), bridgeSessionId, authenticated,
       requestedBoundary: expected, acknowledgedBoundary: acknowledged, capturePosition: capturePosition() }; },

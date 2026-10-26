@@ -120,6 +120,7 @@ export async function driveL4Capture({ l4Case, provider, child, runtimeEvents, w
     requireFact(!l4HasLiveOutput(runtimeEvents()), "l4_runtime_decision_refused");
     const state = child();
     if (state?.l4?.origin) requireFact(nowHostNs() <= BigInt(state.l4.origin.hostNs) + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
+    if (state?.mediaConnected) requireFact(/^(0|[1-9][0-9]{0,19})$/.test(state.firstFrameHostStartNs ?? ""), "l4_capture_origin_refused");
     // Non-conflict selection waits until the next unappended frame was certainly captured after the verifier's 1400 ms floor.
     return state?.joined && state.mediaConnected && provider.submitted.ready && provider.submitted.valid && state.observationPlan?.emitted >= 6 &&
       nowHostNs() >= BigInt(state.l4.origin.hostNs) + (conflict ? 1480000000n : 1500000000n);
@@ -129,8 +130,13 @@ export async function driveL4Capture({ l4Case, provider, child, runtimeEvents, w
     state.observationPlan.planned === rows && state.observationPlan.phase === "running", "l4_plan_binding_refused");
   const now = nowHostNs(), base = BigInt(state.l4.origin.hostNs);
   requireFact(now >= base + (conflict ? 1480000000n : 1500000000n) && now <= base + (conflict ? 1500000000n : 2100000000n), "l4_fixed_window_missed");
-  const observed = provider.submitted, skip = conflict ? 1 : 3; // two-frame margin past the append lag
-  const range = { connection: observed.connection, startFrame: observed.appended + skip, endFrame: observed.appended + skip + 49 };
+  const observed = provider.submitted;
+  // Frame k's nominal capture start is first + (k - 1) * 20 ms; append lag grows with send drift under load.
+  // Select the first future frame whose capture start reaches the verifier floor (conflict 1460 ms, otherwise 1400 ms).
+  const first = BigInt(state.firstFrameHostStartNs), floor = base + (conflict ? 1460000000n : 1400000000n);
+  const startFrame = Math.max(observed.appended + (conflict ? 1 : 3), first >= floor ? 1 : Number((floor - first + 19999999n) / 20000000n) + 1);
+  requireFact(first + BigInt(startFrame - 1) * 20000000n <= base + (conflict ? 1500000000n : 2300000000n), "l4_fixed_window_missed");
+  const range = { connection: observed.connection, startFrame, endFrame: startFrame + 49 };
   const before = runtimeEvents().length;
   await wait(() => { const current = provider.submitted;
     requireFact(current.valid && current.ready && current.connection === range.connection, "l4_recognition_connection_changed");
