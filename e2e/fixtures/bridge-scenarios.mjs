@@ -76,7 +76,8 @@ export function createPhysicalOutcomeEmitter({ binding, scenario, write, close, 
       if (emit) {
         const outcome = observation.left !== null
           ? { outcome: "departure_confirmed", reason: "departure_observed" }
-          : observation.joined ? { outcome: "departure_unconfirmed", reason: "departure_not_observed" }
+          : observation.cleanupFailed ? { outcome: "departure_unconfirmed", reason: "cleanup_failed" }
+            : observation.joined ? { outcome: "departure_unconfirmed", reason: "departure_not_observed" }
             : { outcome: "no_join_action", reason: "join_not_issued" };
         const serialized = { ...expected };
         if (selected.mode === "stale_generation") serialized.physicalGenerationId = (expected.physicalGenerationId[0] === "0" ? "1" : "0") + expected.physicalGenerationId.slice(1);
@@ -96,9 +97,10 @@ export function createPhysicalOutcomeEmitter({ binding, scenario, write, close, 
     }
   }
   return {
-    finish({ joined, left }) {
+    // cleanupFailed: the bridge's own shutdown leave failed (Swift cleanup_failed).
+    finish({ joined, left, cleanupFailed = false }) {
       if (started || terminal) return completion;
-      started = true; observation = { joined, left };
+      started = true; observation = { joined, left, cleanupFailed };
       if (selected.mode !== "held") settle(selected.mode !== "missing");
       else {
         held = true;

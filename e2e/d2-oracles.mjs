@@ -70,6 +70,7 @@ export function d2OrderingOracles(live) {
       const refused = closed.results.every(row => row.status === "rejected" && /^composition_close_failed:/.test(row.reason) && row.reason === closed.results[0].reason);
       requireFact(live.summary.driveFailure === null && ((fulfilled && live.outcome.code === 0) || (refused && live.outcome.code === 70)),
         "entry exit does not match actual close disposition");
+      if (fulfilled) requireFact(childState?.shutdownLeave?.outcome === "ok", "clean close lacks the bridge's own recorded shutdown leave");
       if (refused) requireFact(closed.outcomes.every(outcome => live.reopen.rows.custody.some(row =>
         row.occurrence_id === outcome.occurrenceId && row.state === "quarantined")), "unclean physical close lacks durable quarantine");
       return `same Promise for concurrent/settled close; ${fulfilled ? "clean" : "explicit unconfirmed-close refusal/quarantine"}; ordered store closure and lock reacquired`;

@@ -35,7 +35,8 @@ function fixture(cut: string) {
       { session_id: "42", generation_id: "4", event: { type: terminal, turn_id: "4" }, monotonicNs: "30" },
       ...(cut === "complete-wins" ? [{ type: "voice_activity", session_id: "42", activity: { type: "speech_started" }, monotonicNs: "45" }] : [])] as RuntimeEvent[],
     childState: { playback: [{ sequence: "9", generation: "4", turn: "4", held: true, afterFlush: false }],
-      flushes: cut === "complete-wins" ? [] : [{ generation: "4", monotonicNs: "20" }], renderCallbacks: detail.renderCallbacks, left: null },
+      flushes: cut === "complete-wins" ? [] : [{ generation: "4", monotonicNs: "20" }], renderCallbacks: detail.renderCallbacks, left: null,
+      shutdownLeave: null as null | { reason: string; monotonicNs: string; outcome: string } },
     reopen: { rows: { custody: [{ occurrence_id: "occ", state: "quarantined" }] } },
     summary: { trace, driveFailure: null }, outcome: { code: 70 },
   };
@@ -159,10 +160,16 @@ test("repeated close binds the entry exit code to the close disposition and requ
   const fulfilled = () => Array.from({ length: 3 }, () => ({ status: "fulfilled", reason: "" }));
   for (const [results, code, pass] of [["refused", 70, true], ["refused", 0, false], ["fulfilled", 0, true], ["fulfilled", 70, false]] as const) {
     const f = fixture("repeated-close"); f.outcome.code = code;
-    if (results === "fulfilled") f.closed.results = fulfilled();
+    if (results === "fulfilled") { f.closed.results = fulfilled(); f.childState.shutdownLeave = { reason: "coordinator_stop", monotonicNs: "60", outcome: "ok" }; }
     const row = failedCheck(f, "repeated_owner_close");
     assert.equal(row.status, pass ? "pass" : "fail", `${results} close with exit ${code}: ${row.detail}`);
     if (!pass) assert.match(row.detail, /entry exit does not match/);
+  }
+  // A clean close must come from the bridge's own recorded shutdown leave.
+  for (const shutdownLeave of [null, { reason: "coordinator_stop", monotonicNs: "60", outcome: "failed" }]) {
+    const f = fixture("repeated-close"); f.outcome.code = 0; f.closed.results = fulfilled(); f.childState.shutdownLeave = shutdownLeave;
+    const row = failedCheck(f, "repeated_owner_close");
+    assert.equal(row.status, "fail"); assert.match(row.detail, /lacks the bridge's own recorded shutdown leave/);
   }
   for (const length of [2, 4]) {
     const f = fixture("repeated-close"); f.closed.results = f.closed.results.slice(0, 1).concat(Array.from({ length: length - 1 }, () => ({ ...f.closed.results[0]! })));

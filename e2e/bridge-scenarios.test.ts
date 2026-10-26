@@ -19,6 +19,7 @@ const observations = [
   { joined: false, left: null, outcome: "no_join_action", reason: "join_not_issued" },
   { joined: true, left: null, outcome: "departure_unconfirmed", reason: "departure_not_observed" },
   ...["ended", "removed", "bridge_failure"].map(left => ({ joined: true, left, outcome: "departure_confirmed", reason: "departure_observed" })),
+  { joined: true, left: null, cleanupFailed: true, outcome: "departure_unconfirmed", reason: "cleanup_failed" },
 ];
 function pipe(mode?: string, overrides: Record<string, unknown> = {}) {
   const stream = new PassThrough(), chunks: Buffer[] = [], states: Array<Record<string, unknown>> = [];

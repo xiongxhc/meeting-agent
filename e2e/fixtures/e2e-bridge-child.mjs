@@ -6,8 +6,9 @@
 // capture-clock/v1 provenance, which is what makes the recorder produce a real
 // encrypted recording.
 //
-// The harness drives it through two files inside its own evidence root:
+// The harness drives it through files inside its own evidence root:
 //   `<control>/end`   -- written by the harness: emit `left` with this reason;
+//   `<control>/fail-shutdown-leave` -- if present at shutdown, the shutdown leave fails;
 //   `<control>/state.json` -- written here: what the child actually observed.
 // It never fabricates a transcript, a speaker or a UI identity.
 
@@ -49,7 +50,7 @@ const state = {
   pid: process.pid, configPath, envKeys: Object.keys(process.env).sort(),
   mediaTiming, mediaTimingTargetSequence: mediaTiming === "invalid2ns" ? "26" : null,
   joined: false, mediaConnected: false, framesSent: 0, mediaEndpoint: null,
-  mediaClosedReason: null, leaseRenewals: [], left: null, leave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
+  mediaClosedReason: null, leaseRenewals: [], left: null, leave: null, shutdownLeave: null, endObservation: null, captureDrain: null, captureFinish: null, commands: [], playback: [], flushes: [], withheldFlushes: [], disclosure: null,
   capturePosition: { captureEpoch: "1", sequence: "0", outputEndSample: "0" }, renderCallbacks: [], renderReleases: [], joinTiming: joinClocks,
 };
 const FRAME_MS = 20;
@@ -319,18 +320,42 @@ lines.on("line", (line) => {
   })().catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(10); });
 });
 
-lines.on("close", () => {
+// As BridgeProcess.shutdown() in the Mac bridge: EOF, SIGTERM and SIGINT stop
+// media, then, if still joined, make one bounded recorded leave(coordinator_stop).
+// Success is a confirmed departure. The `<control>/fail-shutdown-leave` file makes
+// that leave fail, as a failed Swift press does: departure_unconfirmed /
+// cleanup_failed and exit 2, so the quarantine path stays testable. The leave is
+// recorded in state.shutdownLeave only; it is not published to the closing parent
+// as a live meeting end, and it is not the parent's `leave` command (state.leave).
+let shutdownWork = null;
+function shutdown() {
+  if (shutdownWork !== null) return shutdownWork;
   observations?.dispose();
-  void (async () => {
+  shutdownWork = (async () => {
     try {
       await captureLifecycle.stop();
       persist();
-      const completion = await physicalOutcome.finish({ joined: state.joined, left: state.left });
+      let cleanupFailed = false;
+      if (joinedNow && !departed) {
+        let fail = false;
+        try { readFileSync(path.join(control, "fail-shutdown-leave")); fail = true; } catch { /* the leave succeeds */ }
+        state.shutdownLeave = { ...bridgeLeaveFact("coordinator_stop", process.hrtime.bigint()), outcome: fail ? "failed" : "ok" };
+        if (fail) cleanupFailed = true;
+        else { joinedNow = false; departed = true; state.left = "removed"; }
+        persist();
+      }
+      const completion = await physicalOutcome.finish({ joined: state.joined, left: state.left, cleanupFailed });
       if (completion.exitCode !== 0) process.exitCode = completion.exitCode;
+      else if (cleanupFailed) process.exitCode = 2;
     } finally {
       if (physicalOutcomeTimer !== null) clearInterval(physicalOutcomeTimer);
       physicalOutcomeTimer = null;
     }
   })().catch(() => { observations?.dispose(); physicalOutcome.dispose(); process.exit(11); });
-});
+  return shutdownWork;
+}
+lines.on("close", () => { void shutdown(); });
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => { void shutdown().then(() => process.exit()); });
+}
 joinClocks.linesReadyNs = String(process.hrtime.bigint()); // stdin handlers are live from here
