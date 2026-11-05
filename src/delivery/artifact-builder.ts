@@ -82,6 +82,32 @@ function largestAdmittedOutputBytes(): number {
   return low;
 }
 
+/** The SDK refuses a processText input above its `MAX_PROCESSING_INPUT_BYTES`
+ * rather than chunking it, and does not export that constant either, so it is
+ * probed the same way: the largest ASCII input `validateClientCommand` admits
+ * is its byte cap. A long transcript is split to fit under it (see
+ * `synthesize`). */
+export const MAX_PROCESSING_INPUT_BYTES = largestAdmittedInputBytes();
+
+function largestAdmittedInputBytes(): number {
+  const admits = (bytes: number): boolean => {
+    try {
+      validateClientCommand({ type: "process_text", requestId: "input-bound-probe", sessionId: 1n,
+        instructions: ".", input: ".".repeat(bytes), outputSchema: { type: "object" }, maxOutputBytes: 1 }, CLIENT_PROTOCOL_VERSION);
+      return true;
+    } catch { return false; }
+  };
+  if (!admits(1)) throw new Error("the installed Runtime SDK admits no text processing input");
+  // Doubling first keeps every probe string within twice the cap.
+  let low = 1, high = 2;
+  while (high <= 1 << 24 && admits(high)) { low = high; high *= 2; }
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (admits(middle)) low = middle; else high = middle;
+  }
+  return low;
+}
+
 /** The WIRE schema (D031): the Runtime enforces exactly `type` (one string),
  * `properties`, `required`, `items`, `enum` and `additionalProperties`, and
  * refuses any other keyword outright, so the bounds above are not spelled
@@ -224,12 +250,7 @@ async function buildTimedArtifact(input: TimedArtifactBuildInput, version: "v1" 
   const participants = participantsFromAttendance(input.attendance);
   const names = new Map(participants.map((entry) => [entry.person_id, entry.display_name]));
   if (names.size > 500 || value.segments.length > 1280) throw new Error("timed artifact output bound exceeded");
-  const orderKey = (instant: string) => {
-    try {
-      const canonical = addMillisecondsToUtcInstant(instant, 0);
-      return `${canonical.slice(0, 19)}.${canonical.slice(19, -1).replace(".", "").padEnd(6, "0")}`;
-    } catch { throw new Error("timed artifact wall instant is invalid"); }
-  };
+  const orderKey = instantOrderKey;
   const meetingStart = orderKey(input.identity.occurrenceStartedAt), meetingEnd = orderKey(input.endedAt);
   const ids = new Set<string>();
   const segments = version === "v2" ? [...value.segments].sort((left, right) => {
@@ -298,18 +319,9 @@ function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transcript">
 async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transcript"> & { readonly transcript: { readonly transcriptComplete: boolean } },
   participants: TeamMemMeetingArtifact["participants"], transcript: TeamMemMeetingArtifact["transcript"],
   transcriptWarnings: readonly { readonly code: string; readonly detail: string }[], version: "v1" | "v2"): Promise<BuiltTeamMemMeetingArtifact | BuiltTeamMemMeetingArtifactV2> {
-  const processed = await input.runtime.processText({
-    sessionId: input.sessionId,
-    instructions: (version === "v1"
-      ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies."
-      : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.") + (input.noVerbatimQuotes === true ? NO_VERBATIM_INSTRUCTION : ""),
-    input: canonicalSynthesisInput(transcript, version, input.knownProjects),
-    outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
-    maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES,
-  });
-  const synthesis = textSynthesisContract.parse(processed.output);
-  const runtimeWarnings = processed.warnings.map(runtimeTextWarning);
-  const baseWarnings = input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length;
+  const { synthesis, runtimeWarnings: rawRuntimeWarnings, warnings: synthesisWarnings } = await synthesize(input, transcript, version);
+  const runtimeWarnings = rawRuntimeWarnings.map(runtimeTextWarning);
+  const baseWarnings = input.processingWarnings.length + transcriptWarnings.length + runtimeWarnings.length + synthesisWarnings.length;
   const projects = input.knownProjects === undefined ? { projects: synthesis.projects, warnings: [] }
     : resolveProjects(synthesis.projects, input.knownProjects, MAX_PROCESSING_WARNINGS - baseWarnings);
   if (baseWarnings + projects.warnings.length > MAX_PROCESSING_WARNINGS) {
@@ -337,7 +349,7 @@ async function assembleSupportedArtifact(input: Omit<ArtifactBuildInput, "transc
     discussion_points: synthesis.discussion_points,
     person_summaries: synthesis.person_summaries,
     recording_gaps: input.recordingGaps.map((gap) => ({ started_at: gap.startedAt, ended_at: gap.endedAt, reason: gap.reason })),
-    processing_warnings: [...input.processingWarnings, ...transcriptWarnings, ...runtimeWarnings, ...projects.warnings],
+    processing_warnings: [...input.processingWarnings, ...transcriptWarnings, ...runtimeWarnings, ...synthesisWarnings, ...projects.warnings],
     provenance: {
       runtime_profile: input.provenance.runtimeProfile,
       stt_provider: input.provenance.sttProvider,
@@ -550,13 +562,284 @@ function runtimeTextWarning(warning: string): { readonly code: string; readonly 
   return { code: "runtime_text_warning", detail: `Runtime text processing warning (sha256:${digest})` };
 }
 
-/** The published project names, then the transcript the synthesis cites. */
-function canonicalSynthesisInput(transcript: TeamMemMeetingArtifact["transcript"], version: "v1" | "v2",
-  knownProjects: readonly string[] | null | undefined): string {
-  return JSON.stringify({ known_projects: synthesisProjectVocabulary(knownProjects), transcript: transcript.map((segment) => version === "v1"
+/** A UTC instant as a string that orders by time, whatever its fraction width. */
+function instantOrderKey(instant: string): string {
+  try {
+    const canonical = addMillisecondsToUtcInstant(instant, 0);
+    return `${canonical.slice(0, 19)}.${canonical.slice(19, -1).replace(".", "").padEnd(6, "0")}`;
+  } catch { throw new Error("timed artifact wall instant is invalid"); }
+}
+
+type TextSynthesis = z.infer<typeof textSynthesisContract>;
+type ProcessingWarning = { readonly code: string; readonly detail: string };
+type ArtifactTranscript = TeamMemMeetingArtifact["transcript"];
+
+/** processText calls: every window call plus every reduce call, each reduce
+ * counted twice for its one retry here (D047). The Runtime may also retry a
+ * schema-invalid answer once inside any processText call, so provider chats
+ * can reach twice this. */
+const MAX_SYNTHESIS_CALLS = 64;
+/** Window or partial summaries merged by one reduce call. */
+const REDUCE_FAN_IN = 6;
+/** Each window and partial merge is asked to keep its prose to this, so
+ * REDUCE_FAN_IN of them fit one Runtime input even at three UTF-8 bytes a
+ * character with up to nine people each (Feishu-length IDs); with ten they do
+ * not. A merge input that still runs over is a visible build failure. */
+const PART_PROSE_CHARACTERS = 600;
+/** The synthesis contract's bounds on a list and on an item's evidence. */
+const MAX_SYNTHESIS_ITEMS = 500, MAX_EVIDENCE_IDS = 100;
+
+const WINDOW_INSTRUCTION = (index: number, count: number) => ` This input is window ${index + 1} of ${count} of one meeting transcript, in time order. Synthesize only what this window shows and cite only its segment IDs; the windows are merged afterwards. Keep the summary and all person summaries together within ${PART_PROSE_CHARACTERS} characters.`;
+const REDUCE_INSTRUCTION = "Merge these per-window syntheses of one meeting, given in time order, into one factual meeting summary and one summary per person. Use only what the window summaries state; do not add facts or infer identities. Return exactly one person summary for each person_id given, with its display_name exactly as given, and no other person.";
+const PARTIAL_REDUCE_INSTRUCTION = ` These windows are one part of a longer meeting and this merge is merged again with the other parts: keep the summary and all person summaries together within ${PART_PROSE_CHARACTERS} characters.`;
+const REDUCE_RETRY_INSTRUCTION = " An earlier answer to this request did not return exactly the people given.";
+const reduceContract = textSynthesisContract.pick({ summary: true, person_summaries: true });
+const REDUCE_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary", "person_summaries"],
+  properties: {
+    summary: (TEAMMEM_TEXT_OUTPUT_SCHEMA.properties as Record<string, unknown>).summary,
+    person_summaries: (TEAMMEM_TEXT_OUTPUT_SCHEMA.properties as Record<string, unknown>).person_summaries,
+  },
+};
+
+type ReducePart = Pick<TextSynthesis, "summary" | "person_summaries"> & { readonly first_window: number; readonly last_window: number };
+
+/** Map/reduce over a transcript the Runtime would refuse in one input (D047).
+ *
+ * A transcript that fits is one call, exactly as before windowing. Otherwise
+ * it is cut into ordered windows that each fit the input cap, never inside a
+ * segment and, where a cut exists, never between entries whose times overlap
+ * (a live entry and the final entry that observed the same speech). Each
+ * window is synthesized with the usual instructions and may cite only its own
+ * segments, unless the item is a project that is not published and so is
+ * dropped anyway.
+ *
+ * Merging: projects, decisions, action items and discussion points are lists
+ * of ID-backed items, so they are merged deterministically: concatenated in
+ * window order, an identical item seen in several windows kept once with the
+ * union of its evidence. A merged item citing more than MAX_EVIDENCE_IDS keeps
+ * an even spread of them (spreadEvidence) and is named in an
+ * `evidence_thinned` warning; the item and its text stay. `summary` and
+ * `person_summaries` are prose, merged by the model in rounds of at most
+ * REDUCE_FAN_IN parts until one remains, so they always come from the model.
+ * No item or text is cut: a merged list over its bound, a reduce input over
+ * the cap, or a reduce answer that does not return exactly its people is a
+ * visible build failure. Every call is planned, and checked against
+ * MAX_SYNTHESIS_CALLS, before the first one. */
+async function synthesize(input: Omit<ArtifactBuildInput, "transcript">, transcript: ArtifactTranscript, version: "v1" | "v2"): Promise<{
+  readonly synthesis: TextSynthesis; readonly runtimeWarnings: readonly string[]; readonly warnings: readonly ProcessingWarning[];
+}> {
+  const noVerbatim = input.noVerbatimQuotes === true ? NO_VERBATIM_INSTRUCTION : "";
+  const instructions = (version === "v1"
+    ? "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies."
+    : "Produce only the requested factual meeting synthesis. Preserve explicit owners and due dates only when stated; every project, decision, action item, and discussion point must cite stored transcript segment IDs. Do not infer identities, owners, or dates. Under projects, list each project the meeting substantively discussed, whether named outright or clearly referred to, using the exact name from known_projects when one applies, and cite the segment IDs that show the discussion. Leave projects empty when none applies. Overlapping live/final entries are observations that may describe the same speech, not proof of repeated events; retain ID-backed factual evidence without inventing identities.") + noVerbatim;
+  const windows = synthesisWindows(transcript, version, input.knownProjects);
+  const count = windows.length;
+  const rounds = reduceRounds(count), reduceCalls = rounds.reduce((sum, calls) => sum + calls, 0);
+  if (count + 2 * reduceCalls > MAX_SYNTHESIS_CALLS) {
+    throw new Error(`meeting transcript needs ${count} synthesis windows and ${reduceCalls} reduce calls, up to ${count + 2 * reduceCalls} calls with retries; at most ${MAX_SYNTHESIS_CALLS} are allowed`);
+  }
+  // Undefined when the name is not published, so the artifact drops the project.
+  const publishedName = ({ name }: { readonly name: string }) => input.knownProjects === undefined ? name
+    : resolveProjects([{ name, evidence_segment_ids: [] }], input.knownProjects).projects[0]?.name;
+  const outputs: TextSynthesis[] = [], runtimeWarnings: string[] = [];
+  for (const [index, window] of windows.entries()) {
+    const processed = await input.runtime.processText({
+      sessionId: input.sessionId,
+      instructions: count === 1 ? instructions : instructions + WINDOW_INSTRUCTION(index, count),
+      input: canonicalSynthesisInput(window, version, input.knownProjects),
+      outputSchema: TEAMMEM_TEXT_OUTPUT_SCHEMA,
+      maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES,
+    });
+    const synthesis = textSynthesisContract.parse(processed.output);
+    // One window is the whole transcript: the artifact checks its evidence as before.
+    // A project that is not published is dropped below, as it is from one window,
+    // so only a published one must cite this window.
+    const ids = new Set(window.map(({ segment_id }) => segment_id));
+    const published = synthesis.projects.filter((project) => publishedName(project) !== undefined);
+    if (count > 1 && [...published, ...synthesis.decisions, ...synthesis.action_items, ...synthesis.discussion_points]
+      .some(({ evidence_segment_ids }) => evidence_segment_ids.some((id) => !ids.has(id)))) {
+      throw new Error(`synthesis window ${index + 1} of ${count} cites evidence_segment_ids outside the window`);
+    }
+    outputs.push(synthesis);
+    runtimeWarnings.push(...processed.warnings);
+  }
+  if (count === 1) return { synthesis: outputs[0]!, runtimeWarnings, warnings: [] };
+
+  const lists = <K extends "projects" | "decisions" | "action_items" | "discussion_points">(field: K) => outputs.map((output) => output[field]);
+  const unpublished = lists("projects").flat().filter((project) => publishedName(project) === undefined);
+  const windowIds = windows.map((window) => window.map(({ segment_id }) => segment_id)), thinned: ProcessingWarning[] = [];
+  const merged = {
+    // Published projects merge under their published name; the rest are only
+    // named in a warning after the merge, whatever they cite.
+    projects: [...mergeItems(lists("projects").map((projects) => projects.filter((project) => publishedName(project) !== undefined)),
+      (project) => publishedName(project)!, "projects", windowIds, thinned),
+      ...unpublished.filter((project, index) => unpublished.findIndex(({ name }) => name === project.name) === index)],
+    decisions: mergeItems(lists("decisions"), ({ text }) => text, "decisions", windowIds, thinned),
+    action_items: mergeItems(lists("action_items"), ({ text, owner, due_date }) => JSON.stringify([text, owner, due_date]), "action_items", windowIds, thinned),
+    discussion_points: mergeItems(lists("discussion_points"), ({ text }) => text, "discussion_points", windowIds, thinned),
+  };
+  let parts: ReducePart[] = outputs.map(({ summary, person_summaries }, index) => ({ first_window: index + 1, last_window: index + 1, summary, person_summaries }));
+  for (const [round, calls] of rounds.entries()) {
+    const next: ReducePart[] = [];
+    for (let call = 0; call < calls; call += 1) {
+      const group = parts.slice(Math.floor(call * parts.length / calls), Math.floor((call + 1) * parts.length / calls));
+      const reduceInput = JSON.stringify({ parts: group });
+      const label = `synthesis reduce round ${round + 1} of ${rounds.length}, windows ${group[0]!.first_window}-${group.at(-1)!.last_window}`;
+      const bytes = Buffer.byteLength(reduceInput, "utf8");
+      if (bytes > MAX_PROCESSING_INPUT_BYTES) throw new Error(`${label}: the summaries take ${bytes} bytes, over the Runtime text processing input cap of ${MAX_PROCESSING_INPUT_BYTES}`);
+      const people = new Map(group.flatMap(({ person_summaries }) => person_summaries.map(({ person_id, display_name }) => [person_id, display_name] as const)));
+      let prose: Pick<TextSynthesis, "summary" | "person_summaries"> | undefined;
+      for (let attempt = 0; prose === undefined; attempt += 1) {
+        if (attempt === 2) throw new Error(`${label}: the answer did not return exactly the people the windows summarized`);
+        const processed = await input.runtime.processText({ sessionId: input.sessionId,
+          instructions: REDUCE_INSTRUCTION + (round < rounds.length - 1 ? PARTIAL_REDUCE_INSTRUCTION : "") + (attempt > 0 ? REDUCE_RETRY_INSTRUCTION : "") + noVerbatim,
+          input: reduceInput, outputSchema: REDUCE_OUTPUT_SCHEMA, maxOutputBytes: MAX_PROCESSED_OUTPUT_BYTES });
+        const answer = reduceContract.parse(processed.output);
+        runtimeWarnings.push(...processed.warnings);
+        const returned = answer.person_summaries;
+        if (returned.length === people.size && new Set(returned.map(({ person_id }) => person_id)).size === people.size &&
+          returned.every(({ person_id, display_name }) => people.get(person_id) === display_name)) prose = answer;
+      }
+      next.push({ first_window: group[0]!.first_window, last_window: group.at(-1)!.last_window, ...prose });
+    }
+    parts = next;
+  }
+  const warnings: ProcessingWarning[] = [
+    ...thinned,
+    { code: "synthesis_reduced", detail: `the ${count} window summaries were merged by the model in ${rounds.length} reduce round(s) of ${rounds.join(", ")} call(s)` },
+    { code: "synthesis_windowed", detail: `transcript synthesized in ${count} windows covering all ${transcript.length} segments` },
+  ];
+  return { synthesis: { summary: parts[0]!.summary, person_summaries: parts[0]!.person_summaries, ...merged }, runtimeWarnings, warnings };
+}
+
+/** Reduce calls per round until one part remains. */
+function reduceRounds(count: number): number[] {
+  const rounds: number[] = [];
+  for (let parts = count; parts > 1; parts = rounds.at(-1)!) rounds.push(Math.ceil(parts / REDUCE_FAN_IN));
+  return rounds;
+}
+
+/** Ordered windows whose serialized input each fits the Runtime input cap. */
+function synthesisWindows(transcript: ArtifactTranscript, version: "v1" | "v2", knownProjects: readonly string[] | null | undefined): ArtifactTranscript[] {
+  if (Buffer.byteLength(canonicalSynthesisInput(transcript, version, knownProjects), "utf8") <= MAX_PROCESSING_INPUT_BYTES) return [transcript];
+  // The serialized input is the empty envelope plus each entry and a comma between entries.
+  const envelope = Buffer.byteLength(canonicalSynthesisInput([], version, knownProjects), "utf8");
+  const sizes = transcript.map((segment) => Buffer.byteLength(JSON.stringify(synthesisEntry(segment, version)), "utf8"));
+  const starts = transcript.map(({ started_at }) => instantOrderKey(started_at)), ends = transcript.map(({ ended_at }) => instantOrderKey(ended_at));
+  const windows: ArtifactTranscript[] = [];
+  for (let start = 0; start < transcript.length;) {
+    let end = start, used = envelope;
+    while (end < transcript.length && used + sizes[end]! + (end > start ? 1 : 0) <= MAX_PROCESSING_INPUT_BYTES) {
+      used += sizes[end]! + (end > start ? 1 : 0);
+      end += 1;
+    }
+    if (end === start) {
+      const bare = Buffer.byteLength(canonicalSynthesisInput([], version, null), "utf8");
+      throw new Error(bare + sizes[start]! <= MAX_PROCESSING_INPUT_BYTES
+        ? `the published project list (${synthesisProjectVocabulary(knownProjects).length} names, ${envelope - bare} bytes) leaves no room for transcript segment ${transcript[start]!.segment_id} under the Runtime text processing input cap of ${MAX_PROCESSING_INPUT_BYTES} bytes`
+        : `transcript segment ${transcript[start]!.segment_id} alone exceeds the Runtime text processing input cap of ${MAX_PROCESSING_INPUT_BYTES} bytes`);
+    }
+    if (end < transcript.length) {
+      // Prefer the latest cut no earlier entry of this window overlaps, unless
+      // it would leave the window less than half full: a long run of
+      // overlapping entries is then cut where it overflows.
+      let latestEnd = ends[start]!, cut = start;
+      for (let index = start + 1; index <= end; index += 1) {
+        if (latestEnd <= starts[index]!) cut = index;
+        if (ends[index]! > latestEnd) latestEnd = ends[index]!;
+      }
+      if (cut - start >= (end - start) / 2) end = cut;
+    }
+    windows.push(transcript.slice(start, end));
+    start = end;
+  }
+  return windows;
+}
+
+/** Concatenates items in window order; identical items become one citing the
+ * union of their evidence. A merged list over MAX_SYNTHESIS_ITEMS is a visible
+ * build failure naming the field. An item whose windows together cite more
+ * than MAX_EVIDENCE_IDS keeps the spreadEvidence selection of them, and one
+ * `evidence_thinned` warning per such item goes to `thinned`, naming the
+ * field, the item (a project by its published name, any other item by its
+ * position in the merged list) and the kept and cited counts. A name is at
+ * most 200 characters, so the detail stays well within the 500 a warning
+ * allows. These warnings count toward MAX_PROCESSING_WARNINGS like every
+ * synthesis warning: a build they would take past it fails visibly
+ * ("processing warning limit exceeded"), so none is dropped (D047). */
+function mergeItems<T extends { readonly evidence_segment_ids: string[] }>(lists: readonly (readonly T[])[], key: (item: T) => string, field: string,
+  windowIds: readonly (readonly string[])[], thinned: ProcessingWarning[]): T[] {
+  const merged = new Map<string, T>();
+  for (const item of lists.flat()) {
+    const existing = merged.get(key(item));
+    merged.set(key(item), existing === undefined ? item
+      : { ...existing, evidence_segment_ids: [...new Set([...existing.evidence_segment_ids, ...item.evidence_segment_ids])] });
+  }
+  const items = [...merged.values()];
+  if (items.length > MAX_SYNTHESIS_ITEMS) throw new Error(`merged synthesis ${field} has ${items.length} items; the artifact allows at most ${MAX_SYNTHESIS_ITEMS}`);
+  return items.map((item, index) => {
+    // Only a merged item can exceed the bound, and its union has no repeats.
+    if (item.evidence_segment_ids.length <= MAX_EVIDENCE_IDS) return item;
+    // Every ID is in its own window, so each window's cited IDs come out in transcript order.
+    const cited = new Set(item.evidence_segment_ids);
+    const perWindow = windowIds.map((ids) => ids.filter((id) => cited.has(id))).filter((ids) => ids.length > 0);
+    const kept = spreadEvidence(perWindow, MAX_EVIDENCE_IDS);
+    const name = field === "projects" ? `"${key(item)}"` : `${index + 1} of ${items.length}`;
+    thinned.push({ code: "evidence_thinned", detail: `${field} item ${name}: kept ${kept.length} of ${cited.size} evidence segment IDs, spread across the ${perWindow.length} windows that cite it` });
+    return { ...item, evidence_segment_ids: kept };
+  });
+}
+
+/** The `limit` evidence IDs an item keeps when its windows together cite more
+ * (D047). `windows` holds, for each window citing the item in time order, the
+ * IDs it cites in transcript order; the result is in transcript order.
+ *
+ * Slots per window, max-min fair: every window is offered the same share,
+ * floor(slots left / windows still sharing). A window citing no more than its
+ * share keeps all its IDs and leaves the sharing; the rest share again what is
+ * left. Once every window still sharing cites more than the share, each gets
+ * the share, and the slots that do not divide evenly go one each to the
+ * earliest of them. So no window keeps more than it cites, every citing window
+ * keeps at least one ID (the share starts at floor(limit / windows) >= 1 and
+ * never falls), and exactly `limit` are kept when more are cited.
+ *
+ * Within a window that keeps c of its n IDs: the IDs at positions
+ * floor((2j + 1) * n / (2c)) for j = 0 .. c - 1, the middle of each of c equal
+ * runs, so the kept IDs are evenly spaced and distinct.
+ *
+ * More citing windows than `limit` cannot happen: at most 42 windows plan
+ * within MAX_SYNTHESIS_CALLS, under the 100 an item may cite. It is checked. */
+export function spreadEvidence(windows: readonly (readonly string[])[], limit: number): string[] {
+  if (windows.length > limit) throw new Error(`an item cited in ${windows.length} windows cannot keep an evidence segment ID from each within ${limit}`);
+  const slots = windows.map(() => 0);
+  let sharing = windows.map((_, index) => index), left = limit;
+  while (sharing.length > 0) {
+    const share = Math.floor(left / sharing.length);
+    const within = sharing.filter((index) => windows[index]!.length <= share);
+    if (within.length === 0) {
+      sharing.forEach((index, order) => { slots[index] = share + (order < left % sharing.length ? 1 : 0); });
+      break;
+    }
+    for (const index of within) { slots[index] = windows[index]!.length; left -= windows[index]!.length; }
+    sharing = sharing.filter((index) => windows[index]!.length > share);
+  }
+  return windows.flatMap((ids, index) => Array.from({ length: slots[index]! }, (_, j) => ids[Math.floor((2 * j + 1) * ids.length / (2 * slots[index]!))]!));
+}
+
+function synthesisEntry(segment: ArtifactTranscript[number], version: "v1" | "v2") {
+  return version === "v1"
     ? { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker }
     : { segment_id: segment.segment_id, text: segment.text, speaker: segment.speaker, started_at: segment.started_at,
-        ended_at: segment.ended_at, provenance: segment.provenance }) });
+        ended_at: segment.ended_at, provenance: segment.provenance };
+}
+
+/** The published project names, then the transcript the synthesis cites. */
+function canonicalSynthesisInput(transcript: ArtifactTranscript, version: "v1" | "v2",
+  knownProjects: readonly string[] | null | undefined): string {
+  return JSON.stringify({ known_projects: synthesisProjectVocabulary(knownProjects), transcript: transcript.map((segment) => synthesisEntry(segment, version)) });
 }
 
 function evidenceSchema(): Record<string, unknown> {

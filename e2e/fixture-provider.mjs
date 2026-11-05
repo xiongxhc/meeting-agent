@@ -21,11 +21,32 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
  * members. The fixture answers exactly that shape, with a visible placeholder
  * summary and no invented project, decision, action item, discussion point or
  * person, so nothing in the artifact can be mistaken for a reading of the
- * recording. Any other prompt gets a one-key object. */
-function schemaShapedAnswer(prompt, messages, l4Case) {
+ * recording. A long meeting's window summaries are merged by further calls
+ * whose input is `{ parts }` and which ask for just the two prose members: the
+ * fixture returns the placeholder and one placeholder summary for each person
+ * the parts name, as the merge must. A test that names `citedProject`
+ * ({ name, idsPerWindow }) also gets that project in every synthesis answer,
+ * citing the first `idsPerWindow` segment IDs of the transcript it was sent.
+ * Any other prompt gets a one-key object. */
+function schemaShapedAnswer(prompt, messages, l4Case, citedProject) {
+  const inputs = messages.flatMap((message) => {
+    try {
+      const parsed = JSON.parse(String(message.content ?? ""));
+      return parsed !== null && typeof parsed === "object" ? [parsed] : [];
+    } catch { return []; }
+  });
+  const reduce = inputs.flatMap((parsed) => Array.isArray(parsed.parts) ? [parsed.parts] : []);
+  if (reduce.length === 1) {
+    const people = new Map(reduce[0].flatMap((part) => part?.person_summaries ?? []).map((entry) => [entry.person_id, entry.display_name]));
+    return JSON.stringify({ summary: PLACEHOLDER, person_summaries: [...people].map(([person_id, display_name]) =>
+      ({ person_id, display_name, text: "Scripted fixture provider merge; no model read this meeting." })) });
+  }
   if (prompt.includes("meeting synthesis")) {
     return JSON.stringify({
-      summary: PLACEHOLDER, projects: [], decisions: [],
+      summary: PLACEHOLDER,
+      projects: citedProject === undefined ? [] : [{ name: citedProject.name, evidence_segment_ids: inputs.flatMap((parsed) => Array.isArray(parsed.transcript) ? parsed.transcript : [])
+        .slice(0, citedProject.idsPerWindow).map(({ segment_id }) => segment_id) }],
+      decisions: [],
       action_items: [], discussion_points: [], person_summaries: l4Case === undefined ? [] : l4PersonSummaries(messages, l4Case),
     });
   }
@@ -33,7 +54,7 @@ function schemaShapedAnswer(prompt, messages, l4Case) {
 }
 
 /** Component-testable HTTP handler; fault arming is explicit and instance-local. */
-export function createFixtureProviderHandler({ l4Case } = {}) {
+export function createFixtureProviderHandler({ l4Case, citedProject } = {}) {
   l4Configuration({ l4Case, interactive: true });
   const calls = [];
   let nextChatFailure = false;
@@ -90,7 +111,7 @@ export function createFixtureProviderHandler({ l4Case } = {}) {
           return;
         }
         recordChat("ok", promptBytes);
-        const content = schemaShapedAnswer(text, body.messages ?? [], l4Case);
+        const content = schemaShapedAnswer(text, body.messages ?? [], l4Case, citedProject);
         if (openAiChat) {
           response.setHeader("content-type", "text/event-stream");
           response.end(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\ndata: [DONE]\n\n`);
